@@ -1,0 +1,39 @@
+services:
+  click-processor:
+    build: .
+    container_name: tds-click-processor
+    ports:
+      - "${TDS_PORT:-8100}:8100"
+    environment:
+      - TDS_NODE_ID=${TDS_NODE_ID:-local}
+      - TDS_NODE_REGION=${TDS_NODE_REGION:-eu}
+      - TDS_ENVIRONMENT=${TDS_ENVIRONMENT:-development}
+      - TDS_REDIS_URL=redis://redis:6379/0
+      - TDS_SECRET_KEY=${TDS_SECRET_KEY:-}
+      - TDS_CENTRAL_URL=${TDS_CENTRAL_URL:-}
+      - TDS_CENTRAL_API_KEY=${TDS_CENTRAL_API_KEY:-}
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8100/health')"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  redis:
+    image: redis:7-alpine
+    container_name: tds-redis
+    command: redis-server --maxmemory 256mb --maxmemory-policy volatile-lru --appendonly yes
+    volumes:
+      - tds-redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+    restart: unless-stopped
+
+volumes:
+  tds-redis-data:

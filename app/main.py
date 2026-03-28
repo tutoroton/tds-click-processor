@@ -235,8 +235,8 @@ async def seed_data(x_tds_key: str = Header("", alias="X-TDS-Key")):
         "name": "US Mobile CPA", "status": "active", "priority": "10",
         "weight": "100", "daily_cap": "10000", "frequency_cap": "3", "frequency_period": "86400",
     })
-    pipe.sadd("campaign:1:has_geo")
-    pipe.sadd("campaign:1:has_device")
+    pipe.set("campaign:1:has_geo", "1")
+    pipe.set("campaign:1:has_device", "1")
     pipe.sadd("geo:US", "1")
     pipe.sadd("device:mobile", "1")
     pipe.sadd("campaign:1:offers", "101", "102")
@@ -249,8 +249,8 @@ async def seed_data(x_tds_key: str = Header("", alias="X-TDS-Key")):
         "name": "EU Desktop CPL", "status": "active", "priority": "5",
         "weight": "100", "daily_cap": "5000",
     })
-    pipe.sadd("campaign:2:has_geo")
-    pipe.sadd("campaign:2:has_os")
+    pipe.set("campaign:2:has_geo", "1")
+    pipe.set("campaign:2:has_os", "1")
     pipe.sadd("geo:DE", "2")
     pipe.sadd("geo:FR", "2")
     pipe.sadd("geo:GB", "2")

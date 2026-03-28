@@ -20,6 +20,12 @@ class Settings(BaseSettings):
     central_url: str = ""
     central_api_key: str = ""
 
+    # Fallback URL when routing fails
+    fallback_url: str = "https://adstudy.dev"
+
+    # Sentry (from env, never hardcode)
+    sentry_dsn: str = ""
+
     # Sync
     sync_interval_seconds: int = 30
     full_sync_interval_seconds: int = 60

@@ -2,214 +2,260 @@
 
 Reads campaign/offer/rule data from Redis, evaluates targeting conditions,
 selects destination URL. All lookups are Redis-only, no SQL.
+
+Every stage is timed to millisecond precision for observability.
 """
 
+import logging
 import random
-import re
+import time
+from urllib.parse import quote
 
 import sentry_sdk
 from app.models import ClickRequest
 from app.redis_client import get_redis
+from app.ua_parser import parse_ua
+
+logger = logging.getLogger("tds.router")
+
+
+def safe_int(value, default=0):
+    """Convert to int safely — never crash on bad Redis data."""
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (ValueError, TypeError):
+        return default
+
+
+def _ms_since(start: float) -> float:
+    """Milliseconds elapsed since start (perf_counter)."""
+    return round((time.perf_counter() - start) * 1000, 2)
 
 
 async def route(req: ClickRequest) -> dict | None:
     """Find matching campaign + offer for this click.
 
-    Returns: {"url": "...", "campaign_id": ..., "offer_id": ...} or None.
+    Returns: {"url": ..., "campaign_id": ..., "offer_id": ..., "timing": {...}} or None.
+    Timing dict contains ms-precision breakdown of every routing stage.
     """
+    t_start = time.perf_counter()
+    timing = {}
+
     r = await get_redis()
 
-    # Step 1: Find campaigns targeting this country + device + OS
+    # Stage 1: UA parsing (cached, should be <0.1ms on cache hit)
+    t0 = time.perf_counter()
     device_type = parse_device_type(req.user_agent)
     os_name = parse_os(req.user_agent)
+    timing["ua_parse_ms"] = _ms_since(t0)
 
-    # Pipeline: fetch all matching sets in one round-trip
+    # Stage 2: Geo/device/OS set lookup (single pipeline round-trip)
+    t0 = time.perf_counter()
     pipe = r.pipeline()
     pipe.smembers(f"geo:{req.country}")
     pipe.smembers(f"device:{device_type}")
     pipe.smembers(f"os:{os_name}")
-    pipe.smembers("campaigns:active")  # all active campaign IDs
+    pipe.smembers("campaigns:active")
     results = await pipe.execute()
+    timing["geo_lookup_ms"] = _ms_since(t0)
 
     geo_ids = results[0] or set()
     device_ids = results[1] or set()
     os_ids = results[2] or set()
     active_ids = results[3] or set()
 
-    # For each active campaign, check if it matches this request.
-    # A campaign matches if:
-    # - It's in the geo set for this country, OR it has no geo targeting (not in ANY geo set)
-    # - Same logic for device and OS
-    #
-    # geo_ids = campaigns that explicitly target this country
-    # If a campaign has NO geo targeting at all, it's a catch-all for geo dimension
-    candidates = set()
-    for cid in active_ids:
-        # Check geo: campaign is in geo:XX set, OR campaign has no geo targeting
-        has_geo_targeting = await r.exists(f"campaign:{cid}:has_geo")
-        geo_match = (cid in geo_ids) or (not has_geo_targeting)
-
-        # Check device
-        has_device_targeting = await r.exists(f"campaign:{cid}:has_device")
-        device_match = (cid in device_ids) or (not has_device_targeting)
-
-        # Check OS
-        has_os_targeting = await r.exists(f"campaign:{cid}:has_os")
-        os_match = (cid in os_ids) or (not has_os_targeting)
-
-        if geo_match and device_match and os_match:
-            candidates.add(cid)
-
-    if not candidates:
+    if not active_ids:
+        timing["route_total_ms"] = _ms_since(t_start)
+        timing["result"] = "no_active_campaigns"
         return None
 
-    # Step 2: Fetch candidate campaign details (one round-trip)
+    active_list = sorted(active_ids)
+
+    # Stage 3: Targeting flags check (batched pipeline)
+    t0 = time.perf_counter()
+    pipe = r.pipeline()
+    for cid in active_list:
+        pipe.exists(f"campaign:{cid}:has_geo")
+        pipe.exists(f"campaign:{cid}:has_device")
+        pipe.exists(f"campaign:{cid}:has_os")
+    exists_results = await pipe.execute()
+
+    candidates = []
+    for i, cid in enumerate(active_list):
+        has_geo = exists_results[i * 3]
+        has_device = exists_results[i * 3 + 1]
+        has_os = exists_results[i * 3 + 2]
+        if ((cid in geo_ids) or (not has_geo)) and \
+           ((cid in device_ids) or (not has_device)) and \
+           ((cid in os_ids) or (not has_os)):
+            candidates.append(cid)
+    timing["targeting_ms"] = _ms_since(t0)
+    timing["candidates_count"] = len(candidates)
+
+    if not candidates:
+        timing["route_total_ms"] = _ms_since(t_start)
+        timing["result"] = "no_candidates"
+        return None
+
+    # Stage 4: Fetch campaign details
+    t0 = time.perf_counter()
     pipe = r.pipeline()
     for cid in candidates:
         pipe.hgetall(f"campaign:{cid}")
     campaigns = await pipe.execute()
+    timing["campaign_fetch_ms"] = _ms_since(t0)
 
-    # Step 3: Filter by additional rules (caps, time, frequency)
+    # Stage 5: Cap/frequency filtering
+    t0 = time.perf_counter()
     eligible = []
     for i, campaign in enumerate(campaigns):
         if not campaign:
             continue
-        cid = list(candidates)[i]
+        cid = candidates[i]
         campaign["_id"] = cid
 
-        # Check daily cap
-        if campaign.get("daily_cap") and campaign["daily_cap"] != "0":
-            cap_key = f"cap:{cid}:daily"
-            current = await r.get(cap_key)
-            if current and int(current) >= int(campaign["daily_cap"]):
+        daily_cap = safe_int(campaign.get("daily_cap"))
+        if daily_cap > 0:
+            current = await r.get(f"cap:{cid}:daily")
+            if current and safe_int(current) >= daily_cap:
                 continue
 
-        # Check frequency cap (per visitor)
-        if req.visitor_id and campaign.get("frequency_cap") and campaign["frequency_cap"] != "0":
-            freq_key = f"freq:{cid}:{req.visitor_id}"
-            visits = await r.get(freq_key)
-            if visits and int(visits) >= int(campaign["frequency_cap"]):
+        freq_cap = safe_int(campaign.get("frequency_cap"))
+        if req.visitor_id and freq_cap > 0:
+            visits = await r.get(f"freq:{cid}:{req.visitor_id}")
+            if visits and safe_int(visits) >= freq_cap:
                 continue
 
         eligible.append(campaign)
+    timing["filtering_ms"] = _ms_since(t0)
+    timing["eligible_count"] = len(eligible)
 
     if not eligible:
+        timing["route_total_ms"] = _ms_since(t_start)
+        timing["result"] = "all_capped"
         return None
 
-    # Step 4: Select campaign by priority (highest) then weight (random)
-    eligible.sort(key=lambda c: int(c.get("priority", "0")), reverse=True)
-    top_priority = int(eligible[0].get("priority", "0"))
-    top_campaigns = [c for c in eligible if int(c.get("priority", "0")) == top_priority]
-
-    # Weighted random among same-priority campaigns
+    # Stage 6: Campaign selection (priority + weight)
+    t0 = time.perf_counter()
+    eligible.sort(key=lambda c: safe_int(c.get("priority"), 0), reverse=True)
+    top_priority = safe_int(eligible[0].get("priority"), 0)
+    top_campaigns = [c for c in eligible if safe_int(c.get("priority"), 0) == top_priority]
     winner = weighted_select(top_campaigns)
+    timing["selection_ms"] = _ms_since(t0)
 
-    # Step 5: Get offer via split
+    # Stage 7: Offer selection
+    t0 = time.perf_counter()
     offer = await select_offer(r, winner["_id"])
+    timing["offer_ms"] = _ms_since(t0)
+
     if not offer:
+        timing["route_total_ms"] = _ms_since(t_start)
+        timing["result"] = "no_offer"
         return None
 
-    # Step 6: Build destination URL
+    # Stage 8: URL building
+    t0 = time.perf_counter()
     url = build_url(offer.get("url", ""), req, winner["_id"], offer.get("_id", ""))
+    timing["url_build_ms"] = _ms_since(t0)
 
-    # Step 7: Increment counters (async, non-blocking)
-    pipe = r.pipeline()
-    cap_key = f"cap:{winner['_id']}:daily"
-    pipe.incr(cap_key)
-    pipe.expire(cap_key, 86400)
-    if req.visitor_id:
-        freq_key = f"freq:{winner['_id']}:{req.visitor_id}"
-        pipe.incr(freq_key)
-        pipe.expire(freq_key, int(winner.get("frequency_period", "86400")))
-    await pipe.execute()
+    # Stage 9: Counter increment (non-blocking)
+    t0 = time.perf_counter()
+    try:
+        pipe = r.pipeline()
+        cap_key = f"cap:{winner['_id']}:daily"
+        pipe.incr(cap_key)
+        pipe.expire(cap_key, 86400)
+        if req.visitor_id:
+            freq_period = safe_int(winner.get("frequency_period"), 86400)
+            freq_key = f"freq:{winner['_id']}:{req.visitor_id}"
+            pipe.incr(freq_key)
+            pipe.expire(freq_key, freq_period if freq_period > 0 else 86400)
+        await pipe.execute()
+    except Exception as e:
+        logger.warning("Counter update failed: %s", e)
+    timing["counter_ms"] = _ms_since(t0)
+
+    timing["route_total_ms"] = _ms_since(t_start)
+    timing["result"] = "matched"
 
     return {
         "url": url,
         "campaign_id": winner["_id"],
         "offer_id": offer.get("_id", ""),
+        "timing": timing,
     }
 
 
 async def select_offer(r, campaign_id: str) -> dict | None:
     """Select offer from campaign's split configuration."""
-    split = await r.hgetall(f"split:{campaign_id}")
-    if not split:
-        # No split — get default offer
-        offers_key = f"campaign:{campaign_id}:offers"
-        offer_ids = await r.smembers(offers_key)
-        if not offer_ids:
-            return None
-        offer_id = random.choice(list(offer_ids))
+    try:
+        split = await r.hgetall(f"split:{campaign_id}")
+        if not split:
+            offers_key = f"campaign:{campaign_id}:offers"
+            offer_ids = await r.smembers(offers_key)
+            if not offer_ids:
+                return None
+            offer_id = random.choice(sorted(offer_ids))
+            offer = await r.hgetall(f"offer:{offer_id}")
+            offer["_id"] = offer_id
+            return offer
+
+        offer_id = weighted_select_from_dict(split)
         offer = await r.hgetall(f"offer:{offer_id}")
         offer["_id"] = offer_id
         return offer
-
-    # Weighted selection from split
-    offer_id = weighted_select_from_dict(split)
-    offer = await r.hgetall(f"offer:{offer_id}")
-    offer["_id"] = offer_id
-    return offer
+    except Exception as e:
+        logger.error("select_offer failed: %s", e)
+        return None
 
 
 def build_url(template: str, req: ClickRequest, campaign_id: str, offer_id: str) -> str:
     """Replace macros in offer URL template with actual values."""
     replacements = {
-        "{click_id}": req.click_id,
-        "{campaign_id}": campaign_id,
-        "{offer_id}": offer_id,
-        "{country}": req.country,
-        "{city}": req.city,
-        "{region}": req.region,
-        "{ip}": req.ip,
-        "{os}": parse_os(req.user_agent),
-        "{device}": parse_device_type(req.user_agent),
-        "{visitor_id}": req.visitor_id or "",
+        "{click_id}": quote(str(req.click_id), safe=""),
+        "{campaign_id}": quote(str(campaign_id), safe=""),
+        "{offer_id}": quote(str(offer_id), safe=""),
+        "{country}": quote(str(req.country), safe=""),
+        "{city}": quote(str(req.city), safe=""),
+        "{region}": quote(str(req.region), safe=""),
+        "{ip}": quote(str(req.ip), safe=""),
+        "{os}": quote(parse_os(req.user_agent), safe=""),
+        "{device}": quote(parse_device_type(req.user_agent), safe=""),
+        "{visitor_id}": quote(str(req.visitor_id or ""), safe=""),
     }
-    # Replace sub params: {sub1}, {sub2}, etc.
-    for key, value in req.query_params.items():
-        replacements[f"{{{key}}}"] = value
+    for key, value in (req.query_params or {}).items():
+        replacements[f"{{{key}}}"] = quote(str(value), safe="")
 
     url = template
     for macro, value in replacements.items():
         url = url.replace(macro, value)
-
     return url
 
 
 def weighted_select(items: list[dict]) -> dict:
-    """Select item by weight field."""
-    weights = [int(item.get("weight", "100")) for item in items]
+    weights = [safe_int(item.get("weight"), 100) for item in items]
     return random.choices(items, weights=weights, k=1)[0]
 
 
 def weighted_select_from_dict(d: dict) -> str:
-    """Select key from {key: weight} dict."""
     keys = list(d.keys())
-    weights = [int(w) for w in d.values()]
+    weights = [safe_int(w, 1) for w in d.values()]
     return random.choices(keys, weights=weights, k=1)[0]
 
 
-def parse_device_type(ua: str) -> str:
-    """Extract device type from User-Agent."""
-    ua_lower = ua.lower()
-    if any(x in ua_lower for x in ["mobile", "iphone", "android", "phone"]):
-        return "mobile"
-    if any(x in ua_lower for x in ["tablet", "ipad"]):
-        return "tablet"
-    return "desktop"
+def parse_device_type(ua: str | None) -> str:
+    return parse_ua(ua or "")["device_type"]
 
 
-def parse_os(ua: str) -> str:
-    """Extract OS from User-Agent."""
-    ua_lower = ua.lower()
-    if "iphone" in ua_lower or "ipad" in ua_lower or "ios" in ua_lower:
-        return "ios"
-    if "android" in ua_lower:
-        return "android"
-    if "windows" in ua_lower:
-        return "windows"
-    if "mac" in ua_lower:
-        return "macos"
-    if "linux" in ua_lower:
-        return "linux"
-    return "other"
+def parse_os(ua: str | None) -> str:
+    return parse_ua(ua or "")["os"]
+
+
+def parse_browser(ua: str | None) -> str:
+    return parse_ua(ua or "")["browser"]
+
+
+def get_full_ua_info(ua: str | None) -> dict:
+    return parse_ua(ua or "")

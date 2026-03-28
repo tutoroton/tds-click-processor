@@ -1,12 +1,12 @@
 """Request/response models for click-processor."""
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class ClickRequest(BaseModel):
     """Incoming request from CF Worker."""
-    click_id: str
-    visitor_id: str | None = None
+    click_id: str = Field(max_length=128, pattern=r'^[a-zA-Z0-9_\-]+$')
+    visitor_id: str | None = Field(default=None, max_length=128, pattern=r'^[a-zA-Z0-9_\-]*$')
     is_returning: bool = False
     # Geo
     ip: str = ""

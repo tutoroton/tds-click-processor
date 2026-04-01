@@ -5,6 +5,7 @@ against local Redis, returns destination URL for redirect.
 """
 
 import asyncio
+import hmac
 import json
 import logging
 import time
@@ -21,6 +22,7 @@ from app.models import ClickRequest, ClickResponse, HealthResponse
 from app.redis_client import get_redis, close_redis
 from app.router import route, parse_device_type, parse_os, parse_browser, get_full_ua_info
 from app.shipper import run_shipper
+from app.sync_client import apply_snapshot, start_periodic_pull
 
 logger = logging.getLogger("tds.click-processor")
 
@@ -58,12 +60,20 @@ async def lifespan(app: FastAPI):
     # Start click shipper
     shipper_task = asyncio.create_task(run_shipper(r))
 
+    # Start periodic sync pull from central
+    sync_task = asyncio.create_task(start_periodic_pull(r, interval=60))
+
     yield
 
     # Shutdown
     shipper_task.cancel()
+    sync_task.cancel()
     try:
         await shipper_task
+    except asyncio.CancelledError:
+        pass
+    try:
+        await sync_task
     except asyncio.CancelledError:
         pass
     await close_redis()
@@ -85,8 +95,8 @@ async def decide(
     """Main routing endpoint. Called by CF Worker for every click."""
     t_endpoint_start = time.perf_counter()
 
-    # Auth check
-    if settings.tds_secret_key and x_tds_key != settings.tds_secret_key:
+    # Auth check (timing-safe)
+    if settings.tds_secret_key and (not x_tds_key or not hmac.compare_digest(x_tds_key, settings.tds_secret_key)):
         raise HTTPException(status_code=403, detail="Invalid TDS key")
 
     # Route the click
@@ -187,15 +197,18 @@ async def health():
     try:
         redis_ok = await r.ping()
         campaigns_count = await r.scard("campaigns:active")
+        sync_ver = await r.get("sync:version")
     except Exception:
         redis_ok = False
         campaigns_count = 0
+        sync_ver = None
 
     return HealthResponse(
         node_id=settings.node_id,
         region=settings.node_region,
         redis=redis_ok,
         campaigns_loaded=campaigns_count,
+        sync_version=int(sync_ver) if sync_ver else 0,
         uptime_seconds=round(time.time() - START_TIME, 1),
     )
 
@@ -217,13 +230,60 @@ async def stats():
         return {"error": str(e), "node_id": settings.node_id}
 
 
+@app.post("/admin/sync")
+async def receive_sync(
+    request: Request,
+    x_tds_key: str = Header("", alias="X-TDS-Key"),
+):
+    """Receive routing snapshot from central admin-api.
+
+    Called by central after full_sync, or manually.
+    Replaces all routing data in local Redis with snapshot.
+    Auth required via X-TDS-Key header.
+    """
+    # Auth (timing-safe)
+    if settings.tds_secret_key and (not x_tds_key or not hmac.compare_digest(x_tds_key, settings.tds_secret_key)):
+        raise HTTPException(status_code=403, detail="Invalid key")
+
+    # Payload size guard (max 50MB)
+    content_length = request.headers.get("content-length")
+    if content_length and int(content_length) > 50 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Payload too large (max 50MB)")
+
+    try:
+        snapshot = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    # Version guard: reject downgrades (prevent accidental or malicious rollback)
+    r = await get_redis()
+    incoming_version = snapshot.get("sync_version", 0)
+    current_version_str = await r.get("sync:version")
+    current_version = int(current_version_str) if current_version_str else 0
+
+    if current_version > 0 and incoming_version < current_version:
+        logger.warning("Rejected sync downgrade: incoming v%d < current v%d", incoming_version, current_version)
+        return {
+            "status": "rejected",
+            "reason": f"version downgrade: incoming v{incoming_version} < current v{current_version}",
+            "keys_written": 0,
+        }
+
+    stats = await apply_snapshot(r, snapshot)
+
+    logger.info("Sync received: %d keys written (v%d)", stats.get("keys_written", 0), incoming_version)
+    return stats
+
+
 @app.post("/admin/seed")
 async def seed_data(x_tds_key: str = Header("", alias="X-TDS-Key")):
     """Load default routing data into local Redis.
 
-    Protected by TDS_SECRET_KEY. Idempotent — safe to call multiple times.
-    This is a stopgap until proper PG→Redis sync is implemented.
+    DISABLED in production. Only available in development mode.
     """
+    if settings.environment == "production":
+        raise HTTPException(status_code=403, detail="Seed disabled in production. Use /admin/sync.")
+
     if settings.tds_secret_key and x_tds_key != settings.tds_secret_key:
         raise HTTPException(status_code=403, detail="Invalid key")
 

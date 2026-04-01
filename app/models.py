@@ -29,6 +29,7 @@ class ClickRequest(BaseModel):
     tls_version: str = ""
     http_protocol: str = ""
     # URL
+    hostname: str = ""
     path: str = ""
     query_params: dict = {}
 
@@ -44,4 +45,5 @@ class HealthResponse(BaseModel):
     region: str
     redis: bool
     campaigns_loaded: int
+    sync_version: int = 0
     uptime_seconds: float

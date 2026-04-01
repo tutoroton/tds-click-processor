@@ -45,6 +45,64 @@ async def route(req: ClickRequest) -> dict | None:
 
     r = await get_redis()
 
+    # Stage 0: Domain-based campaign resolution (highest priority)
+    t0 = time.perf_counter()
+    domain_campaign_id = await resolve_domain_campaign(r, req)
+    timing["domain_resolve_ms"] = _ms_since(t0)
+
+    if domain_campaign_id:
+        # Domain resolved — skip geo targeting, go straight to offer selection
+        timing["domain_matched"] = True
+        timing["campaign_source"] = "domain"
+
+        t0 = time.perf_counter()
+        campaign = await r.hgetall(f"campaign:{domain_campaign_id}")
+        timing["campaign_fetch_ms"] = _ms_since(t0)
+
+        if campaign:
+            campaign["_id"] = domain_campaign_id
+
+            # Stage 7: Offer selection
+            t0 = time.perf_counter()
+            offer = await select_offer(r, domain_campaign_id)
+            timing["offer_ms"] = _ms_since(t0)
+
+            if offer:
+                # Stage 8: URL building
+                t0 = time.perf_counter()
+                url = build_url(offer.get("url", ""), req, domain_campaign_id, offer.get("_id", ""))
+                timing["url_build_ms"] = _ms_since(t0)
+
+                # Stage 9: Counter increment
+                t0 = time.perf_counter()
+                try:
+                    pipe = r.pipeline()
+                    cap_key = f"cap:{domain_campaign_id}:daily"
+                    pipe.incr(cap_key)
+                    pipe.expire(cap_key, 86400)
+                    if req.visitor_id:
+                        freq_period = safe_int(campaign.get("frequency_period"), 86400)
+                        freq_key = f"freq:{domain_campaign_id}:{req.visitor_id}"
+                        pipe.incr(freq_key)
+                        pipe.expire(freq_key, freq_period if freq_period > 0 else 86400)
+                    await pipe.execute()
+                except Exception as e:
+                    logger.warning("Counter update failed: %s", e)
+                timing["counter_ms"] = _ms_since(t0)
+
+                timing["route_total_ms"] = _ms_since(t_start)
+                timing["result"] = "domain_matched"
+
+                return {
+                    "url": url,
+                    "campaign_id": domain_campaign_id,
+                    "offer_id": offer.get("_id", ""),
+                    "timing": timing,
+                }
+
+        # Domain matched but no campaign/offer in Redis — fall through to geo targeting
+        timing["domain_fallthrough"] = True
+
     # Stage 1: UA parsing (cached, should be <0.1ms on cache hit)
     t0 = time.perf_counter()
     device_type = parse_device_type(req.user_agent)
@@ -188,6 +246,62 @@ async def route(req: ClickRequest) -> dict | None:
     }
 
 
+async def resolve_domain_campaign(r, req: ClickRequest) -> str | None:
+    """Resolve campaign_id from domain bindings in Redis.
+
+    Priority order: subdomain > path > param > root (first match wins).
+    """
+    hostname = req.hostname
+    if not hostname:
+        return None
+
+    path = (req.path or "").strip("/")
+    first_segment = path.split("/")[0] if path else ""
+    param_c = (req.query_params or {}).get("c", "")
+
+    # Extract subdomain: if hostname has more parts than 2, the prefix is the subdomain
+    # e.g., "gambling-tier-1.tds.adstudy.dev" → subdomain = "gambling-tier-1", base = "tds.adstudy.dev"
+    parts = hostname.split(".")
+    subdomain = ""
+    base_domain = hostname
+    if len(parts) > 2:
+        # Could be sub.domain.tld or sub.domain.co.uk
+        # Try: first part as subdomain, rest as base
+        subdomain = parts[0]
+        base_domain = ".".join(parts[1:])
+
+    # Build lookup keys in priority order
+    keys_to_check = []
+    if subdomain:
+        keys_to_check.append(f"domain:{base_domain}:subdomain:{subdomain}")
+    if first_segment:
+        keys_to_check.append(f"domain:{hostname}:path:{first_segment}")
+        if base_domain != hostname:
+            keys_to_check.append(f"domain:{base_domain}:path:{first_segment}")
+    if param_c:
+        keys_to_check.append(f"domain:{hostname}:param:{param_c}")
+        if base_domain != hostname:
+            keys_to_check.append(f"domain:{base_domain}:param:{param_c}")
+    keys_to_check.append(f"domain:{hostname}:root")
+    if base_domain != hostname:
+        keys_to_check.append(f"domain:{base_domain}:root")
+
+    if not keys_to_check:
+        return None
+
+    # Batch lookup — single pipeline round-trip
+    pipe = r.pipeline()
+    for key in keys_to_check:
+        pipe.get(key)
+    results = await pipe.execute()
+
+    for val in results:
+        if val:
+            return val  # First match wins
+
+    return None
+
+
 async def select_offer(r, campaign_id: str) -> dict | None:
     """Select offer from campaign's split configuration."""
     try:
@@ -199,11 +313,15 @@ async def select_offer(r, campaign_id: str) -> dict | None:
                 return None
             offer_id = random.choice(sorted(offer_ids))
             offer = await r.hgetall(f"offer:{offer_id}")
+            if not offer:
+                return None
             offer["_id"] = offer_id
             return offer
 
         offer_id = weighted_select_from_dict(split)
         offer = await r.hgetall(f"offer:{offer_id}")
+        if not offer:
+            return None
         offer["_id"] = offer_id
         return offer
     except Exception as e:

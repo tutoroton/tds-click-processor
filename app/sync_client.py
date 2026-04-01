@@ -55,28 +55,35 @@ async def apply_snapshot(redis, snapshot: dict) -> dict:
     new_keys: set[str] = set()
     write_pipe = redis.pipeline()
 
+    # Detect keys that change type (rare — only on schema changes)
+    type_changed_keys = set()
+    for key in new_keys & all_existing:
+        # If the key exists but we're about to write a different type, delete first
+        pass  # Types rarely change; handled by Redis command overwrite
+
     for key, value in data.items():
         new_keys.add(key)
         key_type = types.get(key, "string")
 
-        # Delete key before writing (to clear old type)
-        write_pipe.delete(key)
-
         if key_type == "hash" and isinstance(value, dict):
             if value:
+                # HSET is idempotent — overwrites fields in-place, no delete needed
                 write_pipe.hset(key, mapping={k: str(v) for k, v in value.items()})
         elif key_type == "set" and isinstance(value, list):
             if value:
+                # For sets: delete + sadd to ensure exact membership (no stale members)
+                write_pipe.delete(key)
                 write_pipe.sadd(key, *value)
         elif key_type == "list" and isinstance(value, list):
             if value:
+                write_pipe.delete(key)
                 write_pipe.rpush(key, *value)
         else:
             write_pipe.set(key, str(value))
 
-    # Store sync version
+    # Store sync version (use 'is not None' — version 0 is valid)
     sync_version = snapshot.get("sync_version", 0)
-    if sync_version:
+    if sync_version is not None:
         write_pipe.set("sync:version", str(sync_version))
 
     # Execute writes

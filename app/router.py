@@ -331,6 +331,11 @@ async def select_offer(r, campaign_id: str) -> dict | None:
 
 def build_url(template: str, req: ClickRequest, campaign_id: str, offer_id: str) -> str:
     """Replace macros in offer URL template with actual values."""
+    # System macros (cannot be overridden by query params)
+    system_macros = {
+        "{click_id}", "{campaign_id}", "{offer_id}", "{country}",
+        "{city}", "{region}", "{ip}", "{os}", "{device}", "{visitor_id}",
+    }
     replacements = {
         "{click_id}": quote(str(req.click_id), safe=""),
         "{campaign_id}": quote(str(campaign_id), safe=""),
@@ -343,8 +348,11 @@ def build_url(template: str, req: ClickRequest, campaign_id: str, offer_id: str)
         "{device}": quote(parse_device_type(req.user_agent), safe=""),
         "{visitor_id}": quote(str(req.visitor_id or ""), safe=""),
     }
+    # Query params as additional macros (system macros take priority)
     for key, value in (req.query_params or {}).items():
-        replacements[f"{{{key}}}"] = quote(str(value), safe="")
+        macro = f"{{{key}}}"
+        if macro not in system_macros:
+            replacements[macro] = quote(str(value), safe="")
 
     url = template
     for macro, value in replacements.items():

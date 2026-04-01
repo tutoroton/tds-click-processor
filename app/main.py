@@ -61,7 +61,7 @@ async def lifespan(app: FastAPI):
     shipper_task = asyncio.create_task(run_shipper(r))
 
     # Start periodic sync pull from central
-    sync_task = asyncio.create_task(start_periodic_pull(r, interval=60))
+    sync_task = asyncio.create_task(start_periodic_pull(r, interval=settings.full_sync_interval_seconds))
 
     yield
 

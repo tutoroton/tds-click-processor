@@ -1,0 +1,235 @@
+#!/usr/bin/env bash
+# tds-ctl — Management CLI for TDS routing node
+# Usage: ./tds-ctl <command> [args]
+#
+# Commands:
+#   deploy    — Build and start all containers
+#   stop      — Stop all containers
+#   restart   — Restart all containers
+#   status    — Health check all components
+#   logs      — Tail service logs
+#   seed      — Populate Redis with test data (for development)
+#   redis-cli — Open Redis CLI
+#   sync      — Force full sync from central (when central is configured)
+#   destroy   — Stop and remove all containers + volumes
+
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
+# Load .env if exists
+[ -f .env ] && set -a && source .env && set +a
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+log_ok()   { echo -e "${GREEN}✓${NC} $1"; }
+log_warn() { echo -e "${YELLOW}!${NC} $1"; }
+log_err()  { echo -e "${RED}✗${NC} $1"; }
+
+cmd_deploy() {
+    echo "Deploying TDS routing node..."
+    # Ensure Docker is available
+    if ! command -v docker &>/dev/null; then
+        log_err "Docker not found. Install: curl -fsSL https://get.docker.com | sh"
+        exit 1
+    fi
+
+    # Create .env from example if not exists
+    if [ ! -f .env ]; then
+        cp .env.example .env
+        log_warn ".env created from template — edit TDS_NODE_ID, TDS_NODE_REGION, TDS_SECRET_KEY"
+    fi
+
+    # Build and start
+    docker compose build --quiet
+    docker compose up -d
+    echo ""
+    sleep 2
+    cmd_status
+}
+
+cmd_stop() {
+    docker compose stop
+    log_ok "Stopped"
+}
+
+cmd_restart() {
+    docker compose restart
+    sleep 2
+    cmd_status
+}
+
+cmd_status() {
+    echo "=== TDS Routing Node Status ==="
+    echo ""
+
+    # Check containers
+    local cp_status=$(docker inspect -f '{{.State.Health.Status}}' tds-click-processor 2>/dev/null || echo "not running")
+    local redis_status=$(docker inspect -f '{{.State.Health.Status}}' tds-redis 2>/dev/null || echo "not running")
+
+    if [ "$cp_status" = "healthy" ]; then
+        log_ok "Click Processor: $cp_status"
+    else
+        log_err "Click Processor: $cp_status"
+    fi
+
+    if [ "$redis_status" = "healthy" ]; then
+        log_ok "Redis: $redis_status"
+    else
+        log_err "Redis: $redis_status"
+    fi
+
+    echo ""
+
+    # Fetch health endpoint
+    local port="${TDS_PORT:-8100}"
+    local health=$(curl -s "http://localhost:$port/health" 2>/dev/null)
+    if [ -n "$health" ]; then
+        echo "$health" | python3 -m json.tool 2>/dev/null || echo "$health"
+    else
+        log_err "Cannot reach click-processor at localhost:$port"
+    fi
+
+    echo ""
+
+    # Fetch stats
+    local stats=$(curl -s "http://localhost:$port/stats" 2>/dev/null)
+    if [ -n "$stats" ]; then
+        echo "--- Stats ---"
+        echo "$stats" | python3 -m json.tool 2>/dev/null || echo "$stats"
+    fi
+}
+
+cmd_logs() {
+    local service="${1:-}"
+    if [ -n "$service" ]; then
+        docker compose logs -f "$service"
+    else
+        docker compose logs -f
+    fi
+}
+
+cmd_seed() {
+    echo "Seeding Redis with test data..."
+    local port="${TDS_PORT:-8100}"
+
+    docker exec tds-redis redis-cli FLUSHDB
+
+    # Campaigns
+    docker exec tds-redis redis-cli HSET campaign:1 name "US Mobile CPA" status active priority 10 weight 100 daily_cap 10000 frequency_cap 3 frequency_period 86400
+    docker exec tds-redis redis-cli HSET campaign:2 name "EU Desktop Display" status active priority 5 weight 100 daily_cap 5000 frequency_cap 0 frequency_period 0
+    docker exec tds-redis redis-cli HSET campaign:3 name "Global Catch-All" status active priority 1 weight 100 daily_cap 0 frequency_cap 0 frequency_period 0
+
+    docker exec tds-redis redis-cli SADD campaigns:active 1 2 3
+
+    # Offers
+    docker exec tds-redis redis-cli HSET offer:101 url "https://example.com/offer-us-mobile?clickid={click_id}&country={country}&sub1={sub1}" campaign_id 1 payout 2.50 status active weight 70
+    docker exec tds-redis redis-cli HSET offer:102 url "https://example.com/offer-us-mobile-b?clickid={click_id}&country={country}" campaign_id 1 payout 2.00 status active weight 30
+    docker exec tds-redis redis-cli HSET offer:201 url "https://example.com/offer-eu-desktop?clickid={click_id}&geo={country}" campaign_id 2 payout 1.50 status active weight 100
+    docker exec tds-redis redis-cli HSET offer:301 url "https://example.com/offer-global?cid={click_id}&c={country}&d={device}" campaign_id 3 payout 0.50 status active weight 100
+
+    # Campaign → offers mapping
+    docker exec tds-redis redis-cli SADD campaign:1:offers 101 102
+    docker exec tds-redis redis-cli SADD campaign:2:offers 201
+    docker exec tds-redis redis-cli SADD campaign:3:offers 301
+
+    # Splits (offer weights per campaign)
+    docker exec tds-redis redis-cli HSET split:1 101 70 102 30
+    docker exec tds-redis redis-cli HSET split:2 201 100
+    docker exec tds-redis redis-cli HSET split:3 301 100
+
+    # Targeting flags (campaign has specific targeting for this dimension)
+    # Campaign 3 has NO flags = catch-all
+    docker exec tds-redis redis-cli SET campaign:1:has_geo 1
+    docker exec tds-redis redis-cli SET campaign:2:has_geo 1
+    docker exec tds-redis redis-cli SET campaign:1:has_device 1
+    docker exec tds-redis redis-cli SET campaign:2:has_device 1
+    docker exec tds-redis redis-cli SET campaign:1:has_os 1
+    docker exec tds-redis redis-cli SET campaign:2:has_os 1
+
+    # Geo targeting
+    docker exec tds-redis redis-cli SADD geo:US 1
+    docker exec tds-redis redis-cli SADD geo:CA 1
+    docker exec tds-redis redis-cli SADD geo:GB 2
+    docker exec tds-redis redis-cli SADD geo:DE 2
+    docker exec tds-redis redis-cli SADD geo:FR 2
+    docker exec tds-redis redis-cli SADD geo:PL 2
+
+    # Device targeting
+    docker exec tds-redis redis-cli SADD device:mobile 1 3
+    docker exec tds-redis redis-cli SADD device:desktop 2 3
+    docker exec tds-redis redis-cli SADD device:tablet 3
+
+    # OS targeting
+    docker exec tds-redis redis-cli SADD os:ios 1 3
+    docker exec tds-redis redis-cli SADD os:android 1 3
+    docker exec tds-redis redis-cli SADD os:windows 2 3
+    docker exec tds-redis redis-cli SADD os:macos 2 3
+    docker exec tds-redis redis-cli SADD os:linux 2 3
+    docker exec tds-redis redis-cli SADD os:other 3
+
+    log_ok "Seeded: 3 campaigns, 4 offers, geo/device/os targeting"
+    echo ""
+    echo "Campaign 1: US Mobile CPA (US,CA + mobile + ios,android) → offer 101 (70%) / 102 (30%)"
+    echo "Campaign 2: EU Desktop Display (GB,DE,FR,PL + desktop + windows,macos,linux) → offer 201"
+    echo "Campaign 3: Global Catch-All (any geo + any device + any os) → offer 301"
+    echo ""
+    echo "Test: curl http://localhost:${port}/health"
+    echo "Test: curl -X POST http://localhost:${port}/decide -H 'Content-Type: application/json' -d '{\"click_id\":\"test123\",\"country\":\"US\",\"user_agent\":\"iPhone\"}'"
+}
+
+cmd_redis_cli() {
+    docker exec -it tds-redis redis-cli "$@"
+}
+
+cmd_sync() {
+    local port="${TDS_PORT:-8100}"
+    if [ -z "${TDS_CENTRAL_URL:-}" ]; then
+        log_warn "TDS_CENTRAL_URL not configured. Use 'seed' for standalone mode."
+        exit 1
+    fi
+    log_warn "Sync from central not yet implemented (will be in admin-api phase)"
+}
+
+cmd_destroy() {
+    echo "This will remove all containers and data. Are you sure? (y/N)"
+    read -r confirm
+    if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
+        docker compose down -v
+        log_ok "Destroyed"
+    else
+        echo "Cancelled"
+    fi
+}
+
+# --- Main ---
+case "${1:-help}" in
+    deploy)    cmd_deploy ;;
+    stop)      cmd_stop ;;
+    restart)   cmd_restart ;;
+    status)    cmd_status ;;
+    logs)      cmd_logs "${2:-}" ;;
+    seed)      cmd_seed ;;
+    redis-cli) shift; cmd_redis_cli "$@" ;;
+    sync)      cmd_sync ;;
+    destroy)   cmd_destroy ;;
+    *)
+        echo "tds-ctl — TDS Routing Node Manager"
+        echo ""
+        echo "Usage: ./tds-ctl <command>"
+        echo ""
+        echo "Commands:"
+        echo "  deploy      Build and start all containers"
+        echo "  stop        Stop all containers"
+        echo "  restart     Restart all containers"
+        echo "  status      Health check all components"
+        echo "  logs [svc]  Tail logs (optional: click-processor|redis)"
+        echo "  seed        Populate Redis with test campaigns"
+        echo "  redis-cli   Open Redis CLI"
+        echo "  sync        Force sync from central server"
+        echo "  destroy     Remove everything (containers + data)"
+        ;;
+esac

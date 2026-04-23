@@ -22,7 +22,8 @@ _MANAGED_KEY = "sync:managed_keys"
 # Key prefixes for routing config (NOT operational state)
 _ROUTING_PREFIXES = [
     "campaign:", "campaigns:active",
-    "offer:", "split:", "domain:", "flow:",
+    "offer:", "offer_target:",
+    "split:", "domain:", "flow:",
     "geo:", "device:", "os:",
 ]
 

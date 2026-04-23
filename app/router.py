@@ -6,6 +6,7 @@ selects destination URL. All lookups are Redis-only, no SQL.
 Every stage is timed to millisecond precision for observability.
 """
 
+import json
 import logging
 import random
 import time
@@ -213,10 +214,13 @@ async def route(req: ClickRequest) -> dict | None:
         timing["result"] = "no_offer"
         return None
 
-    # Stage 8: URL building
+    # Stage 8: Target resolution + URL building
     t0 = time.perf_counter()
-    url = build_url(offer.get("url", ""), req, winner["_id"], offer.get("_id", ""))
+    target_url = await resolve_target(r, offer, req)
+    url_template = target_url if target_url else offer.get("url", "")
+    url = build_url(url_template, req, winner["_id"], offer.get("_id", ""))
     timing["url_build_ms"] = _ms_since(t0)
+    timing["target_resolved"] = target_url is not None
 
     # Stage 9: Counter increment (non-blocking)
     t0 = time.perf_counter()
@@ -327,6 +331,87 @@ async def select_offer(r, campaign_id: str) -> dict | None:
     except Exception as e:
         logger.error("select_offer failed: %s", e)
         return None
+
+
+async def resolve_target(r, offer: dict, req: ClickRequest) -> str | None:
+    """Resolve the best matching offer target URL for the click's attributes.
+
+    If offer has targets (has_targets=1):
+      1. Load all target IDs from offer:{offer_id}:targets SET
+      2. For each target (sorted by priority DESC), check criteria match
+      3. First matching target's url_template wins
+      4. Fallback: is_default=1 target
+    If no targets → return None (caller uses offer.url_template)
+    """
+    if offer.get("has_targets") != "1":
+        return None
+
+    offer_id = offer.get("_id", "")
+    target_ids = await r.smembers(f"offer:{offer_id}:targets")
+    if not target_ids:
+        return None
+
+    # Load all targets in one pipeline
+    pipe = r.pipeline()
+    for tid in sorted(target_ids):
+        pipe.hgetall(f"offer_target:{tid}")
+    targets = await pipe.execute()
+
+    # Sort by priority DESC
+    target_list = []
+    for tid, t in zip(sorted(target_ids), targets):
+        if t:
+            t["_id"] = tid
+            t["_priority"] = safe_int(t.get("priority"), 0)
+            target_list.append(t)
+    target_list.sort(key=lambda x: x["_priority"], reverse=True)
+
+    # Build click attributes for matching
+    click_attrs = {
+        "geo": (req.country or "").upper(),
+        "os": parse_os(req.user_agent).lower(),
+        "device_type": parse_device_type(req.user_agent).lower(),
+    }
+
+    default_url = None
+
+    for t in target_list:
+        # Check if this is the default fallback
+        if t.get("is_default") == "1":
+            default_url = t.get("url", "")
+
+        # Parse criteria JSON
+        criteria_raw = t.get("criteria", "[]")
+        try:
+            criteria = json.loads(criteria_raw) if isinstance(criteria_raw, str) else criteria_raw
+        except (json.JSONDecodeError, TypeError):
+            logger.warning("Malformed criteria for offer_target %s, skipping", t.get("_id"))
+            continue  # Skip targets with corrupted criteria (don't treat as match-all)
+
+        # Empty criteria = matches all traffic
+        if not criteria:
+            return t.get("url", "")
+
+        # Check each criterion
+        match = True
+        for c in criteria:
+            dim = c.get("type", "")
+            op = c.get("op", "in")
+            values = [v.lower() if dim != "geo" else v.upper() for v in c.get("values", [])]
+            click_val = click_attrs.get(dim, "")
+
+            if op == "in" and click_val not in values:
+                match = False
+                break
+            elif op == "not_in" and click_val in values:
+                match = False
+                break
+
+        if match:
+            return t.get("url", "")
+
+    # No criteria match — use default target if exists
+    return default_url
 
 
 def build_url(template: str, req: ClickRequest, campaign_id: str, offer_id: str) -> str:

@@ -117,6 +117,81 @@ class TestVisitorIdValidation:
             ClickRequest(click_id="test", visitor_id="vid<script>")
 
 
+class TestQueryParamsValidation:
+    """Vector 2.8 — strict `dict[str, str]` query_params at the
+    Pydantic boundary. Closes type-confusion class of bugs before
+    they reach `resolve_slots` / `safe_substitute` (security audit
+    2026-04-28 HIGH-001).
+    """
+
+    def test_string_values_pass(self):
+        req = ClickRequest(
+            click_id="t",
+            query_params={"a": "1", "b": "two"},
+        )
+        assert req.query_params == {"a": "1", "b": "two"}
+
+    def test_int_value_coerced(self):
+        req = ClickRequest(click_id="t", query_params={"age": 42})
+        assert req.query_params == {"age": "42"}
+
+    def test_bool_value_lowercased(self):
+        # Mirrors `macros._coerce_value` behaviour for cross-layer consistency.
+        req = ClickRequest(click_id="t", query_params={"active": True})
+        assert req.query_params == {"active": "true"}
+
+    def test_float_value_coerced(self):
+        req = ClickRequest(click_id="t", query_params={"price": 3.14})
+        assert req.query_params == {"price": "3.14"}
+
+    def test_none_value_dropped(self):
+        # Treat null as absent — same as not sending the key.
+        req = ClickRequest(click_id="t", query_params={"a": "1", "b": None})
+        assert req.query_params == {"a": "1"}
+
+    def test_list_value_rejected(self):
+        with pytest.raises(ValidationError):
+            ClickRequest(click_id="t", query_params={"k": ["a", "b"]})
+
+    def test_dict_value_rejected(self):
+        with pytest.raises(ValidationError):
+            ClickRequest(click_id="t", query_params={"k": {"nested": "v"}})
+
+    def test_non_string_key_rejected(self):
+        with pytest.raises(ValidationError):
+            ClickRequest(click_id="t", query_params={42: "v"})
+
+    def test_empty_dict_default(self):
+        req = ClickRequest(click_id="t")
+        assert req.query_params == {}
+
+    def test_null_query_params_becomes_empty(self):
+        req = ClickRequest(click_id="t", query_params=None)
+        assert req.query_params == {}
+
+    def test_too_many_keys_rejected(self):
+        # Resource-exhaustion cap: > 100 keys raises (security audit
+        # MEDIUM-004). CF Worker / legitimate advertisers stay well
+        # under 50 keys; 101+ is misconfiguration or DoS attempt.
+        params = {f"k{i}": str(i) for i in range(101)}
+        with pytest.raises(ValidationError):
+            ClickRequest(click_id="t", query_params=params)
+
+    def test_max_keys_accepted(self):
+        # Exactly at cap: accepted.
+        params = {f"k{i}": str(i) for i in range(100)}
+        req = ClickRequest(click_id="t", query_params=params)
+        assert len(req.query_params) == 100
+
+    def test_oversized_value_truncated(self):
+        # Long value truncated rather than rejected — preserves the
+        # click while bounding storage cost.
+        big = "a" * 5000
+        req = ClickRequest(click_id="t", query_params={"k": big})
+        assert len(req.query_params["k"]) == 1024
+        assert req.query_params["k"] == "a" * 1024
+
+
 class TestClickResponse:
     def test_basic(self):
         resp = ClickResponse(url="https://example.com/offer?cid=123")

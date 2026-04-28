@@ -19,12 +19,27 @@ logger = logging.getLogger("tds.sync_client")
 
 _MANAGED_KEY = "sync:managed_keys"
 
-# Key prefixes for routing config (NOT operational state)
+# Key prefixes for routing config (NOT operational state).
+# Stage 2 added `source:` / `sources:active` so click-processor can
+# resolve param_mappings + postback config at click time. Without
+# these prefixes, sync_client would write source keys (the central
+# snapshot includes them) but stale-key cleanup on the next push
+# would miss removed sources — leaving orphan `source:{id}` hashes
+# pointing at archived data.
 _ROUTING_PREFIXES = [
     "campaign:", "campaigns:active",
+    "source:", "sources:active",
     "offer:", "offer_target:",
     "split:", "domain:", "flow:",
+    "flows:scope:",
     "geo:", "device:", "os:",
+    # Vector 2.10 — org-hierarchy snapshot for buyer_id enrichment.
+    # The user hash carries the pre-resolved attribution chain;
+    # team/department/custom_group are auxiliary for stats display.
+    "user:", "users:active",
+    "team:", "teams:active",
+    "department:", "departments:active",
+    "custom_group:", "custom_groups:active",
 ]
 
 

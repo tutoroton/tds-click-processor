@@ -118,6 +118,20 @@ class TestParseBrowser:
 # ============================================================
 
 class TestBuildUrl:
+    """Vector 2.8 — build_url integrates resolve_slots + safe_substitute.
+
+    Macros split into three layers (precedence ascending):
+      1. Slot layer — sub1..sub20 + 19 reserved slots resolved via
+         the merged source∪campaign mapping chain.
+      2. Worker-auto layer — country, city, ip, user_agent, ...
+         (system-fixed names, populated from request).
+      3. Technical layer — click_id, campaign_id, offer_id,
+         visitor_id (system-fixed, always wins).
+
+    These tests verify the integration. Per-priority semantics of
+    the slot layer are exhaustively covered in `test_resolution.py`.
+    """
+
     def _make_request(self, **kwargs):
         defaults = {
             "click_id": "test-click-123",
@@ -131,44 +145,119 @@ class TestBuildUrl:
         defaults.update(kwargs)
         return ClickRequest(**defaults)
 
-    def test_basic_macros(self):
+    def test_technical_macros_always_resolve(self):
         req = self._make_request()
         url = build_url(
-            "https://example.com/offer?cid={click_id}&c={country}",
-            req, "1", "101"
+            "https://example.com/offer?cid={click_id}&oid={offer_id}",
+            req, "1", "101",
         )
         assert "cid=test-click-123" in url
-        assert "c=US" in url
+        assert "oid=101" in url
 
-    def test_sub_params_from_query(self):
-        req = self._make_request(query_params={"source": "fb", "creative": "vid_01"})
+    def test_worker_auto_macros_always_resolve(self):
+        req = self._make_request()
         url = build_url(
-            "https://example.com/?src={source}&cr={creative}",
-            req, "1", "101"
+            "https://example.com/?c={country}&city={city}",
+            req, "1", "101",
         )
-        assert "src=fb" in url
+        # `country` and `city` come from the worker-auto layer — no
+        # mapping required.
+        assert "c=US" in url
+        assert "city=New%20York" in url  # URL-encoded space
+
+    def test_slot_macro_via_source_mapping(self):
+        """Source mapping binds incoming `creative` → slot `sub1`.
+
+        The url_template uses `{sub1}` (canonical slot name), NOT
+        `{creative}`. That's the Vector 2.8 contract — macros refer
+        to canonical slots, mapping aliases the incoming key.
+        """
+        req = self._make_request(query_params={"creative": "vid_01"})
+        url = build_url(
+            "https://example.com/?cr={sub1}", req, "1", "101",
+            source_mappings=[{"slot": "sub1", "alias": "creative"}],
+        )
         assert "cr=vid_01" in url
 
-    def test_empty_macro_not_crash(self):
-        req = self._make_request(visitor_id=None)
+    def test_slot_falls_back_to_hardcoded(self):
+        # No request value, source has hardcoded default → applies.
+        req = self._make_request(query_params={})
         url = build_url(
-            "https://example.com/?vid={visitor_id}",
-            req, "1", "101"
+            "https://example.com/?p={pixel_id}", req, "1", "101",
+            source_mappings=[{"slot": "pixel_id", "default_value": "fb_pixel_42"}],
         )
-        assert "vid=" in url  # empty but no crash
+        assert "p=fb_pixel_42" in url
+
+    def test_unmapped_slot_collapses_to_empty(self):
+        """When mapping doesn't bind a slot, `{slot}` macro drops out.
+
+        New behavior — old `build_url` left `{macro}` literal in the
+        URL. `safe_substitute` cleans up empty query params, so the
+        macro position vanishes entirely.
+        """
+        req = self._make_request(query_params={})
+        url = build_url(
+            "https://example.com/?s={sub1}&keep=1", req, "1", "101",
+            source_mappings=None,
+            campaign_mappings=None,
+        )
+        # `{sub1}` had no mapping → empty → query cleanup drops `s=`.
+        assert "s=" not in url
+        assert "keep=1" in url
 
     def test_no_macros(self):
         req = self._make_request()
         url = build_url("https://example.com/static-page", req, "1", "101")
         assert url == "https://example.com/static-page"
 
-    def test_special_characters_in_params(self):
-        """Params with special chars must be URL-encoded to prevent injection."""
-        req = self._make_request(query_params={"source": "a&b=c", "sub1": "test<script>"})
-        url = build_url("https://example.com/?s={source}", req, "1", "101")
-        # URL-encoded: & → %26, = → %3D (prevents URL parameter injection)
-        assert "a%26b%3Dc" in url
-        assert "<script>" not in url  # XSS chars encoded
+    def test_url_encoding_via_safe_substitute(self):
+        """Special characters in slot values get URL-encoded by `safe_substitute`.
+
+        Verifies the `safe_substitute` integration — encoding is
+        always-on regardless of which layer the value came from.
+        """
+        req = self._make_request(query_params={"creative": "a&b=c<script>"})
+        url = build_url(
+            "https://example.com/?s={sub1}", req, "1", "101",
+            source_mappings=[{"slot": "sub1", "alias": "creative"}],
+        )
+        # `&` → %26, `=` → %3D, `<` → %3C, `>` → %3E.
+        assert "a%26b%3Dc%3Cscript%3E" in url
+        assert "<script>" not in url
+        assert "a&b=c" not in url
+
+    def test_visitor_id_none_drops_macro(self):
+        """`visitor_id=None` → safe_substitute drops the empty query param."""
+        req = self._make_request(visitor_id=None)
+        url = build_url(
+            "https://example.com/?vid={visitor_id}&kept=1", req, "1", "101",
+        )
+        # Empty visitor_id query param dropped.
+        assert "vid=" not in url
+        assert "kept=1" in url
+
+    def test_empty_query_params_macro_collapses(self):
+        """`{source}` with no mapping no longer leaves a literal."""
+        req = self._make_request(query_params={})
+        url = build_url(
+            "https://example.com/?s={source}", req, "1", "101",
+        )
+        # New behavior — literal `{source}` does NOT remain.
+        assert "{source}" not in url
+        # Empty query param was cleaned up.
+        assert "s=" not in url
+
+    def test_campaign_overrides_source_alias(self):
+        """Campaign mapping wins per-slot for the URL-key lookup."""
+        req = self._make_request(query_params={"gclid": "g123", "fbclid": "fb456"})
+        url = build_url(
+            "https://example.com/?clk={source_click_id}", req, "1", "101",
+            source_mappings=[{"slot": "source_click_id", "alias": "fbclid"}],
+            campaign_mappings=[{"slot": "source_click_id", "alias": "gclid"}],
+        )
+        # Campaign alias wins → `gclid` value lands in the slot.
+        assert "clk=g123" in url
+        assert "fb456" not in url
 
 
 # ============================================================
@@ -236,14 +325,29 @@ class TestEdgeCases:
         result = parse_device_type(ua)
         assert isinstance(result, str)
 
-    def test_empty_query_params(self):
+    def test_empty_query_params_no_literal_left(self):
+        # Vector 2.8 — `{source}` macro with no mapping resolves to
+        # NULL; safe_substitute drops the empty query param.
         req = ClickRequest(click_id="test", query_params={})
         url = build_url("https://example.com/?s={source}", req, "1", "101")
-        assert "s={source}" in url  # unreplaced macro stays
+        assert "{source}" not in url
+        assert "s=" not in url
+        assert "example.com" in url
 
-    def test_huge_query_params(self):
-        """Thousands of query params should not crash."""
+    def test_huge_query_params_rejected_at_boundary(self):
+        """Resource-exhaustion cap (security audit MEDIUM-004) — the
+        Pydantic boundary now rejects > 100 keys, so the legacy
+        "thousands shouldn't crash" promise is enforced as
+        boundary rejection rather than tolerant downstream handling.
+        """
+        from pydantic import ValidationError
         params = {f"param_{i}": f"value_{i}" for i in range(1000)}
+        with pytest.raises(ValidationError):
+            ClickRequest(click_id="test", query_params=params)
+
+    def test_max_allowed_query_params_pass_through(self):
+        """At the 100-key cap, build_url processes without crashing."""
+        params = {f"param_{i}": f"value_{i}" for i in range(100)}
         req = ClickRequest(click_id="test", query_params=params)
         url = build_url("https://example.com/", req, "1", "101")
         assert "example.com" in url

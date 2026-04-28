@@ -1,0 +1,552 @@
+"""Unit tests for `app/cascade.py` — Stage 2 / Vectors 2.4 + 2.5.
+
+Pin every step of `docs/design/SCOPE-CASCADE.md` against a literal
+flow-dict harness. Redis is mocked via `AsyncMock`, so these tests
+run in microseconds and never depend on a real broker.
+
+Test plan (mirrors the design doc's test plan + edge cases):
+  1. Specificity — most specific scope wins.
+  2. Campaign-bound vs global tie — campaign-bound wins.
+  3. seq_id tie-break — lower wins.
+  4. is_default — always last in its scope.
+  5. Criteria mismatch — flow excluded.
+  6. Empty criteria — match-all.
+  7. Fallback chain — walks OUT one level on no match.
+  8. No match anywhere — returns None.
+  9. No buyer context — only company-level flows considered.
+ 10. Malformed criteria JSON — flow skipped (not match-all).
+ 11. Pure helpers — `_criteria_match`, `_winner_sort_key`, `_safe_int`.
+"""
+
+from __future__ import annotations
+
+import json
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from app.cascade import (
+    SCOPE_PRIORITY,
+    _criteria_match,
+    _filter_by_criteria,
+    _pick_winner,
+    _safe_int,
+    _winner_sort_key,
+    resolve_flow,
+)
+
+
+# ============================================================
+# Fixture builders
+# ============================================================
+
+
+def _make_flow(
+    *,
+    fid: str,
+    scope_type: str = "company",
+    scope_id: int = 1,
+    campaign_id: str = "0",
+    seq_id: int = 1,
+    is_default: bool = False,
+    criteria: list | None = None,
+    action_type: str = "redirect",
+) -> dict:
+    """Build a flow HASH the way the sync builder emits it."""
+    return {
+        "_id": fid,
+        "scope_type": scope_type,
+        "scope_id": str(scope_id),
+        "campaign_id": campaign_id,
+        "seq_id": str(seq_id),
+        "is_default": "1" if is_default else "0",
+        "criteria": json.dumps(criteria if criteria is not None else []),
+        "action_type": action_type,
+        "action_config": "{}",
+        "name": f"flow-{fid}",
+    }
+
+
+def _redis_with_lists_and_hashes(
+    lists: dict[str, list[str]],
+    hashes: dict[str, dict],
+) -> MagicMock:
+    """Mock Redis with pipeline support for lrange + hgetall.
+
+    The pipeline mock collects ops then `execute()` returns results
+    matching the call order — same contract `resolve_flow` relies on.
+    """
+
+    class FakePipeline:
+        def __init__(self):
+            self._ops: list[tuple[str, str]] = []
+
+        def lrange(self, key, _start, _end):
+            self._ops.append(("lrange", key))
+
+        def hgetall(self, key):
+            self._ops.append(("hgetall", key))
+
+        async def execute(self):
+            out = []
+            for op, key in self._ops:
+                if op == "lrange":
+                    out.append(list(lists.get(key, [])))
+                elif op == "hgetall":
+                    out.append(dict(hashes.get(key, {})))
+            return out
+
+    redis = MagicMock()
+    redis.pipeline = lambda: FakePipeline()
+    return redis
+
+
+# ============================================================
+# Step 3 — Specificity (most specific scope wins)
+# ============================================================
+
+
+class TestSpecificity:
+    @pytest.mark.asyncio
+    async def test_buyer_beats_team(self):
+        """Buyer-scoped flow beats team-scoped flow when both match."""
+        flows = {
+            "flow:10": _make_flow(fid="10", scope_type="buyer", scope_id=5, seq_id=1),
+            "flow:20": _make_flow(fid="20", scope_type="team", scope_id=3, seq_id=2),
+        }
+        lists = {
+            "campaign:1:flows": [],
+            "flows:scope:1:buyer:5": ["10"],
+            "flows:scope:1:team:3": ["20"],
+            "flows:scope:1:company:1": [],
+        }
+        r = _redis_with_lists_and_hashes(lists, flows)
+
+        winner = await resolve_flow(
+            r, campaign_id="1", company_id=1, buyer_id=5,
+            team_id=3, department_id=None, custom_group_id=None,
+            click_attrs={"geo": "US", "os": "ios", "device_type": "mobile"},
+        )
+        assert winner is not None
+        assert winner["_id"] == "10"
+
+    @pytest.mark.asyncio
+    async def test_custom_group_beats_team(self):
+        flows = {
+            "flow:30": _make_flow(fid="30", scope_type="custom_group", scope_id=10, seq_id=1),
+            "flow:40": _make_flow(fid="40", scope_type="team", scope_id=3, seq_id=2),
+        }
+        lists = {
+            "campaign:1:flows": [],
+            "flows:scope:1:custom_group:10": ["30"],
+            "flows:scope:1:team:3": ["40"],
+        }
+        r = _redis_with_lists_and_hashes(lists, flows)
+        winner = await resolve_flow(
+            r, campaign_id="1", company_id=1, buyer_id=None,
+            team_id=3, department_id=None, custom_group_id=10,
+            click_attrs={"geo": "US", "os": "ios", "device_type": "mobile"},
+        )
+        assert winner["_id"] == "30"
+
+    @pytest.mark.asyncio
+    async def test_team_beats_department(self):
+        flows = {
+            "flow:50": _make_flow(fid="50", scope_type="team", scope_id=3, seq_id=1),
+            "flow:60": _make_flow(fid="60", scope_type="department", scope_id=2, seq_id=1),
+        }
+        lists = {
+            "campaign:1:flows": [],
+            "flows:scope:1:team:3": ["50"],
+            "flows:scope:1:department:2": ["60"],
+        }
+        r = _redis_with_lists_and_hashes(lists, flows)
+        winner = await resolve_flow(
+            r, campaign_id="1", company_id=1, buyer_id=None,
+            team_id=3, department_id=2, custom_group_id=None,
+            click_attrs={"geo": "US", "os": "ios", "device_type": "mobile"},
+        )
+        assert winner["_id"] == "50"
+
+    @pytest.mark.asyncio
+    async def test_department_beats_company(self):
+        flows = {
+            "flow:70": _make_flow(fid="70", scope_type="department", scope_id=2, seq_id=1),
+            "flow:80": _make_flow(fid="80", scope_type="company", scope_id=1, seq_id=1),
+        }
+        lists = {
+            "campaign:1:flows": [],
+            "flows:scope:1:department:2": ["70"],
+            "flows:scope:1:company:1": ["80"],
+        }
+        r = _redis_with_lists_and_hashes(lists, flows)
+        winner = await resolve_flow(
+            r, campaign_id="1", company_id=1, buyer_id=None,
+            team_id=None, department_id=2, custom_group_id=None,
+            click_attrs={"geo": "US", "os": "ios", "device_type": "mobile"},
+        )
+        assert winner["_id"] == "70"
+
+
+# ============================================================
+# Step 4 — Tie-break within same scope
+# ============================================================
+
+
+class TestTieBreak:
+    @pytest.mark.asyncio
+    async def test_campaign_bound_beats_global_at_same_scope(self):
+        """When 2 flows share scope, the campaign-bound one wins."""
+        bound = _make_flow(
+            fid="100", scope_type="company", scope_id=1, seq_id=5, campaign_id="1",
+        )
+        global_flow = _make_flow(
+            fid="200", scope_type="company", scope_id=1, seq_id=2, campaign_id="0",
+        )
+        flows = {"flow:100": bound, "flow:200": global_flow}
+        lists = {
+            "campaign:1:flows": ["100"],
+            "flows:scope:1:company:1": ["200"],
+        }
+        r = _redis_with_lists_and_hashes(lists, flows)
+
+        winner = await resolve_flow(
+            r, campaign_id="1", company_id=1, buyer_id=None,
+            team_id=None, department_id=None, custom_group_id=None,
+            click_attrs={"geo": "US", "os": "ios", "device_type": "mobile"},
+        )
+        # Campaign-bound wins despite higher seq_id.
+        assert winner["_id"] == "100"
+
+    @pytest.mark.asyncio
+    async def test_lower_seq_id_wins_when_bound_ness_equal(self):
+        a = _make_flow(fid="11", scope_type="company", scope_id=1, seq_id=1, campaign_id="1")
+        b = _make_flow(fid="22", scope_type="company", scope_id=1, seq_id=5, campaign_id="1")
+        flows = {"flow:11": a, "flow:22": b}
+        lists = {"campaign:1:flows": ["11", "22"]}
+        r = _redis_with_lists_and_hashes(lists, flows)
+        winner = await resolve_flow(
+            r, campaign_id="1", company_id=1, buyer_id=None,
+            team_id=None, department_id=None, custom_group_id=None,
+            click_attrs={"geo": "US", "os": "ios", "device_type": "mobile"},
+        )
+        assert winner["_id"] == "11"
+
+    @pytest.mark.asyncio
+    async def test_is_default_loses_to_explicit_at_same_scope(self):
+        explicit = _make_flow(
+            fid="33", scope_type="company", scope_id=1, seq_id=10,
+            campaign_id="1", is_default=False,
+        )
+        default = _make_flow(
+            fid="44", scope_type="company", scope_id=1, seq_id=1,
+            campaign_id="1", is_default=True,
+        )
+        flows = {"flow:33": explicit, "flow:44": default}
+        lists = {"campaign:1:flows": ["33", "44"]}
+        r = _redis_with_lists_and_hashes(lists, flows)
+        winner = await resolve_flow(
+            r, campaign_id="1", company_id=1, buyer_id=None,
+            team_id=None, department_id=None, custom_group_id=None,
+            click_attrs={"geo": "US", "os": "ios", "device_type": "mobile"},
+        )
+        # Explicit wins despite higher seq_id — defaults LAST.
+        assert winner["_id"] == "33"
+
+    @pytest.mark.asyncio
+    async def test_tie_break_combined_default_global_seq(self):
+        """All three tie-break rules in one bucket."""
+        flows_list = [
+            _make_flow(fid="A", campaign_id="0", is_default=True, seq_id=1),
+            _make_flow(fid="B", campaign_id="1", is_default=True, seq_id=1),
+            _make_flow(fid="C", campaign_id="0", is_default=False, seq_id=10),
+            _make_flow(fid="D", campaign_id="1", is_default=False, seq_id=5),
+            _make_flow(fid="E", campaign_id="1", is_default=False, seq_id=2),
+        ]
+        sorted_ids = [f["_id"] for f in sorted(flows_list, key=_winner_sort_key)]
+        # Expected order: explicit-bound by seq_id ASC, then explicit-global,
+        # then default-bound, then default-global.
+        assert sorted_ids == ["E", "D", "C", "B", "A"]
+
+
+# ============================================================
+# Step 2 — Criteria match
+# ============================================================
+
+
+class TestCriteriaMatch:
+    def test_empty_criteria_matches_all(self):
+        flows = [_make_flow(fid="1", criteria=[])]
+        survivors = _filter_by_criteria(
+            flows, {"geo": "US", "os": "ios", "device_type": "mobile"},
+        )
+        assert len(survivors) == 1
+
+    def test_geo_in_match(self):
+        flows = [_make_flow(fid="1", criteria=[
+            {"type": "geo", "op": "in", "values": ["US", "CA"]},
+        ])]
+        ok = _filter_by_criteria(flows, {"geo": "US", "os": "ios", "device_type": "mobile"})
+        assert len(ok) == 1
+
+    def test_geo_in_no_match(self):
+        flows = [_make_flow(fid="1", criteria=[
+            {"type": "geo", "op": "in", "values": ["US", "CA"]},
+        ])]
+        ok = _filter_by_criteria(flows, {"geo": "PL", "os": "ios", "device_type": "mobile"})
+        assert len(ok) == 0
+
+    def test_geo_not_in_match(self):
+        flows = [_make_flow(fid="1", criteria=[
+            {"type": "geo", "op": "not_in", "values": ["RU", "CN"]},
+        ])]
+        ok = _filter_by_criteria(flows, {"geo": "US", "os": "ios", "device_type": "mobile"})
+        assert len(ok) == 1
+
+    def test_combined_criteria_all_must_match(self):
+        flows = [_make_flow(fid="1", criteria=[
+            {"type": "geo", "op": "in", "values": ["US"]},
+            {"type": "os", "op": "in", "values": ["ios"]},
+            {"type": "device_type", "op": "in", "values": ["mobile"]},
+        ])]
+        ok = _filter_by_criteria(flows, {"geo": "US", "os": "ios", "device_type": "mobile"})
+        assert len(ok) == 1
+        # Mobile but Android — fails os.
+        no = _filter_by_criteria(flows, {"geo": "US", "os": "android", "device_type": "mobile"})
+        assert len(no) == 0
+
+    def test_unknown_operator_fails_safe(self):
+        flows = [_make_flow(fid="1", criteria=[
+            {"type": "geo", "op": "regex", "values": ["US"]},
+        ])]
+        # Unknown op — never matches.
+        no = _filter_by_criteria(flows, {"geo": "US", "os": "ios", "device_type": "mobile"})
+        assert len(no) == 0
+
+    def test_malformed_criteria_skipped(self):
+        bad = _make_flow(fid="1")
+        bad["criteria"] = "{not json"
+        good = _make_flow(fid="2", criteria=[])
+        survivors = _filter_by_criteria(
+            [bad, good], {"geo": "US", "os": "ios", "device_type": "mobile"},
+        )
+        assert [f["_id"] for f in survivors] == ["2"]
+
+    def test_non_dict_criterion_excludes_flow(self):
+        flow = _make_flow(fid="1")
+        flow["criteria"] = json.dumps(["not-a-dict"])
+        survivors = _filter_by_criteria(
+            [flow], {"geo": "US", "os": "ios", "device_type": "mobile"},
+        )
+        assert survivors == []
+
+    def test_geo_case_handling(self):
+        """`_criteria_match` treats geo as ALREADY upper — caller normalizes."""
+        # Caller normalizes click_attrs.geo; values come from admin-api as-is.
+        assert _criteria_match(
+            [{"type": "geo", "op": "in", "values": ["US"]}],
+            {"geo": "US", "os": "ios", "device_type": "mobile"},
+        ) is True
+        # Lowercase click_attr will NOT match — proves caller normalization
+        # contract is honored.
+        assert _criteria_match(
+            [{"type": "geo", "op": "in", "values": ["US"]}],
+            {"geo": "us", "os": "ios", "device_type": "mobile"},
+        ) is False
+
+
+# ============================================================
+# Step 5 — Fallback chain
+# ============================================================
+
+
+class TestFallbackChain:
+    @pytest.mark.asyncio
+    async def test_fallback_walks_buyer_to_team(self):
+        """Buyer-level flow doesn't match → team-level still wins."""
+        buyer_flow = _make_flow(
+            fid="10", scope_type="buyer", scope_id=5, seq_id=1,
+            criteria=[{"type": "geo", "op": "in", "values": ["RU"]}],  # excludes US
+        )
+        team_flow = _make_flow(
+            fid="20", scope_type="team", scope_id=3, seq_id=2,
+            criteria=[],  # match-all
+        )
+        flows = {"flow:10": buyer_flow, "flow:20": team_flow}
+        lists = {
+            "campaign:1:flows": [],
+            "flows:scope:1:buyer:5": ["10"],
+            "flows:scope:1:team:3": ["20"],
+        }
+        r = _redis_with_lists_and_hashes(lists, flows)
+        winner = await resolve_flow(
+            r, campaign_id="1", company_id=1, buyer_id=5,
+            team_id=3, department_id=None, custom_group_id=None,
+            click_attrs={"geo": "US", "os": "ios", "device_type": "mobile"},
+        )
+        # Buyer flow filtered out by criteria — falls back to team.
+        assert winner["_id"] == "20"
+
+    @pytest.mark.asyncio
+    async def test_fallback_to_company_when_others_miss(self):
+        team_flow = _make_flow(
+            fid="20", scope_type="team", scope_id=3, seq_id=1,
+            criteria=[{"type": "geo", "op": "in", "values": ["RU"]}],
+        )
+        company_flow = _make_flow(
+            fid="30", scope_type="company", scope_id=1, seq_id=1,
+            criteria=[],
+        )
+        flows = {"flow:20": team_flow, "flow:30": company_flow}
+        lists = {
+            "campaign:1:flows": [],
+            "flows:scope:1:team:3": ["20"],
+            "flows:scope:1:company:1": ["30"],
+        }
+        r = _redis_with_lists_and_hashes(lists, flows)
+        winner = await resolve_flow(
+            r, campaign_id="1", company_id=1, buyer_id=None,
+            team_id=3, department_id=None, custom_group_id=None,
+            click_attrs={"geo": "US", "os": "ios", "device_type": "mobile"},
+        )
+        assert winner["_id"] == "30"
+
+    @pytest.mark.asyncio
+    async def test_no_match_anywhere_returns_none(self):
+        flow = _make_flow(
+            fid="10", scope_type="company", scope_id=1, seq_id=1,
+            criteria=[{"type": "geo", "op": "in", "values": ["RU"]}],
+        )
+        flows = {"flow:10": flow}
+        lists = {"campaign:1:flows": [], "flows:scope:1:company:1": ["10"]}
+        r = _redis_with_lists_and_hashes(lists, flows)
+        winner = await resolve_flow(
+            r, campaign_id="1", company_id=1, buyer_id=None,
+            team_id=None, department_id=None, custom_group_id=None,
+            click_attrs={"geo": "US", "os": "ios", "device_type": "mobile"},
+        )
+        assert winner is None
+
+
+# ============================================================
+# Edge cases — no candidates, no buyer context, etc.
+# ============================================================
+
+
+class TestEdgeCases:
+    @pytest.mark.asyncio
+    async def test_no_candidates_returns_none(self):
+        r = _redis_with_lists_and_hashes({}, {})
+        winner = await resolve_flow(
+            r, campaign_id="1", company_id=1, buyer_id=5,
+            team_id=3, department_id=2, custom_group_id=10,
+            click_attrs={"geo": "US", "os": "ios", "device_type": "mobile"},
+        )
+        assert winner is None
+
+    @pytest.mark.asyncio
+    async def test_no_buyer_context_only_company(self):
+        """Click without buyer chain → only company-level flows considered."""
+        company_flow = _make_flow(
+            fid="10", scope_type="company", scope_id=1, seq_id=1,
+            criteria=[],
+        )
+        team_flow = _make_flow(
+            fid="20", scope_type="team", scope_id=3, seq_id=1,
+            criteria=[],
+        )
+        flows = {"flow:10": company_flow, "flow:20": team_flow}
+        lists = {
+            "campaign:1:flows": [],
+            "flows:scope:1:company:1": ["10"],
+            "flows:scope:1:team:3": ["20"],  # would never be fetched without team_id
+        }
+        r = _redis_with_lists_and_hashes(lists, flows)
+        winner = await resolve_flow(
+            r, campaign_id="1", company_id=1, buyer_id=None,
+            team_id=None, department_id=None, custom_group_id=None,
+            click_attrs={"geo": "US", "os": "ios", "device_type": "mobile"},
+        )
+        assert winner["_id"] == "10"
+
+    @pytest.mark.asyncio
+    async def test_no_company_id_means_campaign_only(self):
+        """Without company_id we can't address scope keyspace."""
+        bound = _make_flow(
+            fid="100", campaign_id="1", scope_type="company", scope_id=1,
+        )
+        flows = {"flow:100": bound}
+        lists = {"campaign:1:flows": ["100"]}
+        r = _redis_with_lists_and_hashes(lists, flows)
+        winner = await resolve_flow(
+            r, campaign_id="1", company_id=None, buyer_id=None,
+            team_id=None, department_id=None, custom_group_id=None,
+            click_attrs={"geo": "US", "os": "ios", "device_type": "mobile"},
+        )
+        # campaign-bound flow's scope is `company:1` — but click_levels has
+        # company=None → no level matches → returns None. This is the
+        # documented behavior: without a tenant, no scope evaluation.
+        assert winner is None
+
+    @pytest.mark.asyncio
+    async def test_dedupe_repeated_flow_id(self):
+        """Same flow ID in two lists shouldn't double-load."""
+        flow = _make_flow(fid="10", scope_type="company", scope_id=1, seq_id=1)
+        flows = {"flow:10": flow}
+        lists = {
+            "campaign:1:flows": ["10"],
+            "flows:scope:1:company:1": ["10"],
+        }
+        r = _redis_with_lists_and_hashes(lists, flows)
+        winner = await resolve_flow(
+            r, campaign_id="1", company_id=1, buyer_id=None,
+            team_id=None, department_id=None, custom_group_id=None,
+            click_attrs={"geo": "US", "os": "ios", "device_type": "mobile"},
+        )
+        assert winner["_id"] == "10"
+
+    @pytest.mark.asyncio
+    async def test_missing_flow_hash_skipped(self):
+        """Sync drift: scope list has ID but hash absent → skip."""
+        flows = {}  # Hash missing
+        lists = {
+            "campaign:1:flows": [],
+            "flows:scope:1:company:1": ["999"],
+        }
+        r = _redis_with_lists_and_hashes(lists, flows)
+        winner = await resolve_flow(
+            r, campaign_id="1", company_id=1, buyer_id=None,
+            team_id=None, department_id=None, custom_group_id=None,
+            click_attrs={"geo": "US", "os": "ios", "device_type": "mobile"},
+        )
+        assert winner is None
+
+
+# ============================================================
+# Pure helpers
+# ============================================================
+
+
+class TestPureHelpers:
+    def test_safe_int_normal(self):
+        assert _safe_int("42") == 42
+        assert _safe_int(42) == 42
+
+    def test_safe_int_handles_bad_input(self):
+        assert _safe_int(None) == 0
+        assert _safe_int("abc") == 0
+        assert _safe_int(None, default=99) == 99
+
+    def test_winner_sort_key_explicit_bound_lowest(self):
+        """Explicit campaign-bound flow with seq=1 is the smallest key."""
+        flow = _make_flow(fid="A", campaign_id="1", is_default=False, seq_id=1)
+        assert _winner_sort_key(flow) == (0, 0, 1)
+
+    def test_winner_sort_key_default_global_largest(self):
+        flow = _make_flow(fid="A", campaign_id="0", is_default=True, seq_id=99)
+        assert _winner_sort_key(flow) == (1, 1, 99)
+
+    def test_scope_priority_constant(self):
+        assert SCOPE_PRIORITY == (
+            "buyer", "custom_group", "team", "department", "company",
+        )

@@ -4,17 +4,39 @@ Reads campaign/offer/rule data from Redis, evaluates targeting conditions,
 selects destination URL. All lookups are Redis-only, no SQL.
 
 Every stage is timed to millisecond precision for observability.
+
+Stage 2 / Vector 2.8 — `build_url()` resolves macros via the merged
+source∪campaign mapping chain (per `docs/design/PARAMETER-SYSTEM.md`)
+and emits URL-safe output through `safe_substitute()` (`macros.py`).
+Incoming GET keys must be aliased to a canonical slot via Source
+`param_mappings` or Campaign `default_param_mappings` to land in the
+redirect URL.
+
+Stage 2 / Vectors 2.4 + 2.5 — flow-aware routing via scope cascade
+resolution (`docs/design/SCOPE-CASCADE.md`). After a winner campaign is
+picked, the click-processor consults `flow:{id}` candidates from
+`campaign:{cid}:flows` + `flows:scope:{...}` lists, applies criteria
+matching, and walks the scope hierarchy (buyer < custom_group < team
+< department < company) to pick exactly one flow. The chosen flow's
+`action_type` (redirect / offer / split / block) drives URL emission
+via `app.action_executor`. Legacy `select_offer` is preserved as a
+fallback when no flow matches at any scope level — this makes the
+migration safe for campaigns whose flows haven't yet been authored.
 """
 
 import json
 import logging
 import random
 import time
-from urllib.parse import quote
+from typing import Any
 
 import sentry_sdk
+from app import action_executor, cascade
+from app.enrichment import enrich_buyer
+from app.macros import safe_substitute
 from app.models import ClickRequest
 from app.redis_client import get_redis
+from app.resolution import parse_param_mappings, resolve_slots
 from app.ua_parser import parse_ua
 
 logger = logging.getLogger("tds.router")
@@ -38,8 +60,19 @@ def _ms_since(start: float) -> float:
 async def route(req: ClickRequest) -> dict | None:
     """Find matching campaign + offer for this click.
 
-    Returns: {"url": ..., "campaign_id": ..., "offer_id": ..., "timing": {...}} or None.
-    Timing dict contains ms-precision breakdown of every routing stage.
+    Returns one of three shapes:
+      - Happy path: `{"url": str, "campaign_id": str, "offer_id": str,
+        "timing": dict}` — caller emits 302 to `url`.
+      - Block sentinel: `{"url": None, "campaign_id": str, "offer_id":
+        None, "timing": dict, "blocked": True}` — caller emits 404
+        (or worker may serve a block page). Distinguished by
+        `result.get("blocked") is True` OR `result.get("url") is None`.
+      - `None` — no campaign matched; caller emits the worker's
+        default fallback (typically 404 with a generic page).
+
+    Timing dict contains ms-precision breakdown of every routing stage,
+    plus a `route_via` tag (`flow_cascade`, `flow_cascade_block`, or
+    `legacy_split`) for ops drill-down.
     """
     t_start = time.perf_counter()
     timing = {}
@@ -52,7 +85,7 @@ async def route(req: ClickRequest) -> dict | None:
     timing["domain_resolve_ms"] = _ms_since(t0)
 
     if domain_campaign_id:
-        # Domain resolved — skip geo targeting, go straight to offer selection
+        # Domain resolved — skip geo targeting, go straight to flow cascade.
         timing["domain_matched"] = True
         timing["campaign_source"] = "domain"
 
@@ -63,45 +96,14 @@ async def route(req: ClickRequest) -> dict | None:
         if campaign:
             campaign["_id"] = domain_campaign_id
 
-            # Stage 7: Offer selection
-            t0 = time.perf_counter()
-            offer = await select_offer(r, domain_campaign_id)
-            timing["offer_ms"] = _ms_since(t0)
+            routed = await _route_via_campaign(
+                r, campaign, domain_campaign_id, req, timing,
+                result_label="domain_matched",
+            )
+            if routed is not None:
+                return routed
 
-            if offer:
-                # Stage 8: URL building
-                t0 = time.perf_counter()
-                url = build_url(offer.get("url", ""), req, domain_campaign_id, offer.get("_id", ""))
-                timing["url_build_ms"] = _ms_since(t0)
-
-                # Stage 9: Counter increment
-                t0 = time.perf_counter()
-                try:
-                    pipe = r.pipeline()
-                    cap_key = f"cap:{domain_campaign_id}:daily"
-                    pipe.incr(cap_key)
-                    pipe.expire(cap_key, 86400)
-                    if req.visitor_id:
-                        freq_period = safe_int(campaign.get("frequency_period"), 86400)
-                        freq_key = f"freq:{domain_campaign_id}:{req.visitor_id}"
-                        pipe.incr(freq_key)
-                        pipe.expire(freq_key, freq_period if freq_period > 0 else 86400)
-                    await pipe.execute()
-                except Exception as e:
-                    logger.warning("Counter update failed: %s", e)
-                timing["counter_ms"] = _ms_since(t0)
-
-                timing["route_total_ms"] = _ms_since(t_start)
-                timing["result"] = "domain_matched"
-
-                return {
-                    "url": url,
-                    "campaign_id": domain_campaign_id,
-                    "offer_id": offer.get("_id", ""),
-                    "timing": timing,
-                }
-
-        # Domain matched but no campaign/offer in Redis — fall through to geo targeting
+        # Domain matched but no usable routing path — fall through to geo targeting.
         timing["domain_fallthrough"] = True
 
     # Stage 1: UA parsing (cached, should be <0.1ms on cache hit)
@@ -166,7 +168,14 @@ async def route(req: ClickRequest) -> dict | None:
     campaigns = await pipe.execute()
     timing["campaign_fetch_ms"] = _ms_since(t0)
 
-    # Stage 5: Cap/frequency filtering
+    # Stage 5: Cap/frequency filtering — delegates to the shared
+    # `_campaign_caps_exceeded` helper so both this branch and the
+    # domain-resolved branch (`_route_via_campaign`) honour the same
+    # eligibility contract. Per-candidate sequential awaits are
+    # acceptable inside the 10ms budget at realistic candidate
+    # cardinality (1-50). If the cardinality grows we'd batch via
+    # pipeline, but that's premature optimization until profiling
+    # shows it.
     t0 = time.perf_counter()
     eligible = []
     for i, campaign in enumerate(campaigns):
@@ -174,19 +183,8 @@ async def route(req: ClickRequest) -> dict | None:
             continue
         cid = candidates[i]
         campaign["_id"] = cid
-
-        daily_cap = safe_int(campaign.get("daily_cap"))
-        if daily_cap > 0:
-            current = await r.get(f"cap:{cid}:daily")
-            if current and safe_int(current) >= daily_cap:
-                continue
-
-        freq_cap = safe_int(campaign.get("frequency_cap"))
-        if req.visitor_id and freq_cap > 0:
-            visits = await r.get(f"freq:{cid}:{req.visitor_id}")
-            if visits and safe_int(visits) >= freq_cap:
-                continue
-
+        if await _campaign_caps_exceeded(r, cid, campaign, req.visitor_id):
+            continue
         eligible.append(campaign)
     timing["filtering_ms"] = _ms_since(t0)
     timing["eligible_count"] = len(eligible)
@@ -204,34 +202,376 @@ async def route(req: ClickRequest) -> dict | None:
     winner = weighted_select(top_campaigns)
     timing["selection_ms"] = _ms_since(t0)
 
-    # Stage 7: Offer selection
-    t0 = time.perf_counter()
-    offer = await select_offer(r, winner["_id"])
-    timing["offer_ms"] = _ms_since(t0)
+    # Stages 6.5-9: flow cascade → action execution → counter increment.
+    routed = await _route_via_campaign(
+        r, winner, winner["_id"], req, timing, result_label="matched",
+    )
+    if routed is not None:
+        return routed
 
-    if not offer:
-        timing["route_total_ms"] = _ms_since(t_start)
-        timing["result"] = "no_offer"
+    # No routing path found (no flow + legacy fallback exhausted).
+    timing["route_total_ms"] = _ms_since(t_start)
+    timing["result"] = "no_offer"
+    return None
+
+
+async def _route_via_campaign(
+    r,
+    campaign: dict[str, Any],
+    campaign_id: str,
+    req: ClickRequest,
+    timing: dict[str, Any],
+    *,
+    result_label: str,
+) -> dict[str, Any] | None:
+    """Drive the routing tail end for one resolved campaign.
+
+    Encapsulates Stages 6.5-9 so both the domain-resolved branch and the
+    geo-targeting branch share one implementation. Stages:
+
+      6.5 — Flow cascade (Vectors 2.4 + 2.5): resolve a single flow per
+            `docs/design/SCOPE-CASCADE.md`. If a flow matches, its
+            `action_type` drives URL emission via
+            `action_executor.execute_action`. `block` short-circuits to
+            None (caller surfaces 404). Other actions return URL.
+      7   — Legacy `select_offer` fallback: when cascade returns None,
+            pick an offer from `split:{campaign_id}` HASH and use the
+            offer's URL/target. Preserves backward compat for campaigns
+            whose flows haven't been authored yet (Stage 2 → Stage 3
+            transition).
+      8   — `build_url` substitution.
+      9   — Cap + frequency counter increment (non-blocking).
+
+    Returns a routing result dict (`{url, campaign_id, offer_id, timing}`)
+    when a path is found; None when the click should fall through to the
+    next branch (e.g. domain match but no flow + no legacy split).
+    """
+    t_branch = time.perf_counter()
+
+    # Cap pre-check (security audit 2026-04-28 CRITICAL-001 fix).
+    # Stage 5 already filtered geo-branch candidates by caps, so for
+    # that path this is a redundant ~0.5ms double-check kept for
+    # symmetry. For the domain branch this is the FIRST cap check —
+    # without it a domain-bound campaign with daily_cap=N could route
+    # unlimited clicks until the next click read a stale counter.
+    if await _campaign_caps_exceeded(r, campaign_id, campaign, req.visitor_id):
+        timing["route_total_ms"] = _ms_since(t_branch)
+        timing["result"] = "campaign_capped"
         return None
 
-    # Stage 8: Target resolution + URL building
+    # Resolve param-mapping context once — used by both cascade action
+    # execution and legacy fallback for URL substitution.
+    source_mappings, campaign_mappings = await _fetch_resolution_context(
+        r, campaign_id, campaign, req.query_params or {},
+    )
+
+    # Stage 6.5 — flow cascade.
+    t0 = time.perf_counter()
+    cascade_result = await _try_flow_cascade(
+        r, campaign, campaign_id, req,
+        source_mappings=source_mappings,
+        campaign_mappings=campaign_mappings,
+    )
+    timing["cascade_ms"] = _ms_since(t0)
+
+    if cascade_result is not None:
+        # `block` action: short-circuit with no redirect URL but DO
+        # bump counters — a blocked click still routed (to a 404), and
+        # cap/freq counters guard against retry-storm abuse where an
+        # attacker probes a known-block geo to bypass per-visitor rate
+        # limits (security audit 2026-04-28 HIGH-002). Stage 6 alert
+        # module consumes `action_config.alert` separately.
+        if cascade_result.get("action") == "block":
+            await _bump_counters(r, campaign_id, campaign, req, timing)
+            timing["route_via"] = "flow_cascade_block"
+            timing["route_total_ms"] = _ms_since(t_branch)
+            timing["result"] = "blocked_by_flow"
+            return {
+                "url": None,
+                "campaign_id": campaign_id,
+                "offer_id": None,
+                "timing": timing,
+                "blocked": True,
+            }
+
+        url = cascade_result["url"]
+        # Preserve `None` rather than coercing to empty string — Stage 3
+        # `clicks` row writer will treat None as SQL NULL, which is the
+        # right shape for a redirect-action click that has no offer
+        # attribution (code review LOW-002 2026-04-28).
+        offer_id = cascade_result.get("offer_id")
+        timing["url_build_ms"] = timing.get("cascade_ms", 0)
+        timing["route_via"] = "flow_cascade"
+        await _bump_counters(r, campaign_id, campaign, req, timing)
+        timing["route_total_ms"] = _ms_since(t_branch)
+        timing["result"] = result_label
+        return {
+            "url": url,
+            "campaign_id": campaign_id,
+            "offer_id": offer_id if offer_id is not None else "",
+            "timing": timing,
+        }
+
+    # Stage 7 — legacy fallback (no flow matched).
+    t0 = time.perf_counter()
+    offer = await select_offer(r, campaign_id)
+    timing["offer_ms"] = _ms_since(t0)
+    if not offer:
+        return None
+
+    # Stage 8 — legacy URL build via offer.url / target resolution.
     t0 = time.perf_counter()
     target_url = await resolve_target(r, offer, req)
     url_template = target_url if target_url else offer.get("url", "")
-    url = build_url(url_template, req, winner["_id"], offer.get("_id", ""))
+    url = build_url(
+        url_template, req, campaign_id, offer.get("_id", ""),
+        source_mappings=source_mappings,
+        campaign_mappings=campaign_mappings,
+    )
     timing["url_build_ms"] = _ms_since(t0)
     timing["target_resolved"] = target_url is not None
+    timing["route_via"] = "legacy_split"
 
-    # Stage 9: Counter increment (non-blocking)
+    # Stage 9 — counter increment.
+    await _bump_counters(r, campaign_id, campaign, req, timing)
+    timing["route_total_ms"] = _ms_since(t_branch)
+    timing["result"] = result_label
+
+    return {
+        "url": url,
+        "campaign_id": campaign_id,
+        "offer_id": offer.get("_id", ""),
+        "timing": timing,
+    }
+
+
+async def _try_flow_cascade(
+    r,
+    campaign: dict[str, Any],
+    campaign_id: str,
+    req: ClickRequest,
+    *,
+    source_mappings,
+    campaign_mappings,
+) -> dict[str, Any] | None:
+    """Run scope cascade + action execution. Returns None if no flow.
+
+    Steps:
+      a. Resolve canonical slots from query_params + mappings (cheap,
+         pure Python). Used to extract `buyer_id` for enrichment.
+      b. Enrich `buyer_id` → org-hierarchy chain via single Redis
+         HGETALL (`enrich_buyer`). When buyer slot is missing or
+         non-numeric, the chain is empty — cascade falls back to
+         company-level scope (resolved from campaign.company_id).
+      c. Resolve winning flow via `cascade.resolve_flow`.
+      d. Execute action via `action_executor.execute_action`.
+
+    Per `architecture.md` Latency Budgets: this branch adds at most
+    1 enrich + 2 cascade pipelines + 1-2 action HGETALLs ≈ 4-5ms in
+    the cascade-hit shape. Within the per-click 10ms total budget on
+    healthy Redis.
+    """
+    slots, _extras = resolve_slots(
+        query_params=req.query_params or {},
+        source_mappings=source_mappings,
+        campaign_mappings=campaign_mappings,
+    )
+    buyer_chain = await _resolve_buyer_chain(r, slots, campaign)
+
+    flow = await cascade.resolve_flow(
+        r,
+        campaign_id=campaign_id,
+        company_id=buyer_chain["company_id"],
+        buyer_id=buyer_chain["buyer_id"],
+        team_id=buyer_chain["team_id"],
+        department_id=buyer_chain["department_id"],
+        custom_group_id=buyer_chain["custom_group_id"],
+        click_attrs={
+            "geo": (req.country or "").upper(),
+            "os": parse_os(req.user_agent).lower(),
+            "device_type": parse_device_type(req.user_agent).lower(),
+        },
+    )
+    if flow is None:
+        return None
+
+    return await action_executor.execute_action(
+        r, flow, req, campaign_id,
+        source_mappings=source_mappings,
+        campaign_mappings=campaign_mappings,
+        build_url_fn=build_url,
+    )
+
+
+async def _resolve_buyer_chain(
+    r,
+    slots: dict[str, str | None],
+    campaign: dict[str, Any],
+) -> dict[str, int | None]:
+    """Resolve `buyer_id` → org-hierarchy chain for cascade.
+
+    Returns `{buyer_id, team_id, department_id, custom_group_id, company_id}`
+    with int values (or None when absent). The `company_id` ALWAYS
+    comes from the campaign — never from the buyer enrichment — because
+    the cascade keyspace is tenant-scoped and the campaign is the
+    authoritative tenant for THIS click's routing.
+
+    **Cross-tenant defense (Stage 2 hardening, security audit
+    2026-04-28 HIGH-001 amplification):** when an attacker on company A
+    crafts `?buyer_id=N` where user N belongs to company B,
+    `enrich_buyer` returns B's chain. Without this defense the cascade
+    would walk `flows:scope:B:*` keys and route A's traffic via B's
+    flows — a multi-tenant data leak via PK enumeration. We close it
+    by asserting `enriched.company_id == campaign.company_id`. On
+    mismatch we discard the entire enrichment chain (drop team /
+    department / custom_group / buyer attribution to None) and fall
+    back to the campaign's company-scope only. Mismatch fires a HIGH
+    activity-log + Sentry warning per `api-security` rule security
+    event list.
+
+    The Stage 3 cross-tenant key-shape fix (`user:{company_id}:{user_id}`)
+    is still pinned in `docs/roadmap/stage-2-sync-excellence.md` —
+    once it ships, `enrich_buyer` will refuse mismatched companies at
+    source and this assertion becomes pure defense in depth.
+    """
+    raw_buyer = (slots or {}).get("buyer_id")
+    enriched = await enrich_buyer(r, raw_buyer)
+
+    campaign_company_id = _to_int(campaign.get("company_id"))
+    enriched_company_id = _to_int(enriched.get("company_id"))
+
+    # If enrichment yielded a tenant that doesn't match the campaign,
+    # treat the click as anonymous — the buyer/team/dept/group context
+    # would otherwise leak across tenants. Logged so ops can detect
+    # advertiser misconfig vs attacker probing.
+    if enriched_company_id is not None and (
+        campaign_company_id is None or enriched_company_id != campaign_company_id
+    ):
+        # Sanitize raw_buyer for log + Sentry — it's a valid digit-only
+        # ID (enrich_buyer's isdigit() gate already filtered hostile
+        # input), but we cap length to avoid breadcrumb pollution per
+        # `observability` rule. Buyer IDs are internal user PKs, not
+        # PII per se, but full-length verbatim logging is unnecessary.
+        sanitized_buyer = (
+            str(raw_buyer)[:16] if raw_buyer is not None else "<missing>"
+        )
+        logger.warning(
+            "cross-tenant buyer_id rejected: campaign_company=%s buyer=%s "
+            "enriched_company=%s — falling back to campaign tenant scope",
+            campaign_company_id, sanitized_buyer, enriched_company_id,
+        )
+        # Tag + context for Sentry security event correlation.
+        # `set_tag` is queryable in dashboards; `set_context` carries
+        # the full mismatch detail for incident investigation.
+        # Per `api-security` rule security event list — cross-tenant
+        # PK enumeration is a HIGH-severity signal worth alerting on.
+        sentry_sdk.set_tag("security_event", "cross_tenant_buyer_rejection")
+        sentry_sdk.set_context("cross_tenant_attempt", {
+            "campaign_company": campaign_company_id,
+            "enriched_company": enriched_company_id,
+            "buyer_id_prefix": sanitized_buyer,
+        })
+        sentry_sdk.capture_message(
+            "cross-tenant buyer_id attempt blocked",
+            level="warning",
+        )
+        return {
+            "buyer_id": None,
+            "team_id": None,
+            "department_id": None,
+            "custom_group_id": None,
+            "company_id": campaign_company_id,
+        }
+
+    return {
+        "buyer_id": _to_int(raw_buyer),
+        "team_id": _to_int(enriched.get("team_id")),
+        "department_id": _to_int(enriched.get("department_id")),
+        "custom_group_id": _to_int(enriched.get("custom_group_id")),
+        # Always use campaign's tenant for keyspace, even when chain
+        # matches — defense-in-depth so a future bug in `enrich_buyer`
+        # cannot poison the keyspace anchor.
+        "company_id": campaign_company_id,
+    }
+
+
+async def _campaign_caps_exceeded(
+    r,
+    campaign_id: str,
+    campaign: dict[str, Any],
+    visitor_id: str | None,
+) -> bool:
+    """Stage-5-equivalent eligibility check for a single campaign.
+
+    Returns True when EITHER:
+      - daily_cap > 0 AND `cap:{campaign_id}:daily` ≥ daily_cap, OR
+      - frequency_cap > 0 AND visitor_id present AND
+        `freq:{campaign_id}:{visitor_id}` ≥ frequency_cap.
+
+    Used by both routing branches:
+      - Geo branch: Stage 5 calls this per-candidate to filter out
+        capped campaigns BEFORE selection (the original behaviour).
+      - Domain branch: `_route_via_campaign` calls this once at entry.
+        Pre-Vector 2.4+2.5 the domain branch went straight from
+        `resolve_domain_campaign` to `select_offer` and skipped the
+        eligibility check entirely — every domain-bound campaign
+        could over-deliver beyond `daily_cap` (security audit
+        2026-04-28 CRITICAL-001). Hoisting the check into the
+        shared orchestrator closes the asymmetry: both branches
+        now honour caps before any routing work runs.
+
+    Cost: 1-2 Redis GETs (daily counter + optional freq counter).
+    For the geo branch this is at most a redundant double-check
+    (Stage 5 already filtered) — kept defensively because the cost
+    is far below the 10ms hot-path budget and the symmetry guards
+    against future regressions where Stage 5 logic drifts.
+
+    Failure-mode: any Redis error here is treated as "not capped"
+    so a transient outage doesn't block routing. The fail-open
+    posture matches `_bump_counters` — caps are best-effort, never
+    fail the click.
+    """
+    try:
+        daily_cap = safe_int(campaign.get("daily_cap"))
+        if daily_cap > 0:
+            current = await r.get(f"cap:{campaign_id}:daily")
+            if current and safe_int(current) >= daily_cap:
+                return True
+
+        freq_cap = safe_int(campaign.get("frequency_cap"))
+        if visitor_id and freq_cap > 0:
+            visits = await r.get(f"freq:{campaign_id}:{visitor_id}")
+            if visits and safe_int(visits) >= freq_cap:
+                return True
+    except Exception as e:  # pragma: no cover — Redis transient
+        logger.warning(
+            "cap check failed for campaign:%s — failing open: %s",
+            campaign_id, e,
+        )
+    return False
+
+
+async def _bump_counters(
+    r,
+    campaign_id: str,
+    campaign: dict[str, Any],
+    req: ClickRequest,
+    timing: dict[str, Any],
+) -> None:
+    """Stage 9 — daily cap + per-visitor frequency increment.
+
+    Non-blocking: failures are logged but never fail the click. Counters
+    drift in worst case; click still routes.
+    """
     t0 = time.perf_counter()
     try:
         pipe = r.pipeline()
-        cap_key = f"cap:{winner['_id']}:daily"
+        cap_key = f"cap:{campaign_id}:daily"
         pipe.incr(cap_key)
         pipe.expire(cap_key, 86400)
         if req.visitor_id:
-            freq_period = safe_int(winner.get("frequency_period"), 86400)
-            freq_key = f"freq:{winner['_id']}:{req.visitor_id}"
+            freq_period = safe_int(campaign.get("frequency_period"), 86400)
+            freq_key = f"freq:{campaign_id}:{req.visitor_id}"
             pipe.incr(freq_key)
             pipe.expire(freq_key, freq_period if freq_period > 0 else 86400)
         await pipe.execute()
@@ -239,15 +579,33 @@ async def route(req: ClickRequest) -> dict | None:
         logger.warning("Counter update failed: %s", e)
     timing["counter_ms"] = _ms_since(t0)
 
-    timing["route_total_ms"] = _ms_since(t_start)
-    timing["result"] = "matched"
 
-    return {
-        "url": url,
-        "campaign_id": winner["_id"],
-        "offer_id": offer.get("_id", ""),
-        "timing": timing,
-    }
+def _to_int(value: Any) -> int | None:
+    """Best-effort int parse; returns None on bad / empty input."""
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (ValueError, TypeError):
+        return None
+
+
+def _safe_id_sort_key(rid: Any) -> tuple[int, int, str]:
+    """Sort Redis IDs numerically with stable fallback for malformed input.
+
+    Returns `(bucket, value, original)`:
+      - bucket=0 + numeric value when `int(rid)` succeeds
+      - bucket=1 + 0 + raw string when parse fails (sorts after numeric;
+        original string used as tiebreaker for determinism)
+
+    Mirrors `action_executor._safe_target_sort_key`. Promote to a shared
+    helper if a third caller needs this — left inline for now per
+    `reusability-discipline` "extract at 2nd use".
+    """
+    try:
+        return (0, int(rid), str(rid))
+    except (ValueError, TypeError):
+        return (1, 0, str(rid))
 
 
 async def resolve_domain_campaign(r, req: ClickRequest) -> str | None:
@@ -414,35 +772,176 @@ async def resolve_target(r, offer: dict, req: ClickRequest) -> str | None:
     return default_url
 
 
-def build_url(template: str, req: ClickRequest, campaign_id: str, offer_id: str) -> str:
-    """Replace macros in offer URL template with actual values."""
-    # System macros (cannot be overridden by query params)
-    system_macros = {
-        "{click_id}", "{campaign_id}", "{offer_id}", "{country}",
-        "{city}", "{region}", "{ip}", "{os}", "{device}", "{visitor_id}",
-    }
-    replacements = {
-        "{click_id}": quote(str(req.click_id), safe=""),
-        "{campaign_id}": quote(str(campaign_id), safe=""),
-        "{offer_id}": quote(str(offer_id), safe=""),
-        "{country}": quote(str(req.country), safe=""),
-        "{city}": quote(str(req.city), safe=""),
-        "{region}": quote(str(req.region), safe=""),
-        "{ip}": quote(str(req.ip), safe=""),
-        "{os}": quote(parse_os(req.user_agent), safe=""),
-        "{device}": quote(parse_device_type(req.user_agent), safe=""),
-        "{visitor_id}": quote(str(req.visitor_id or ""), safe=""),
-    }
-    # Query params as additional macros (system macros take priority)
-    for key, value in (req.query_params or {}).items():
-        macro = f"{{{key}}}"
-        if macro not in system_macros:
-            replacements[macro] = quote(str(value), safe="")
+# Defensive cap on per-click source enumeration. Realistic campaigns
+# have 1-5 linked sources; a campaign with hundreds is either a
+# misconfiguration or admin-led DoS. The cap keeps the hot path
+# under its 10ms latency budget regardless of input. See security
+# audit 2026-04-28 (HIGH-003) — pending follow-up: add an O(1)
+# `campaign:{id}:source_by_slug:{slug}` index in the sync builder
+# so enumeration disappears entirely.
+_MAX_SOURCES_PER_CAMPAIGN_AT_CLICK = 100
 
-    url = template
-    for macro, value in replacements.items():
-        url = url.replace(macro, value)
-    return url
+
+async def _resolve_source_for_click(
+    r,
+    campaign_id: str,
+    query_params: dict[str, str],
+) -> dict[str, Any]:
+    """Look up the source matching this click — Stage 2 / Vector 2.8.
+
+    Resolution: `?source=<slug>` query param → match against sources
+    linked to the campaign via `campaign:{id}:sources` SET. Returns
+    the source HASH (with `_id`) or `{}` if no match.
+
+    Slug comparison is case-insensitive — admin-api `_slugify` lower-
+    cases on write but we normalise on read defensively in case
+    legacy rows ever drift.
+
+    Company-default-source fallback (when `?source` is absent or no
+    match) is intentionally deferred — sync builder doesn't yet emit
+    the company-default index. Until then, no-source means
+    `resolve_slots` falls back to campaign-only mapping resolution,
+    which is the design-doc-correct behavior.
+    """
+    src_slug_raw = query_params.get("source") if query_params else None
+    if not src_slug_raw:
+        return {}
+    src_slug = src_slug_raw.strip().lower()
+    if not src_slug:
+        return {}
+
+    source_ids = await r.smembers(f"campaign:{campaign_id}:sources")
+    if not source_ids:
+        return {}
+
+    # Cap enumeration to bound hot-path Redis pipeline length. Sort
+    # numerically (not lexicographic) so "lower-numbered" actually
+    # means lowest int — `sorted({"10","100","2"})` lexicographic
+    # gives `["10","100","2"]` while attackers can craft slug
+    # collisions that crowd out legit sources at the lex prefix.
+    # Numeric sort matches admin-api PG SERIAL allocation order
+    # (security audit 2026-04-28 HIGH-004). Mirror of
+    # `_safe_target_sort_key` in `action_executor.py`.
+    sorted_ids = sorted(source_ids, key=_safe_id_sort_key)
+    if len(sorted_ids) > _MAX_SOURCES_PER_CAMPAIGN_AT_CLICK:
+        logger.warning(
+            "campaign:%s has %d sources (>cap %d); truncating enumeration",
+            campaign_id, len(sorted_ids), _MAX_SOURCES_PER_CAMPAIGN_AT_CLICK,
+        )
+        sentry_sdk.capture_message(
+            f"campaign:{campaign_id} source count exceeds cap",
+            level="warning",
+        )
+        sorted_ids = sorted_ids[:_MAX_SOURCES_PER_CAMPAIGN_AT_CLICK]
+
+    pipe = r.pipeline()
+    for sid in sorted_ids:
+        pipe.hgetall(f"source:{sid}")
+    results = await pipe.execute()
+
+    for sid, src in zip(sorted_ids, results):
+        if src and (src.get("slug") or "").strip().lower() == src_slug:
+            src["_id"] = sid
+            return src
+    return {}
+
+
+async def _fetch_resolution_context(
+    r,
+    campaign_id: str,
+    campaign: dict[str, Any],
+    query_params: dict[str, Any],
+) -> tuple[list[dict[str, Any]] | None, list[dict[str, Any]] | None]:
+    """Resolve which source matched + parse both mapping layers.
+
+    Returns `(source_mappings, campaign_mappings)` ready to pass to
+    `build_url(...)`. `None` for source_mappings indicates "no source
+    matched" — `resolve_slots` then drives the campaign-only chain.
+    """
+    src = await _resolve_source_for_click(r, campaign_id, query_params)
+    source_mappings = parse_param_mappings(src.get("param_mappings")) if src else None
+    campaign_mappings = parse_param_mappings(campaign.get("default_param_mappings"))
+    return source_mappings, campaign_mappings
+
+
+def build_url(
+    template: str,
+    req: ClickRequest,
+    campaign_id: str,
+    offer_id: str,
+    *,
+    source_mappings: list[dict[str, Any]] | None = None,
+    campaign_mappings: list[dict[str, Any]] | None = None,
+) -> str:
+    """Build the redirect URL by substituting macros in `template`.
+
+    Stage 2 / Vector 2.8 — uses the merged source∪campaign mapping
+    chain via `resolution.resolve_slots`, then routes through
+    `macros.safe_substitute` for safe URL output (path-segment
+    collapse, empty-query-param drop, always-encode).
+
+    Resolution order per `docs/design/PARAMETER-SYSTEM.md`:
+      1. Request URL via merged map (campaign alias wins per slot).
+      2. Campaign hardcoded `default_value`.
+      3. Source hardcoded `default_value`.
+      4. NULL — substituter handles by collapsing the macro position.
+
+    Worker-auto fields (`country`, `city`, `ip`, …) and technical
+    slots (`click_id`, `campaign_id`, `offer_id`, `visitor_id`) are
+    populated directly from the request — they are SYSTEM-fixed
+    macro names that cannot be remapped via param_mappings (see
+    `macros-registry.md`). This is also why they overwrite any
+    same-named slot value at the end of the values dict.
+
+    Returns:
+        Final URL string. Never contains a literal `{macro}` —
+        unfilled macros collapse via `safe_substitute`'s cleanup.
+    """
+    # Step 1 — resolve canonical slots via merged mapping chain.
+    slots, _extras = resolve_slots(
+        query_params=req.query_params or {},
+        source_mappings=source_mappings,
+        campaign_mappings=campaign_mappings,
+    )
+
+    # Step 2 — build the macro values dict. Layered so system-fixed
+    # names always win over slot-resolved ones (a misconfigured
+    # mapping cannot accidentally override `{click_id}` etc.).
+    values: dict[str, Any] = {}
+
+    # Slot layer (lowest precedence — overwritten by worker/technical
+    # for system-reserved macro names).
+    for slot, value in slots.items():
+        values[slot] = value
+
+    # Worker-auto layer — pull from request fields. Empty strings
+    # become None so `safe_substitute` collapses the macro cleanly.
+    worker_auto_fields = (
+        "country", "city", "region", "ip", "continent",
+        "timezone", "postal_code", "latitude", "longitude",
+        "as_org", "colo", "user_agent", "referer", "accept_language",
+        "tls_version", "http_protocol", "hostname", "path",
+    )
+    for key in worker_auto_fields:
+        v = getattr(req, key, "")
+        values[key] = v if v else None
+    values["asn"] = req.asn if req.asn else None
+
+    # Substituted-auto layer — UA parsing.
+    ua = parse_ua(req.user_agent or "")
+    values["os"] = ua.get("os") or None
+    values["device_type"] = ua.get("device_type") or None
+    values["device"] = ua.get("device_type") or None  # legacy alias
+    values["browser"] = ua.get("browser") or None
+
+    # Technical layer (always wins for system-reserved names).
+    values["click_id"] = req.click_id or None
+    values["campaign_id"] = str(campaign_id) if campaign_id else None
+    values["offer_id"] = str(offer_id) if offer_id else None
+    values["visitor_id"] = req.visitor_id or None
+
+    # Step 3 — safe substitute (handles NULL collapse + URL encoding).
+    return safe_substitute(template, values)
 
 
 def weighted_select(items: list[dict]) -> dict:

@@ -356,6 +356,102 @@ class TestCriteriaMatch:
 
 
 # ============================================================
+# F.17 — Per-type case strategy + new criterion dimensions
+# ============================================================
+#
+# These tests pin the cascade matcher's vocabulary contract for the
+# 4 dimensions added in F.17 (browser, region, city, language). The
+# matcher MUST mirror admin-api's storage casing — drift here breaks
+# every saved criterion silently.
+
+
+class TestCasePreserveDims:
+    """Per-type casing strategy — see `cascade._CASE_PRESERVE`.
+
+    `geo` / `region` / `browser` / `language` keep their value
+    verbatim (admin-api validates them in the same casing the
+    parser/CF emits). `os` / `device_type` / `city` lowercase both
+    sides.
+    """
+
+    def test_browser_title_case_match(self):
+        # device_detector emits "Samsung Browser" — admin-api stores
+        # the same string; matcher MUST NOT lowercase the criterion.
+        assert _criteria_match(
+            [{"type": "browser", "op": "in", "values": ["Chrome", "Samsung Browser"]}],
+            {"browser": "Samsung Browser"},
+        ) is True
+
+    def test_browser_lowercase_click_misses_title_case_criterion(self):
+        # Stale lowercase emission would silently miss — pin the
+        # contract that prevents accidental .lower() reintroduction.
+        assert _criteria_match(
+            [{"type": "browser", "op": "in", "values": ["Chrome"]}],
+            {"browser": "chrome"},
+        ) is False
+
+    def test_region_human_name_match(self):
+        # CF emits "California" verbatim from MaxMind; admin-api
+        # stores the same.
+        assert _criteria_match(
+            [{"type": "region", "op": "in", "values": ["California", "Texas"]}],
+            {"region": "California"},
+        ) is True
+
+    def test_region_unicode_match(self):
+        assert _criteria_match(
+            [{"type": "region", "op": "in", "values": ["Київська область"]}],
+            {"region": "Київська область"},
+        ) is True
+
+    def test_language_bcp47_strict_casing(self):
+        # `en-US` matches; `en-us` would be a save-time validator
+        # rejection at admin-api so we don't test the lowercase path
+        # here (it can't be stored).
+        assert _criteria_match(
+            [{"type": "language", "op": "in", "values": ["en-US", "uk-UA"]}],
+            {"language": "uk-UA"},
+        ) is True
+
+    def test_language_short_form_match(self):
+        # Operator may save just `"en"` — matcher should accept the
+        # exact string, not "en-US" / "en-GB" prefix-extend.
+        assert _criteria_match(
+            [{"type": "language", "op": "in", "values": ["en"]}],
+            {"language": "en"},
+        ) is True
+        assert _criteria_match(
+            [{"type": "language", "op": "in", "values": ["en"]}],
+            {"language": "en-US"},
+        ) is False
+
+    def test_city_lowercases_both_sides(self):
+        # `city` is NOT in CASE_PRESERVE — operator-saved "London" is
+        # lowercased in the matcher, click_attrs.city is also already
+        # lowercased upstream by router. Either way, "london" wins.
+        assert _criteria_match(
+            [{"type": "city", "op": "in", "values": ["London", "Paris"]}],
+            {"city": "london"},
+        ) is True
+
+    def test_empty_click_attr_misses_in_criterion(self):
+        # CF didn't emit a region for this click — `op=in` fails closed.
+        assert _criteria_match(
+            [{"type": "region", "op": "in", "values": ["California"]}],
+            {"region": ""},
+        ) is False
+
+    def test_empty_click_attr_passes_not_in_criterion(self):
+        # `op=not_in` is permissive on missing data — that's the
+        # "exclude these regions" semantic. Empty region passes
+        # because empty is in nothing.
+        assert _criteria_match(
+            [{"type": "region", "op": "not_in", "values": ["California"]}],
+            {"region": ""},
+        ) is True
+
+
+# ============================================================
 # Step 5 — Fallback chain
 # ============================================================
 

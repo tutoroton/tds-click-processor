@@ -40,7 +40,21 @@ def parse_ua(ua: str) -> dict:
         "device_type_raw": device_type,
         "os": (d.os_name() or "").lower() or "other",
         "os_version": d.os_version() or "",
-        "browser": (d.client_name() or "").lower() or "other",
+        # F.17 (2026-05-03): emit device_detector's canonical Title
+        # Case client name verbatim ("Chrome", "Mobile Safari",
+        # "Microsoft Edge", "Samsung Browser", "Yandex Browser").
+        # admin-api's `browser` criterion enum is the SAME taxonomy
+        # (loaded from device_detector's bundled YAML via
+        # `app.common.browser_taxonomy.KNOWN_BROWSERS`); operators
+        # save criteria with these exact strings, so the storage and
+        # runtime vocabularies must agree. The previous `.lower()` —
+        # which leaked "microsoft edge" / "chrome mobile" — silently
+        # broke the would-be match between OT criteria and live
+        # clicks. URL macro `{browser}` substitution likewise now
+        # yields Title Case in target URLs (downstream analytics
+        # that case-folded the value see no behaviour change; rare
+        # case-sensitive consumers should update their parsers).
+        "browser": d.client_name() or "other",
         "browser_version": d.client_version() or "",
         "device_brand": d.device_brand() or "",
         "device_model": d.device_model() or "",

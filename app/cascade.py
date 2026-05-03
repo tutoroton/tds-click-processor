@@ -45,7 +45,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any
+from typing import Any, Final
 
 logger = logging.getLogger("tds.cascade")
 
@@ -297,13 +297,33 @@ def _filter_by_criteria(
     return survivors
 
 
+# F.17 (2026-05-03): per-type casing strategy. The 4 dimensions in
+# this set carry their value verbatim — admin-api validates them in
+# the same casing the click-processor emits, so lowercasing here would
+# break the match. Everything else (currently `os`, `device_type`,
+# `city`) is lowercased on both sides.
+#
+#   geo       — ISO 3166-1 uppercase ("US"), enforced by both ends
+#   region    — CF / GeoNames human name ("California", "Київська область")
+#   browser   — device_detector canonical Title Case ("Samsung Browser")
+#   language  — BCP47 strict casing ("en-US", not "en-us")
+#
+# Mirror this set in `router.py`'s legacy `resolve_target` matcher
+# (it walks an offer-target list directly when cascade misses).
+# Drift between the two matchers is a silent foot-gun.
+_CASE_PRESERVE: Final[frozenset[str]] = frozenset({
+    "geo", "region", "browser", "language",
+})
+
+
 def _criteria_match(
     criteria: list[dict[str, Any]], click_attrs: dict[str, str],
 ) -> bool:
     """All criteria must hold (AND semantics).
 
-    Supports `op='in'` and `op='not_in'`. Geo values stay upper-cased,
-    os/device_type lower — same convention as `resolve_target`.
+    Supports `op='in'` and `op='not_in'`. Per-type casing per
+    `_CASE_PRESERVE` above — `geo` / `region` / `browser` / `language`
+    keep their value verbatim, all other dims lowercase both sides.
 
     Membership uses a `frozenset` for O(1) check instead of `O(n)`
     list scan. Admin-api caps `values` at 500 strings per criterion
@@ -320,7 +340,7 @@ def _criteria_match(
         raw_values = c.get("values", []) or []
         click_val = click_attrs.get(dim, "")
 
-        if dim == "geo":
+        if dim in _CASE_PRESERVE:
             values = frozenset(v for v in raw_values if isinstance(v, str))
         else:
             values = frozenset(

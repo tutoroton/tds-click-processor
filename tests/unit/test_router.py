@@ -91,26 +91,97 @@ class TestParseOS:
 # ============================================================
 
 class TestParseBrowser:
+    # F.17 (2026-05-03): browser values are now device_detector's
+    # canonical Title Case names — same vocabulary admin-api validates
+    # against (`KNOWN_BROWSERS` from the bundled taxonomy).
     def test_chrome(self):
-        assert parse_browser("Mozilla/5.0 Chrome/120.0.6099.130 Safari/537.36") == "chrome"
+        assert parse_browser("Mozilla/5.0 Chrome/120.0.6099.130 Safari/537.36") == "Chrome"
 
     def test_safari(self):
-        assert parse_browser("Mozilla/5.0 (Macintosh) AppleWebKit/605.1.15 Safari/605.1") == "safari"
+        assert parse_browser("Mozilla/5.0 (Macintosh) AppleWebKit/605.1.15 Safari/605.1") == "Safari"
 
     def test_firefox(self):
-        assert parse_browser("Mozilla/5.0 (Windows; rv:121.0) Gecko/20100101 Firefox/121.0") == "firefox"
+        assert parse_browser("Mozilla/5.0 (Windows; rv:121.0) Gecko/20100101 Firefox/121.0") == "Firefox"
 
     def test_edge(self):
-        assert parse_browser("Mozilla/5.0 Chrome/120.0 Safari/537.36 Edg/120.0") == "microsoft edge"
+        assert parse_browser("Mozilla/5.0 Chrome/120.0 Safari/537.36 Edg/120.0") == "Microsoft Edge"
 
     def test_opera(self):
-        assert parse_browser("Mozilla/5.0 Chrome/120.0 Safari/537.36 OPR/106.0") == "opera"
+        assert parse_browser("Mozilla/5.0 Chrome/120.0 Safari/537.36 OPR/106.0") == "Opera"
 
     def test_empty(self):
         assert parse_browser("") == "other"
 
     def test_bot(self):
-        assert parse_browser("Googlebot/2.1") == "googlebot"
+        # Bots still flow through the same parser; they emit their
+        # canonical name (e.g. `Googlebot`). is_bot=True in parse_ua
+        # is the discriminator for downstream consumers that care.
+        assert parse_browser("Googlebot/2.1") == "Googlebot"
+
+
+# ============================================================
+# F.17 — Accept-Language Parsing (parse_accept_language)
+# ============================================================
+
+
+class TestParseAcceptLanguage:
+    """Per-F.17 user decision (2026-05-03): only the PRIMARY language
+    counts for criterion matching. Secondary q-weighted languages do
+    not — a Russian-primary user with `Accept-Language: ru-RU,en;q=0.9,uk;q=0.7`
+    is RU even if they nominally read English / Ukrainian.
+
+    Output casing follows BCP47: lowercase language, uppercase region.
+    """
+
+    # `pytest` import is already at the top of the file via parametrize
+    # — keeping these as plain methods to match the surrounding test
+    # style (no parametrize used elsewhere in the parsing tests).
+
+    def test_simple_lang_only(self):
+        from app.router import parse_accept_language
+        assert parse_accept_language("en") == "en"
+
+    def test_lang_with_region(self):
+        from app.router import parse_accept_language
+        assert parse_accept_language("en-US") == "en-US"
+
+    def test_primary_wins_over_secondary(self):
+        from app.router import parse_accept_language
+        # Per the F.17 contract — Russian is primary, not Ukrainian.
+        assert parse_accept_language("ru-RU,en;q=0.9,uk;q=0.7") == "ru-RU"
+
+    def test_strips_q_weight_on_primary(self):
+        from app.router import parse_accept_language
+        assert parse_accept_language("uk-UA;q=1.0,en;q=0.9") == "uk-UA"
+
+    def test_normalizes_casing(self):
+        from app.router import parse_accept_language
+        # Browsers occasionally ship `EN-us` / `en_US` style — we
+        # canonicalize lower-Upper for the language tag, anything
+        # else falls through.
+        assert parse_accept_language("EN-us") == "en-US"
+
+    def test_lang_only_when_region_malformed(self):
+        from app.router import parse_accept_language
+        # 3-letter region per BCP47 is rare-but-valid (e.g. spanish
+        # `es-419` for Latin America). Our criterion validator
+        # accepts only 2-letter regions, so we degrade to lang-only
+        # for now — operator can target `es` and catch the parent.
+        assert parse_accept_language("es-419") == "es"
+
+    def test_empty_header(self):
+        from app.router import parse_accept_language
+        assert parse_accept_language("") == ""
+
+    def test_none_header(self):
+        from app.router import parse_accept_language
+        assert parse_accept_language(None) == ""
+
+    def test_garbage_yields_empty(self):
+        from app.router import parse_accept_language
+        assert parse_accept_language("*") == ""
+        assert parse_accept_language("a") == ""        # 1-char lang
+        assert parse_accept_language("english") == ""  # non-2-char
 
 
 # ============================================================

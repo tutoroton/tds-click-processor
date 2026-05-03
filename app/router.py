@@ -386,10 +386,21 @@ async def _try_flow_cascade(
         team_id=buyer_chain["team_id"],
         department_id=buyer_chain["department_id"],
         custom_group_id=buyer_chain["custom_group_id"],
+        # F.17 (2026-05-03): 7-dim click_attrs. Each value's casing
+        # matches what admin-api validates — see `cascade._CASE_PRESERVE`
+        # for which dims preserve case (geo / region / browser /
+        # language) vs lowercase (os / device_type / city). Values
+        # that CF or the parser couldn't resolve fall through as `""`
+        # — `op=in` fails closed (no match), `op=not_in` passes
+        # everyone (no-op for that criterion).
         click_attrs={
             "geo": (req.country or "").upper(),
             "os": parse_os(req.user_agent).lower(),
             "device_type": parse_device_type(req.user_agent).lower(),
+            "browser": parse_browser(req.user_agent),  # Title Case verbatim
+            "region": req.region or "",                # CF human name verbatim
+            "city": (req.city or "").lower(),          # case-insensitive match
+            "language": parse_accept_language(req.accept_language),
         },
     )
     if flow is None:
@@ -724,14 +735,29 @@ async def resolve_target(r, offer: dict, req: ClickRequest) -> str | None:
             target_list.append(t)
     target_list.sort(key=lambda x: x["_priority"], reverse=True)
 
-    # Build click attributes for matching
+    # F.17 (2026-05-03): legacy offer-target picker — same 7-dim
+    # click_attrs as the cascade path above. Inline matcher mirrors
+    # `cascade._CASE_PRESERVE` for the 4 dims that preserve case
+    # (geo / region / browser / language); the rest are lowercased
+    # both sides. Drift between this matcher and `cascade._criteria_match`
+    # is a silent foot-gun — keep both in lockstep on any case rule
+    # change.
     click_attrs = {
         "geo": (req.country or "").upper(),
         "os": parse_os(req.user_agent).lower(),
         "device_type": parse_device_type(req.user_agent).lower(),
+        "browser": parse_browser(req.user_agent),
+        "region": req.region or "",
+        "city": (req.city or "").lower(),
+        "language": parse_accept_language(req.accept_language),
     }
 
     default_url = None
+
+    # Mirrors `cascade._CASE_PRESERVE`. Kept inline — moving to a
+    # shared module would force a circular import (router imports
+    # from cascade for the Stage 2 path; cascade can't import back).
+    case_preserve_dims = {"geo", "region", "browser", "language"}
 
     for t in target_list:
         # Check if this is the default fallback
@@ -755,7 +781,11 @@ async def resolve_target(r, offer: dict, req: ClickRequest) -> str | None:
         for c in criteria:
             dim = c.get("type", "")
             op = c.get("op", "in")
-            values = [v.lower() if dim != "geo" else v.upper() for v in c.get("values", [])]
+            raw_values = c.get("values", [])
+            if dim in case_preserve_dims:
+                values = [v for v in raw_values if isinstance(v, str)]
+            else:
+                values = [v.lower() if isinstance(v, str) else v for v in raw_values]
             click_val = click_attrs.get(dim, "")
 
             if op == "in" and click_val not in values:
@@ -969,3 +999,47 @@ def parse_browser(ua: str | None) -> str:
 
 def get_full_ua_info(ua: str | None) -> dict:
     return parse_ua(ua or "")
+
+
+def parse_accept_language(header: str | None) -> str:
+    """Extract the user's PRIMARY BCP47 language tag from an
+    `Accept-Language` header.
+
+    Per F.17 user decision (2026-05-03): only the first listed
+    language counts for criterion matching. Secondary q-weighted
+    languages do not — a user with `Accept-Language: ru-RU,en;q=0.9,uk;q=0.7`
+    is a Russian-primary user, even if they nominally understand
+    English / Ukrainian. Showing them an `uk`-targeted creative
+    burns the impression.
+
+    Returns:
+      - `"en-US"` / `"pt-BR"` style when both lang+region are valid
+      - `"en"` / `"uk"` when only language is present
+      - `""` when header is empty / first tag is unparseable
+
+    Casing follows BCP47: lowercase language, uppercase region. The
+    admin-api `language` validator regex matches this same casing
+    (`^[a-z]{2}(-[A-Z]{2})?$`), so saved criteria and live emissions
+    agree.
+
+    Defensive — never raises. Malformed headers (e.g.
+    `Accept-Language: *`, garbage bytes) yield `""` so the criterion
+    `op=in` fails closed (no match), while `op=not_in` passes
+    everyone (effectively a no-op for that criterion). This mirrors
+    the existing missing-data convention for `geo` / `region`.
+    """
+    if not header:
+        return ""
+    primary = header.split(",", 1)[0].strip()
+    primary = primary.split(";", 1)[0].strip()  # strip ;q=...
+    if not primary:
+        return ""
+    parts = primary.split("-", 1)
+    lang = parts[0].lower()
+    if not (len(lang) == 2 and lang.isalpha()):
+        return ""
+    if len(parts) == 2:
+        country = parts[1].upper()
+        if len(country) == 2 and country.isalpha():
+            return f"{lang}-{country}"
+    return lang

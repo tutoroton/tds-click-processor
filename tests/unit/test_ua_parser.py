@@ -82,21 +82,36 @@ class TestOS:
 # ============================================================
 
 class TestBrowser:
+    # F.17 (2026-05-03): browser values are now device_detector's
+    # canonical Title Case names (`Chrome`, `Microsoft Edge`,
+    # `Mobile Safari`) instead of the previous `.lower()` shorthand.
+    # Storage vocabulary in admin-api's `browser` criterion enum is
+    # the same taxonomy — drift here breaks live-click matching.
     def test_chrome(self):
         r = parse_ua("Mozilla/5.0 (Windows NT 10.0) Chrome/120.0.6099.130 Safari/537.36")
-        assert r["browser"] == "chrome"
+        assert r["browser"] == "Chrome"
 
     def test_safari(self):
         r = parse_ua("Mozilla/5.0 (Macintosh; Intel Mac OS X 14_2) AppleWebKit/605.1.15 Version/17.2 Safari/605.1")
-        assert r["browser"] == "safari"
+        assert r["browser"] == "Safari"
 
     def test_firefox(self):
         r = parse_ua("Mozilla/5.0 (Windows; rv:121.0) Gecko/20100101 Firefox/121.0")
-        assert r["browser"] == "firefox"
+        assert r["browser"] == "Firefox"
 
     def test_edge(self):
         r = parse_ua("Mozilla/5.0 Chrome/120.0 Safari/537.36 Edg/120.0")
-        assert r["browser"] == "microsoft edge"
+        assert r["browser"] == "Microsoft Edge"
+
+    def test_mobile_safari(self):
+        # iOS Safari yields "Mobile Safari" (not just "Safari") —
+        # important contrast for criterion targeting.
+        r = parse_ua("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0) AppleWebKit/605.1.15 Version/17.0 Mobile/15E148 Safari/604.1")
+        assert r["browser"] == "Mobile Safari"
+
+    def test_samsung_browser(self):
+        r = parse_ua("Mozilla/5.0 (Linux; Android 13; SM-S918B) SamsungBrowser/22.0 Chrome/115.0.0.0 Mobile Safari/537.36")
+        assert r["browser"] == "Samsung Browser"
 
     def test_empty(self):
         r = parse_ua("")

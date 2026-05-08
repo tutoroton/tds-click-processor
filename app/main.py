@@ -5,6 +5,7 @@ against local Redis, returns destination URL for redirect.
 """
 
 import asyncio
+import gzip
 import hmac
 import json
 import logging
@@ -230,6 +231,10 @@ async def stats():
         return {"error": str(e), "node_id": settings.node_id}
 
 
+_MAX_COMPRESSED_BYTES = 50 * 1024 * 1024   # 50MB on the wire (zip-bomb gate)
+_MAX_UNCOMPRESSED_BYTES = 500 * 1024 * 1024  # 500MB after gunzip — gives admin-api ~10x headroom for the same 50MB-on-wire cap when gzip is on (closes G-16 / T1.2)
+
+
 @app.post("/admin/sync")
 async def receive_sync(
     request: Request,
@@ -240,19 +245,72 @@ async def receive_sync(
     Called by central after full_sync, or manually.
     Replaces all routing data in local Redis with snapshot.
     Auth required via X-TDS-Key header.
+
+    Body MAY be gzip-compressed when admin-api has
+    `TDS_SYNC_PUSH_GZIP_ENABLED=true`. Detected via
+    `Content-Encoding: gzip`. Without that header the body is
+    parsed as plain JSON (legacy / older admin-api builds).
+
+    Two-stage size guard (T1.2 / G-16):
+      - On-the-wire body capped at 50MB (`_MAX_COMPRESSED_BYTES`).
+        Gzip-bomb defense — even a worst-case 1000:1 compression
+        ratio caps in-memory expansion at 50GB, which the
+        post-decompress cap below catches.
+      - After gunzip, decoded JSON capped at 500MB
+        (`_MAX_UNCOMPRESSED_BYTES`). This is the EFFECTIVE
+        snapshot size cap. With gzip on, admin-api can ship
+        ~500MB worth of JSON in ~50MB on the wire (~85-90% ratio
+        for routing config payloads).
     """
     # Auth (timing-safe)
     if settings.tds_secret_key and (not x_tds_key or not hmac.compare_digest(x_tds_key, settings.tds_secret_key)):
         raise HTTPException(status_code=403, detail="Invalid key")
 
-    # Payload size guard (max 50MB)
+    # Pre-decompress payload size guard.
     content_length = request.headers.get("content-length")
-    if content_length and int(content_length) > 50 * 1024 * 1024:
-        raise HTTPException(status_code=413, detail="Payload too large (max 50MB)")
+    if content_length and int(content_length) > _MAX_COMPRESSED_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Payload too large on wire (max {_MAX_COMPRESSED_BYTES // (1024 * 1024)}MB)",
+        )
+
+    raw_body = await request.body()
+
+    # Optional gzip decompression. The admin-api side gates on
+    # `TDS_SYNC_PUSH_GZIP_ENABLED`; this end is dual-decode (always
+    # accepts both, additive change). Older admin-api builds that
+    # don't set the header continue to work unchanged.
+    encoding = request.headers.get("content-encoding", "").strip().lower()
+    if encoding == "gzip":
+        try:
+            decoded = gzip.decompress(raw_body)
+        except (OSError, EOFError) as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid gzip body: {exc}",
+            )
+        # Post-decompress cap — the actual snapshot semantic limit.
+        if len(decoded) > _MAX_UNCOMPRESSED_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    f"Snapshot too large after decompression "
+                    f"(max {_MAX_UNCOMPRESSED_BYTES // (1024 * 1024)}MB)"
+                ),
+            )
+        raw_body = decoded
+    elif encoding and encoding != "identity":
+        # Unknown encoding — fail clearly rather than silently
+        # treating as plain JSON. `identity` is the spec-permitted
+        # "no encoding" value, accept it as a no-op.
+        raise HTTPException(
+            status_code=415,
+            detail=f"Unsupported Content-Encoding: {encoding!r}",
+        )
 
     try:
-        snapshot = await request.json()
-    except Exception:
+        snapshot = json.loads(raw_body)
+    except (ValueError, json.JSONDecodeError):
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
     # Version guard: reject downgrades (prevent accidental or malicious rollback)
@@ -284,7 +342,14 @@ async def seed_data(x_tds_key: str = Header("", alias="X-TDS-Key")):
     if settings.environment == "production":
         raise HTTPException(status_code=403, detail="Seed disabled in production. Use /admin/sync.")
 
-    if settings.tds_secret_key and x_tds_key != settings.tds_secret_key:
+    # T1.13 (G-30 closure 2026-05-08) — `hmac.compare_digest` instead of
+    # `!=`. Mirrors `/decide` + `/admin/sync` (lines 100, 266) and rule
+    # `sync-protocol` → "hmac.compare_digest for auth". Defense-in-depth:
+    # `/admin/seed` is dev-only AND already gated by environment check
+    # above, so no production risk today, but the inconsistency was a
+    # foot-gun for any future operator copying this block to a new
+    # endpoint. Regression-fenced by tests/unit/test_admin_auth_timing_safe.py.
+    if settings.tds_secret_key and (not x_tds_key or not hmac.compare_digest(x_tds_key, settings.tds_secret_key)):
         raise HTTPException(status_code=403, detail="Invalid key")
 
     r = await get_redis()

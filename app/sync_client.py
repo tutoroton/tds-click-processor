@@ -2,8 +2,30 @@
 
 Writes routing data to local Redis using atomic write-then-delete pattern:
 1. Write all new keys first
-2. Then delete stale keys
+2. Then delete stale keys (delta against the previous managed-keys set)
 3. This ensures routing data is NEVER empty during sync
+
+Stale-key discovery (T1.3 / G-21, 2026-05-09)
+--------------------------------------------
+Previously this module SCAN-ed Redis on every apply across 17 prefix
+buckets to find keys we own. SCAN cost grows linearly with the
+keyspace AND with the prefix list — at the projected scale of ~10k
+keys per prefix bucket the SCAN block dominated apply latency
+(~100x the rest of the function).
+
+Since admin-api maintains `_MANAGED_KEY` = "sync:managed_keys" as the
+authoritative SET of keys it owns (rebuilt at the end of every apply
+on both sides), we can discover the previous set in a single
+`SMEMBERS` round-trip — O(N) Redis-side, but no per-prefix iteration
+and no client-side prefix matching. New nodes start with an empty
+SMEMBERS result, which is correct: a fresh Redis can't have stale
+routing data by definition. Upgraded nodes already have
+`_MANAGED_KEY` populated from the previous (SCAN-era) apply, so
+there's no cold-start migration step — the swap is transparent.
+
+`_ROUTING_PREFIXES` is retained below as documentation / a debug
+breadcrumb (e.g., `redis-cli --scan --pattern 'campaign:*'` for a
+human operator), but is no longer consulted by `apply_snapshot`.
 """
 
 import asyncio
@@ -19,13 +41,9 @@ logger = logging.getLogger("tds.sync_client")
 
 _MANAGED_KEY = "sync:managed_keys"
 
-# Key prefixes for routing config (NOT operational state).
-# Stage 2 added `source:` / `sources:active` so click-processor can
-# resolve param_mappings + postback config at click time. Without
-# these prefixes, sync_client would write source keys (the central
-# snapshot includes them) but stale-key cleanup on the next push
-# would miss removed sources — leaving orphan `source:{id}` hashes
-# pointing at archived data.
+# Documentation-only — see module docstring "Stale-key discovery".
+# These are the prefix buckets the central snapshot writes; useful
+# for ad-hoc redis-cli inspection. NOT consulted by apply_snapshot.
 _ROUTING_PREFIXES = [
     "campaign:", "campaigns:active",
     "source:", "sources:active",
@@ -46,8 +64,13 @@ _ROUTING_PREFIXES = [
 async def apply_snapshot(redis, snapshot: dict) -> dict:
     """Apply snapshot to local Redis using write-first-delete-after pattern.
 
-    Order: write new keys → delete stale keys → update tracking.
-    This ensures routing data is never empty during sync.
+    Order: read previous managed-keys set → write new keys → delete
+    stale (previous \\ new) → rewrite managed-keys set. This ensures
+    routing data is never empty during sync.
+
+    Stale-key delta is computed against the `_MANAGED_KEY` SET that
+    the previous successful apply left behind — see module docstring
+    "Stale-key discovery (T1.3 / G-21)" for the rationale.
     """
     t_start = time.perf_counter()
 
@@ -57,15 +80,13 @@ async def apply_snapshot(redis, snapshot: dict) -> dict:
     if not data:
         return {"status": "empty", "keys_written": 0}
 
-    # Step 1: Find ALL existing routing keys
-    all_existing = set()
-    for prefix in _ROUTING_PREFIXES:
-        cursor = 0
-        while True:
-            cursor, keys = await redis.scan(cursor, match=f"{prefix}*", count=200)
-            all_existing.update(keys)
-            if cursor == 0:
-                break
+    # Step 1: Read the previous managed-keys set (T1.3 / G-21).
+    # Empty on a brand-new node — that's correct: nothing to clean.
+    # Non-empty on an upgraded node — the previous apply (under SCAN
+    # or the new code path; both maintain `_MANAGED_KEY` identically)
+    # left the authoritative set. SMEMBERS is a single round-trip
+    # regardless of cardinality vs. the previous N-prefix SCAN loop.
+    all_existing: set[str] = set(await redis.smembers(_MANAGED_KEY))
 
     # Step 2: WRITE new keys first (before any deletes)
     new_keys: set[str] = set()

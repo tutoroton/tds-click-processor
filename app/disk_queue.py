@@ -1,0 +1,368 @@
+"""Disk fallback queue for click writes (T2.2 / G-23).
+
+Closes the click-loss gap on the `/decide` hot path. The MAXLEN
+cap (T2.1) defends Redis from unbounded growth, but cannot help
+when Redis itself is unreachable — XADD raises, the click
+record vanishes. This module catches that case: the record is
+serialised to a local JSON file; a background drainer replays it
+into Redis once the outage clears. Drained files are unlinked.
+
+Storage layout:
+
+    var/click-queue/
+        <YYYY-MM-DD>/
+            <YYYYMMDDTHHMMSS>-<uuid8>.json
+            ...
+
+Date-bucketed for human inspection + log-rotation parity. ISO-8601
+timestamp prefix gives time-sorted listing (drainer drains oldest
+first — first-in-first-out semantics, matching Redis Streams'
+natural order). UUID suffix avoids collision when the same second
+sees multiple enqueues.
+
+Atomic write contract:
+
+    1. Write to <name>.tmp
+    2. fsync the file descriptor
+    3. Rename .tmp → <name> (atomic on POSIX)
+
+A crash mid-write leaves a `.tmp` file. The drainer scans only
+`*.json` files, so half-written records are never replayed — they
+sit on disk until manually inspected (operator may want to
+post-mortem). The fsync before rename ensures durable write
+ordering: even if power dies between rename and the next loop
+iteration, the file is recoverable.
+
+Hot-path performance:
+
+    enqueue_click() runs OFF the asyncio event loop via
+    asyncio.to_thread() — file I/O happens in the default thread
+    pool, the loop stays free for other requests. Typical write
+    latency is sub-millisecond for our payload size; even under
+    heavy outage load the budget is dominated by Redis-recovery
+    time, not by disk write.
+
+In-memory size counter:
+
+    A naive cap check (rglob + count on every enqueue) would scan
+    100k files on every click during a sustained outage —
+    pathological. Instead we maintain an in-memory counter,
+    initialised once at first call by a single filesystem scan.
+    Increment on successful write, decrement on successful drain.
+    Exact in single-process click-processor (the only deployment
+    today); if the service ever runs multi-worker, the counter
+    becomes a per-worker estimate — still acceptable for a cap
+    check (worst case: ~N workers go ~N% over cap).
+
+Reference: rule `sync-protocol`, action-items.md T2.2,
+open-questions.md G-23.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import time
+import uuid
+from pathlib import Path
+
+import sentry_sdk
+
+from app.config import settings
+
+logger = logging.getLogger("tds.disk_queue")
+
+
+# In-memory count of files currently in the queue. Initialised
+# lazily on first enqueue from a filesystem scan; mutated on
+# every enqueue (+1) and successful drain (-1). Accuracy is
+# guaranteed in single-process deployment; multi-worker would
+# need a shared counter (per-worker estimate is good enough for
+# a cap check, see module docstring).
+_queue_size: int = 0
+_queue_size_initialized: bool = False
+_init_lock: asyncio.Lock | None = None
+
+
+def _get_init_lock() -> asyncio.Lock:
+    """Lazy lock construction — `asyncio.Lock()` requires a running
+    event loop, so we defer instantiation to first call. Safe in
+    single-loop context (only one event loop ever exists in
+    click-processor's lifespan)."""
+    global _init_lock
+    if _init_lock is None:
+        _init_lock = asyncio.Lock()
+    return _init_lock
+
+
+def _queue_root() -> Path:
+    """Resolve the queue root path. Resolution is per-call so a
+    test that monkeypatches settings.disk_queue_root sees the new
+    value without restart."""
+    return Path(settings.disk_queue_root)
+
+
+def _today_dir() -> Path:
+    """Today's UTC bucket — keeps a long-running queue from piling
+    100k files in a single directory (some filesystems degrade
+    badly past ~10k entries per directory)."""
+    return _queue_root() / time.strftime("%Y-%m-%d", time.gmtime())
+
+
+def _new_filename() -> str:
+    """Time-sorted, collision-resistant filename. ``YYYYMMDDTHHMMSS``
+    prefix sorts lexicographically by time; 8-char UUID4 suffix
+    avoids same-second collisions across concurrent enqueues."""
+    ts = time.strftime("%Y%m%dT%H%M%S", time.gmtime())
+    suffix = uuid.uuid4().hex[:8]
+    return f"{ts}-{suffix}.json"
+
+
+def _count_queue_files_sync() -> int:
+    """One-shot filesystem scan — used at first-init to seed the
+    in-memory counter. Counts only `*.json` (excludes `.tmp` and
+    other ad-hoc files an operator might place there)."""
+    root = _queue_root()
+    if not root.exists():
+        return 0
+    return sum(1 for _ in root.rglob("*.json"))
+
+
+def _list_queue_files_sync() -> list[Path]:
+    """Sorted listing of queueable files. Sort is critical — gives
+    the drainer FIFO semantics (oldest clicks ship first), matching
+    Redis Stream natural order."""
+    root = _queue_root()
+    if not root.exists():
+        return []
+    return sorted(root.rglob("*.json"))
+
+
+def _write_file_sync(path: Path, data: bytes) -> None:
+    """Atomic write via `tmp + fsync + rename`.
+
+    POSIX rename is atomic on the same filesystem. Creating the
+    parent directory is idempotent (mkdir parents=True,
+    exist_ok=True). The file descriptor is closed in `finally` so
+    a write error doesn't leak the FD even before the rename
+    happens.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    try:
+        os.write(fd, data)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.rename(tmp_path, path)
+
+
+async def _ensure_initialized() -> None:
+    """Lazy first-time initialization of the in-memory size counter.
+
+    Single FS scan, guarded by an asyncio.Lock so concurrent
+    enqueues during the first outage don't all trigger their own
+    rglob (which would defeat the optimization that motivated this
+    counter in the first place).
+    """
+    global _queue_size, _queue_size_initialized
+    if _queue_size_initialized:
+        return
+    async with _get_init_lock():
+        if _queue_size_initialized:
+            return
+        _queue_size = await asyncio.to_thread(_count_queue_files_sync)
+        _queue_size_initialized = True
+        logger.info(
+            "Disk queue initialized — %d existing file(s) at %s",
+            _queue_size, _queue_root(),
+        )
+
+
+def _decrement_size() -> None:
+    """Decrement counter, never below zero. Counter underflow
+    would only happen if drain saw a file that enqueue didn't
+    count (e.g., file placed externally) — we don't want to track
+    a negative value, so we clamp."""
+    global _queue_size
+    _queue_size = max(0, _queue_size - 1)
+
+
+async def get_queue_size() -> int:
+    """Return current queue size — safe to call from /health or
+    metrics emitters. Triggers lazy init on first call."""
+    await _ensure_initialized()
+    return _queue_size
+
+
+async def enqueue_click(record: dict) -> bool:
+    """Persist a click record to the disk queue.
+
+    Returns True on success (file written, atomic, durable).
+    Returns False on cap rejection or write failure (the click is
+    LOST in this case — the caller is expected to log CRITICAL +
+    Sentry capture so the incident is visible).
+
+    Caller contract: this function is intended for the XADD-failure
+    fallback path on `/decide`. It is NOT a primary write path —
+    the steady state writes directly to Redis. So the cap is sized
+    for outage duration, not click volume × seconds.
+    """
+    global _queue_size
+    await _ensure_initialized()
+
+    cap = settings.disk_queue_max_files
+    if cap > 0 and _queue_size >= cap:
+        logger.error(
+            "Disk queue at cap (%d ≥ %d) — DROPPING click. "
+            "Resolve Redis outage or raise TDS_DISK_QUEUE_MAX_FILES.",
+            _queue_size, cap,
+        )
+        sentry_sdk.capture_message(
+            f"Disk-queue cap reached ({_queue_size} ≥ {cap}); "
+            "click rejected.",
+            level="error",
+        )
+        return False
+
+    try:
+        payload = json.dumps(record, default=str).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        logger.error("Failed to serialize click for disk queue: %s", exc)
+        sentry_sdk.capture_exception(exc)
+        return False
+
+    path = _today_dir() / _new_filename()
+    try:
+        await asyncio.to_thread(_write_file_sync, path, payload)
+    except OSError as exc:
+        logger.error("Failed to enqueue click to disk: %s", exc)
+        sentry_sdk.capture_exception(exc)
+        return False
+
+    _queue_size += 1
+    return True
+
+
+async def drain_to_redis(redis) -> dict:
+    """Replay queued clicks back into the Redis stream.
+
+    Stops at the FIRST XADD failure — no point pounding a Redis
+    that's still impaired. The remaining files stay on disk and
+    will be retried by the next drainer iteration. Successful
+    drains delete the file and decrement the in-memory counter.
+
+    Returns stats dict for caller logging:
+      - drained: number of files successfully replayed + deleted
+      - skipped: files that vanished mid-drain (race with another
+        drainer or manual cleanup)
+      - failed: 1 if the loop broke on Redis error, else 0
+      - remaining: best-effort count of files still on disk
+    """
+    await _ensure_initialized()
+
+    files = await asyncio.to_thread(_list_queue_files_sync)
+    drained = 0
+    skipped = 0
+    failed = 0
+
+    for path in files:
+        try:
+            data = await asyncio.to_thread(path.read_bytes)
+        except FileNotFoundError:
+            # Race — another drainer or manual cleanup grabbed it.
+            skipped += 1
+            continue
+        except OSError as exc:
+            logger.warning("Failed to read queued click %s: %s", path.name, exc)
+            sentry_sdk.capture_exception(exc)
+            skipped += 1
+            continue
+
+        try:
+            await redis.xadd(
+                "stream:clicks",
+                {"data": data.decode("utf-8")},
+                maxlen=settings.stream_clicks_maxlen,
+                approximate=True,
+            )
+        except Exception as exc:  # noqa: BLE001 — broad on purpose
+            # XADD raised → Redis still impaired. Stop the drain
+            # loop. Don't unlink the file — next iteration retries.
+            logger.warning(
+                "Drain stopped at %s — Redis still impaired: %s",
+                path.name, exc,
+            )
+            failed = 1
+            break
+
+        # XADD succeeded — file is safe to remove. If unlink fails
+        # (e.g., another drainer raced us), we treat that as a
+        # successful drain anyway: the data is in Redis, the file
+        # not being there is the desired end state.
+        try:
+            await asyncio.to_thread(path.unlink)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            logger.warning(
+                "XADD-OK but unlink failed for %s: %s",
+                path.name, exc,
+            )
+        _decrement_size()
+        drained += 1
+
+    return {
+        "drained": drained,
+        "skipped": skipped,
+        "failed": failed,
+        "remaining": max(0, len(files) - drained - skipped),
+    }
+
+
+async def run_drainer(redis, interval: int | None = None) -> None:
+    """Background task: periodic drain attempt.
+
+    Started in the FastAPI lifespan, cancelled on shutdown. Robust
+    to per-iteration errors — a transient failure in one round
+    doesn't kill the loop.
+    """
+    if interval is None:
+        interval = settings.disk_queue_drain_interval_seconds
+    logger.info("Disk-queue drainer started (interval=%ds)", interval)
+
+    while True:
+        try:
+            await asyncio.sleep(interval)
+            stats = await drain_to_redis(redis)
+            if stats["drained"] > 0 or stats["failed"] > 0:
+                logger.info(
+                    "Disk-queue drain: %d drained, %d skipped, "
+                    "%d failed, %d remaining",
+                    stats["drained"], stats["skipped"],
+                    stats["failed"], stats["remaining"],
+                )
+        except asyncio.CancelledError:
+            logger.info("Disk-queue drainer cancelled — shutting down")
+            raise
+        except Exception:  # noqa: BLE001
+            logger.exception("Disk-queue drainer iteration failed")
+
+
+# ---------------------------------------------------------------------------
+# Test hooks — for unit tests that need to reset module state.
+# ---------------------------------------------------------------------------
+
+
+def _reset_state_for_tests() -> None:
+    """Reset module-level state. Called from test fixtures only —
+    NOT for production use. Production lifecycle is single-init,
+    no reset.
+    """
+    global _queue_size, _queue_size_initialized, _init_lock
+    _queue_size = 0
+    _queue_size_initialized = False
+    _init_lock = None

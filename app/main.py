@@ -24,6 +24,7 @@ from app.models import ClickRequest, ClickResponse, HealthResponse
 from app.redis_client import get_redis, close_redis
 from app.router import route, parse_device_type, parse_os, parse_browser, get_full_ua_info
 from app.shipper import run_shipper
+from app.disk_queue import enqueue_click as enqueue_click_to_disk, run_drainer as run_disk_drainer
 from app.sync_client import apply_snapshot, start_periodic_pull
 
 logger = logging.getLogger("tds.click-processor")
@@ -65,17 +66,28 @@ async def lifespan(app: FastAPI):
     # Start periodic sync pull from central
     sync_task = asyncio.create_task(start_periodic_pull(r, interval=settings.full_sync_interval_seconds))
 
+    # Start disk-queue drainer (T2.2 / G-23). Periodically replays
+    # any clicks that landed on disk during a Redis outage back
+    # into the stream. Runs unconditionally — even in standalone
+    # mode there's no harm in scanning an empty queue every 30s.
+    disk_drainer_task = asyncio.create_task(run_disk_drainer(r))
+
     yield
 
     # Shutdown
     shipper_task.cancel()
     sync_task.cancel()
+    disk_drainer_task.cancel()
     try:
         await shipper_task
     except asyncio.CancelledError:
         pass
     try:
         await sync_task
+    except asyncio.CancelledError:
+        pass
+    try:
+        await disk_drainer_task
     except asyncio.CancelledError:
         pass
     await close_redis()
@@ -203,6 +215,25 @@ async def decide(
     except Exception as e:
         logger.error("Failed to write click to stream: %s", e, extra={"click_id": req.click_id})
         sentry_sdk.capture_exception(e)
+        # T2.2 / G-23 — fall back to disk queue when Redis is
+        # unreachable. Without this, every click during a Redis
+        # outage was LOST: the log + Sentry capture above record
+        # the symptom but the click_record itself never made it
+        # to the stream → never to central → never to analytics.
+        # The disk file is replayed by the background drainer
+        # task once Redis recovers; nothing is lost provided
+        # disk space holds (cap = TDS_DISK_QUEUE_MAX_FILES).
+        enqueued = await enqueue_click_to_disk(click_record)
+        if enqueued:
+            logger.info(
+                "Click %s queued to disk after Redis failure",
+                req.click_id,
+            )
+        # If `enqueued is False`, enqueue_click_to_disk has
+        # already logged + Sentry-captured the cap rejection or
+        # write failure. The click is genuinely lost in that
+        # path — operator's signal to scale Redis or raise the
+        # cap.
     timing["stream_write_ms"] = round((time.perf_counter() - t_stream) * 1000, 2)
     timing["endpoint_total_ms"] = round((time.perf_counter() - t_endpoint_start) * 1000, 2)
 

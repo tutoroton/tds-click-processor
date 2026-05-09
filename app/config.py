@@ -49,6 +49,33 @@ class Settings(BaseSettings):
     # Tunable per-environment via TDS_STREAM_CLICKS_MAXLEN.
     stream_clicks_maxlen: int = 1_000_000
 
+    # T2.2 / G-23 — disk fallback queue for clicks when XADD fails.
+    # The MAXLEN cap above defends against unbounded growth, but
+    # cannot help when Redis itself is unreachable (container OOM,
+    # restart, brief network partition). Without this fallback,
+    # every click during a Redis outage is LOST — log + Sentry
+    # capture, but the click never lands in stream:clicks, never
+    # ships to central, never appears in analytics. Revenue blind
+    # spot.
+    #
+    # On XADD failure, /decide writes the click record to a JSON
+    # file under `disk_queue_root` (atomic write — .tmp + rename).
+    # A background drainer task scans the queue every
+    # `disk_queue_drain_interval_seconds` and replays files back
+    # into Redis once it recovers. Drained files are unlinked.
+    #
+    # Cap (`disk_queue_max_files`) bounds the disk usage during
+    # prolonged outages — at 100k files * ~500 B = ~50 MB budget.
+    # Exceeding the cap CRITICAL-logs and rejects the enqueue
+    # (loud failure) rather than silently rotating oldest. If your
+    # incident response can't recover Redis within the cap window,
+    # the operator's options are: scale Redis, raise the cap,
+    # accept loss for new clicks. We never silently drop the
+    # OLDEST click — that's revenue we already earned.
+    disk_queue_root: str = "var/click-queue"
+    disk_queue_max_files: int = 100_000
+    disk_queue_drain_interval_seconds: int = 30
+
     model_config = {"env_prefix": "TDS_"}
 
 

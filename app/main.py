@@ -25,6 +25,7 @@ from app.redis_client import get_redis, close_redis
 from app.router import route, parse_device_type, parse_os, parse_browser, get_full_ua_info
 from app.shipper import run_shipper
 from app.disk_queue import enqueue_click as enqueue_click_to_disk, run_drainer as run_disk_drainer
+from app.observability import run_observability_loop
 from app.sync_client import apply_snapshot, start_periodic_pull
 
 logger = logging.getLogger("tds.click-processor")
@@ -72,12 +73,25 @@ async def lifespan(app: FastAPI):
     # mode there's no harm in scanning an empty queue every 30s.
     disk_drainer_task = asyncio.create_task(run_disk_drainer(r))
 
+    # Start observability loop (T2.6 partial). Periodically emits
+    # `stream.clicks.length` + `disk_queue.size` to Sentry as
+    # warn-level breadcrumbs when either approaches its cap. No
+    # cap = no alert, but we still log at INFO when non-zero so
+    # operators see outage start. Independent of shipper /
+    # drainer cadences (60s default vs 30s drain) to keep
+    # alert granularity matched to typical Sentry evaluation.
+    observability_task = asyncio.create_task(run_observability_loop(r))
+
     yield
 
-    # Shutdown
+    # Shutdown — cancel all background tasks and await each so
+    # graceful shutdown completes within the FastAPI lifespan
+    # window. CancelledError is the expected exit and is silently
+    # absorbed; any other exception propagates.
     shipper_task.cancel()
     sync_task.cancel()
     disk_drainer_task.cancel()
+    observability_task.cancel()
     try:
         await shipper_task
     except asyncio.CancelledError:
@@ -88,6 +102,10 @@ async def lifespan(app: FastAPI):
         pass
     try:
         await disk_drainer_task
+    except asyncio.CancelledError:
+        pass
+    try:
+        await observability_task
     except asyncio.CancelledError:
         pass
     await close_redis()

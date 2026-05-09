@@ -39,12 +39,19 @@ def _flow(action_type: str, action_config: dict) -> dict:
 
 
 def _stub_build_url():
-    """Return a stub `build_url_fn` that captures inputs + emits a marker URL."""
+    """Return a stub `build_url_fn` that captures inputs + emits a marker URL.
+
+    Signature MUST mirror `router.build_url` — including the T2.5
+    additions `target_id` + `flow_id` (kwargs). When the production
+    signature gains a new param, this stub must be updated too;
+    otherwise action_executor's call shape breaks here loudly.
+    """
     calls: list[tuple] = []
 
     def fn(template, req, campaign_id, offer_id, *,
-           source_mappings, campaign_mappings):
-        calls.append((template, campaign_id, offer_id))
+           source_mappings, campaign_mappings,
+           target_id=None, flow_id=None):
+        calls.append((template, campaign_id, offer_id, target_id, flow_id))
         return f"FINAL[{template}|cid={campaign_id}|oid={offer_id}]"
 
     fn.calls = calls  # type: ignore[attr-defined]

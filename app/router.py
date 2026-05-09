@@ -902,11 +902,13 @@ def build_url(
     *,
     source_mappings: list[dict[str, Any]] | None = None,
     campaign_mappings: list[dict[str, Any]] | None = None,
+    target_id: str | None = None,
+    flow_id: str | None = None,
 ) -> str:
     """Build the redirect URL by substituting macros in `template`.
 
-    Stage 2 / Vector 2.8 — uses the merged source∪campaign mapping
-    chain via `resolution.resolve_slots`, then routes through
+    Stage 2 / Vector 2.8 + T2.5 — uses the merged source∪campaign
+    mapping chain via `resolution.resolve_slots`, then routes through
     `macros.safe_substitute` for safe URL output (path-segment
     collapse, empty-query-param drop, always-encode).
 
@@ -916,12 +918,34 @@ def build_url(
       3. Source hardcoded `default_value`.
       4. NULL — substituter handles by collapsing the macro position.
 
-    Worker-auto fields (`country`, `city`, `ip`, …) and technical
-    slots (`click_id`, `campaign_id`, `offer_id`, `visitor_id`) are
-    populated directly from the request — they are SYSTEM-fixed
-    macro names that cannot be remapped via param_mappings (see
-    `macros-registry.md`). This is also why they overwrite any
-    same-named slot value at the end of the values dict.
+    Worker-auto fields (`country`, `city`, `ip`, …), substituted-auto
+    fields (`language`, `cost`), UA-parsed fields (`os`, `os_version`,
+    `browser`, `browser_version`, `device_type`), and technical slots
+    (`click_id`, `campaign_id`, `offer_id`, `visitor_id`,
+    `offer_target_id`, `flow_id`) are populated directly from the
+    request / route context — they are SYSTEM-fixed macro names that
+    cannot be remapped via param_mappings (see `macros-registry.md`).
+    This is also why they overwrite any same-named slot value at the
+    end of the values dict.
+
+    T2.5 (2026-05-09) closure of the macros-registry contract — six
+    macros that previously substituted to empty are now populated:
+    `os_version`, `browser_version`, `language`, `cost`,
+    `offer_target_id`, `flow_id`. Reaches the canonical 70-macro
+    landing-context set documented in
+    `docs/roadmap/stage-1a-research/macros-registry.md`.
+
+    Args:
+        template: URL template containing `{macro}` placeholders.
+        req: ClickRequest (worker fields, UA, accept_language).
+        campaign_id: Stringified campaign PK for `{campaign_id}`.
+        offer_id: Stringified offer PK for `{offer_id}` ('' if N/A).
+        source_mappings: Source's `param_mappings` (resolution chain).
+        campaign_mappings: Campaign's overrides (wins per slot).
+        target_id: Offer-target PK (`{offer_target_id}`). NULL for
+            `redirect` actions which have no target.
+        flow_id: Winning flow PK (`{flow_id}`). NULL when caller
+            doesn't have one (legacy split path).
 
     Returns:
         Final URL string. Never contains a literal `{macro}` —
@@ -957,17 +981,46 @@ def build_url(
         values[key] = v if v else None
     values["asn"] = req.asn if req.asn else None
 
-    # Substituted-auto layer — UA parsing.
+    # UA-parsed layer — full 5-field set per macros-registry.md
+    # `UA_PARSED_SLOTS`. T2.5 added os_version + browser_version
+    # (already emitted by `parse_ua` since F.17 — just wired here).
+    # `device` is the legacy pre-F.17 alias for `device_type`; kept
+    # so existing operator templates with `{device}` keep working.
     ua = parse_ua(req.user_agent or "")
     values["os"] = ua.get("os") or None
+    values["os_version"] = ua.get("os_version") or None
     values["device_type"] = ua.get("device_type") or None
     values["device"] = ua.get("device_type") or None  # legacy alias
     values["browser"] = ua.get("browser") or None
+    values["browser_version"] = ua.get("browser_version") or None
+
+    # Substituted-auto layer (T2.5) — `SUBSTITUTED_AUTO_SLOTS`
+    # from admin-api `app/common/parameters.py`.
+    #
+    # `language`: primary BCP47 tag from Accept-Language (per F.17,
+    # only the first listed language counts — secondary q-weighted
+    # are ignored). Same parser used elsewhere in router for
+    # criterion matching, so substitution + match agree.
+    #
+    # `cost`: advertiser-supplied per-click cost. Read from
+    # `query_params['cost']` directly because cost is NOT in
+    # `RESERVED_SLOTS` (so the merged source∪campaign mapping
+    # chain doesn't carry it). Empty / unparseable → NULL,
+    # collapsed by substituter cleanup.
+    parsed_lang = parse_accept_language(req.accept_language)
+    values["language"] = parsed_lang or None
+    qp_cost = (req.query_params or {}).get("cost") if req.query_params else None
+    values["cost"] = qp_cost if qp_cost else None
 
     # Technical layer (always wins for system-reserved names).
+    # T2.5 added offer_target_id + flow_id — caller now threads
+    # them through (action_executor passes pinned_target_id and
+    # flow["_id"] respectively).
     values["click_id"] = req.click_id or None
     values["campaign_id"] = str(campaign_id) if campaign_id else None
     values["offer_id"] = str(offer_id) if offer_id else None
+    values["offer_target_id"] = str(target_id) if target_id else None
+    values["flow_id"] = str(flow_id) if flow_id else None
     values["visitor_id"] = req.visitor_id or None
 
     # Step 3 — safe substitute (handles NULL collapse + URL encoding).

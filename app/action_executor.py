@@ -90,15 +90,22 @@ async def execute_action(
     action_type = flow.get("action_type", "")
     config = _parse_action_config(flow.get("action_config", "{}"))
 
+    # T2.5 — extract flow_id once so the per-action helpers can
+    # thread it into build_url for the {flow_id} macro. The Redis
+    # HASH key is `flow:{id}`, surfaced by the cascade resolver
+    # as `flow["_id"]`. Stringified at the boundary so build_url
+    # always sees a str | None (avoids per-helper int/str coercion).
+    flow_id = str(flow["_id"]) if isinstance(flow, dict) and flow.get("_id") else None
+
     if action_type == "redirect":
         return _execute_redirect(config, req, campaign_id, build_url_fn,
-                                 source_mappings, campaign_mappings)
+                                 source_mappings, campaign_mappings, flow_id)
     if action_type == "offer":
         return await _execute_offer(r, config, req, campaign_id, build_url_fn,
-                                     source_mappings, campaign_mappings)
+                                     source_mappings, campaign_mappings, flow_id)
     if action_type == "split":
         return await _execute_split(r, config, req, campaign_id, build_url_fn,
-                                     source_mappings, campaign_mappings)
+                                     source_mappings, campaign_mappings, flow_id)
     if action_type == "block":
         return BLOCK_RESULT
 
@@ -123,6 +130,7 @@ def _execute_redirect(
     build_url_fn,
     source_mappings,
     campaign_mappings,
+    flow_id: str | None,
 ) -> dict[str, Any] | None:
     """`redirect` — substitute macros in `action_config.url`.
 
@@ -134,10 +142,15 @@ def _execute_redirect(
         logger.warning("redirect action missing url — falling back")
         return None
 
+    # T2.5 — thread flow_id so {flow_id} macro resolves. redirect
+    # actions have no offer/target so those macros remain NULL
+    # and collapse via safe_substitute's cleanup pass.
     url = build_url_fn(
         url_template, req, campaign_id, "",
         source_mappings=source_mappings,
         campaign_mappings=campaign_mappings,
+        target_id=None,
+        flow_id=flow_id,
     )
     return {"url": url, "offer_id": None, "target_id": None}
 
@@ -150,6 +163,7 @@ async def _execute_offer(
     build_url_fn,
     source_mappings,
     campaign_mappings,
+    flow_id: str | None,
 ) -> dict[str, Any] | None:
     """`offer` — flow has pinned offer_id + target_id."""
     offer_id = config.get("offer_id")
@@ -162,6 +176,7 @@ async def _execute_offer(
         r, str(offer_id), target_id,
         req, campaign_id, build_url_fn,
         source_mappings, campaign_mappings,
+        flow_id,
     )
 
 
@@ -173,6 +188,7 @@ async def _execute_split(
     build_url_fn,
     source_mappings,
     campaign_mappings,
+    flow_id: str | None,
 ) -> dict[str, Any] | None:
     """`split` — weighted random pick over `action_config.offers`."""
     entries = config.get("offers")
@@ -203,6 +219,7 @@ async def _execute_split(
         r, str(chosen["offer_id"]), chosen.get("target_id"),
         req, campaign_id, build_url_fn,
         source_mappings, campaign_mappings,
+        flow_id,
     )
 
 
@@ -215,6 +232,7 @@ async def _resolve_offer_url(
     build_url_fn,
     source_mappings,
     campaign_mappings,
+    flow_id: str | None,
 ) -> dict[str, Any] | None:
     """Shared between offer + split actions — load target → URL.
 
@@ -254,10 +272,18 @@ async def _resolve_offer_url(
             )
             return None
 
+    # T2.5 — pinned_target_id resolves the {offer_target_id} macro;
+    # flow_id (threaded from execute_action) resolves {flow_id}.
+    # When `target_id` was pinned by config, `pinned_target_id` is
+    # that value; when fallback walked to offer.is_default_target,
+    # it's the discovered target. Either way the macro substitution
+    # reflects the actual destination, not the requested one.
     url = build_url_fn(
         pinned_template, req, campaign_id, offer_id,
         source_mappings=source_mappings,
         campaign_mappings=campaign_mappings,
+        target_id=pinned_target_id,
+        flow_id=flow_id,
     )
     return {
         "url": url,

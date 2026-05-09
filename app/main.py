@@ -123,6 +123,7 @@ app = FastAPI(
 async def decide(
     req: ClickRequest,
     x_tds_key: str = Header("", alias="X-TDS-Key"),
+    x_test_id: str = Header("", alias="X-Test-Id"),
 ):
     """Main routing endpoint. Called by CF Worker for every click."""
     t_endpoint_start = time.perf_counter()
@@ -130,6 +131,15 @@ async def decide(
     # Auth check (timing-safe)
     if settings.tds_secret_key and (not x_tds_key or not hmac.compare_digest(x_tds_key, settings.tds_secret_key)):
         raise HTTPException(status_code=403, detail="Invalid TDS key")
+
+    # Traffic simulation framework (Phase 1, 2026-05-09).
+    # Tag Sentry span with test_id so verifier can find every event for
+    # one synthetic via `mcp__sentry__search_events tags.test_id:<uuid>`.
+    # Echoed back in the response so Worker → debug JSON surfaces the
+    # round-trip for assertion. Purely additive — production traffic
+    # without the header is unchanged.
+    if x_test_id:
+        sentry_sdk.set_tag("test_id", x_test_id)
 
     # Route the click
     try:
@@ -255,7 +265,10 @@ async def decide(
     timing["stream_write_ms"] = round((time.perf_counter() - t_stream) * 1000, 2)
     timing["endpoint_total_ms"] = round((time.perf_counter() - t_endpoint_start) * 1000, 2)
 
-    return {"url": result["url"], "status": 302, "timing": timing}
+    response = {"url": result["url"], "status": 302, "timing": timing}
+    if x_test_id:
+        response["echoed_test_id"] = x_test_id
+    return response
 
 
 @app.get("/health", response_model=HealthResponse)

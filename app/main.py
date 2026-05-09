@@ -177,11 +177,28 @@ async def decide(
     # Include timing in click record for PG storage
     click_record["timing"] = timing
 
-    # Write to local stream
+    # Write to local stream.
+    # T2.1 / G-22: inline `MAXLEN ~ N` enforces a hard ceiling on
+    # the stream so a central-collector outage cannot grow it
+    # unbounded → Redis OOM → routing degradation + click loss.
+    # `approximate=True` (the redis-py `~` modifier) makes the trim
+    # O(1) per XADD by trimming whole macro-nodes rather than
+    # exact-counting; the cap is honoured to ±10% of target which
+    # is more than sufficient for a defense-in-depth ceiling. Under
+    # normal operation the shipper.run_shipper loop XTRIMs the
+    # stream to ~10k after every successful batch ship, so this cap
+    # is rarely exercised — it exists for the failure-mode tail.
+    # Cap value is env-configurable (TDS_STREAM_CLICKS_MAXLEN);
+    # default 1M ≈ ~500 MB Redis budget at ~500 B/click.
     t_stream = time.perf_counter()
     try:
         r = await get_redis()
-        await r.xadd("stream:clicks", {"data": json.dumps(click_record, default=str)})
+        await r.xadd(
+            "stream:clicks",
+            {"data": json.dumps(click_record, default=str)},
+            maxlen=settings.stream_clicks_maxlen,
+            approximate=True,
+        )
     except Exception as e:
         logger.error("Failed to write click to stream: %s", e, extra={"click_id": req.click_id})
         sentry_sdk.capture_exception(e)

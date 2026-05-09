@@ -103,6 +103,48 @@ class TestAtomicWrite:
         disk_queue._write_file_sync(target, b"second")
         assert target.read_bytes() == b"second"
 
+    def test_file_mode_is_owner_read_write_only(self, tmp_path):
+        """Audit fix (Agent 2 HIGH-2, 2026-05-09): click records
+        contain PII (IP, geo, full UA, advertiser-supplied
+        identifiers in query_params). Files MUST be 0o600 — owner
+        read+write only. World-readable 0o644 would let any
+        co-located process / shared bind-mount read every queued
+        click during a Redis outage.
+        """
+        target = tmp_path / "queue" / "x.json"
+        disk_queue._write_file_sync(target, b'{"k": 1}')
+
+        # Stat the file mode — mask out the file-type bits, keep
+        # only the permission bits.
+        import os as _os
+        mode = _os.stat(target).st_mode & 0o777
+        assert mode == 0o600, (
+            f"Expected 0o600 (owner rw only) for PII-bearing click "
+            f"records; got {oct(mode)}. World-readable mode leaks "
+            f"every queued click to any local process."
+        )
+
+    def test_parent_dir_mode_is_owner_only(self, tmp_path):
+        """Audit fix (Agent 2 HIGH-2, 2026-05-09): the parent
+        directory listing leaks queue depth + filenames (which
+        encode timestamps + UUIDs — useful for an attacker
+        timing-correlating clicks). Mode 0o700 — owner-only
+        access at the directory level too.
+        """
+        target = tmp_path / "queue" / "today" / "x.json"
+        disk_queue._write_file_sync(target, b'{"k": 1}')
+
+        import os as _os
+        mode = _os.stat(target.parent).st_mode & 0o777
+        # We require <= 0o700 — `0o700` is the goal but if the
+        # process umask is more restrictive (rare), accept that
+        # as still secure.
+        assert mode & 0o077 == 0, (
+            f"Parent dir {target.parent} leaks read access to "
+            f"group/other (mode {oct(mode)}). Click queue must "
+            f"be owner-only at the directory level."
+        )
+
 
 # ---------------------------------------------------------------------------
 # enqueue_click
@@ -347,6 +389,46 @@ async def test_drain_skips_tmp_files():
     assert stats["drained"] == 1
     # The .tmp survives — we don't sweep them up.
     assert (root / "incomplete.json.tmp").exists()
+
+
+@pytest.mark.asyncio
+async def test_drain_unlink_failure_keeps_file_and_counter():
+    """Audit fix (Agent 1 HIGH-2, 2026-05-09): when XADD succeeds
+    but unlink raises OSError (permission denied, FS full during
+    journal update, etc.), the file MUST stay on disk AND the
+    in-memory counter MUST NOT decrement. Otherwise counter
+    underestimates real queue depth → cap check lets in more
+    enqueues than the disk holds → silent over-cap during a
+    sustained outage.
+    """
+    await disk_queue.enqueue_click({"id": 1})
+    await disk_queue.enqueue_click({"id": 2})
+    assert await disk_queue.get_queue_size() == 2
+
+    redis = _make_redis_mock()
+    # Patch Path.unlink to raise OSError — simulates permission /
+    # FS-state failure post-XADD. asyncio.to_thread wraps unlink,
+    # so patching at the Path class level is the cleanest hook.
+    from unittest.mock import patch
+    original_unlink = Path.unlink
+
+    def flaky_unlink(self, *a, **kw):
+        raise OSError("simulated unlink failure")
+
+    with patch.object(Path, "unlink", flaky_unlink):
+        stats = await disk_queue.drain_to_redis(redis)
+
+    # Drain reports nothing successful — both files hit the same
+    # unlink-OSError branch.
+    assert stats["drained"] == 0
+    # Counter unchanged — files still on disk.
+    assert await disk_queue.get_queue_size() == 2
+
+    # Files truly remain on disk (sanity check the patch was
+    # restored cleanly + the files weren't deleted by some other
+    # path).
+    files = list(Path(disk_queue.settings.disk_queue_root).rglob("*.json"))
+    assert len(files) == 2
 
 
 @pytest.mark.asyncio

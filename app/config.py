@@ -1,6 +1,15 @@
 """Click-processor configuration. All settings from environment variables."""
 
+from pydantic import model_validator
 from pydantic_settings import BaseSettings
+
+
+# Environments where missing secrets are TOLERATED — local dev,
+# unit tests, ad-hoc explorer scripts. Mirrors the admin-api
+# `_LOCAL_ENVIRONMENTS` constant in `services/admin-api/app/config.py`.
+# Any environment NOT in this set must boot WITH a non-empty
+# `tds_secret_key` (audit closure 2026-05-09 — Agent 2 HIGH-1).
+_LOCAL_ENVIRONMENTS = frozenset({"local", "development"})
 
 
 class Settings(BaseSettings):
@@ -77,6 +86,54 @@ class Settings(BaseSettings):
     disk_queue_drain_interval_seconds: int = 30
 
     model_config = {"env_prefix": "TDS_"}
+
+    @model_validator(mode="after")
+    def _enforce_secret_presence(self) -> "Settings":
+        """Refuse to boot in non-local environments without a
+        valid `tds_secret_key`. Mirrors admin-api's startup guard
+        (services/admin-api/app/config.py).
+
+        Audit closure 2026-05-09 (Agent 2 HIGH-1): without this
+        guard, a click-processor node deployed with
+        `TDS_SECRET_KEY=""` would silently no-op BOTH the
+        X-TDS-Key auth check (`if settings.tds_secret_key and
+        not hmac.compare_digest(...)`) AND the T2.4 X-TDS-Body-Sig
+        verifier (`if x_tds_body_sig and settings.tds_secret_key`).
+        Both defenses short-circuit on the falsy `and`, leaving
+        the `/admin/sync` endpoint open to unauthenticated +
+        un-integrity-checked snapshot pushes from any caller —
+        full multi-tenant routing tampering.
+
+        The check fires AFTER all field defaults apply so the
+        `tds_secret_key: str = ""` default still works in local
+        dev (environment="development" → guard short-circuits at
+        the first `if`).
+
+        Length floor `32` matches admin-api's `tds_secret_key`
+        guard and rule `api-security` "≥256 bits per HS256".
+        """
+        if self.environment in _LOCAL_ENVIRONMENTS:
+            return self
+
+        if not self.tds_secret_key:
+            raise ValueError(
+                f"TDS_SECRET_KEY must be set when TDS_ENVIRONMENT="
+                f"'{self.environment}'. Empty secret silently "
+                f"disables BOTH X-TDS-Key auth AND X-TDS-Body-Sig "
+                f"integrity verification on /admin/sync, leaving "
+                f"the snapshot-apply path open to MITM tampering. "
+                f"Mirrors the admin-api guard for the same secret."
+            )
+
+        if len(self.tds_secret_key) < 32:
+            raise ValueError(
+                f"TDS_SECRET_KEY must be at least 32 characters "
+                f"(≥256 bits per `api-security.md` HS256 target; "
+                f"same length floor as admin-api). Current length: "
+                f"{len(self.tds_secret_key)}."
+            )
+
+        return self
 
 
 settings = Settings()

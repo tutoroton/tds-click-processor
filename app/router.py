@@ -970,10 +970,22 @@ def build_url(
 
     # Worker-auto layer — pull from request fields. Empty strings
     # become None so `safe_substitute` collapses the macro cleanly.
+    #
+    # Audit closure 2026-05-09 (Agent 4 MAJOR): `colo` was
+    # historically present in this tuple but is NOT a member of
+    # `WORKER_AUTO_SLOTS` — the canonical macro registry routes
+    # CF colo info via `worker_colo`, which `macros-registry.md`
+    # decision M1 explicitly EXCLUDES from landing macros (audit-
+    # only technical slot, leaks routing infrastructure to
+    # advertiser-facing URLs). `colo` removed from this tuple to
+    # eliminate the ghost key. If a future use case needs CF
+    # colo in landing URLs, promote `worker_colo` in
+    # `parameters.py:_TECH_LANDING_MACROS` with an explicit
+    # decision entry in `macros-registry.md` first.
     worker_auto_fields = (
         "country", "city", "region", "ip", "continent",
         "timezone", "postal_code", "latitude", "longitude",
-        "as_org", "colo", "user_agent", "referer", "accept_language",
+        "as_org", "user_agent", "referer", "accept_language",
         "tls_version", "http_protocol", "hostname", "path",
     )
     for key in worker_auto_fields:
@@ -1007,6 +1019,17 @@ def build_url(
     # `RESERVED_SLOTS` (so the merged source∪campaign mapping
     # chain doesn't carry it). Empty / unparseable → NULL,
     # collapsed by substituter cleanup.
+    #
+    # Provenance gap (audit closure 2026-05-09 — Agent 4 MAJOR):
+    # `app/common/parameters.py:SUBSTITUTED_AUTO_SLOTS` documents
+    # `cost` as "advertiser-supplied OR hardcoded campaign cost".
+    # The campaign-hardcoded fallback (read `cost` from the
+    # `campaign:{id}` Redis hash when query param absent) is
+    # DEFERRED — admin-api has no `campaigns.default_cost` column
+    # yet, so there's nothing to read. Tracked separately for the
+    # next Stage 1 vector that adds the schema. For now, missing
+    # `?cost=` in the click URL → `{cost}` macro collapses cleanly
+    # (existing semantics preserved; no new behaviour change).
     parsed_lang = parse_accept_language(req.accept_language)
     values["language"] = parsed_lang or None
     qp_cost = (req.query_params or {}).get("cost") if req.query_params else None

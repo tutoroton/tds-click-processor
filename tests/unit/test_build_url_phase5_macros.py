@@ -165,16 +165,34 @@ class TestCostMacro:
     def test_cost_special_chars_url_encoded(self):
         """Even if cost is a malformed string with special chars,
         it must be URL-encoded — never break the URL syntactically.
-        Defense vs misbehaving traffic source."""
+        Defense vs misbehaving traffic source.
+
+        Audit fix 2026-05-09 (Agent 4 minor): the prior assertion
+        used `or "%3D" in url` which made it pass on any URL
+        containing `%3D` anywhere — even if the cost segment
+        itself was un-encoded. Replaced with two unconditional
+        per-segment checks.
+        """
         url = build_url(
             "https://x.example/?c={cost}",
             _req(query_params={"cost": "a&b=evil"}),
             "1", "101",
         )
         # & and = should be percent-encoded; payload becomes
-        # `c=a%26b%3Devil`.
+        # `c=a%26b%3Devil`. Slice the cost segment and verify
+        # the dangerous shape is GONE from THAT segment, not
+        # from any random part of the URL.
+        cost_segment = url.split("c=")[1].split("&")[0]
+        assert "%3D" in cost_segment, (
+            f"`=` in cost value MUST be URL-encoded as %3D in the "
+            f"cost segment specifically; got {cost_segment!r}"
+        )
+        assert "%26" in cost_segment, (
+            f"`&` in cost value MUST be URL-encoded as %26 in the "
+            f"cost segment specifically; got {cost_segment!r}"
+        )
+        # The full encoded value as a positive sanity check.
         assert "c=a%26b%3Devil" in url
-        assert "evil" not in url.split("c=")[1].split("&")[0] or "%3D" in url
 
 
 # ---------------------------------------------------------------------------

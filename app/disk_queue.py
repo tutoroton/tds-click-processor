@@ -148,10 +148,34 @@ def _write_file_sync(path: Path, data: bytes) -> None:
     exist_ok=True). The file descriptor is closed in `finally` so
     a write error doesn't leak the FD even before the rename
     happens.
+
+    File mode `0o600` (owner read+write only) — the queue contains
+    click records with PII (IP, geo, full UA, query_params that
+    may carry advertiser-supplied identifiers). World-readable
+    `0o644` would let any co-located process / sidecar / shared
+    bind-mount read every queued click during a Redis outage.
+    Parent directory `0o700` mirrors the same boundary at the dir
+    level (a user-listable parent leaks filenames, which encode
+    timestamps + UUIDs). Closes Agent 2 HIGH-2 audit finding
+    (security review 2026-05-09).
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    # `mkdir(mode=...)` only honours mode on FIRST creation —
+    # subsequent calls with exist_ok=True don't tighten an
+    # already-loose dir. Defensive chmod ensures the boundary
+    # holds even when the directory pre-existed (e.g., previous
+    # process ran with a more permissive umask).
+    try:
+        os.chmod(path.parent, 0o700)
+    except OSError:
+        # Non-fatal — if chmod fails the file write below still
+        # emits at 0o600 so the click bytes themselves stay
+        # protected. Common cause: directory owned by another UID
+        # (e.g., backup process). Log via the file-level error
+        # path if write itself fails.
+        pass
     tmp_path = path.with_suffix(path.suffix + ".tmp")
-    fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
         os.write(fd, data)
         os.fsync(fd)
@@ -299,21 +323,38 @@ async def drain_to_redis(redis) -> dict:
             failed = 1
             break
 
-        # XADD succeeded — file is safe to remove. If unlink fails
-        # (e.g., another drainer raced us), we treat that as a
-        # successful drain anyway: the data is in Redis, the file
-        # not being there is the desired end state.
+        # XADD succeeded — file is safe to remove. The unlink
+        # outcome determines counter accounting:
+        #   FileNotFoundError → another drainer/cleanup got there
+        #     first; treat as drained (data in Redis, file gone).
+        #   OSError (e.g. permission denied, ENOSPC during journal
+        #     update on full disk) → the file STAYS on disk; counter
+        #     MUST NOT decrement, otherwise it underestimates real
+        #     queue depth and the cap check lets through more
+        #     enqueues than the disk holds. Skip increment of
+        #     `drained` too — the next drain cycle re-attempts
+        #     XADD (idempotent if click_id-deduped downstream) and
+        #     unlink. Closes Agent 1 HIGH-2 audit finding
+        #     (code review 2026-05-09).
         try:
             await asyncio.to_thread(path.unlink)
         except FileNotFoundError:
-            pass
+            _decrement_size()
+            drained += 1
         except OSError as exc:
             logger.warning(
-                "XADD-OK but unlink failed for %s: %s",
+                "XADD-OK but unlink failed for %s: %s — file kept "
+                "on disk, will be retried by next drainer iteration",
                 path.name, exc,
             )
-        _decrement_size()
-        drained += 1
+            sentry_sdk.capture_exception(exc)
+            # Counter NOT decremented; `drained` NOT incremented.
+            # Move on to the next file — don't break the loop, this
+            # is a per-file unlink issue, not a Redis impairment.
+            continue
+        else:
+            _decrement_size()
+            drained += 1
 
     return {
         "drained": drained,

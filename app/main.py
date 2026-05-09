@@ -6,6 +6,7 @@ against local Redis, returns destination URL for redirect.
 
 import asyncio
 import gzip
+import hashlib
 import hmac
 import json
 import logging
@@ -256,6 +257,7 @@ _MAX_UNCOMPRESSED_BYTES = 500 * 1024 * 1024  # 500MB after gunzip — gives admi
 async def receive_sync(
     request: Request,
     x_tds_key: str = Header("", alias="X-TDS-Key"),
+    x_tds_body_sig: str = Header("", alias="X-TDS-Body-Sig"),
 ):
     """Receive routing snapshot from central admin-api.
 
@@ -267,6 +269,17 @@ async def receive_sync(
     `TDS_SYNC_PUSH_GZIP_ENABLED=true`. Detected via
     `Content-Encoding: gzip`. Without that header the body is
     parsed as plain JSON (legacy / older admin-api builds).
+
+    Optional body integrity (T2.4): if admin-api ships an
+    ``X-TDS-Body-Sig: sha256=<hex>`` header, the on-the-wire
+    body bytes are verified against the HMAC-SHA256 of those
+    bytes computed with ``tds_secret_key``. Mismatch → 401.
+    Older admin-api builds that don't ship the header continue
+    to work unchanged (lenient mode for the rolling-deploy
+    window). Once the entire fleet of admin-api builds emits
+    the sig, operators can ratchet up to "require-sig" via a
+    future config flag — but that's a follow-up; today's
+    contract is "if present, verify; if absent, don't reject".
 
     Two-stage size guard (T1.2 / G-16):
       - On-the-wire body capped at 50MB (`_MAX_COMPRESSED_BYTES`).
@@ -292,6 +305,45 @@ async def receive_sync(
         )
 
     raw_body = await request.body()
+
+    # T2.4 — body integrity check. Verify BEFORE decompression so
+    # a corrupt gzip body fails the sig check (cleaner error
+    # surface) rather than the gunzip step. Sig is over the EXACT
+    # bytes that arrived on the wire — independent of compression.
+    #
+    # Lenient on absent header (older admin-api builds + dev mode
+    # without tds_secret_key configured). Strict on present-but-
+    # mismatched: that's the active-MITM scenario the sig defends
+    # against, so 401 with no further processing.
+    if x_tds_body_sig and settings.tds_secret_key:
+        # Format `sha256=<hex>` mirrors GitHub webhook signature
+        # convention. Future algos (sha512) can ship under the
+        # same header; today we only accept sha256.
+        if not x_tds_body_sig.startswith("sha256="):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Unsupported X-TDS-Body-Sig algorithm: "
+                    f"{x_tds_body_sig.split('=', 1)[0]!r}"
+                ),
+            )
+        provided_hex = x_tds_body_sig[len("sha256="):]
+        expected_hex = hmac.new(
+            settings.tds_secret_key.encode("utf-8"),
+            raw_body,
+            hashlib.sha256,
+        ).hexdigest()
+        # Timing-safe compare — avoids per-byte timing leak that
+        # could let an attacker reconstruct a forged sig.
+        if not hmac.compare_digest(provided_hex, expected_hex):
+            logger.warning(
+                "X-TDS-Body-Sig mismatch — rejecting tampered or "
+                "forged sync push (T2.4 closure).",
+            )
+            raise HTTPException(
+                status_code=401,
+                detail="Body signature mismatch",
+            )
 
     # Optional gzip decompression. The admin-api side gates on
     # `TDS_SYNC_PUSH_GZIP_ENABLED`; this end is dual-decode (always

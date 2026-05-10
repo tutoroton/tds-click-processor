@@ -400,6 +400,7 @@ async def receive_sync(
     request: Request,
     x_tds_key: str = Header("", alias="X-TDS-Key"),
     x_tds_body_sig: str = Header("", alias="X-TDS-Body-Sig"),
+    x_test_id: str = Header("", alias="X-Test-Id"),
 ):
     """Receive routing snapshot from central admin-api.
 
@@ -437,6 +438,20 @@ async def receive_sync(
     # Auth (timing-safe)
     if settings.tds_secret_key and (not x_tds_key or not hmac.compare_digest(x_tds_key, settings.tds_secret_key)):
         raise HTTPException(status_code=403, detail="Invalid key")
+
+    # Diagnostic correlation — when admin-api propagated X-Test-Id (per
+    # `_build_push_headers` in admin-api SyncService), bind it so the
+    # `node.sync_apply_*` checkpoints land in the same obs:test:<id>
+    # stream as the upstream mutation.
+    if x_test_id:
+        sentry_sdk.set_tag("test_id", x_test_id)
+        set_test_id(x_test_id)
+        emit_checkpoint("node.sync_apply_start", {
+            "node_id": settings.node_id,
+            "content_encoding": request.headers.get("content-encoding", ""),
+            "content_length": request.headers.get("content-length"),
+            "has_body_sig": bool(x_tds_body_sig),
+        })
 
     # Pre-decompress payload size guard.
     content_length = request.headers.get("content-length")
@@ -541,6 +556,14 @@ async def receive_sync(
     stats = await apply_snapshot(r, snapshot)
 
     logger.info("Sync received: %d keys written (v%d)", stats.get("keys_written", 0), incoming_version)
+    if x_test_id:
+        emit_checkpoint("node.sync_apply_done", {
+            "node_id": settings.node_id,
+            "sync_version": incoming_version,
+            "keys_written": stats.get("keys_written", 0),
+            "stale_removed": stats.get("stale_removed", 0),
+            "elapsed_ms": stats.get("elapsed_ms"),
+        })
     return stats
 
 

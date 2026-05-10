@@ -20,6 +20,14 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from contextlib import asynccontextmanager
 
 from app.config import settings
+from app.diag import (
+    before_send as diag_before_send,
+    emit_checkpoint,
+    emit_obs,
+    run_obs_drain,
+    set_test_id,
+    traces_sampler as diag_traces_sampler,
+)
 from app.models import ClickRequest, ClickResponse, HealthResponse
 from app.redis_client import get_redis, close_redis
 from app.router import route, parse_device_type, parse_os, parse_browser, get_full_ua_info
@@ -31,6 +39,17 @@ from app.sync_client import apply_snapshot, start_periodic_pull
 logger = logging.getLogger("tds.click-processor")
 
 # Sentry initialization — DSN from config, not hardcoded [C1 fix]
+#
+# `traces_sampler` (callback) replaces the flat `traces_sample_rate`:
+# - Returns 1.0 for requests carrying X-Test-Id when `diag_traces_boost`
+#   is on (full chronological span capture for diagnostic probes).
+# - Returns 0.1 baseline otherwise (production sample stays unchanged).
+# - Returns 0.1 when `diag_traces_boost` is off regardless of header
+#   (production safety — toggle is the master switch).
+#
+# `before_send` redacts sensitive headers + query keys (X-TDS-Key,
+# debug=, Authorization). Defense-in-depth backstop independent of
+# whether each capture site remembered to scrub.
 if settings.sentry_dsn:
     sentry_sdk.init(
         dsn=settings.sentry_dsn,
@@ -38,7 +57,8 @@ if settings.sentry_dsn:
             StarletteIntegration(transaction_style="endpoint"),
             FastApiIntegration(transaction_style="endpoint"),
         ],
-        traces_sample_rate=0.1,
+        traces_sampler=diag_traces_sampler,
+        before_send=diag_before_send,
         environment=settings.environment,
         release=f"geo-tds-backend@0.1.0",
         server_name=f"{settings.node_id}",
@@ -82,6 +102,13 @@ async def lifespan(app: FastAPI):
     # alert granularity matched to typical Sentry evaluation.
     observability_task = asyncio.create_task(run_observability_loop(r))
 
+    # Diagnostic obs-stream drainer. Started unconditionally — when
+    # `TDS_DIAG_OBS_STREAM=false` (production default) the queue
+    # stays empty and the drain loop is a no-op every 100ms. Cheap
+    # to leave running; avoids a code-path divergence between
+    # prod and staging.
+    diag_drain_task = asyncio.create_task(run_obs_drain(r))
+
     yield
 
     # Shutdown — cancel all background tasks and await each so
@@ -92,6 +119,7 @@ async def lifespan(app: FastAPI):
     sync_task.cancel()
     disk_drainer_task.cancel()
     observability_task.cancel()
+    diag_drain_task.cancel()
     try:
         await shipper_task
     except asyncio.CancelledError:
@@ -106,6 +134,10 @@ async def lifespan(app: FastAPI):
         pass
     try:
         await observability_task
+    except asyncio.CancelledError:
+        pass
+    try:
+        await diag_drain_task
     except asyncio.CancelledError:
         pass
     await close_redis()
@@ -132,14 +164,31 @@ async def decide(
     if settings.tds_secret_key and (not x_tds_key or not hmac.compare_digest(x_tds_key, settings.tds_secret_key)):
         raise HTTPException(status_code=403, detail="Invalid TDS key")
 
-    # Traffic simulation framework (Phase 1, 2026-05-09).
+    # Traffic simulation framework (Phase 1, 2026-05-09) +
+    # diagnostic toolkit (Phase 1, 2026-05-10).
+    #
     # Tag Sentry span with test_id so verifier can find every event for
     # one synthetic via `mcp__sentry__search_events tags.test_id:<uuid>`.
     # Echoed back in the response so Worker → debug JSON surfaces the
     # round-trip for assertion. Purely additive — production traffic
     # without the header is unchanged.
+    #
+    # ALSO bind to the request-scoped context var so emit_checkpoint()
+    # calls in route() / cascade() / sync_client.apply_snapshot() etc.
+    # can append to obs:test:<id> Redis stream without threading the
+    # test_id through every signature. The context var is local to
+    # this request — concurrent /decide calls each see their own.
     if x_test_id:
         sentry_sdk.set_tag("test_id", x_test_id)
+        set_test_id(x_test_id)
+        emit_checkpoint("click.decide_in", {
+            "click_id": req.click_id,
+            "country": req.country,
+            "city": req.city,
+            "ip": req.ip,
+            "user_agent": req.user_agent[:120],
+            "node_id": settings.node_id,
+        })
 
     # Route the click
     try:
@@ -147,16 +196,29 @@ async def decide(
     except Exception as e:
         logger.error("route() failed: %s", e, extra={"click_id": req.click_id})
         sentry_sdk.capture_exception(e)
+        emit_checkpoint("click.route_failed", {"error": str(e)[:200]})
         return ClickResponse(
             url=f"{settings.fallback_url}?reason=error&click_id={quote(req.click_id, safe='')}",
             status=302,
         )
 
     if result is None:
+        emit_checkpoint("click.no_match", {"click_id": req.click_id})
         return ClickResponse(
             url=f"{settings.fallback_url}?reason=no_match&click_id={quote(req.click_id, safe='')}",
             status=302,
         )
+
+    # Routing decision resolved — emit summary checkpoint with the
+    # selected campaign / offer / final URL so the trace timeline
+    # shows exactly what the cascade picked. The route() function
+    # also emits per-stage checkpoints internally (`click.cascade_*`,
+    # `click.macro_*`) for finer detail.
+    emit_checkpoint("click.action_resolved", {
+        "campaign_id": result.get("campaign_id"),
+        "offer_id": result.get("offer_id"),
+        "url": result.get("url", "")[:200],
+    })
 
     # Extract routing timing
     routing_timing = result.get("timing", {})
@@ -240,6 +302,10 @@ async def decide(
             maxlen=settings.stream_clicks_maxlen,
             approximate=True,
         )
+        emit_checkpoint("click.stream_xadd", {
+            "click_id": req.click_id,
+            "stream_write_ms": round((time.perf_counter() - t_stream) * 1000, 2),
+        })
     except Exception as e:
         logger.error("Failed to write click to stream: %s", e, extra={"click_id": req.click_id})
         sentry_sdk.capture_exception(e)
@@ -257,6 +323,11 @@ async def decide(
                 "Click %s queued to disk after Redis failure",
                 req.click_id,
             )
+        emit_checkpoint("click.disk_queue_fallback", {
+            "click_id": req.click_id,
+            "enqueued": enqueued,
+            "error": str(e)[:200],
+        })
         # If `enqueued is False`, enqueue_click_to_disk has
         # already logged + Sentry-captured the cap rejection or
         # write failure. The click is genuinely lost in that
@@ -268,6 +339,15 @@ async def decide(
     response = {"url": result["url"], "status": 302, "timing": timing}
     if x_test_id:
         response["echoed_test_id"] = x_test_id
+        # Final checkpoint with full timing breakdown so the trace
+        # timeline closes cleanly — the gap-detector flags requests
+        # that emit decide_in but never decide_out as suspect.
+        emit_checkpoint("click.decide_out", {
+            "click_id": req.click_id,
+            "url": result["url"][:200],
+            "endpoint_total_ms": timing["endpoint_total_ms"],
+            "stream_write_ms": timing.get("stream_write_ms"),
+        })
     return response
 
 

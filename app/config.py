@@ -85,6 +85,51 @@ class Settings(BaseSettings):
     disk_queue_max_files: int = 100_000
     disk_queue_drain_interval_seconds: int = 30
 
+    # ------------------------------------------------------------------
+    # Diagnostic mode toggles. All three default `False` — production
+    # safety-first. Operator flips per-environment via `.env`:
+    #   staging: all True (full diagnostic visibility for calibration)
+    #   production: all False; flip individually for incident response
+    #
+    # The toggles gate behaviour ONLY when the request also carries the
+    # `X-Test-Id` header — diagnostic mode is "deep observation for
+    # tagged requests", never a global verbosity boost. Production
+    # traffic without the header is unaffected by any toggle value.
+    #
+    # Granularity rationale (3 toggles vs 1):
+    #   - traces_boost: Sentry tracesSampler returns 1.0 for tagged
+    #     requests. Cost: extra Sentry quota for a small fraction of
+    #     traffic. Cheapest to enable.
+    #   - obs_stream: emits per-checkpoint events to local Redis
+    #     `obs:test:<id>` for trace-CLI aggregation. Cost: ~0.1 ms
+    #     per request via background drain (zero impact on /decide
+    #     latency budget). Most useful for full chronology.
+    #   - verbose_logs: structured-log INFO at every checkpoint
+    #     (otherwise DEBUG/dropped). Cost: log-volume increase for
+    #     tagged requests. Useful when Sentry/obs stream are
+    #     unreachable and the operator only has docker logs.
+    #
+    # Full discipline: rule `diagnostic-mode`, skill
+    # `diagnostic-tracing`.
+    # ------------------------------------------------------------------
+    diag_traces_boost: bool = False
+    diag_obs_stream: bool = False
+    diag_verbose_logs: bool = False
+
+    # Bounded queue for the obs-stream background drain. Caps the
+    # in-memory backlog if Redis is briefly unreachable — drops oldest
+    # rather than blocking the request path. Sized for ~10s of dense
+    # tagged traffic at typical checkpoint counts.
+    diag_obs_queue_max: int = 10_000
+    diag_obs_drain_interval_ms: int = 100
+    # Per-test stream hard cap (XADD MAXLEN ~). Bounds Redis growth if
+    # an operator pumps a very large probe set through one test_id.
+    diag_obs_stream_maxlen: int = 10_000
+    # TTL on the obs:test:<id> key. 1h is enough for the trace CLI to
+    # consume; trace runs typically happen seconds-to-minutes after
+    # the probe.
+    diag_obs_stream_ttl_seconds: int = 3600
+
     model_config = {"env_prefix": "TDS_"}
 
     @model_validator(mode="after")

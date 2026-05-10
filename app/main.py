@@ -190,6 +190,18 @@ async def decide(
             "node_id": settings.node_id,
         })
 
+    # Audit closure 2026-05-10 (Code-reviewer #1 HIGH-1): the previous
+    # implementation only emitted `click.decide_out` on the SUCCESS
+    # path. Every error / no_match probe failed the gap-detector's
+    # open-without-close invariant — the trace CLI flagged exactly the
+    # failure cases operators most need to investigate. Fix: emit
+    # `click.decide_out` on EVERY exit path with an `outcome` label so
+    # the timeline is honest about what happened. We don't use a
+    # try/finally wrapper because the function has only three exit
+    # points and explicit emits keep each path's payload (route_error
+    # carries the exception, no_match carries the click_id, success
+    # carries timing) without a central outcome tracker.
+
     # Route the click
     try:
         result = await route(req)
@@ -197,6 +209,12 @@ async def decide(
         logger.error("route() failed: %s", e, extra={"click_id": req.click_id})
         sentry_sdk.capture_exception(e)
         emit_checkpoint("click.route_failed", {"error": str(e)[:200]})
+        if x_test_id:
+            emit_checkpoint("click.decide_out", {
+                "click_id": req.click_id,
+                "outcome": "route_error",
+                "endpoint_total_ms": round((time.perf_counter() - t_endpoint_start) * 1000, 2),
+            })
         return ClickResponse(
             url=f"{settings.fallback_url}?reason=error&click_id={quote(req.click_id, safe='')}",
             status=302,
@@ -204,6 +222,12 @@ async def decide(
 
     if result is None:
         emit_checkpoint("click.no_match", {"click_id": req.click_id})
+        if x_test_id:
+            emit_checkpoint("click.decide_out", {
+                "click_id": req.click_id,
+                "outcome": "no_match",
+                "endpoint_total_ms": round((time.perf_counter() - t_endpoint_start) * 1000, 2),
+            })
         return ClickResponse(
             url=f"{settings.fallback_url}?reason=no_match&click_id={quote(req.click_id, safe='')}",
             status=302,
@@ -339,11 +363,14 @@ async def decide(
     response = {"url": result["url"], "status": 302, "timing": timing}
     if x_test_id:
         response["echoed_test_id"] = x_test_id
-        # Final checkpoint with full timing breakdown so the trace
-        # timeline closes cleanly — the gap-detector flags requests
-        # that emit decide_in but never decide_out as suspect.
+        # Success-path checkpoint with full timing breakdown.
+        # Mirrors the early-return decide_out emits above (route_error,
+        # no_match) — every exit path emits decide_out so the trace
+        # timeline always closes cleanly. Outcome label distinguishes
+        # the success path from failure paths in the rendered output.
         emit_checkpoint("click.decide_out", {
             "click_id": req.click_id,
+            "outcome": "matched",
             "url": result["url"][:200],
             "endpoint_total_ms": timing["endpoint_total_ms"],
             "stream_write_ms": timing.get("stream_write_ms"),

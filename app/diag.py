@@ -78,6 +78,7 @@ import asyncio
 import contextvars
 import json
 import logging
+import re
 import time
 from typing import Any
 
@@ -86,6 +87,38 @@ import sentry_sdk
 from app.config import settings
 
 logger = logging.getLogger("tds.diag")
+
+# X-Test-Id values that pass into Sentry tags + Redis stream keys
+# MUST be bounded length and benign character set. The header is
+# unauthenticated at the CF edge — a malicious client can craft any
+# value. Without this gate (audit closure 2026-05-10, Agent 2 HIGH-1
+# / HIGH-2 / HIGH-3):
+#  - Redis OOM via attacker-chosen `obs:test:<huge-or-many-keys>`
+#  - Sentry tag indexing degradation (200-char limit + control-char
+#    rejection)
+#  - Log injection via newline-bearing values in `extra={...}`
+#
+# UUID-shape (RFC 4122) is the canonical generator output and the
+# narrowest correct match. We accept dashes + hex chars only, capped
+# at 64 (handles uuid4 with optional run-suffix per the traffic
+# framework convention). Mirror of admin-api/app/diag.py validator.
+_VALID_TEST_ID = re.compile(r"^[0-9a-fA-F-]{8,64}$")
+
+
+def _is_valid_test_id(test_id: str) -> bool:
+    """Whitelist-validate an X-Test-Id value before any propagation.
+
+    Returns True for safely-tagged probes; False for absent / oversized /
+    out-of-charset values. Callers MUST treat False as "no test_id" —
+    drop the value silently rather than raising (the diag path must
+    never fail a request).
+    """
+    if not test_id:
+        return False
+    if len(test_id) > 64:
+        return False
+    return bool(_VALID_TEST_ID.match(test_id))
+
 
 # Request-scoped test_id. Bound by the middleware (`bind_test_id`)
 # at the top of `/decide` and read by every checkpoint emit site.
@@ -104,12 +137,18 @@ def get_test_id() -> str:
 def set_test_id(test_id: str) -> contextvars.Token:
     """Bind test_id to the current request's context.
 
+    Validates with `_is_valid_test_id` — out-of-charset / oversized
+    values collapse to "" so emit_obs early-returns + Redis keys can
+    never be poisoned. Audit closure 2026-05-10.
+
     Returns a Token so the caller can `_test_id_var.reset(token)` at
     the end of the request — but in FastAPI middleware the context
     naturally tears down when the request scope ends, so resetting
     is optional.
     """
-    return _test_id_var.set(test_id or "")
+    if not _is_valid_test_id(test_id or ""):
+        return _test_id_var.set("")
+    return _test_id_var.set(test_id)
 
 
 # Bounded async queue for obs-stream events. Items are
@@ -347,9 +386,22 @@ def before_send(event: dict, hint: dict) -> dict | None:
     object: the hooks below remove auth secrets even when the
     capturing code didn't think to scrub. Never returns None (we
     always want the event to ship — just sanitized).
+
+    Audit closure 2026-05-10 (Agent 2 MED-1): added x-api-key for
+    parity with admin-api twin (same set of secrets crosses both
+    services in different code paths). Audit MED-2: expanded query-
+    key set to cover common credential-bearing variations
+    (api_key/access_token/bearer/etc).
     """
-    SENSITIVE_HEADERS = {"x-tds-key", "x-tds-body-sig", "authorization", "cookie"}
-    SENSITIVE_QUERY_KEYS = {"debug", "key", "token"}
+    SENSITIVE_HEADERS = {
+        "x-tds-key", "x-tds-body-sig", "authorization",
+        "cookie", "x-api-key",
+    }
+    SENSITIVE_QUERY_KEYS = {
+        "debug", "key", "token", "password",
+        "api_key", "apikey", "access_token", "refresh_token",
+        "bearer", "secret", "passwd", "pwd", "auth", "session",
+    }
 
     request = event.get("request") or {}
     headers = request.get("headers") or {}

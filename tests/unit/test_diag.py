@@ -43,9 +43,23 @@ def test_emit_obs_no_op_without_test_id():
     assert diag._obs_queue is None
 
 
+def test_set_test_id_rejects_invalid_values():
+    """Audit closure 2026-05-10 — UUID-shape gate prevents Redis key
+    poisoning + Sentry tag pollution from attacker-crafted X-Test-Id
+    headers reaching click-processor (auth-gated by X-TDS-Key but
+    defense-in-depth)."""
+    from app import diag
+    for bad in ("abc", "a" * 65, "valid; rm -rf /", "with\nnewline"):
+        diag.set_test_id(bad)
+        assert diag.get_test_id() == "", f"should reject {bad!r}"
+    valid = "7f3a2c61-e08e-4f62-91a7-d4f9c0b8a2e1"
+    diag.set_test_id(valid)
+    assert diag.get_test_id() == valid
+
+
 def test_emit_obs_no_op_when_toggle_off():
     from app import diag
-    diag.set_test_id("abc")
+    diag.set_test_id("abc12345")
     with _set_toggles(obs=False):
         diag.emit_obs("click.decide_in", {"foo": "bar"})
     assert diag._obs_queue is None
@@ -53,7 +67,7 @@ def test_emit_obs_no_op_when_toggle_off():
 
 def test_emit_obs_queues_when_both_conditions_true():
     from app import diag
-    diag.set_test_id("abc")
+    diag.set_test_id("abc12345")
     with _set_toggles(obs=True):
         diag.emit_obs("click.decide_in", {"click_id": "019e..."})
     assert diag._obs_queue is not None
@@ -63,14 +77,14 @@ def test_emit_obs_queues_when_both_conditions_true():
 def test_traces_sampler_boosts_for_tagged_request():
     from app import diag
     with _set_toggles(traces=True):
-        ctx = {"asgi_scope": {"headers": [(b"x-test-id", b"abc")]}}
+        ctx = {"asgi_scope": {"headers": [(b"x-test-id", b"abcdef12")]}}
         assert diag.traces_sampler(ctx) == 1.0
 
 
 def test_traces_sampler_baseline_otherwise():
     from app import diag
     with _set_toggles(traces=False):
-        ctx = {"asgi_scope": {"headers": [(b"x-test-id", b"abc")]}}
+        ctx = {"asgi_scope": {"headers": [(b"x-test-id", b"abcdef12")]}}
         assert diag.traces_sampler(ctx) == 0.1
 
 
@@ -81,7 +95,7 @@ def test_drain_batch_emits_click_processor_service_field():
     to route timeline rendering."""
     from app import diag
 
-    diag.set_test_id("abc")
+    diag.set_test_id("abc12345")
     with _set_toggles(obs=True):
         diag.emit_obs("click.decide_in", {})
 

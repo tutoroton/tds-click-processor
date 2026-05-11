@@ -167,13 +167,25 @@ def _write_file_sync(path: Path, data: bytes) -> None:
     # process ran with a more permissive umask).
     try:
         os.chmod(path.parent, 0o700)
-    except OSError:
-        # Non-fatal — if chmod fails the file write below still
-        # emits at 0o600 so the click bytes themselves stay
-        # protected. Common cause: directory owned by another UID
-        # (e.g., backup process). Log via the file-level error
-        # path if write itself fails.
-        pass
+    except OSError as exc:
+        # M7 fix (2026-05-11): WAS silent `pass`. The earlier
+        # rationale (file itself written at 0o600 still protects
+        # the click bytes) holds, BUT operators had no signal when
+        # the directory perms drifted — e.g., a hostile co-tenant
+        # owning the path. Log + Sentry-capture so the operator
+        # sees the misconfig. Still non-fatal: the file write is
+        # the load-bearing protection; the dir chmod is hygiene.
+        logger.warning(
+            "Disk queue: chmod 0o700 failed on %s — directory may be "
+            "world-readable. The queued click file is still written at "
+            "0o600 so PII bytes stay protected, but verify directory "
+            "ownership: %s",
+            path.parent, exc,
+        )
+        sentry_sdk.capture_message(
+            f"Disk-queue chmod failed on {path.parent}: {exc}",
+            level="warning",
+        )
     tmp_path = path.with_suffix(path.suffix + ".tmp")
     fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:

@@ -97,7 +97,24 @@ class Settings(BaseSettings):
     # the operator's options are: scale Redis, raise the cap,
     # accept loss for new clicks. We never silently drop the
     # OLDEST click — that's revenue we already earned.
-    disk_queue_root: str = "var/click-queue"
+    # M7 fix (2026-05-11): absolute-path requirement.
+    #
+    # Was: `var/click-queue` — RELATIVE to process CWD at runtime.
+    # If uvicorn was launched with `cwd=/` (some container configs,
+    # systemd ExecStart with `WorkingDirectory=/`, or operator typo),
+    # queued click files landed at `/var/click-queue/...` — a
+    # system-wide path the service may not own. Worst case: a
+    # hostile co-tenant on the same node creates `/var/click-queue`
+    # with world-readable perms BEFORE the service starts; service
+    # writes click PII files (IP, geo, lat/lon, full UA) into the
+    # attacker-readable directory; the defensive `chmod(0o700)` then
+    # swallows OSError silently, masking the misconfig.
+    #
+    # Now: default to absolute `/var/tds/click-queue` and a field
+    # validator (below) refuses to construct Settings with a
+    # non-absolute value. Loud failure at startup > silent data
+    # loss at runtime.
+    disk_queue_root: str = "/var/tds/click-queue"
     disk_queue_max_files: int = 100_000
     disk_queue_drain_interval_seconds: int = 30
 
@@ -194,6 +211,41 @@ class Settings(BaseSettings):
                 f"{len(self.tds_secret_key)}."
             )
 
+        return self
+
+    @model_validator(mode="after")
+    def _enforce_disk_queue_root_absolute(self) -> "Settings":
+        """M7 fix (2026-05-11): refuse to boot with a relative
+        `disk_queue_root`.
+
+        Was a silent-data-loss footgun: if uvicorn started with
+        `cwd=/`, queued click files landed at `/var/click-queue/...`
+        — a path the service likely doesn't own. `chmod(0o700)`
+        failures were silently swallowed, so the misconfig was
+        invisible until you went looking for the lost clicks. The
+        drainer's sorted-glob scan would then find no files and
+        silently skip replay.
+
+        Loud startup failure > silent runtime data loss. Operator
+        sees the error message on `docker compose up` and fixes it
+        before any traffic flows.
+
+        Empty value is allowed (turns the disk-fallback feature off
+        cleanly — drainer becomes a no-op). This preserves existing
+        local-dev behaviour where operators don't want a system
+        path created. Only non-empty + relative raises.
+        """
+        if self.disk_queue_root and not self.disk_queue_root.startswith("/"):
+            raise ValueError(
+                f"TDS_DISK_QUEUE_ROOT must be an absolute path "
+                f"(starts with '/'). Got '{self.disk_queue_root}'. "
+                f"Relative paths resolve against the process CWD at "
+                f"runtime, which is unreliable across container / "
+                f"systemd configs and has caused silent data loss "
+                f"during Redis-outage fallback. Use e.g. "
+                f"'/var/tds/click-queue' (default) or set to '' to "
+                f"disable disk fallback entirely."
+            )
         return self
 
 

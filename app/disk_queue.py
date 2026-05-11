@@ -306,6 +306,68 @@ async def drain_to_redis(redis) -> dict:
             skipped += 1
             continue
 
+        # H1 fix (2026-05-11): apply the same idempotency gate on the
+        # replay path. Without this, a Redis outage followed by recovery
+        # would produce a stream entry for every queued file — but if
+        # the original /decide also succeeded on a different node (the
+        # race that motivated H1 in the first place), the replay
+        # introduces a duplicate. The TTL is the same operator-tuned
+        # `click_dedup_ttl_seconds`. Failure to extract click_id from
+        # the payload (corrupt file) is unlikely (we wrote it ourselves
+        # atomically) but we fail-open in that case — better to replay
+        # a possibly-duplicate than lose a click in a Redis-outage tail.
+        click_id_for_dedup: str | None = None
+        if settings.click_dedup_ttl_seconds > 0:
+            try:
+                parsed = json.loads(data)
+                cid = parsed.get("click_id")
+                if isinstance(cid, str) and cid:
+                    click_id_for_dedup = cid
+            except (json.JSONDecodeError, AttributeError) as exc:
+                logger.warning(
+                    "Drain: failed to parse click_id from %s for dedup: %s — "
+                    "proceeding without dedup",
+                    path.name, exc,
+                )
+        if click_id_for_dedup is not None:
+            try:
+                acquired = await redis.set(
+                    f"click:seen:{click_id_for_dedup}",
+                    "1",
+                    nx=True,
+                    ex=settings.click_dedup_ttl_seconds,
+                )
+                if not acquired:
+                    # Duplicate — original /decide already wrote to
+                    # stream. Unlink the queued file and skip XADD;
+                    # counter still decrements (file is gone, no
+                    # accounting drift).
+                    logger.info(
+                        "Drain: duplicate click_id %s (already in stream) — "
+                        "dropping queued file %s",
+                        click_id_for_dedup, path.name,
+                    )
+                    try:
+                        await asyncio.to_thread(path.unlink)
+                    except FileNotFoundError:
+                        pass
+                    except OSError as exc:
+                        logger.warning(
+                            "Drain: unlink failed after duplicate-skip on %s: %s",
+                            path.name, exc,
+                        )
+                    _decrement_size()
+                    drained += 1  # accounting: file IS gone, click handled
+                    continue
+            except Exception as exc:  # noqa: BLE001 — Redis impaired
+                # Dedup failed → fail-open to legacy behaviour. The XADD
+                # below may still raise (Redis impaired); the existing
+                # error handling at line ~324 stops the drain loop.
+                logger.warning(
+                    "Drain: SETNX failed for %s: %s — proceeding without dedup",
+                    click_id_for_dedup, exc,
+                )
+
         try:
             await redis.xadd(
                 "stream:clicks",

@@ -58,6 +58,22 @@ class Settings(BaseSettings):
     # Tunable per-environment via TDS_STREAM_CLICKS_MAXLEN.
     stream_clicks_maxlen: int = 1_000_000
 
+    # H1 fix (2026-05-11): TTL for the per-click idempotency marker
+    # `click:seen:<click_id>` set by `acquire_click_dedup` in main.py.
+    # The marker MUST outlive the realistic Worker→edge retry window
+    # but eventually expire to bound Redis memory growth. 30 days
+    # aligns with `data-flow.md`'s `click:{click_id}` TTL — the click
+    # record itself is referenced by postbacks up to 30d after the
+    # initial 302, so any genuine duplicate within that window is a
+    # retry / replay, not a fresh click. After 30d the same click_id
+    # is practically guaranteed to be a new generation (UUID v7-class
+    # rollover bound is in the centuries; collision is impossible at
+    # observed traffic). Operator override path: env var
+    # `TDS_CLICK_DEDUP_TTL_SECONDS`. Set to 0 to DISABLE dedup
+    # entirely (operator escape hatch for Redis OOM or extreme
+    # retry-storm incidents during a deploy).
+    click_dedup_ttl_seconds: int = 86400 * 30  # 30 days, 0 = disabled
+
     # T2.2 / G-23 — disk fallback queue for clicks when XADD fails.
     # The MAXLEN cap above defends against unbounded growth, but
     # cannot help when Redis itself is unreachable (container OOM,

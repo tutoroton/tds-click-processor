@@ -151,6 +151,65 @@ app = FastAPI(
 )
 
 
+# ============================================================================
+# Click idempotency gate (H1 fix, 2026-05-11)
+# ============================================================================
+
+async def _acquire_click_dedup(click_id: str) -> bool | None:
+    """Atomic first-seen check for a click_id via Redis SETNX.
+
+    Returns:
+        True  — first time we see this click_id (caller proceeds with XADD).
+        False — duplicate detected (caller skips XADD; the click is already
+                in the stream from a prior /decide call for the same id).
+        None  — dedup unavailable (Redis error, or feature disabled by
+                operator). Caller MUST fail-open and proceed with XADD;
+                downstream ClickHouse dedup on click_id is the safety net.
+
+    Atomicity: `SET key NX EX ttl` is a single Redis primitive — exactly
+    one of N concurrent calls with the same click_id wins. No race window.
+
+    Disabled path: when `settings.click_dedup_ttl_seconds == 0`, the
+    function short-circuits to None (no Redis call, no overhead). This is
+    the operator's escape hatch for incident response — restore previous
+    behaviour without a redeploy.
+
+    Live evidence motivating this gate: Sentry GEO-TDS-WORKER-1 showed
+    18 events / 9 users in the last hour before audit 2026-05-11. The
+    same click_id was XADD'd from BOTH AU and CA nodes within ~3 seconds
+    because the Worker's 2s `AbortSignal.timeout` fires roughly when
+    click-processor's response is still on the wire (EU→AU 290ms each
+    way + ~1.7s click-processor under burst load).
+    """
+    if settings.click_dedup_ttl_seconds <= 0:
+        # Operator-disabled — fail-open to legacy behaviour.
+        return None
+    try:
+        r = await get_redis()
+        # `SET key value NX EX ttl` returns truthy on first-set, None on
+        # collision. redis-py exposes this via `r.set(..., nx=True, ex=...)`
+        # which returns True / None. Normalise None → False here so the
+        # caller's branch logic is simple (`is False`).
+        acquired = await r.set(
+            f"click:seen:{click_id}",
+            "1",
+            nx=True,
+            ex=settings.click_dedup_ttl_seconds,
+        )
+        return True if acquired else False
+    except Exception as exc:
+        # Redis hiccup → log + fail-open. Better one duplicate than one
+        # lost click. ClickHouse downstream dedup on click_id PK is the
+        # eventual safety net. Sentry-capture is intentional — operator
+        # signal that dedup is degraded (not silent).
+        logger.warning(
+            "Click dedup SETNX failed for %s: %s — failing open",
+            click_id, exc,
+        )
+        sentry_sdk.capture_exception(exc)
+        return None
+
+
 @app.post("/decide")
 async def decide(
     req: ClickRequest,
@@ -303,6 +362,59 @@ async def decide(
 
     # Include timing in click record for PG storage
     click_record["timing"] = timing
+
+    # H1 fix (2026-05-11): idempotency gate BEFORE XADD.
+    #
+    # Without this, a CF Worker retry on its 2s `AbortSignal.timeout`
+    # produced a SECOND /decide call for the same click_id. Live
+    # evidence (Sentry GEO-TDS-WORKER-1 + audit 2026-05-11): the same
+    # click_id (e.g. `019e1407e312e5ba5d38b0f9`) successfully resolved
+    # on BOTH AU and CA edge nodes within ~3 seconds, both XADD'd to
+    # `stream:clicks` → ClickHouse double-counted the click + the
+    # postback chain fired twice for the same advertiser.
+    #
+    # `SET click:seen:<id> NX EX <ttl>` is atomic — exactly one of
+    # the concurrent /decide calls returns `True` (sets the marker),
+    # the other returns `False` (marker existed) and skips its XADD.
+    # Both calls STILL return the routing URL to the Worker so the
+    # user-facing 302 is unaffected — only the analytics-side
+    # double-write is prevented. This matches the data-flow.md
+    # design intent of `click:{click_id}` TTL 30d and aligns the
+    # postback dedup pattern (event:{click_id}:{type} SETNX 30d)
+    # already documented in data-flow.md.
+    #
+    # Fail-open semantics: if the SET call itself fails (Redis
+    # impaired), we LOG + skip dedup and proceed with XADD. A
+    # duplicate is preferable to a lost click in that case — the
+    # central collector + ClickHouse can deduplicate downstream
+    # (click_id is the natural primary key per data-flow.md).
+    #
+    # Operator escape hatch: `click_dedup_ttl_seconds=0` disables
+    # the gate entirely (skip both SET and the check). Use only for
+    # incident response (Redis OOM, retry-storm during deploy).
+    dedup_ok = await _acquire_click_dedup(req.click_id)
+    if dedup_ok is False:
+        # Duplicate detected — return success without re-writing the
+        # stream / disk fallback. Worker user still gets the redirect.
+        emit_checkpoint("click.duplicate_skipped", {
+            "click_id": req.click_id,
+            "outcome": "duplicate",
+        })
+        timing["endpoint_total_ms"] = round(
+            (time.perf_counter() - t_endpoint_start) * 1000, 2,
+        )
+        response = {"url": result["url"], "status": 302, "timing": timing}
+        if x_test_id:
+            response["echoed_test_id"] = x_test_id
+            emit_checkpoint("click.decide_out", {
+                "click_id": req.click_id,
+                "outcome": "duplicate",
+                "url": result["url"][:200],
+                "endpoint_total_ms": timing["endpoint_total_ms"],
+            })
+        return response
+    # dedup_ok is True (first-seen) or None (Redis dedup unavailable
+    # — fail-open, proceed with XADD as before).
 
     # Write to local stream.
     # T2.1 / G-22: inline `MAXLEN ~ N` enforces a hard ceiling on

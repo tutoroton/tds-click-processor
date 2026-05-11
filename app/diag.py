@@ -102,7 +102,15 @@ logger = logging.getLogger("tds.diag")
 # narrowest correct match. We accept dashes + hex chars only, capped
 # at 64 (handles uuid4 with optional run-suffix per the traffic
 # framework convention). Mirror of admin-api/app/diag.py validator.
-_VALID_TEST_ID = re.compile(r"^[0-9a-fA-F-]{8,64}$")
+# M4 fix (2026-05-11): require ≥1 hex digit. The previous regex
+# `^[0-9a-fA-F-]{8,64}$` accepted strings of only dashes like
+# `--------` — these passed validation, polluted Sentry tag
+# cardinality, and caused `obs:test:--------` key collisions
+# across unrelated probes that happened to pick the trivial
+# value. The `(?=.*[0-9a-fA-F])` lookahead asserts at least one
+# hex digit is present; the rest of the contract is unchanged.
+# Mirrored in admin-api/app/diag.py + Worker index.js.
+_VALID_TEST_ID = re.compile(r"^(?=.*[0-9a-fA-F])[0-9a-fA-F-]{8,64}$")
 
 
 def _is_valid_test_id(test_id: str) -> bool:

@@ -19,7 +19,7 @@ from sentry_sdk.integrations.starlette import StarletteIntegration
 from fastapi import FastAPI, Header, HTTPException, Request
 from contextlib import asynccontextmanager
 
-from app.config import settings
+from app.config import _LOCAL_ENVIRONMENTS, settings
 from app.diag import (
     before_send as diag_before_send,
     emit_checkpoint,
@@ -710,10 +710,32 @@ async def receive_sync(
 async def seed_data(x_tds_key: str = Header("", alias="X-TDS-Key")):
     """Load default routing data into local Redis.
 
-    DISABLED in production. Only available in development mode.
+    DISABLED outside local/development. Only available when the
+    `_LOCAL_ENVIRONMENTS` membership check passes.
     """
-    if settings.environment == "production":
-        raise HTTPException(status_code=403, detail="Seed disabled in production. Use /admin/sync.")
+    # M8 fix (2026-05-11): was `== "production"`, which only blocked
+    # the exact string "production". A `TDS_ENVIRONMENT=staging` (or
+    # any typo / capitalisation drift) silently passed this gate and
+    # then a separate auth issue (H6 fail-open when `tds_secret_key=""`)
+    # could let an attacker hit /admin/seed → overwrite Redis routing
+    # data with hardcoded campaigns 1/2/3 → real clicks redirected
+    # to `https://example.com/offer-*` placeholders. Two independent
+    # gate failures compounded to unauthenticated seed on staging.
+    #
+    # Now uses the same `_LOCAL_ENVIRONMENTS` frozenset that the
+    # config's `_enforce_secret_presence` guard uses — single source
+    # of truth for "is this a sandbox env that allows dev affordances".
+    # If `environment` is not in {"local", "development"}, /admin/seed
+    # is 403 regardless of auth header (because seed has no business
+    # being callable on staging or production).
+    if settings.environment not in _LOCAL_ENVIRONMENTS:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Seed disabled outside local/development environments. "
+                "Use /admin/sync for staging/production routing data."
+            ),
+        )
 
     # T1.13 (G-30 closure 2026-05-08) — `hmac.compare_digest` instead of
     # `!=`. Mirrors `/decide` + `/admin/sync` (lines 100, 266) and rule

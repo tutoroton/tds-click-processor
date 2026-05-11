@@ -133,7 +133,12 @@ def _make_redis_mock(initial_managed: set[str] | None = None) -> AsyncMock:
     # delete pipeline only exists when there's something to delete.
     pipelines: list[MagicMock] = []
 
-    def _pipeline_factory():
+    def _pipeline_factory(*args, **kwargs):
+        # H2 fix (2026-05-11) added `transaction=True` to the write
+        # pipeline construction in `apply_snapshot`. Accept arbitrary
+        # args/kwargs so the test mock stays compatible with either
+        # call style. The real redis-py accepts the kwarg and
+        # returns a pipeline that wraps ops in MULTI/EXEC.
         p = _make_pipeline_mock()
         pipelines.append(p)
         return p

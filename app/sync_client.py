@@ -88,9 +88,27 @@ async def apply_snapshot(redis, snapshot: dict) -> dict:
     # regardless of cardinality vs. the previous N-prefix SCAN loop.
     all_existing: set[str] = set(await redis.smembers(_MANAGED_KEY))
 
-    # Step 2: WRITE new keys first (before any deletes)
+    # Step 2: WRITE new keys first (before any deletes).
+    #
+    # H2 fix (2026-05-11): wrap in `transaction=True` so the entire
+    # batch executes as one Redis MULTI/EXEC block. Without this, the
+    # `delete + sadd` pair for set keys (and `delete + rpush` for list
+    # keys) below is pipelined (single round-trip) but NOT atomic at
+    # the server — a concurrent `/decide` reader between the DELETE
+    # and SADD applying server-side sees an empty set and falls through
+    # to no-match. Under single-process uvicorn (--workers 2 default
+    # in the Dockerfile) the race window is microseconds and rarely
+    # observable, but it becomes load-bearing if the deployment scales
+    # workers horizontally or if a future heavy `/decide` path widens
+    # the read-vs-sync race. The MULTI block makes set replacement
+    # atomic in the same trip — readers see either the old set or the
+    # new set, never an empty intermediate state.
+    #
+    # Aligns with `sync-protocol` rule's asyncio.Lock central-side
+    # guarantee — the sync apply on the click-processor side is now
+    # transactional in the same spirit as the producer side.
     new_keys: set[str] = set()
-    write_pipe = redis.pipeline()
+    write_pipe = redis.pipeline(transaction=True)
 
     # Detect keys that change type (rare — only on schema changes)
     type_changed_keys = set()

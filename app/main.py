@@ -152,6 +152,49 @@ app = FastAPI(
 
 
 # ============================================================================
+# Shared X-TDS-Key auth helper (H6 fix, 2026-05-11)
+# ============================================================================
+
+def _check_tds_key(x_tds_key: str) -> None:
+    """Validate the `X-TDS-Key` header. Raise 403 on failure.
+
+    H6 fix (2026-05-11): rewritten from the legacy pattern
+        if settings.tds_secret_key and (not x_tds_key or not compare_digest(...)):
+            raise 403
+    to:
+        if not (x_tds_key and settings.tds_secret_key and compare_digest(...)):
+            raise 403
+
+    The legacy pattern fails OPEN when `settings.tds_secret_key == ""`
+    — the leading `if settings.tds_secret_key and ...` short-circuits
+    on the falsy `and`, leaving every endpoint that uses it
+    unauthenticated. In production this is unreachable because
+    `_enforce_secret_presence` (config.py model validator) refuses to
+    boot with an empty key in non-local environments. But in local /
+    development, an operator who runs the container on a non-isolated
+    network (LAN, public IP, accidentally) is exposed.
+
+    The inverted form fails CLOSED — empty stored secret means EVERY
+    request is rejected. This is the safer default: local-dev with no
+    secret should not accept ANY traffic; the operator must either
+    set a key or use a different endpoint.
+
+    Timing-safe per rule `api-security` — `hmac.compare_digest` is
+    used regardless of which side is empty (we still construct the
+    comparison so a timing observation cannot leak whether the stored
+    secret is empty).
+    """
+    # Encode to bytes once — compare_digest accepts both str and bytes
+    # but mixing trips a TypeError. The empty bytes case is harmless
+    # (compare_digest("", "") returns True; the outer `and` chain
+    # catches it via the truthiness checks).
+    provided = x_tds_key or ""
+    stored = settings.tds_secret_key or ""
+    if not (provided and stored and hmac.compare_digest(provided, stored)):
+        raise HTTPException(status_code=403, detail="Invalid TDS key")
+
+
+# ============================================================================
 # Click idempotency gate (H1 fix, 2026-05-11)
 # ============================================================================
 
@@ -219,9 +262,8 @@ async def decide(
     """Main routing endpoint. Called by CF Worker for every click."""
     t_endpoint_start = time.perf_counter()
 
-    # Auth check (timing-safe)
-    if settings.tds_secret_key and (not x_tds_key or not hmac.compare_digest(x_tds_key, settings.tds_secret_key)):
-        raise HTTPException(status_code=403, detail="Invalid TDS key")
+    # Auth check (timing-safe + fail-closed per H6 fix).
+    _check_tds_key(x_tds_key)
 
     # Traffic simulation framework (Phase 1, 2026-05-09) +
     # diagnostic toolkit (Phase 1, 2026-05-10).
@@ -574,9 +616,8 @@ async def receive_sync(
         ~500MB worth of JSON in ~50MB on the wire (~85-90% ratio
         for routing config payloads).
     """
-    # Auth (timing-safe)
-    if settings.tds_secret_key and (not x_tds_key or not hmac.compare_digest(x_tds_key, settings.tds_secret_key)):
-        raise HTTPException(status_code=403, detail="Invalid key")
+    # Auth (timing-safe + fail-closed per H6 fix).
+    _check_tds_key(x_tds_key)
 
     # Diagnostic correlation — when admin-api propagated X-Test-Id (per
     # `_build_push_headers` in admin-api SyncService), bind it so the
@@ -737,15 +778,15 @@ async def seed_data(x_tds_key: str = Header("", alias="X-TDS-Key")):
             ),
         )
 
-    # T1.13 (G-30 closure 2026-05-08) — `hmac.compare_digest` instead of
-    # `!=`. Mirrors `/decide` + `/admin/sync` (lines 100, 266) and rule
-    # `sync-protocol` → "hmac.compare_digest for auth". Defense-in-depth:
-    # `/admin/seed` is dev-only AND already gated by environment check
-    # above, so no production risk today, but the inconsistency was a
-    # foot-gun for any future operator copying this block to a new
-    # endpoint. Regression-fenced by tests/unit/test_admin_auth_timing_safe.py.
-    if settings.tds_secret_key and (not x_tds_key or not hmac.compare_digest(x_tds_key, settings.tds_secret_key)):
-        raise HTTPException(status_code=403, detail="Invalid key")
+    # H6 fix (2026-05-11): use the shared `_check_tds_key` helper.
+    # Was the legacy fail-open `if settings.tds_secret_key and ...`;
+    # now fails closed via `_check_tds_key` (empty stored secret →
+    # all requests rejected). Original T1.13 (G-30 closure 2026-05-08)
+    # timing-safety pin is preserved — `_check_tds_key` uses
+    # `hmac.compare_digest` per rule `sync-protocol` → "hmac.compare_digest
+    # for auth". Regression-fenced by
+    # tests/unit/test_admin_auth_timing_safe.py.
+    _check_tds_key(x_tds_key)
 
     r = await get_redis()
     pipe = r.pipeline()

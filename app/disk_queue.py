@@ -354,6 +354,18 @@ async def drain_to_redis(redis) -> dict:
                     # stream. Unlink the queued file and skip XADD;
                     # counter still decrements (file is gone, no
                     # accounting drift).
+                    #
+                    # VF1 fix (2026-05-11 code-review cycle):
+                    # increment `skipped`, NOT `drained`. The
+                    # docstring of `drain_to_redis` says drained =
+                    # "files successfully replayed + deleted" — but
+                    # a duplicate is NOT replayed (we INTENTIONALLY
+                    # skip the XADD). Bucketing it under `drained`
+                    # inflated the success-rate metric and made the
+                    # `skipped` counter misrepresent reality during
+                    # any post-Redis-outage replay where the
+                    # original /decide had also succeeded on a
+                    # sibling node.
                     logger.info(
                         "Drain: duplicate click_id %s (already in stream) — "
                         "dropping queued file %s",
@@ -369,7 +381,7 @@ async def drain_to_redis(redis) -> dict:
                             path.name, exc,
                         )
                     _decrement_size()
-                    drained += 1  # accounting: file IS gone, click handled
+                    skipped += 1
                     continue
             except Exception as exc:  # noqa: BLE001 — Redis impaired
                 # Dedup failed → fail-open to legacy behaviour. The XADD

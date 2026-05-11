@@ -367,21 +367,29 @@ async def _drain_batch(redis, queue: asyncio.Queue, maxlen: int, ttl: int) -> No
 
 
 def traces_sampler(sampling_context: dict) -> float:
-    """Sentry tracesSampler — boost to 1.0 when X-Test-Id is present
-    AND `diag_traces_boost` toggle is on. Falls back to 0.1 baseline
-    otherwise.
+    """Sentry tracesSampler — boost to 1.0 when a VALIDATED X-Test-Id
+    is present AND `diag_traces_boost` toggle is on. Falls back to
+    0.1 baseline otherwise.
 
     Reads the header directly from the WSGI/ASGI envelope so it works
     BEFORE FastAPI middleware has had a chance to bind the context
     var — the sampler runs at request-span creation time which is the
     earliest possible point in the trace.
+
+    VF5 fix (2026-05-11 validation cycle): the Worker's
+    `_diagTracesSampler` gates on `_isValidTestId(testId)` before
+    boosting, ensuring an attacker-crafted header value (newline
+    injection, oversized, non-hex) doesn't burn Sentry quota or
+    pollute trace tag cardinality. The Python twin previously
+    accepted ANY non-empty header — asymmetric with the Worker. Now
+    both sides validate via the same regex.
     """
     if not settings.diag_traces_boost:
         return 0.1
     asgi_scope = sampling_context.get("asgi_scope") or {}
     headers = dict(asgi_scope.get("headers") or [])
     test_id = headers.get(b"x-test-id", b"").decode("ascii", errors="ignore")
-    if test_id:
+    if test_id and _is_valid_test_id(test_id):
         return 1.0
     return 0.1
 

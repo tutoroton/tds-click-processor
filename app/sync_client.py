@@ -90,19 +90,22 @@ async def apply_snapshot(redis, snapshot: dict) -> dict:
 
     # Step 2: WRITE new keys first (before any deletes).
     #
-    # H2 fix (2026-05-11): wrap in `transaction=True` so the entire
-    # batch executes as one Redis MULTI/EXEC block. Without this, the
-    # `delete + sadd` pair for set keys (and `delete + rpush` for list
-    # keys) below is pipelined (single round-trip) but NOT atomic at
-    # the server — a concurrent `/decide` reader between the DELETE
-    # and SADD applying server-side sees an empty set and falls through
-    # to no-match. Under single-process uvicorn (--workers 2 default
-    # in the Dockerfile) the race window is microseconds and rarely
-    # observable, but it becomes load-bearing if the deployment scales
-    # workers horizontally or if a future heavy `/decide` path widens
-    # the read-vs-sync race. The MULTI block makes set replacement
-    # atomic in the same trip — readers see either the old set or the
-    # new set, never an empty intermediate state.
+    # H2 fix (2026-05-11) — scope is the WRITE PHASE ONLY:
+    # `transaction=True` here wraps the per-key DELETE + SADD (and
+    # DELETE + RPUSH for lists) inside one Redis MULTI/EXEC block,
+    # so a concurrent `/decide` reader sees EITHER the old set OR
+    # the new set, never an empty intermediate state.
+    #
+    # NOT covered by this transaction:
+    #   - the stale-delete pipeline at Step 3 (best-effort)
+    #   - the tracking pipeline at Step 4 (best-effort)
+    #   - the cross-pipeline ordering (Step 2 commits before Step 3
+    #     starts, but a reader between Steps 2 and 3 sees the new
+    #     keys + the to-be-deleted old keys)
+    # The "write-first, delete-after" sequencing (rule
+    # `sync-protocol`) guarantees no routing-empty window between
+    # full-sync attempts; this transaction tightens the
+    # within-Step-2 race observed under burst load.
     #
     # Aligns with `sync-protocol` rule's asyncio.Lock central-side
     # guarantee — the sync apply on the click-processor side is now
@@ -110,11 +113,12 @@ async def apply_snapshot(redis, snapshot: dict) -> dict:
     new_keys: set[str] = set()
     write_pipe = redis.pipeline(transaction=True)
 
-    # Detect keys that change type (rare — only on schema changes)
-    type_changed_keys = set()
-    for key in new_keys & all_existing:
-        # If the key exists but we're about to write a different type, delete first
-        pass  # Types rarely change; handled by Redis command overwrite
+    # VF2 fix (2026-05-11 code-review cycle): dead `type_changed_keys`
+    # set + empty-body loop removed. It was scaffolding from an earlier
+    # refactor pass — the variable was never read again and the loop's
+    # body was `pass`. The comment above the deleted block (type
+    # rarely changes; handled by Redis command overwrite) is the
+    # accurate runtime behaviour and is preserved in this comment.
 
     for key, value in data.items():
         new_keys.add(key)

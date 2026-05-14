@@ -239,12 +239,13 @@ async def _check_tds_key(x_tds_key: str) -> int | None:
         digest = _hash_secret(provided)
         worker_id_str = await r.get(f"worker_secret_hash:{digest}")
         if worker_id_str:
-            # Bytes vs str — fakeredis-aio returns bytes by default;
-            # production uses redis-py decode_responses=True so it's
-            # already str. Normalise here so callers see a consistent
-            # int return type.
-            if isinstance(worker_id_str, bytes):
-                worker_id_str = worker_id_str.decode("utf-8")
+            # Production redis-py is configured with `decode_responses=True`
+            # (see `app/redis_client.py:15`) so every value is already a
+            # str. The defensive bytes-decode branch that previously lived
+            # here was dead code per the F.24 Phase 1 audit (Agent B MED).
+            # If a future redis client config flips that off, the
+            # `int(worker_id_str)` cast below will raise TypeError on
+            # bytes input and the except branch falls through to legacy.
             try:
                 return int(worker_id_str)
             except (TypeError, ValueError):

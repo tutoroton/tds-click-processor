@@ -152,46 +152,132 @@ app = FastAPI(
 
 
 # ============================================================================
-# Shared X-TDS-Key auth helper (H6 fix, 2026-05-11)
+# Shared X-TDS-Key auth helper — F.24 Phase 1 dual-path + H6 fix
 # ============================================================================
+#
+# DUAL-PATH AUTH (F.24 Phase 1, 2026-05-14)
+# -----------------------------------------
+# Admin-api now emits a per-Worker `TDS_SECRET_KEY` (see WorkerService.
+# deploy_script + sync builder `workers.py`). The auth path discovers
+# which Worker sent a request by hashing the incoming `X-TDS-Key` with
+# sha256 and looking up `worker_secret_hash:{hex} → worker_id` in
+# local Redis. The legacy global `settings.tds_secret_key` remains a
+# fallback so:
+#   1. Existing AU/CA traffic (Worker still has the old global secret
+#      baked in) stays authenticated until the next deploy_script
+#      rotates its secret to a per-Worker value.
+#   2. Rolling deploys never have an authentication gap — old
+#      click-processor sees only global; new click-processor sees both.
+#   3. Operator emergency rollback to pre-Phase-1 is a zero-touch
+#      revert — re-deploying the old Worker script still works.
+#
+# Order matters for clarity, not correctness: we check per-Worker
+# FIRST because that is the long-term primary path. After all Workers
+# rotate their secrets (24-72h after Phase 1 rollout), the legacy
+# branch is dead code that can be removed in a follow-up cleanup.
+#
+# Hot-path cost: one Redis GET (~0.5ms) added to /decide's 10ms budget
+# — within the contract documented in `diagnostic-mode` rule. The
+# Redis call uses the singleton client (`get_redis()`) so no
+# connection allocation overhead per request.
 
-def _check_tds_key(x_tds_key: str) -> None:
+def _hash_secret(plaintext: str) -> str:
+    """sha256 hex digest of the secret. Identical to the admin-api
+    sync builder's hash (see `app/sync/builders/workers.py`) so the
+    two sides agree on the lookup key.
+    """
+    return hashlib.sha256(plaintext.encode("utf-8")).hexdigest()
+
+
+async def _check_tds_key(x_tds_key: str) -> int | None:
     """Validate the `X-TDS-Key` header. Raise 403 on failure.
 
-    H6 fix (2026-05-11): rewritten from the legacy pattern
-        if settings.tds_secret_key and (not x_tds_key or not compare_digest(...)):
-            raise 403
-    to:
-        if not (x_tds_key and settings.tds_secret_key and compare_digest(...)):
-            raise 403
+    Returns: worker_id (int) when the per-Worker path matched, OR
+    `0` when the legacy global fallback matched (sentinel — the value
+    is the int 0, not a real id). Returns are advisory; callers may
+    ignore them today (no caller pattern requires forensic
+    attribution yet — that's the F.24 plan §0.2 deferred phase).
 
-    The legacy pattern fails OPEN when `settings.tds_secret_key == ""`
-    — the leading `if settings.tds_secret_key and ...` short-circuits
-    on the falsy `and`, leaving every endpoint that uses it
-    unauthenticated. In production this is unreachable because
-    `_enforce_secret_presence` (config.py model validator) refuses to
-    boot with an empty key in non-local environments. But in local /
-    development, an operator who runs the container on a non-isolated
-    network (LAN, public IP, accidentally) is exposed.
+    Algorithm:
+      1. PER-WORKER lookup. Hash `x_tds_key` with sha256, GET
+         `worker_secret_hash:{hex}` in local Redis. A hit returns
+         the originating Worker id.
+      2. LEGACY global fallback. Constant-time compare against
+         `settings.tds_secret_key`. Empty stored key fails closed
+         (H6 fix discipline preserved — see "Fail-closed" note below).
+      3. NEITHER → raise HTTPException(403).
 
-    The inverted form fails CLOSED — empty stored secret means EVERY
-    request is rejected. This is the safer default: local-dev with no
-    secret should not accept ANY traffic; the operator must either
-    set a key or use a different endpoint.
+    Fail-closed discipline (H6 fix, 2026-05-11 — preserved):
+      An empty `settings.tds_secret_key` MUST NOT auto-authenticate
+      any caller. The Redis lookup similarly cannot pass an empty
+      x_tds_key — the digest of an empty string is a real value, but
+      the admin-api builder excludes empty ciphertexts so the key
+      simply isn't there. Both branches fail closed for the
+      not-configured case.
 
-    Timing-safe per rule `api-security` — `hmac.compare_digest` is
-    used regardless of which side is empty (we still construct the
-    comparison so a timing observation cannot leak whether the stored
-    secret is empty).
+    Timing safety:
+      The legacy path uses `hmac.compare_digest` regardless of which
+      side is empty so a timing observation cannot leak whether the
+      stored secret is empty (per `api-security`). The Redis lookup
+      uses the hex digest of the provided value — even a timing
+      observation that reveals "key exists in Redis" doesn't leak
+      the secret itself (digests are one-way).
+
+    Redis-unavailable mode:
+      If Redis is unreachable (rare — `/decide` already relies on
+      Redis for SETNX dedup + XADD), we fall through to the legacy
+      path. Operator misconfig (empty global + Redis down) results
+      in 403 for every request — fail-closed.
     """
-    # Encode to bytes once — compare_digest accepts both str and bytes
-    # but mixing trips a TypeError. The empty bytes case is harmless
-    # (compare_digest("", "") returns True; the outer `and` chain
-    # catches it via the truthiness checks).
     provided = x_tds_key or ""
-    stored = settings.tds_secret_key or ""
-    if not (provided and stored and hmac.compare_digest(provided, stored)):
+    if not provided:
         raise HTTPException(status_code=403, detail="Invalid TDS key")
+
+    # ── Per-Worker path (F.24 Phase 1) ──────────────────────────────
+    try:
+        r = await get_redis()
+        digest = _hash_secret(provided)
+        worker_id_str = await r.get(f"worker_secret_hash:{digest}")
+        if worker_id_str:
+            # Bytes vs str — fakeredis-aio returns bytes by default;
+            # production uses redis-py decode_responses=True so it's
+            # already str. Normalise here so callers see a consistent
+            # int return type.
+            if isinstance(worker_id_str, bytes):
+                worker_id_str = worker_id_str.decode("utf-8")
+            try:
+                return int(worker_id_str)
+            except (TypeError, ValueError):
+                # Corrupted index entry — log + fall through to
+                # legacy. Don't fail the auth because a sync glitch
+                # corrupted a row; the legacy global secret is the
+                # safety net.
+                logger.warning(
+                    "worker_secret_hash:%s → non-integer worker_id=%r; "
+                    "falling through to legacy global secret check.",
+                    digest, worker_id_str,
+                )
+    except HTTPException:
+        raise
+    except Exception as e:
+        # Redis unreachable or transient error — fall through to
+        # legacy. Log loud so operators see when this fires (it
+        # SHOULD be rare; persistent Redis outage is a separate
+        # incident affecting many other code paths).
+        logger.warning(
+            "_check_tds_key: per-Worker lookup failed (%s); "
+            "falling through to legacy global secret.", e,
+        )
+
+    # ── Legacy global secret fallback ───────────────────────────────
+    stored = settings.tds_secret_key or ""
+    if provided and stored and hmac.compare_digest(provided, stored):
+        # Sentinel 0 — distinguishes "matched via legacy" from "matched
+        # via per-Worker hash". No real Worker has id=0 (SERIAL starts
+        # at 1), so callers can disambiguate trivially.
+        return 0
+
+    raise HTTPException(status_code=403, detail="Invalid TDS key")
 
 
 # ============================================================================
@@ -263,7 +349,7 @@ async def decide(
     t_endpoint_start = time.perf_counter()
 
     # Auth check (timing-safe + fail-closed per H6 fix).
-    _check_tds_key(x_tds_key)
+    await _check_tds_key(x_tds_key)
 
     # Traffic simulation framework (Phase 1, 2026-05-09) +
     # diagnostic toolkit (Phase 1, 2026-05-10).
@@ -617,7 +703,7 @@ async def receive_sync(
         for routing config payloads).
     """
     # Auth (timing-safe + fail-closed per H6 fix).
-    _check_tds_key(x_tds_key)
+    await _check_tds_key(x_tds_key)
 
     # Diagnostic correlation — when admin-api propagated X-Test-Id (per
     # `_build_push_headers` in admin-api SyncService), bind it so the
@@ -786,7 +872,7 @@ async def seed_data(x_tds_key: str = Header("", alias="X-TDS-Key")):
     # `hmac.compare_digest` per rule `sync-protocol` → "hmac.compare_digest
     # for auth". Regression-fenced by
     # tests/unit/test_admin_auth_timing_safe.py.
-    _check_tds_key(x_tds_key)
+    await _check_tds_key(x_tds_key)
 
     r = await get_redis()
     pipe = r.pipeline()

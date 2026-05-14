@@ -58,6 +58,12 @@ _ROUTING_PREFIXES = [
     "team:", "teams:active",
     "department:", "departments:active",
     "custom_group:", "custom_groups:active",
+    # F.24 Phase 1 — per-Worker TDS_SECRET_KEY auth lookup index.
+    # Click-processor's `_check_tds_key` hashes incoming X-TDS-Key
+    # + GETs `worker_secret_hash:{hex}` to resolve the originating
+    # Worker. A miss falls through to the legacy global secret
+    # constant-time compare (dual-window discipline).
+    "worker_secret_hash:",
 ]
 
 

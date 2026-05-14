@@ -149,8 +149,24 @@ def test_helper_fails_closed_when_either_side_empty():
         "locals so the fail-closed contract is explicit. "
         "If renaming, update this test."
     )
-    assert "if not (provided and stored" in body, (
-        "H6 fail-closed pattern `if not (provided and stored and "
-        "compare_digest(...))` is the regression-fence shape. "
-        "If you intentionally changed it, update this assertion."
+    # F.24 Phase 1 (2026-05-14): the helper went from
+    #   `if not (provided and stored and compare_digest(...))`
+    # to the inverted positive-match form
+    #   `if provided and stored and compare_digest(...): return 0`
+    # The fail-closed semantics are preserved — if either side is
+    # empty, the positive branch doesn't fire and execution falls
+    # through to `raise HTTPException`. The regression fence below
+    # pins the semantic invariant: all three identifiers
+    # (`provided`, `stored`, `compare_digest`) MUST co-occur in the
+    # legacy fallback branch.
+    assert (
+        "if provided and stored and hmac.compare_digest" in body
+        or "if not (provided and stored and hmac.compare_digest" in body
+    ), (
+        "H6 fail-closed contract requires `provided`, `stored`, and "
+        "`hmac.compare_digest` to co-occur in the legacy auth branch. "
+        "Either the positive form (F.24 Phase 1) or the original "
+        "negative form is acceptable; both fail closed when either "
+        "side is empty. If neither matches, the auth surface drifted "
+        "off the regression fence — fix the helper or update this test."
     )

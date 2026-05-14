@@ -305,6 +305,70 @@ class TestFullSetIntegration:
 
 
 # ---------------------------------------------------------------------------
+# F.X canonical-binding rule — end-to-end through build_url
+# ---------------------------------------------------------------------------
+
+
+class TestCanonicalBindingFXBuildUrl:
+    """End-to-end coverage of the F.X canonical-binding rule
+    (locked 2026-05-14, plan doc
+    `docs/roadmap/stage-1a-research/canonical-slot-binding-fix.md`).
+
+    Resolution-layer tests live in ``test_resolution.py`` —
+    ``TestCanonicalBindingFX``. These tests pin the same contract
+    through ``build_url`` so a regression in slot → values dict
+    threading also surfaces in CI.
+    """
+
+    def test_canonical_source_macro_resolves_from_query(self):
+        """Plan § 1 root cause — ``{source}`` macro must substitute
+        the value of ``?source=`` GET key even when no
+        ``param_mappings`` entry enumerates the slot.
+
+        This is the exact symptom Flow 300 v3 hit on 2026-05-13:
+        operator wired ``&source={source}`` into the redirect
+        template, click arrived with ``?source=fb``, and pre-F.X
+        the macro substituted empty. Post-F.X the value flows
+        through.
+        """
+        url = build_url(
+            "https://x.example/?src={source}",
+            _req(),  # query_params includes source=fb
+            "1", "101",
+            source_mappings=None,
+            campaign_mappings=None,
+        )
+        assert "src=fb" in url, (
+            f"F.X regression: canonical {{source}} macro lost its "
+            f"value in {url!r}. Verify resolve_slots iterates "
+            f"CANONICAL_SLOTS and build_url threads the slot dict "
+            f"into the macro values."
+        )
+
+    def test_canonical_keyword_macro_resolves_via_canonical_first(self):
+        """Plan § 3 decision matrix — canonical wins on collision.
+
+        Operator defines source mapping ``{slot:'keyword', alias:'k'}``.
+        Click arrives with BOTH ``?keyword=canonical_value`` AND
+        ``?k=alias_value``. F.X canonical-first guarantees that
+        ``{keyword}`` macro substitutes ``canonical_value`` (NOT
+        ``alias_value``) because the canonical name takes priority.
+        """
+        url = build_url(
+            "https://x.example/?kw={keyword}",
+            _req(query_params={
+                "keyword": "canonical_value",
+                "k": "alias_value",
+            }),
+            "1", "101",
+            source_mappings=[{"slot": "keyword", "alias": "k"}],
+            campaign_mappings=None,
+        )
+        assert "kw=canonical_value" in url
+        assert "alias_value" not in url
+
+
+# ---------------------------------------------------------------------------
 # Source-pin: build_url signature
 # ---------------------------------------------------------------------------
 

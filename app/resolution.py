@@ -8,17 +8,29 @@ Pure helpers — NO I/O. Used by click-processor's `/decide` to:
   3. Capture unmapped query params into `extras` for the eventual
      `clicks.extras` JSONB column (Stage 3 storage target).
 
-Design pin: PARAMETER-SYSTEM.md §"Resolution chain" (lines 74-110).
-The semantics are a textbook 4-priority chain with one subtlety —
-when both layers define a slot, the campaign's alias wins for the
-URL-key lookup, but if neither the request nor the campaign hardcode
-fills it, the source's hardcoded value still applies as a final
-fallback. That layered behavior is what `resolve_slots` encodes.
+Design pin: PARAMETER-SYSTEM.md §"Key resolution".
+
+Canonical-binding rule (F.X, locked 2026-05-14; plan doc:
+`docs/roadmap/stage-1a-research/canonical-slot-binding-fix.md`):
+
+  Every name in `CANONICAL_SLOTS` (= `RESERVED_SLOTS` ∪ `SUB_SLOTS`,
+  39 names) is ALWAYS treated as a primary input key for its slot
+  regardless of whether a `SubIdMapping` entry exists. The
+  `alias` field on an entry adds an ADDITIONAL alternative URL
+  key. Both keys are tried at click time; canonical name wins on
+  collision (i.e., `?source=A&s=B` with `{slot:"source", alias:"s"}`
+  binds `slots["source"]="A"`). The previous Vector 2.8 behaviour
+  — where canonical slots only resolved when explicitly enumerated
+  in `param_mappings` — silently produced empty `{macro}`
+  substitutions for any operator who relied on the default vocabulary
+  (see Flow 300 v3 debug, 2026-05-13).
 
 Stage 4 (event-processor) will reuse this same module for postback
 slot resolution — the algorithm is identical, just over a different
-(request URL > postback config > NULL) chain. Stage 4 entry decides
-whether to share via `app/common/` or vendor.
+(request URL > postback config > NULL) chain. The same
+canonical-binding rule applies once that path lands; the postback
+registry (`RESERVED_POSTBACK_SLOTS`, 5 names) extends the canonical
+set in that scope.
 """
 
 from __future__ import annotations
@@ -26,6 +38,8 @@ from __future__ import annotations
 import json
 import logging
 from typing import Any
+
+from app.parameters import CANONICAL_SLOTS
 
 logger = logging.getLogger("tds.resolution")
 
@@ -169,22 +183,42 @@ def resolve_slots(
 
     Returns:
         `(slots, extras)`:
-          - `slots` — `{slot_name: value_or_None}`. Every slot that
-            either layer defines is keyed; value is `None` when no
-            priority level filled it (the substituter then handles
-            NULL safely).
+          - `slots` — `{slot_name: value_or_None}`. Includes every
+            slot that EITHER (a) resolved to a non-NULL value through
+            any priority level, OR (b) is explicitly enumerated in
+            `source_mappings` / `campaign_mappings`. Canonical slots
+            (`CANONICAL_SLOTS`) that auto-iterated but didn't resolve
+            and were never explicitly mapped are OMITTED — that keeps
+            the dict small and preserves the pre-F.X test contract
+            (`"keyword" not in slots` when nothing populates it).
           - `extras` — `{get_key: value}` for incoming query params
-            not consumed by any mapping. Becomes the `clicks.extras`
-            JSONB row in Stage 3.
+            not consumed by any mapping AND not matching a canonical
+            slot name. Becomes the `clicks.extras` JSONB row in
+            Stage 3.
 
-    Resolution order per PARAMETER-SYSTEM.md:
-      1. Request URL via merged map (campaign alias wins per slot).
-      2. Campaign hardcoded `default_value` (when campaign defines
-         the slot).
-      3. Source hardcoded `default_value` (when source defines the
-         slot — applies even if campaign also defined but had no
-         hardcoded value to contribute).
-      4. NULL.
+    Resolution chain per PARAMETER-SYSTEM.md (F.X canonical-binding):
+      For each slot in `CANONICAL_SLOTS ∪ src_by_slot ∪ cmp_by_slot`:
+
+        1. Request URL — try the canonical slot name first, then the
+           explicit `alias` (when defined and different). First
+           non-empty value wins. Canonical-first guarantees that a
+           same-named GET key beats an alias collision per the
+           design decision matrix.
+        2. Campaign hardcoded `default_value` (only when campaign
+           defines the slot).
+        3. Source hardcoded `default_value` (only when source defines
+           the slot — applies even when campaign overrode the alias
+           but left `default_value` empty).
+        4. NULL.
+
+    Examined-key bookkeeping: every candidate GET key (canonical
+    name AND alias) that exists in `query_params` is marked
+    consumed before priority-1 picks a winner. That way the loser
+    (the key whose value canonical-first ignored) does NOT leak
+    into `extras`. Canonical slot names are also dropped from
+    `extras` unconditionally as a defence-in-depth — even when the
+    slot never matched any of the resolution layers, its GET key
+    was semantically claimed.
     """
     src = source_mappings if isinstance(source_mappings, list) else []
     cmp = campaign_mappings if isinstance(campaign_mappings, list) else []
@@ -207,10 +241,13 @@ def resolve_slots(
             if isinstance(slot, str) and slot:
                 cmp_by_slot[slot] = m
 
-    # Union of slots that ANY layer defines — that's the set we need
-    # to resolve. Anything outside this set has no chance of being
-    # bound to a canonical slot, so it falls into extras.
-    all_slots = set(src_by_slot) | set(cmp_by_slot)
+    # F.X — canonical-binding union. Every canonical slot
+    # auto-iterates so a same-named GET key reaches its slot even
+    # without an admin-authored mapping entry. Explicitly-mapped
+    # non-canonical slots (legacy advertiser flows that mapped to
+    # an arbitrary slot name not in the canonical registry) keep
+    # working through the same loop.
+    all_slots = CANONICAL_SLOTS | set(src_by_slot) | set(cmp_by_slot)
 
     # Track which incoming GET keys were consumed by a mapping so
     # `extras` can exclude them. We mark a key consumed even when
@@ -222,22 +259,46 @@ def resolve_slots(
     for slot in all_slots:
         cmp_entry = cmp_by_slot.get(slot)
         src_entry = src_by_slot.get(slot)
+        is_explicitly_mapped = (cmp_entry is not None) or (src_entry is not None)
 
         # Effective alias = campaign's wins per slot (per design
         # doc §"Key resolution"). When campaign doesn't define the
-        # slot, source's alias is the only option.
+        # slot, source's alias is the only option. When neither
+        # defines the slot (canonical-only auto-iteration), there
+        # is no alias — only the canonical name itself.
         primary_entry = cmp_entry if cmp_entry is not None else src_entry
-        # `primary_entry` is non-None because slot came from union.
-        get_key = _entry_alias(primary_entry) if primary_entry else slot
 
-        # Step 1 — request URL via merged map.
-        if get_key and get_key in query_params:
-            examined_keys.add(get_key)
-            value = query_params[get_key]
-            if value is not None and value != "":
-                slots[slot] = str(value)
-                continue
-            # Empty value → fall through to hardcoded layers.
+        # F.X — candidate GET keys in priority order. Canonical
+        # slot name FIRST, then the explicit alias (when defined
+        # and different). The plan's canonical-first decision means
+        # `?<slot_name>=` always trumps `?<alias>=` on collision.
+        get_keys: list[str] = [slot]
+        if primary_entry is not None:
+            alias = _entry_alias(primary_entry)
+            if alias and alias != slot:
+                get_keys.append(alias)
+
+        # Mark every candidate GET key that exists in the query as
+        # examined BEFORE picking a winner. This ensures the
+        # canonical-loser (or alias-loser, depending on which won)
+        # is dropped from `extras` instead of leaking as a duplicate
+        # of the resolved slot value.
+        for key in get_keys:
+            if key in query_params:
+                examined_keys.add(key)
+
+        # Step 1 — request URL. First non-empty value wins (canonical
+        # first guaranteed by `get_keys` ordering).
+        request_value: str | None = None
+        for key in get_keys:
+            raw = query_params.get(key)
+            if raw is not None and raw != "":
+                request_value = str(raw)
+                break
+
+        if request_value is not None:
+            slots[slot] = request_value
+            continue
 
         # Step 2 — campaign hardcoded (only when campaign defines).
         if cmp_entry is not None:
@@ -254,14 +315,29 @@ def resolve_slots(
                 slots[slot] = src_default
                 continue
 
-        # Step 4 — NULL.
-        slots[slot] = None
+        # Step 4 — NULL. Only emit the slot into the result dict
+        # when it was explicitly enumerated by either layer. A
+        # canonical slot that auto-iterated but resolved to nothing
+        # is omitted from `slots` — the macro substituter handles
+        # an absent key identically to a `None` value, and omitting
+        # keeps the contract close to pre-F.X tests that asserted
+        # exact dict shape on the explicit-only slot set.
+        if is_explicitly_mapped:
+            slots[slot] = None
 
-    # Extras = query keys not consumed. Coerce values to str for
-    # the eventual JSONB column (Stage 3 will pin the shape).
+    # Extras = query keys not consumed by any slot iteration AND
+    # not matching a canonical slot name. The canonical-name guard
+    # is defence-in-depth: even when a canonical slot's auto-binding
+    # loop didn't iterate over the key (e.g., the key arrived with
+    # an empty value the priority chain dropped), the key is still
+    # semantically the slot's input and should never leak as a
+    # generic extras entry. Coerce values to str for the eventual
+    # JSONB column (Stage 3 will pin the shape).
     extras: dict[str, str] = {}
     for k, v in query_params.items():
         if k in examined_keys:
+            continue
+        if k in CANONICAL_SLOTS:
             continue
         if v is None:
             continue

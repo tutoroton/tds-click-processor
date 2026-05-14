@@ -201,17 +201,32 @@ class TestPriority4Null:
         )
         assert slots == {"buyer_id": None}
 
-    def test_unmapped_slot_not_in_result(self):
-        # Slot that no layer defines doesn't appear in slots.
-        slots, _ = resolve_slots(
+    def test_canonical_slot_autobinds_without_mapping(self):
+        """F.X (2026-05-14) — canonical-binding rule.
+
+        Pre-F.X: a canonical slot like ``keyword`` only appeared in
+        the result when an entry on source/campaign explicitly
+        enumerated it. The same-named GET key was a stranger that
+        landed in ``extras``.
+
+        Post-F.X: every name in ``CANONICAL_SLOTS`` (39 names) is a
+        primary input key for its slot regardless of whether an
+        entry exists. A same-named GET key auto-binds.
+
+        Explicitly mapped slots that didn't resolve still emit
+        ``None`` so consumers (``build_url``) see the slot is present
+        but empty — same contract as pre-F.X.
+        """
+        slots, extras = resolve_slots(
             query_params={"keyword": "trader"},
             source_mappings=[{"slot": "sub1"}],
             campaign_mappings=None,
         )
-        # `keyword` slot was never mapped — not present in slots.
-        assert "keyword" not in slots
-        # `sub1` is mapped but no value → NULL.
-        assert slots == {"sub1": None}
+        # `keyword` is canonical → auto-binds from same-named key.
+        # `sub1` is explicitly mapped but has no resolvable value → NULL.
+        assert slots == {"keyword": "trader", "sub1": None}
+        # `keyword` is the canonical input — never an extras leak.
+        assert extras == {}
 
 
 # ============================================================
@@ -487,26 +502,37 @@ class TestSpecScenario:
         }
         assert extras == {}
 
-    def test_source_routing_key_lands_in_extras_when_unmapped(self):
-        """Pin behavior: `?source=<slug>` is the routing key consumed
-        by `_resolve_source_for_click`, but `resolve_slots` has no
-        knowledge of routing semantics. When neither the source nor
-        the campaign maps the canonical slot `source`, the routing
-        key flows into extras (Stage 3 will store it as JSONB).
+    def test_source_routing_key_autobinds_canonical_slot(self):
+        """F.X (2026-05-14) — canonical-binding rule.
 
-        This is intentional — extras = "everything not slot-bound".
-        Stage 3 storage spec MAY add a routing-key exclusion list,
-        but per Vector 2.8 the contract is "extras carries it".
+        Pre-F.X: ``?source=<slug>`` was the routing key consumed by
+        ``_resolve_source_for_click`` for slug lookup, but
+        ``resolve_slots`` had no knowledge of routing semantics. When
+        neither layer mapped the canonical slot ``source``, the
+        routing key flowed into extras.
+
+        Post-F.X: ``source`` is canonical, so the GET key
+        auto-binds — both as the routing slug AND as the value of
+        ``{source}`` URL macro. The two roles intentionally overlap.
+        Routing identification by slug happens via
+        ``_resolve_source_for_click`` (a separate hardcoded read of
+        ``query_params['source']``), and ``resolve_slots`` separately
+        populates the same value into ``slots['source']``. Operators
+        wanting the macro to differ from the source slug must alias
+        the slot (e.g., ``{slot:'source', alias:'src_value'}``);
+        canonical-first then still emits ``slots['source']`` from
+        ``?source=`` because canonical wins on collision.
         """
         slots, extras = resolve_slots(
             query_params={"source": "fb", "creative": "v"},
             source_mappings=[{"slot": "sub1", "alias": "creative"}],
             campaign_mappings=None,
         )
-        assert slots == {"sub1": "v"}
-        # `source` was used by the router for slug lookup but the
-        # mapping never bound it to a slot, so it lands in extras.
-        assert extras == {"source": "fb"}
+        # `source` canonical-auto-binds; `sub1` resolves through the
+        # explicit alias entry.
+        assert slots == {"source": "fb", "sub1": "v"}
+        # No extras — both keys are claimed by slots.
+        assert extras == {}
 
     def test_source_slot_explicitly_mapped_consumed(self):
         """Inverse case: when the canonical `source` slot IS mapped
@@ -522,6 +548,150 @@ class TestSpecScenario:
             campaign_mappings=None,
         )
         assert slots == {"source": "fb", "sub1": "v"}
+        assert extras == {}
+
+
+# ============================================================
+# F.X canonical-binding rule — contract-pinning tests
+# ============================================================
+#
+# These tests pin the canonical-binding contract introduced by
+# F.X (locked 2026-05-14). Plan doc:
+# `docs/roadmap/stage-1a-research/canonical-slot-binding-fix.md`.
+# Each test exercises a specific cell of the decision matrix in
+# § 3 of that document.
+
+
+class TestCanonicalBindingFX:
+    def test_canonical_source_binds_without_mapping(self):
+        """Plan § 3 — canonical-only iteration.
+
+        Empty mappings on both layers. ``?source=fb`` MUST land in
+        ``slots['source']`` because ``source`` is a canonical slot
+        name. Other 38 canonical slots auto-iterate but resolve to
+        NULL and aren't explicitly mapped → omitted from result.
+        """
+        slots, extras = resolve_slots(
+            query_params={"source": "fb"},
+            source_mappings=None,
+            campaign_mappings=None,
+        )
+        assert slots == {"source": "fb"}
+        assert extras == {}
+
+    def test_canonical_sub1_binds_without_mapping(self):
+        """Plan § 3 — SUB_SLOTS coverage.
+
+        ``sub1`` is part of ``SUB_SLOTS`` (sub1..sub20). The
+        canonical-binding rule applies to it identically to
+        ``RESERVED_SLOTS`` members. ``?sub1=fb`` MUST bind without
+        any explicit mapping entry.
+        """
+        slots, extras = resolve_slots(
+            query_params={"sub1": "fb"},
+            source_mappings=None,
+            campaign_mappings=None,
+        )
+        assert slots == {"sub1": "fb"}
+        assert extras == {}
+
+    def test_canonical_wins_over_alias_on_collision(self):
+        """Plan § 3 — decision matrix row "canonical wins on collision".
+
+        When both ``?source=`` AND ``?s=`` arrive AND the source
+        defines ``{slot:'source', alias:'s'}``, canonical wins:
+        ``slots['source']`` resolves to the canonical key's value,
+        not the alias key's. Both keys are marked examined so
+        neither leaks to extras.
+        """
+        slots, extras = resolve_slots(
+            query_params={"source": "fb", "s": "other"},
+            source_mappings=[{"slot": "source", "alias": "s"}],
+            campaign_mappings=None,
+        )
+        assert slots == {"source": "fb"}
+        # `s` is the alias — also stripped from extras.
+        assert extras == {}
+
+    def test_alias_works_when_canonical_absent(self):
+        """Plan § 3 — alias as additional input key.
+
+        When the canonical-named GET key is absent, the alias is
+        the secondary input. ``?s=fb`` resolves ``slots['source']``
+        when an entry maps ``source`` to alias ``s``.
+        """
+        slots, extras = resolve_slots(
+            query_params={"s": "fb"},
+            source_mappings=[{"slot": "source", "alias": "s"}],
+            campaign_mappings=None,
+        )
+        assert slots == {"source": "fb"}
+        assert extras == {}
+
+    def test_canonical_name_never_in_extras(self):
+        """Plan § 3 / § 5 design rule — canonical guard on extras.
+
+        Even when the canonical slot auto-iterated and resolved
+        successfully, the canonical-name GET key is stripped from
+        ``extras`` (defence-in-depth — the key is semantically the
+        slot's input regardless of whether the resolution loop
+        added the key to ``examined_keys`` or not).
+        """
+        _, extras = resolve_slots(
+            query_params={"source": "fb"},
+            source_mappings=None,
+            campaign_mappings=None,
+        )
+        assert "source" not in extras
+
+    def test_canonical_resolves_via_campaign_default(self):
+        """Plan § 3 — priority chain still applies under canonical-binding.
+
+        When the canonical GET key is absent and no alias entry
+        exists, the campaign's hardcoded ``default_value`` fills
+        the slot. The auto-iteration of canonical slots doesn't
+        bypass the priority chain — it only adds the slot to the
+        iteration set.
+        """
+        slots, extras = resolve_slots(
+            query_params={},
+            source_mappings=None,
+            campaign_mappings=[{"slot": "source", "default_value": "organic"}],
+        )
+        assert slots == {"source": "organic"}
+        assert extras == {}
+
+    def test_alias_collision_with_other_canonical_fills_only_canonical_slot(self):
+        """Plan § 3 — alias pointing at ANOTHER canonical name.
+
+        An admin who maps ``{slot:'source', alias:'host'}`` is doing
+        something unusual: the alias name is itself a canonical
+        slot (``host``). The canonical-first rule resolves this
+        deterministically:
+
+          - ``?host=X`` populates the canonical ``host`` slot first
+            (auto-iteration of ``host`` consumes the GET key).
+          - The ``source`` slot's alias lookup then sees ``host``
+            already examined; the value-resolution loop ALSO
+            reads ``query_params['host']`` (the get_keys list for
+            the ``source`` slot is ``[source, host]`` since alias
+            is set). So ``slots['source']`` ALSO resolves to ``X``.
+
+        Both slots get the same value — the admin's choice. The
+        admin-api alias-collision validator (Phase 6 of the plan,
+        optional) would warn at save time so the operator
+        understands the consequence. This test pins the runtime
+        behaviour either way.
+        """
+        slots, extras = resolve_slots(
+            query_params={"host": "example.com"},
+            source_mappings=[{"slot": "source", "alias": "host"}],
+            campaign_mappings=None,
+        )
+        # Both canonical `host` (auto-bind) and `source`
+        # (alias-lookup) read the same GET key.
+        assert slots == {"host": "example.com", "source": "example.com"}
+        # `host` is canonical — never in extras regardless.
         assert extras == {}
 
 

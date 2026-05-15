@@ -282,6 +282,31 @@ async def _check_tds_key(x_tds_key: str) -> int | None:
 
 
 # ============================================================================
+# Click event-time resolution (F.24 Phase 5.1b)
+# ============================================================================
+
+def _resolve_click_timestamp(click_ts: str | None) -> str:
+    """Canonical click instant for the click record / collector created_at.
+
+    Returns the EDGE-generated `click_ts` verbatim when the CF Worker
+    supplied it (the F.24-Phase-5.1b path: one value, captured once at
+    the edge, serialised once in raceBackends → byte-identical across
+    every node in a true-racing fan-out, so the collector's
+    `ON CONFLICT (click_id, created_at)` collapses N raced inserts to
+    ONE row). Falls back to this node's own UTC second when absent —
+    non-Worker callers (smoke scripts, integration tests) and the
+    dual-deploy window where an older Worker has not yet rolled out;
+    those are not subject to racing fan-out so per-node time is
+    acceptable. `or` intentionally treats "" the same as None (a
+    Pydantic-stripped empty string must not become the click's time).
+
+    Pure (no I/O) so it is unit-tested directly rather than through the
+    full /decide path — mirrors the worker `fetchImpl` testability seam.
+    """
+    return click_ts or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+# ============================================================================
 # Click idempotency gate (H1 fix, 2026-05-11)
 # ============================================================================
 
@@ -310,6 +335,25 @@ async def _acquire_click_dedup(click_id: str) -> bool | None:
     because the Worker's 2s `AbortSignal.timeout` fires roughly when
     click-processor's response is still on the wire (EU→AU 290ms each
     way + ~1.7s click-processor under burst load).
+
+    SCOPE — this SETNX is NODE-LOCAL (each edge node has its own Redis;
+    `settings.redis_url` = the node's own instance). It dedups
+    SAME-NODE retries only. It does NOT and never did dedup the SAME
+    click_id arriving at DIFFERENT nodes. Pre-F.24-Phase-5 the
+    Worker's sequential fallback hit a second node only on a timeout
+    (the rare evidence above). F.24 Phase 5 makes the Worker race ALL
+    nodes for EVERY click → multi-node-same-click is now the NORM, far
+    beyond what a node-local gate can cover. The CROSS-NODE
+    idempotency guarantee is therefore the COLLECTOR's
+    `ON CONFLICT (click_id, created_at) DO NOTHING` — which only works
+    if `created_at` is byte-identical across raced nodes. F.24
+    Phase 5.1b makes that hold: `created_at` is sourced from the
+    EDGE-generated `click_ts` (req.click_ts → click_record["timestamp"]
+    → collector), captured ONCE at the Worker and serialised ONCE in
+    raceBackends, so every raced node ships the identical
+    (click_id, created_at). This node-local SETNX remains a useful
+    fast-path (skips a redundant same-node stream write) but is no
+    longer load-bearing for cross-node correctness.
     """
     if settings.click_dedup_ttl_seconds <= 0:
         # Operator-disabled — fail-open to legacy behaviour.
@@ -441,7 +485,10 @@ async def decide(
     ua_info = get_full_ua_info(req.user_agent)
     click_record = {
         "click_id": req.click_id,
-        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        # F.24 Phase 5.1b — EDGE-generated canonical click instant (the
+        # cross-node dedup anchor for true racing). Full rationale +
+        # fallback semantics in `_resolve_click_timestamp`.
+        "timestamp": _resolve_click_timestamp(req.click_ts),
         "node_id": settings.node_id,
         "campaign_id": result.get("campaign_id"),
         "offer_id": result.get("offer_id"),

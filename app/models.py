@@ -19,6 +19,42 @@ _MAX_QUERY_PARAM_VALUE_LENGTH = 1024
 class ClickRequest(BaseModel):
     """Incoming request from CF Worker."""
     click_id: str = Field(max_length=128, pattern=r'^[a-zA-Z0-9_\-]+$')
+    # F.24 Phase 5.1b — canonical click instant, generated ONCE at the
+    # CF Worker edge (single source of truth, alongside click_id). It
+    # becomes the collector's `clicks.created_at`, which is the
+    # cross-node dedup anchor for true-racing fan-out (the clicks PK is
+    # (click_id, created_at) on a created_at-partitioned table; both
+    # halves must be edge-stable so N raced nodes collapse to one row
+    # via ON CONFLICT). Strict ISO-8601 UTC, `Z` suffix, optional
+    # millisecond fraction (JS toISOString emits 3; allow 1-6 for other
+    # callers). Optional + None default: absent → click-processor falls
+    # back to its own gmtime (dual-deploy window + non-Worker callers).
+    # Validated at the boundary (api-contracts / data-handling) because
+    # the value parameterises a TIMESTAMPTZ AND the collector's
+    # `clicks` RANGE-partition routing key (PRIMARY KEY
+    # (click_id, created_at) PARTITION BY RANGE(created_at)). The
+    # SEMANTIC-range pattern (year 20xx, month 01-12, day 01-31, hour
+    # 00-23, min/sec 00-59) is the FIRST defense layer: it rejects the
+    # obvious garbage / far-future class (`2099-…`, `…-13-…`,
+    # `…-99-…`) at /decide ingress so it never reaches the collector
+    # (5.1b security-cycle finding #3 — a shape-valid out-of-range
+    # date is a NEW surface vs the pre-5.1b node-`gmtime()` which was
+    # always ~now/in-range; an unroutable created_at made
+    # `collector.executemany` fail the WHOLE batch → shipper never
+    # acks → poison-pill stall + co-batched legit-click loss). The
+    # pattern alone cannot bound to the LIVE ±partition window (a
+    # regex doesn't know "now"); the load-bearing fix is the
+    # `clicks_default` DEFAULT partition in collector init.sql
+    # (defense-in-depth — any still-out-of-range value lands there
+    # instead of aborting the batch). max_length bounds it.
+    click_ts: str | None = Field(
+        default=None,
+        max_length=40,
+        pattern=(
+            r'^20\d{2}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])'
+            r'T([01]\d|2[0-3]):[0-5]\d:[0-5]\d(\.\d{1,6})?Z$'
+        ),
+    )
     visitor_id: str | None = Field(default=None, max_length=128, pattern=r'^[a-zA-Z0-9_\-]*$')
     is_returning: bool = False
     # Geo

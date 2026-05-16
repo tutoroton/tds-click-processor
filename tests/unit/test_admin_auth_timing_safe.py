@@ -1,29 +1,37 @@
-"""Regression fence — every X-TDS-Key check uses `hmac.compare_digest`.
+"""Regression fence — X-TDS-Key auth is timing-safe + single-path.
 
-Pinned by rule `sync-protocol` → "Key Rules" → "hmac.compare_digest
-for auth": click-processor exposes 3 endpoints that authenticate via
-the shared X-TDS-Key header (`POST /decide`, `POST /admin/sync`,
-`POST /admin/seed`). All three MUST use timing-safe comparison.
+Click-processor exposes 3 endpoints that authenticate via the shared
+X-TDS-Key header (`POST /decide`, `POST /admin/sync`,
+`POST /admin/seed`), all through the single shared helper
+`_check_tds_key`.
 
-Background — T1.13 (G-30 closure 2026-05-08): `/admin/seed` historically
-diverged from its siblings, using `x_tds_key != settings.tds_secret_key`.
-Defense-in-depth fix; the endpoint is dev-only (gated by
-`environment == "production"`), but the inconsistency would have been a
-foot-gun if anyone copy-pasted the block to a new endpoint.
+**F.25 (2026-05-16):** `_check_tds_key` no longer does ANY string
+comparison of `settings.tds_secret_key` — the legacy global-secret
+fallback was removed (every Worker carries a per-Worker secret,
+verified deterministically). X-TDS-Key auth is now a one-way sha256
+digest → Redis `worker_secret_hash:{hex}` lookup, which is strictly
+MORE timing-safe than a string compare (a one-way digest lookup
+leaks nothing about the secret). The `hmac.compare_digest` timing
+discipline (rule `sync-protocol` "hmac.compare_digest for auth")
+still governs the X-TDS-Body-Sig verifier + `sync/router` channel
+auth — distinct paths, out of scope for this helper.
 
-Strategy: source-grep regression at the file level. The test:
+Background — T1.13 (G-30 closure 2026-05-08): `/admin/seed`
+historically diverged using `x_tds_key != settings.tds_secret_key`.
+The `==`/`!=` ban below is the permanent fence so a naive
+direct-equality compare against the secret can never land silently.
 
-  1. Forbids the `==` / `!=` patterns against `tds_secret_key`.
-  2. Counts `hmac.compare_digest` calls with the canonical signature
-     and asserts ≥3 (one per protected endpoint).
+Strategy: source-grep regression at the file level. The tests:
 
-Pure file-read — no module import side effects, no Redis/FastAPI
-startup. Runs in milliseconds.
+  1. Forbid the `==` / `!=` patterns against `tds_secret_key`.
+  2. Pin ≥3 `_check_tds_key` call sites (one per protected endpoint).
+  3. Pin the helper does NOT compare the global secret (single-path).
+  4. Pin the helper fails closed (no legacy sentinel `return 0`).
 
-If a fourth protected endpoint ships, this test will fail loud until
-the count is bumped here AND the endpoint adopts the timing-safe
-pattern. That's the regression fence: future drift is impossible to
-land silently.
+Pure file-read — no import side effects, no Redis/FastAPI startup.
+
+If a fourth protected endpoint ships, test #2 fails loud until the
+count is bumped AND the endpoint adopts `_check_tds_key`.
 """
 
 from __future__ import annotations
@@ -97,76 +105,87 @@ def test_at_least_three_check_tds_key_calls_for_admin_endpoints():
     )
 
 
-def test_check_tds_key_helper_uses_hmac_compare_digest():
-    """The `_check_tds_key` helper MUST use `hmac.compare_digest`.
-
-    H6 fix consolidated the per-endpoint inline checks into this
-    single helper. If a future refactor strips the timing-safe
-    comparison out of the helper, ALL three endpoints regress at
-    once. This pin defends the helper's contract.
+def _strip_first_docstring(fn_src: str) -> str:
+    """Drop the function's leading docstring so source-pins inspect
+    CODE only — a docstring legitimately *describes* removed patterns
+    (e.g. explains why `settings.tds_secret_key` is no longer
+    consulted), which must not trip a `not in` code assertion.
     """
-    source = _read_main_source()
-    # Locate the helper body. We search for the function header and
-    # require `hmac.compare_digest` to appear in the surrounding
-    # function code. A strict regex would be fragile; the file-level
-    # presence + the `def _check_tds_key` anchor are sufficient.
-    assert "def _check_tds_key(" in source, (
-        "`_check_tds_key` helper is missing from main.py. "
-        "H6 fix design requires a single canonical auth helper to "
-        "prevent per-endpoint drift."
+    parts = fn_src.split('"""')
+    if len(parts) >= 3:
+        # parts[0] = signature line, parts[1] = docstring body,
+        # parts[2:] = the actual code after the closing triple-quote.
+        return parts[0] + '"""'.join(parts[2:])
+    return fn_src
+
+
+def _check_tds_key_body(source: str) -> str:
+    """Slice the `_check_tds_key` helper body (header → next top-level
+    def / @app), docstring removed."""
+    assert "async def _check_tds_key(" in source, (
+        "`_check_tds_key` helper is missing from main.py. The single "
+        "canonical auth helper must exist to prevent per-endpoint "
+        "drift."
     )
-    # Pull out the helper body (rough — from header to next top-level
-    # `def` or `@app`).
-    start = source.index("def _check_tds_key(")
-    # Stop at the next top-level definition.
+    start = source.index("async def _check_tds_key(")
     rest = source[start:]
     end_markers = ["\n@app.", "\ndef ", "\nasync def "]
     end_offsets = [rest.find(m, 1) for m in end_markers if rest.find(m, 1) > 0]
-    body = rest[:min(end_offsets)] if end_offsets else rest
-    assert "hmac.compare_digest" in body, (
-        "`_check_tds_key` body must call hmac.compare_digest for "
-        "timing-safe comparison. Found body without it — regression."
+    sliced = rest[: min(end_offsets)] if end_offsets else rest
+    return _strip_first_docstring(sliced)
+
+
+def test_check_tds_key_helper_does_not_compare_the_global_secret():
+    """F.25 (2026-05-16): `_check_tds_key` no longer does ANY string
+    comparison of `settings.tds_secret_key`. The legacy global-secret
+    fallback was removed; auth is a one-way sha256 digest → Redis
+    `worker_secret_hash:{hex}` lookup. That is strictly more
+    timing-safe than the prior `hmac.compare_digest` branch (a
+    one-way digest lookup leaks nothing about the secret).
+
+    Pin: the helper body MUST NOT reference `settings.tds_secret_key`
+    at all (no fallback compare can be reintroduced silently), and
+    MUST still perform the `worker_secret_hash:` lookup. A future
+    refactor that re-adds a global-secret compare here regresses the
+    F.25 single-path contract AND re-opens the dual-window.
+    """
+    body = _check_tds_key_body(_read_main_source())
+    assert "settings.tds_secret_key" not in body, (
+        "`_check_tds_key` must NOT consult `settings.tds_secret_key` "
+        "post-F.25 — the legacy global-secret fallback was removed. "
+        "Re-introducing it re-opens the dual-window AND adds a "
+        "string-compare timing surface. The global secret remains the "
+        "SYNC-channel credential only (see rule `outbound-http-safety`)."
+    )
+    assert "worker_secret_hash:" in body, (
+        "`_check_tds_key` must perform the per-Worker "
+        "`worker_secret_hash:{hex}` Redis lookup — the sole auth "
+        "path post-F.25."
     )
 
 
-def test_helper_fails_closed_when_either_side_empty():
-    """The helper signature MUST verify BOTH provided and stored
-    secrets are non-empty BEFORE accepting. This is the H6 closure
-    — the legacy `if settings.tds_secret_key and ...` pattern fails
-    OPEN when the stored secret is empty; the helper fails CLOSED."""
-    source = _read_main_source()
-    start = source.index("def _check_tds_key(")
-    rest = source[start:]
-    end_markers = ["\n@app.", "\ndef ", "\nasync def "]
-    end_offsets = [rest.find(m, 1) for m in end_markers if rest.find(m, 1) > 0]
-    body = rest[:min(end_offsets)] if end_offsets else rest
-    # The fail-closed invariant: both `provided` and `stored` must
-    # appear in the condition alongside `compare_digest`. The exact
-    # AST shape is implementation-detail, but the three identifiers
-    # MUST co-occur.
-    assert "provided" in body and "stored" in body, (
-        "`_check_tds_key` should bind `provided` and `stored` "
-        "locals so the fail-closed contract is explicit. "
-        "If renaming, update this test."
+def test_helper_fails_closed_single_path():
+    """Post-F.25 fail-closed contract: an empty `x_tds_key` is
+    rejected at step 1 (`raise HTTPException`); a per-Worker miss /
+    corrupted index / Redis error all fall through to a final
+    `raise HTTPException(status_code=403`. `settings.tds_secret_key`
+    is never consulted, so an empty/misconfigured global secret can
+    no longer auto-authenticate any Worker here — strictly more
+    fail-closed than the pre-F.25 H6 invert."""
+    body = _check_tds_key_body(_read_main_source())
+    assert body.count("raise HTTPException(status_code=403") >= 2, (
+        "Helper must raise 403 on empty header (step 1) AND on the "
+        "terminal per-Worker miss / Redis-error path — fail closed."
     )
-    # F.24 Phase 1 (2026-05-14): the helper went from
-    #   `if not (provided and stored and compare_digest(...))`
-    # to the inverted positive-match form
-    #   `if provided and stored and compare_digest(...): return 0`
-    # The fail-closed semantics are preserved — if either side is
-    # empty, the positive branch doesn't fire and execution falls
-    # through to `raise HTTPException`. The regression fence below
-    # pins the semantic invariant: all three identifiers
-    # (`provided`, `stored`, `compare_digest`) MUST co-occur in the
-    # legacy fallback branch.
-    assert (
-        "if provided and stored and hmac.compare_digest" in body
-        or "if not (provided and stored and hmac.compare_digest" in body
-    ), (
-        "H6 fail-closed contract requires `provided`, `stored`, and "
-        "`hmac.compare_digest` to co-occur in the legacy auth branch. "
-        "Either the positive form (F.24 Phase 1) or the original "
-        "negative form is acceptable; both fail closed when either "
-        "side is empty. If neither matches, the auth surface drifted "
-        "off the regression fence — fix the helper or update this test."
+    assert "provided" in body, (
+        "`_check_tds_key` should still bind a `provided` local for "
+        "the empty-header guard. If renaming, update this test."
+    )
+    # Negative pin: the removed legacy branch + sentinel must NOT
+    # silently return — no `return 0` (the old legacy sentinel).
+    assert "return 0" not in body, (
+        "Found `return 0` — the F.24 legacy sentinel. F.25 removed "
+        "the global-secret fallback; a per-Worker hit returns the "
+        "real worker_id, everything else raises 403. A `return 0` "
+        "means the legacy branch was reintroduced."
     )

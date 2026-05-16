@@ -1,44 +1,45 @@
-"""Tests for `_check_tds_key` — H6 fail-closed (2026-05-11) + F.24
-Phase 1 dual-path auth (2026-05-14).
+"""Tests for `_check_tds_key` — single-path per-Worker auth.
 
-## H6 — Fail-closed (preserved)
+## History
 
-Legacy pattern: `if settings.tds_secret_key and (not x_tds_key or
-not hmac.compare_digest(...)): raise`. The leading `and` short-
-circuits to "no auth check" when `settings.tds_secret_key == ""`.
+- H6 fail-closed (2026-05-11): the legacy
+  `if settings.tds_secret_key and not compare_digest(...)` pattern
+  failed OPEN when the stored secret was empty. H6 inverted it to
+  fail CLOSED.
+- F.24 Phase 1 (2026-05-14): added the per-Worker path
+  (`worker_secret_hash:{sha256_hex} → worker_id` in local Redis) in
+  FRONT of the legacy global-secret fallback (dual-window). Legacy
+  match returned sentinel `0`.
+- **F.25 (2026-05-16): the legacy global-secret fallback was
+  REMOVED.** Migration 057 backfilled every `workers` row with the
+  global value (encrypted) as its per-Worker secret, so
+  `sha256(global) → worker_id` is already in the per-Worker Redis
+  index for every active+deployed Worker — a Worker still presenting
+  the global header authenticates via the per-Worker path, not a
+  special branch. Verified deterministically on staging (all Workers
+  carry a per-Worker secret; 0 active+deployed missing). The global
+  secret itself is NOT removed — it stays the sync/edge-channel
+  credential — only the `_check_tds_key` fallback is gone.
 
-In production this was unreachable (startup guard refuses empty
-key in non-local environments). But in local/development, an
-operator running on a non-isolated network was exposed.
+## Post-F.25 contract (what these tests pin)
 
-H6 fix: invert to `if not (provided and stored and compare_digest):
-raise`. Empty stored secret now means EVERY request is rejected.
-
-## F.24 Phase 1 — Per-Worker dual-path
-
-Admin-api emits a per-Worker `TDS_SECRET_KEY` and a sync builder
-pushes `worker_secret_hash:{sha256_hex} → worker_id` to local
-Redis. `_check_tds_key` now:
-  1. Hashes the incoming X-TDS-Key with sha256.
-  2. GETs `worker_secret_hash:{hex}` — on hit, returns the int
-     `worker_id` (positive — used by future forensics paths).
-  3. On miss, falls back to legacy `settings.tds_secret_key`
-     constant-time compare — on hit, returns sentinel `0`.
-  4. Otherwise raises 403.
-
-Tests pin:
-  - H6 closure (preserved) — empty stored secret 403s every request
-  - per-Worker path — hash matches Redis key → returns worker_id
-  - legacy fallback — Redis miss + compare_digest match → returns 0
-  - 403 path — unknown secret + Redis miss
-  - timing-safe (regression fence on `compare_digest` usage)
+  1. Empty `x_tds_key` → 403 (step 1).
+  2. Per-Worker hash hit → return the int `worker_id` (≥ 1).
+  3. Per-Worker MISS → 403. `settings.tds_secret_key` is NOT
+     consulted (no legacy fallback, no sentinel `0`).
+  4. Redis error / corrupted index entry → 403 (FAIL CLOSED). The
+     pre-F.25 behaviour (fall through to legacy → sentinel 0) is
+     GONE — this is the key behaviour-change pin.
+  5. Fail-closed is strictly stronger than the pre-F.25 H6 invert:
+     an empty/misconfigured global secret can no longer
+     auto-authenticate any Worker here.
 """
 
 from __future__ import annotations
 
 import hashlib
 import inspect
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
 import pytest
 from fastapi import HTTPException
@@ -49,19 +50,15 @@ def _sha256(s: str) -> str:
 
 
 class _FakeRedisEmpty:
-    """Minimal stub of the asyncio Redis client surface that
-    `_check_tds_key` calls. Returns None on every `get` — forces
-    the legacy fallback path on every test that uses it.
-    """
+    """Stub: every `get` misses → per-Worker MISS path (now → 403)."""
 
     async def get(self, key: str):
         return None
 
 
 class _FakeRedisHit:
-    """Stub that returns `worker_id_str` ONLY when `get(key)` matches
-    the pre-configured key. Mirrors the production semantics where
-    the sync builder only writes hashes for active Workers.
+    """Stub: returns `worker_id_str` only for the pre-configured key
+    (mirrors the sync builder writing hashes only for active Workers).
     """
 
     def __init__(self, expected_key: str, worker_id_str: str):
@@ -73,8 +70,8 @@ class _FakeRedisHit:
 
 
 class _FakeRedisError:
-    """Stub that raises on `get` — simulates a transient Redis outage.
-    `_check_tds_key` must catch + fall through to legacy.
+    """Stub: raises on `get` — simulates a transient Redis outage.
+    Post-F.25 the helper must FAIL CLOSED (403), not fall to legacy.
     """
 
     async def get(self, key: str):
@@ -83,7 +80,7 @@ class _FakeRedisError:
 
 @pytest.fixture
 def patch_redis_empty():
-    """`get_redis()` returns a fake that always misses → legacy path."""
+    """`get_redis()` → a fake that always misses (per-Worker MISS)."""
     from app import main
 
     async def _empty():
@@ -94,79 +91,94 @@ def patch_redis_empty():
 
 
 # ---------------------------------------------------------------------------
-# H6 closure — fail-closed semantics with the dual-path active
+# Fail-closed semantics (single per-Worker path)
 # ---------------------------------------------------------------------------
 
 
-class TestH6FailClosed:
-    """Behaviour pin for the H6 fix — preserved through the F.24
-    Phase 1 dual-path refactor."""
-
+class TestFailClosed:
     @pytest.mark.asyncio
-    async def test_valid_key_passes(self, patch_redis_empty):
+    async def test_per_worker_miss_403_even_with_matching_global(
+        self, patch_redis_empty
+    ):
+        """KEY F.25 BEHAVIOUR CHANGE: a per-Worker MISS now 403s even
+        when the incoming key EQUALS the global `settings.tds_secret_key`.
+        Pre-F.25 this returned sentinel `0` via the legacy fallback;
+        the fallback is gone — the global secret is no longer honoured
+        by this helper at all."""
         from app import main
 
-        with patch.object(main.settings, "tds_secret_key", "the-shared-secret-32chars-long-aa"):
-            # Returns sentinel 0 (legacy path matched).
-            result = await main._check_tds_key("the-shared-secret-32chars-long-aa")
-            assert result == 0
+        with patch.object(
+            main.settings, "tds_secret_key",
+            "the-shared-secret-32chars-long-aa",
+        ):
+            with pytest.raises(HTTPException) as exc:
+                await main._check_tds_key("the-shared-secret-32chars-long-aa")
+            assert exc.value.status_code == 403
 
     @pytest.mark.asyncio
     async def test_wrong_key_403(self, patch_redis_empty):
         from app import main
 
         with patch.object(main.settings, "tds_secret_key", "stored-secret"):
-            with pytest.raises(HTTPException) as exc_info:
+            with pytest.raises(HTTPException) as exc:
                 await main._check_tds_key("wrong-secret")
-            assert exc_info.value.status_code == 403
+            assert exc.value.status_code == 403
 
     @pytest.mark.asyncio
-    async def test_missing_header_403_when_stored_set(self, patch_redis_empty):
-        """Empty incoming `X-TDS-Key` header MUST 403 even when
-        the stored secret is set."""
+    async def test_missing_header_403(self, patch_redis_empty):
+        """Empty incoming `X-TDS-Key` → 403 at step 1 (before any
+        Redis lookup)."""
         from app import main
 
         with patch.object(main.settings, "tds_secret_key", "stored-secret"):
-            with pytest.raises(HTTPException) as exc_info:
+            with pytest.raises(HTTPException) as exc:
                 await main._check_tds_key("")
-            assert exc_info.value.status_code == 403
+            assert exc.value.status_code == 403
 
     @pytest.mark.asyncio
-    async def test_empty_stored_secret_403_h6_closure(self, patch_redis_empty):
-        """H6 CORE CLOSURE — empty stored secret means EVERY
-        request rejected, regardless of what the client sends.
-
-        Pre-fix: this was 200 (fail-open) because the `if
-        settings.tds_secret_key and ...` guard short-circuited.
-        Post-fix: 403 because `not (provided and stored and ...)`
-        is True when `stored == ""`."""
+    async def test_empty_stored_secret_403(self, patch_redis_empty):
+        """Empty global secret → still 403 on per-Worker miss. The
+        secret is not consulted by this helper post-F.25, so an
+        empty/misconfigured global secret CANNOT auto-authenticate —
+        strictly more fail-closed than the pre-F.25 H6 invert."""
         from app import main
 
         with patch.object(main.settings, "tds_secret_key", ""):
-            with pytest.raises(HTTPException) as exc_info:
+            with pytest.raises(HTTPException) as exc:
                 await main._check_tds_key("anything-client-sends")
-            assert exc_info.value.status_code == 403
+            assert exc.value.status_code == 403
 
     @pytest.mark.asyncio
     async def test_empty_both_sides_403(self, patch_redis_empty):
-        """No surprise edge case — empty + empty still 403."""
         from app import main
 
         with patch.object(main.settings, "tds_secret_key", ""):
             with pytest.raises(HTTPException):
                 await main._check_tds_key("")
 
-    def test_helper_uses_compare_digest_not_double_equals(self):
-        """Time-safety regression fence — assert the helper body
-        contains the `compare_digest` call, not `==`. Source-level
-        pin in `test_admin_auth_timing_safe.py` also exists; this is
-        the behavioural angle.
-        """
+    def test_helper_does_not_compare_global_secret(self):
+        """Behavioural-angle source pin (file-level pin lives in
+        `test_admin_auth_timing_safe.py`): the helper CODE must NOT
+        reference `settings.tds_secret_key` (legacy fallback removed)
+        and must NOT carry a timing-attack-prone direct equality.
+
+        The docstring is stripped first — it legitimately *describes*
+        the removed pattern + the secret's remaining sync role, which
+        must not trip a `not in` code assertion."""
         from app import main
 
-        src = inspect.getsource(main._check_tds_key)
-        assert "hmac.compare_digest" in src
-        # No naive equality against stored secret allowed.
+        full = inspect.getsource(main._check_tds_key)
+        parts = full.split('"""')
+        src = parts[0] + '"""'.join(parts[2:]) if len(parts) >= 3 else full
+        assert "settings.tds_secret_key" not in src, (
+            "`_check_tds_key` CODE must not consult the global secret "
+            "post-F.25 — the legacy fallback was removed."
+        )
+        assert "hmac.compare_digest" not in src, (
+            "`_check_tds_key` CODE must not do any secret string "
+            "compare post-F.25 — auth is a one-way sha256 → Redis "
+            "digest lookup (no timing surface)."
+        )
         forbidden = [
             "x_tds_key == settings.tds_secret_key",
             "settings.tds_secret_key == x_tds_key",
@@ -179,18 +191,15 @@ class TestH6FailClosed:
 
 
 # ---------------------------------------------------------------------------
-# F.24 Phase 1 — Per-Worker dual-path
+# Per-Worker path (the SOLE auth path post-F.25)
 # ---------------------------------------------------------------------------
 
 
-class TestF24DualPath:
-    """Behaviour pin for the F.24 Phase 1 per-Worker auth path."""
-
+class TestF24SinglePath:
     @pytest.mark.asyncio
     async def test_per_worker_hit_returns_worker_id(self):
-        """When the incoming X-TDS-Key's sha256 hash matches a Redis
-        `worker_secret_hash:*` key, the helper returns the int
-        `worker_id` — NOT the sentinel 0."""
+        """X-TDS-Key sha256 hash matches a Redis `worker_secret_hash:*`
+        key → returns the int `worker_id`."""
         from app import main
 
         secret = "tdssec_per_worker_value_43_chars_xxxxxxxxxx"
@@ -201,64 +210,75 @@ class TestF24DualPath:
             return fake_redis
 
         with patch.object(main, "get_redis", _fake_get_redis), \
-             patch.object(main.settings, "tds_secret_key", "something-completely-different-32chars-x"):
+             patch.object(
+                 main.settings, "tds_secret_key",
+                 "something-completely-different-32chars-x",
+             ):
             result = await main._check_tds_key(secret)
-            assert result == 42, (
-                "Per-Worker hash hit must return the matched worker_id; "
-                "the legacy global secret in this test is intentionally "
-                "different so the test cannot accidentally pass via the "
-                "legacy fallback."
-            )
+            assert result == 42
 
     @pytest.mark.asyncio
-    async def test_legacy_fallback_returns_sentinel_zero(self, patch_redis_empty):
-        """Redis miss + global secret match → returns sentinel `0`.
-        Distinguishes "matched via legacy" from "matched via per-Worker".
-        The dual-window discipline relies on this fallback during the
-        24h migration window."""
+    async def test_per_worker_miss_with_matching_global_now_403(
+        self, patch_redis_empty
+    ):
+        """Redis miss + incoming key == global secret → 403 (NOT the
+        old sentinel `0`). The dual-window legacy fallback is gone;
+        this is the canonical F.25 regression pin."""
         from app import main
 
-        with patch.object(main.settings, "tds_secret_key", "legacy-global-32chars-aaaaaaaaaaa"):
-            result = await main._check_tds_key("legacy-global-32chars-aaaaaaaaaaa")
-            assert result == 0
+        with patch.object(
+            main.settings, "tds_secret_key",
+            "legacy-global-32chars-aaaaaaaaaaa",
+        ):
+            with pytest.raises(HTTPException) as exc:
+                await main._check_tds_key("legacy-global-32chars-aaaaaaaaaaa")
+            assert exc.value.status_code == 403
 
     @pytest.mark.asyncio
-    async def test_redis_outage_falls_through_to_legacy(self):
-        """If Redis is unreachable, the per-Worker lookup must NOT
-        block the auth path. The helper catches the exception and
-        falls through to the legacy global compare_digest."""
+    async def test_redis_outage_fails_closed_403(self):
+        """Redis unreachable → 403 (FAIL CLOSED). Pre-F.25 this fell
+        through to the legacy global compare (→ sentinel 0). Post-F.25
+        there is no fallback: `/decide` cannot serve without Redis
+        anyway (`architecture.md` fail-closed), so failing auth closed
+        here is consistent, not a new outage surface."""
         from app import main
 
         async def _err_redis():
             return _FakeRedisError()
 
         with patch.object(main, "get_redis", _err_redis), \
-             patch.object(main.settings, "tds_secret_key", "global-secret-32chars-bbbbbbbbb"):
-            # Legacy succeeds → return sentinel 0
-            result = await main._check_tds_key("global-secret-32chars-bbbbbbbbb")
-            assert result == 0
+             patch.object(
+                 main.settings, "tds_secret_key",
+                 "global-secret-32chars-bbbbbbbbb",
+             ):
+            with pytest.raises(HTTPException) as exc:
+                await main._check_tds_key("global-secret-32chars-bbbbbbbbb")
+            assert exc.value.status_code == 403
 
     @pytest.mark.asyncio
-    async def test_unknown_secret_with_no_legacy_match_403(self, patch_redis_empty):
-        """Cold path — Redis miss AND legacy compare_digest miss → 403.
-        Neither path matched, the request is unauthorised."""
+    async def test_unknown_secret_403(self, patch_redis_empty):
+        """Redis miss + unknown key → 403."""
         from app import main
 
-        with patch.object(main.settings, "tds_secret_key", "legacy-32chars-cccccccccccccccccc"):
-            with pytest.raises(HTTPException) as exc_info:
+        with patch.object(
+            main.settings, "tds_secret_key",
+            "legacy-32chars-cccccccccccccccccc",
+        ):
+            with pytest.raises(HTTPException) as exc:
                 await main._check_tds_key("attacker-supplied-32chars-xxxxxx")
-            assert exc_info.value.status_code == 403
+            assert exc.value.status_code == 403
 
     @pytest.mark.asyncio
-    async def test_corrupted_worker_id_falls_through(self):
-        """Defensive — if a sync bug ever wrote a non-numeric value
-        under `worker_secret_hash:*`, the helper logs + falls through
-        to legacy instead of crashing the auth path."""
+    async def test_corrupted_worker_id_fails_closed_403(self):
+        """Defensive: a sync bug writing a non-numeric value under
+        `worker_secret_hash:*` must NOT crash the auth path AND must
+        NOT auto-authenticate. Pre-F.25 it fell through to legacy
+        (→ 0); post-F.25 it FAILS CLOSED (403) — there is no legacy
+        net, and a corrupted index entry is never a valid auth."""
         from app import main
 
         secret = "tdssec_value_that_will_be_hashed_xxxxxx"
         expected_key = f"worker_secret_hash:{_sha256(secret)}"
-        # Intentionally non-numeric value — must not crash.
         fake_redis = _FakeRedisHit(expected_key, worker_id_str="not_an_int")
 
         async def _fake_get_redis():
@@ -266,24 +286,20 @@ class TestF24DualPath:
 
         with patch.object(main, "get_redis", _fake_get_redis), \
              patch.object(main.settings, "tds_secret_key", secret):
-            # Legacy fallback succeeds (the same string matches itself).
-            result = await main._check_tds_key(secret)
-            assert result == 0
+            with pytest.raises(HTTPException) as exc:
+                await main._check_tds_key(secret)
+            assert exc.value.status_code == 403
 
     def test_uses_full_sha256_hex_not_prefix(self):
-        """Source-level pin — `_hash_secret` returns the full hex
-        digest, NOT a prefix. A prefix-based lookup would introduce
-        a class of collision bugs at Worker counts in the millions
-        and divergence between admin-api / click-processor hashing
-        rules would silently break auth."""
+        """Source pin — `_hash_secret` returns the FULL hex digest,
+        not a prefix. A prefix lookup introduces collision bugs at
+        scale and divergence vs the admin-api sync builder."""
         from app import main
 
         src = inspect.getsource(main._hash_secret)
-        # The full hex digest is 64 chars. A prefix-style impl would
-        # call `.hexdigest()[:N]`. Pin against that.
         assert ".hexdigest()" in src
         assert ".hexdigest()[" not in src, (
             "_hash_secret appears to slice the hex digest (prefix). "
-            "Must use the full 64-char hex per the F.24 Phase 1 "
-            "design — see comments in `app/sync/builders/workers.py`."
+            "Must use the full 64-char hex per F.24 Phase 1 — see "
+            "`app/sync/builders/workers.py`."
         )

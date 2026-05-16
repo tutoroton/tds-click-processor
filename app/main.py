@@ -155,26 +155,38 @@ app = FastAPI(
 # Shared X-TDS-Key auth helper — F.24 Phase 1 dual-path + H6 fix
 # ============================================================================
 #
-# DUAL-PATH AUTH (F.24 Phase 1, 2026-05-14)
-# -----------------------------------------
-# Admin-api now emits a per-Worker `TDS_SECRET_KEY` (see WorkerService.
+# SINGLE-PATH PER-WORKER AUTH (F.24 Phase 1, 2026-05-14;
+#                              F.25 legacy branch removed 2026-05-16)
+# --------------------------------------------------------------------
+# Admin-api emits a per-Worker `TDS_SECRET_KEY` (see WorkerService.
 # deploy_script + sync builder `workers.py`). The auth path discovers
 # which Worker sent a request by hashing the incoming `X-TDS-Key` with
 # sha256 and looking up `worker_secret_hash:{hex} → worker_id` in
-# local Redis. The legacy global `settings.tds_secret_key` remains a
-# fallback so:
-#   1. Existing AU/CA traffic (Worker still has the old global secret
-#      baked in) stays authenticated until the next deploy_script
-#      rotates its secret to a per-Worker value.
-#   2. Rolling deploys never have an authentication gap — old
-#      click-processor sees only global; new click-processor sees both.
-#   3. Operator emergency rollback to pre-Phase-1 is a zero-touch
-#      revert — re-deploying the old Worker script still works.
+# local Redis.
 #
-# Order matters for clarity, not correctness: we check per-Worker
-# FIRST because that is the long-term primary path. After all Workers
-# rotate their secrets (24-72h after Phase 1 rollout), the legacy
-# branch is dead code that can be removed in a follow-up cleanup.
+# The legacy global `settings.tds_secret_key` fallback inside
+# `_check_tds_key` was REMOVED in F.25 cleanup. It was the F.24
+# Phase 1 dual-window net while Workers carried the old global secret
+# baked into their CF script. Migration 057 backfilled EVERY existing
+# `workers` row with `tds_secret_key_encrypted` (the global value,
+# encrypted) so `sha256(global) → worker_id` is already in the
+# per-Worker Redis index for every active+deployed Worker — a Worker
+# still presenting the global header authenticates via the per-Worker
+# path, NOT a special-case branch. This was verified DETERMINISTICALLY
+# on staging 2026-05-16 (every `workers` row has a per-Worker secret;
+# 0 active+deployed Workers missing one) — the dual-window's purpose
+# was to reach exactly this state, confirmed by DB fact rather than a
+# calendar soak (geo-tds is pre-MVP / no production traffic, so a
+# time-based soak yields no signal — see
+# `docs/roadmap/stage-1a-research/f25-destructive-cleanup-plan.md`).
+#
+# The global secret itself is NOT removed — it remains the credential
+# for the sync push/pull + edge-node channel (admin-api sync auth +
+# X-TDS-Body-Sig both directions, click-processor pull client, edge
+# provisioning). ONLY the `_check_tds_key` Worker-auth fallback is
+# gone. A Worker that genuinely missed rotation now fails CLOSED (403)
+# instead of being silently masked by the global secret — the correct
+# end-state. Reversible: revert this commit re-adds the branch.
 #
 # Hot-path cost: one Redis GET (~0.5ms) added to /decide's 10ms budget
 # — within the contract documented in `diagnostic-mode` rule. The
@@ -189,45 +201,60 @@ def _hash_secret(plaintext: str) -> str:
     return hashlib.sha256(plaintext.encode("utf-8")).hexdigest()
 
 
-async def _check_tds_key(x_tds_key: str) -> int | None:
+async def _check_tds_key(x_tds_key: str) -> int:
     """Validate the `X-TDS-Key` header. Raise 403 on failure.
 
-    Returns: worker_id (int) when the per-Worker path matched, OR
-    `0` when the legacy global fallback matched (sentinel — the value
-    is the int 0, not a real id). Returns are advisory; callers may
-    ignore them today (no caller pattern requires forensic
-    attribution yet — that's the F.24 plan §0.2 deferred phase).
+    Returns: worker_id (int ≥ 1) — the Worker whose per-Worker secret
+    matched. Never returns 0/None (the F.24 Phase 1 legacy sentinel
+    `0` was removed with the legacy branch in F.25). The return is
+    advisory; callers may ignore it today (no caller pattern requires
+    forensic attribution yet — F.24 plan §0.2 deferred phase).
 
-    Algorithm:
-      1. PER-WORKER lookup. Hash `x_tds_key` with sha256, GET
+    Algorithm (single per-Worker path, F.25 2026-05-16):
+      1. Reject empty `x_tds_key` outright (403).
+      2. PER-WORKER lookup. Hash `x_tds_key` with sha256, GET
          `worker_secret_hash:{hex}` in local Redis. A hit returns
          the originating Worker id.
-      2. LEGACY global fallback. Constant-time compare against
-         `settings.tds_secret_key`. Empty stored key fails closed
-         (H6 fix discipline preserved — see "Fail-closed" note below).
-      3. NEITHER → raise HTTPException(403).
+      3. ANYTHING ELSE (miss / corrupted index entry / Redis error)
+         → raise HTTPException(403). FAIL CLOSED.
 
-    Fail-closed discipline (H6 fix, 2026-05-11 — preserved):
-      An empty `settings.tds_secret_key` MUST NOT auto-authenticate
-      any caller. The Redis lookup similarly cannot pass an empty
-      x_tds_key — the digest of an empty string is a real value, but
-      the admin-api builder excludes empty ciphertexts so the key
-      simply isn't there. Both branches fail closed for the
-      not-configured case.
+    Why no legacy global-secret fallback (F.25):
+      The F.24 Phase 1 dual-window fell back to a constant-time
+      compare against `settings.tds_secret_key` on per-Worker miss.
+      Migration 057 backfilled EVERY `workers` row with the global
+      value (encrypted) as its per-Worker secret, so
+      `sha256(global) → worker_id` is already in the per-Worker index
+      for every active+deployed Worker — a Worker still presenting
+      the global header authenticates via step 2, not a branch.
+      Verified deterministically on staging 2026-05-16 (all Workers
+      carry a per-Worker secret; 0 active+deployed missing). Removing
+      the branch makes a genuinely-unrotated Worker fail CLOSED —
+      the correct end-state. The global secret itself is NOT removed:
+      it remains the sync push/pull + edge-node channel credential
+      (admin-api sync auth, X-TDS-Body-Sig both directions, pull
+      client, edge provisioning) — see rule `outbound-http-safety`
+      "Worker → Backend integrity".
+
+    Fail-closed discipline (H6 fix, 2026-05-11):
+      An empty `x_tds_key` is rejected at step 1. Empty/misconfigured
+      `settings.tds_secret_key` can no longer auto-authenticate any
+      Worker here (the secret is not consulted on this path at all) —
+      strictly more fail-closed than the pre-F.25 H6 invert.
 
     Timing safety:
-      The legacy path uses `hmac.compare_digest` regardless of which
-      side is empty so a timing observation cannot leak whether the
-      stored secret is empty (per `api-security`). The Redis lookup
-      uses the hex digest of the provided value — even a timing
-      observation that reveals "key exists in Redis" doesn't leak
-      the secret itself (digests are one-way).
+      No string comparison of the secret happens here anymore — auth
+      is a one-way sha256 digest → Redis key lookup. A timing
+      observation that reveals "key exists in Redis" does not leak
+      the secret (digests are one-way). The `hmac.compare_digest`
+      timing discipline still governs the sync-channel auth paths
+      (`_admin_sync` body-sig, `sync/router`) — out of scope here.
 
     Redis-unavailable mode:
-      If Redis is unreachable (rare — `/decide` already relies on
-      Redis for SETNX dedup + XADD), we fall through to the legacy
-      path. Operator misconfig (empty global + Redis down) results
-      in 403 for every request — fail-closed.
+      If Redis is unreachable the per-Worker lookup fails → 403
+      (fail-closed). `/decide` cannot serve a request without Redis
+      anyway (SINTER/SETNX/XADD — `architecture.md` "Click Processor
+      → Redis down → Fail-closed"), so failing auth closed here is
+      consistent, not a new outage surface.
     """
     provided = x_tds_key or ""
     if not provided:
@@ -261,23 +288,23 @@ async def _check_tds_key(x_tds_key: str) -> int | None:
     except HTTPException:
         raise
     except Exception as e:
-        # Redis unreachable or transient error — fall through to
-        # legacy. Log loud so operators see when this fires (it
-        # SHOULD be rare; persistent Redis outage is a separate
-        # incident affecting many other code paths).
+        # Redis unreachable or transient error — FAIL CLOSED (403).
+        # The F.24 Phase 1 dual-window fell through to the legacy
+        # global secret here; F.25 removed that branch (every Worker
+        # carries a per-Worker secret — verified deterministically
+        # 2026-05-16). `/decide` cannot serve a request without Redis
+        # anyway (SINTER/SETNX/XADD — `architecture.md` fail-closed),
+        # so failing auth closed here is consistent, not a new outage
+        # surface. Log loud — a persistent Redis outage is a separate
+        # incident affecting many other code paths.
         logger.warning(
             "_check_tds_key: per-Worker lookup failed (%s); "
-            "falling through to legacy global secret.", e,
+            "failing closed (403) — no legacy fallback (F.25).", e,
         )
 
-    # ── Legacy global secret fallback ───────────────────────────────
-    stored = settings.tds_secret_key or ""
-    if provided and stored and hmac.compare_digest(provided, stored):
-        # Sentinel 0 — distinguishes "matched via legacy" from "matched
-        # via per-Worker hash". No real Worker has id=0 (SERIAL starts
-        # at 1), so callers can disambiguate trivially.
-        return 0
-
+    # Per-Worker miss / corrupted index entry / Redis error → 403.
+    # No legacy global-secret fallback (removed F.25 — see the
+    # SINGLE-PATH PER-WORKER AUTH note above the helper).
     raise HTTPException(status_code=403, detail="Invalid TDS key")
 
 
@@ -912,14 +939,16 @@ async def seed_data(x_tds_key: str = Header("", alias="X-TDS-Key")):
             ),
         )
 
-    # H6 fix (2026-05-11): use the shared `_check_tds_key` helper.
-    # Was the legacy fail-open `if settings.tds_secret_key and ...`;
-    # now fails closed via `_check_tds_key` (empty stored secret →
-    # all requests rejected). Original T1.13 (G-30 closure 2026-05-08)
-    # timing-safety pin is preserved — `_check_tds_key` uses
-    # `hmac.compare_digest` per rule `sync-protocol` → "hmac.compare_digest
-    # for auth". Regression-fenced by
-    # tests/unit/test_admin_auth_timing_safe.py.
+    # Shared `_check_tds_key` helper (H6 fix 2026-05-11 consolidated
+    # the per-endpoint inline checks here). F.25 (2026-05-16): the
+    # helper is now single-path per-Worker — a sha256(X-TDS-Key) →
+    # `worker_secret_hash:{hex}` Redis lookup; miss / Redis-error →
+    # 403 FAIL CLOSED. No `hmac.compare_digest` against the global
+    # secret anymore (legacy fallback removed) → strictly more
+    # fail-closed AND more timing-safe (one-way digest lookup, no
+    # secret string-compare). Contract regression-fenced by
+    # tests/unit/test_admin_auth_timing_safe.py +
+    # test_check_tds_key_h6.py.
     await _check_tds_key(x_tds_key)
 
     r = await get_redis()

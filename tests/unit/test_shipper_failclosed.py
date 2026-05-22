@@ -220,3 +220,111 @@ async def test_run_shipper_raises_on_non_local_empty_url(monkeypatch):
     with patch("app.shipper.sentry_sdk"):  # Suppress Sentry side effect
         with pytest.raises(ShipperDisabledError):
             await run_shipper(redis_mock)
+
+
+# ---------------------------------------------------------------------------
+# F.29 Sprint 1.6 — try/finally guarantee that mark_stopped() always
+# fires on run_shipper exit. Caught by Agent 3 validation 2026-05-23.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_shipper_marks_stopped_on_cancellation(monkeypatch):
+    """G5 critical fix verification. Pre-Sprint-1.6 there was NO
+    finally block around the main loop — task cancellation left
+    ``shipper_metrics.running=True`` forever. /health then reported
+    the shipper as alive while the task was actually dead — exactly
+    the audit-2026-05-16 silent-disable pathology that G5 was built
+    to surface.
+
+    Post-Sprint-1.6: the loop is wrapped in try/finally so cancellation
+    (graceful lifespan shutdown OR test-driven cancel) propagates
+    CancelledError through finally → mark_stopped() fires →
+    ``shipper_metrics.running`` flips to False BEFORE the task
+    coroutine fully unwinds.
+    """
+    import asyncio
+
+    from app import shipper_metrics as shipper_metrics_module
+    shipper_metrics_module._reset_for_tests()
+
+    # Configure a valid central_url so the loop actually enters; in
+    # local env so we don't trip the fail-closed guard.
+    monkeypatch.setattr(shipper.settings, "environment", "local")
+    monkeypatch.setattr(shipper.settings, "central_url", "http://test:8200")
+    monkeypatch.setattr(shipper.settings, "central_api_key", "key")
+
+    # Redis mock: xgroup_create succeeds, xreadgroup blocks forever
+    # so the loop is "running" until we cancel it.
+    redis_mock = MagicMock()
+    redis_mock.xgroup_create = AsyncMock()
+
+    blocked = asyncio.Event()
+    async def _block_forever(*args, **kwargs):
+        blocked.set()
+        await asyncio.sleep(3600)  # blocks until cancelled
+    redis_mock.xreadgroup = AsyncMock(side_effect=_block_forever)
+
+    task = asyncio.create_task(run_shipper(redis_mock))
+
+    # Wait until the shipper has flipped running=True and is parked
+    # inside xreadgroup. Short timeout — if we don't reach this state
+    # quickly the test is genuinely broken.
+    await asyncio.wait_for(blocked.wait(), timeout=1.0)
+    assert shipper_metrics_module.metrics.running is True, (
+        "Pre-cancel state: shipper should report running=True after "
+        "mark_running() fires in the loop entry."
+    )
+
+    # Cancel and await — finally block must run.
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    # The critical G5 invariant: after cancellation, /health must
+    # reflect the shipper as STOPPED. Pre-Sprint-1.6 this was True
+    # — the bug Agent 3 caught.
+    assert shipper_metrics_module.metrics.running is False, (
+        "G5 promise broken: after task cancellation, shipper_metrics"
+        ".running is still True. /health would lie about shipper "
+        "liveness — exactly the audit-2026-05-16 pathology."
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_shipper_marks_stopped_on_unexpected_crash(monkeypatch):
+    """Sister test to cancellation. An unexpected exception that
+    escapes the outer catch-all (rare but possible — e.g., asyncio
+    primitive errors that don't go through except blocks) must still
+    trigger mark_stopped() via the finally clause.
+
+    We inject a BaseException subclass (which the catch-all
+    ``except Exception`` does NOT catch) so the loop's catch-all is
+    bypassed and we exercise the FINALLY path specifically.
+    """
+    import asyncio
+
+    from app import shipper_metrics as shipper_metrics_module
+    shipper_metrics_module._reset_for_tests()
+
+    monkeypatch.setattr(shipper.settings, "environment", "local")
+    monkeypatch.setattr(shipper.settings, "central_url", "http://test:8200")
+
+    class _CrashBaseException(BaseException):
+        """Subclass of BaseException, not Exception — bypasses the
+        loop's `except Exception` catch-all."""
+
+    redis_mock = MagicMock()
+    redis_mock.xgroup_create = AsyncMock()
+    redis_mock.xreadgroup = AsyncMock(
+        side_effect=_CrashBaseException("simulated crash"),
+    )
+
+    with pytest.raises(_CrashBaseException):
+        await run_shipper(redis_mock)
+
+    assert shipper_metrics_module.metrics.running is False, (
+        "G5 invariant broken: unexpected crash (BaseException) left "
+        "running=True. The finally clause should fire regardless of "
+        "exception class."
+    )

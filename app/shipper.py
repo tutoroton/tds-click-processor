@@ -237,198 +237,217 @@ async def run_shipper(redis_pool):
     # F.29 Sprint 1.4 — surface "shipper is alive" to /health. Pre-F.29
     # /health returned redis=true even when the shipper task had crashed
     # silently; running=true here flips ON only after the consumer group
-    # is established. The matching mark_stopped() lives in the finally
-    # block at the end of this function so cancellation on lifespan
-    # shutdown surfaces correctly in /health right up to process exit.
+    # is established. The matching mark_stopped() runs in the try/finally
+    # block below (Sprint 1.6 fix), so cancellation on lifespan shutdown
+    # AND unexpected mid-loop crashes both surface as running=False in
+    # /health immediately after exit.
     shipper_metrics.mark_running()
 
-    retry_delay = 1
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        while True:
-            try:
-                # Read batch from local stream
-                results = await redis_pool.xreadgroup(
-                    GROUP_NAME, CONSUMER_NAME,
-                    {STREAM_KEY: ">"},
-                    count=BATCH_SIZE,
-                    block=BATCH_TIMEOUT_MS,
-                )
+    # F.29 Sprint 1.6 (validation cycle) — try/finally guarantees
+    # mark_stopped() fires on ANY exit (graceful cancellation OR
+    # unexpected crash mid-loop). Without this the running flag
+    # stayed True forever after a task crash → /health reported
+    # the shipper as alive while it was actually dead, exactly the
+    # 50-day audit-2026-05-16 silent-disable pathology that G5 was
+    # built to surface. Caught by Agent 3 validation 2026-05-23.
+    try:
+        retry_delay = 1
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            while True:
+                try:
+                    # Read batch from local stream
+                    results = await redis_pool.xreadgroup(
+                        GROUP_NAME, CONSUMER_NAME,
+                        {STREAM_KEY: ">"},
+                        count=BATCH_SIZE,
+                        block=BATCH_TIMEOUT_MS,
+                    )
 
-                if not results:
-                    continue
+                    if not results:
+                        continue
 
-                stream_name, messages = results[0]
-                clicks = []
-                msg_ids = []
+                    stream_name, messages = results[0]
+                    clicks = []
+                    msg_ids = []
 
-                for msg_id, data in messages:
-                    msg_ids.append(msg_id)
-                    try:
-                        click = json.loads(data.get("data", "{}"))
-                        clicks.append(click)
-                    except (json.JSONDecodeError, TypeError) as parse_exc:
-                        # F.29 Sprint 1.3 (2026-05-23) — visible parse
-                        # failure. Pre-F.29 the except branch silently
-                        # ACKed and continued, hiding corrupt payloads
-                        # from Sentry. Now we WARN-log + capture with
-                        # ``op=parse_payload`` so the parse-failure rate
-                        # is visible per node + alertable in Sprint 4.1.
-                        logger.warning(
-                            "Shipper parse failure (op=%s) for msg=%s: %s. "
-                            "ACKing to unblock stream — corrupt click "
-                            "payload, data is lost.",
-                            OP_PARSE_PAYLOAD, msg_id, parse_exc,
-                        )
-                        _capture_op_msg(
-                            OP_PARSE_PAYLOAD,
-                            f"Shipper parse failure for msg_id={msg_id}: "
-                            f"{parse_exc}",
-                            level="warning",
-                            msg_id=str(msg_id),
-                        )
-                        # Best-effort XACK. Wrapped because Redis
-                        # impairment is exactly the condition we are
-                        # recovering from; without the wrap an XACK
-                        # failure would propagate to the outer Exception
-                        # handler and lose the parse-payload tag. The
-                        # parse-failed message stays in the pending
-                        # entry list on XACK failure; XREADGROUP with
-                        # ``>`` moves past it on the consumer side.
+                    for msg_id, data in messages:
+                        msg_ids.append(msg_id)
+                        try:
+                            click = json.loads(data.get("data", "{}"))
+                            clicks.append(click)
+                        except (json.JSONDecodeError, TypeError) as parse_exc:
+                            # F.29 Sprint 1.3 (2026-05-23) — visible parse
+                            # failure. Pre-F.29 the except branch silently
+                            # ACKed and continued, hiding corrupt payloads
+                            # from Sentry. Now we WARN-log + capture with
+                            # ``op=parse_payload`` so the parse-failure rate
+                            # is visible per node + alertable in Sprint 4.1.
+                            logger.warning(
+                                "Shipper parse failure (op=%s) for msg=%s: %s. "
+                                "ACKing to unblock stream — corrupt click "
+                                "payload, data is lost.",
+                                OP_PARSE_PAYLOAD, msg_id, parse_exc,
+                            )
+                            _capture_op_msg(
+                                OP_PARSE_PAYLOAD,
+                                f"Shipper parse failure for msg_id={msg_id}: "
+                                f"{parse_exc}",
+                                level="warning",
+                                msg_id=str(msg_id),
+                            )
+                            # Best-effort XACK. Wrapped because Redis
+                            # impairment is exactly the condition we are
+                            # recovering from; without the wrap an XACK
+                            # failure would propagate to the outer Exception
+                            # handler and lose the parse-payload tag. The
+                            # parse-failed message stays in the pending
+                            # entry list on XACK failure; XREADGROUP with
+                            # ``>`` moves past it on the consumer side.
+                            try:
+                                await redis_pool.xack(
+                                    STREAM_KEY, GROUP_NAME, msg_id,
+                                )
+                            except Exception as xack_exc:  # noqa: BLE001
+                                logger.warning(
+                                    "Shipper xack failure (op=%s) for msg=%s: %s",
+                                    OP_XACK, msg_id, xack_exc,
+                                )
+                                _capture_op_exc(
+                                    OP_XACK,
+                                    xack_exc,
+                                    msg_id=str(msg_id),
+                                    context="post-parse-failure-ack",
+                                )
+
+                    if not clicks:
+                        continue
+
+                    # Send batch to central collector
+                    response = await client.post(
+                        f"{settings.central_url}/api/clicks/batch",
+                        json={"node_id": settings.node_id, "clicks": clicks},
+                        headers={"X-Node-Key": settings.central_api_key},
+                    )
+
+                    if response.status_code in (200, 202):
+                        # Success — ACK + XTRIM. Wrapped because a Redis
+                        # blip between the successful POST and ACK would
+                        # otherwise propagate to the outer ``except
+                        # Exception`` and tag this as ``op=loop_iteration``
+                        # — losing the fact that the batch DID reach
+                        # central. With ``op=xack_batch`` the operator can
+                        # see that at-least-once semantics were exercised
+                        # (clicks may be re-delivered next iteration via
+                        # PEL claim) and that the duplicate is benign.
                         try:
                             await redis_pool.xack(
-                                STREAM_KEY, GROUP_NAME, msg_id,
+                                STREAM_KEY, GROUP_NAME, *msg_ids,
                             )
-                        except Exception as xack_exc:  # noqa: BLE001
-                            logger.warning(
-                                "Shipper xack failure (op=%s) for msg=%s: %s",
-                                OP_XACK, msg_id, xack_exc,
+                            await redis_pool.xtrim(
+                                STREAM_KEY, maxlen=10000, approximate=True,
+                            )
+                        except Exception as ack_exc:  # noqa: BLE001
+                            logger.error(
+                                "Shipper xack/xtrim failure (op=%s) — batch was "
+                                "DELIVERED to central but local stream not "
+                                "ACKed. Clicks may be re-delivered (at-least-"
+                                "once contract — Sprint 2 deadletter will "
+                                "bound replays): %s",
+                                OP_XACK_BATCH, ack_exc,
                             )
                             _capture_op_exc(
-                                OP_XACK,
-                                xack_exc,
-                                msg_id=str(msg_id),
-                                context="post-parse-failure-ack",
+                                OP_XACK_BATCH,
+                                ack_exc,
+                                batch_size=len(clicks),
+                                collector_status=response.status_code,
                             )
-
-                if not clicks:
-                    continue
-
-                # Send batch to central collector
-                response = await client.post(
-                    f"{settings.central_url}/api/clicks/batch",
-                    json={"node_id": settings.node_id, "clicks": clicks},
-                    headers={"X-Node-Key": settings.central_api_key},
-                )
-
-                if response.status_code in (200, 202):
-                    # Success — ACK + XTRIM. Wrapped because a Redis
-                    # blip between the successful POST and ACK would
-                    # otherwise propagate to the outer ``except
-                    # Exception`` and tag this as ``op=loop_iteration``
-                    # — losing the fact that the batch DID reach
-                    # central. With ``op=xack_batch`` the operator can
-                    # see that at-least-once semantics were exercised
-                    # (clicks may be re-delivered next iteration via
-                    # PEL claim) and that the duplicate is benign.
-                    try:
-                        await redis_pool.xack(
-                            STREAM_KEY, GROUP_NAME, *msg_ids,
-                        )
-                        await redis_pool.xtrim(
-                            STREAM_KEY, maxlen=10000, approximate=True,
-                        )
-                    except Exception as ack_exc:  # noqa: BLE001
-                        logger.error(
-                            "Shipper xack/xtrim failure (op=%s) — batch was "
-                            "DELIVERED to central but local stream not "
-                            "ACKed. Clicks may be re-delivered (at-least-"
-                            "once contract — Sprint 2 deadletter will "
-                            "bound replays): %s",
-                            OP_XACK_BATCH, ack_exc,
-                        )
-                        _capture_op_exc(
-                            OP_XACK_BATCH,
-                            ack_exc,
-                            batch_size=len(clicks),
-                            collector_status=response.status_code,
-                        )
-                        # F.29 Sprint 1.4 — surface this distinct
-                        # outcome to /health so operators see "batch
-                        # got there but local ACK didn't" without
-                        # having to read logs.
-                        shipper_metrics.record_ship(
-                            "ack_failed", batch_size=len(clicks),
-                        )
+                            # F.29 Sprint 1.4 — surface this distinct
+                            # outcome to /health so operators see "batch
+                            # got there but local ACK didn't" without
+                            # having to read logs.
+                            shipper_metrics.record_ship(
+                                "ack_failed", batch_size=len(clicks),
+                            )
+                        else:
+                            logger.info(
+                                "Shipped %d clicks to central (op=%s)",
+                                len(clicks), OP_BATCH_POST,
+                            )
+                            shipper_metrics.record_ship(
+                                "success", batch_size=len(clicks),
+                            )
+                        retry_delay = 1  # Reset retry delay
                     else:
-                        logger.info(
-                            "Shipped %d clicks to central (op=%s)",
-                            len(clicks), OP_BATCH_POST,
+                        # F.29 Sprint 1.3 — non-2xx response was warn-log
+                        # only pre-F.29. Now tagged op=batch_post so the
+                        # Sprint 4.1 alert "shipper.batch.success_ratio<X"
+                        # has a queryable signal.
+                        logger.warning(
+                            "Central returned %s (op=%s): %s. Retry in %ss.",
+                            response.status_code, OP_BATCH_POST,
+                            response.text[:200], retry_delay,
+                        )
+                        _capture_op_msg(
+                            OP_BATCH_POST,
+                            f"Central returned {response.status_code}",
+                            level="warning",
+                            collector_status=response.status_code,
+                            response_body=response.text[:500],
+                            batch_size=len(clicks),
                         )
                         shipper_metrics.record_ship(
-                            "success", batch_size=len(clicks),
+                            "collector_error", batch_size=len(clicks),
                         )
-                    retry_delay = 1  # Reset retry delay
-                else:
-                    # F.29 Sprint 1.3 — non-2xx response was warn-log
-                    # only pre-F.29. Now tagged op=batch_post so the
-                    # Sprint 4.1 alert "shipper.batch.success_ratio<X"
-                    # has a queryable signal.
+                        await asyncio.sleep(retry_delay)
+                        retry_delay = min(retry_delay * 2, MAX_RETRY_DELAY)
+
+                except httpx.RequestError as e:
+                    # F.29 Sprint 1.3 — tagged op=batch_post (HTTP
+                    # connectivity, not redis). Pre-F.29 warn-log only;
+                    # central-unreachable was invisible in Sentry. Now
+                    # the op tag groups these with HTTP 5xx for unified
+                    # alerting on "batch_post failure rate".
                     logger.warning(
-                        "Central returned %s (op=%s): %s. Retry in %ss.",
-                        response.status_code, OP_BATCH_POST,
-                        response.text[:200], retry_delay,
+                        "Central unreachable (op=%s): %s. Retry in %ss.",
+                        OP_BATCH_POST, e, retry_delay,
                     )
-                    _capture_op_msg(
+                    _capture_op_exc(
                         OP_BATCH_POST,
-                        f"Central returned {response.status_code}",
-                        level="warning",
-                        collector_status=response.status_code,
-                        response_body=response.text[:500],
+                        e,
                         batch_size=len(clicks),
+                        failure_kind="httpx.RequestError",
                     )
                     shipper_metrics.record_ship(
-                        "collector_error", batch_size=len(clicks),
+                        "unreachable", batch_size=len(clicks),
                     )
                     await asyncio.sleep(retry_delay)
                     retry_delay = min(retry_delay * 2, MAX_RETRY_DELAY)
-
-            except httpx.RequestError as e:
-                # F.29 Sprint 1.3 — tagged op=batch_post (HTTP
-                # connectivity, not redis). Pre-F.29 warn-log only;
-                # central-unreachable was invisible in Sentry. Now
-                # the op tag groups these with HTTP 5xx for unified
-                # alerting on "batch_post failure rate".
-                logger.warning(
-                    "Central unreachable (op=%s): %s. Retry in %ss.",
-                    OP_BATCH_POST, e, retry_delay,
-                )
-                _capture_op_exc(
-                    OP_BATCH_POST,
-                    e,
-                    batch_size=len(clicks),
-                    failure_kind="httpx.RequestError",
-                )
-                shipper_metrics.record_ship(
-                    "unreachable", batch_size=len(clicks),
-                )
-                await asyncio.sleep(retry_delay)
-                retry_delay = min(retry_delay * 2, MAX_RETRY_DELAY)
-            except Exception as e:
-                # F.29 Sprint 1.3 — catch-all gets a distinct tag so
-                # operators can split "structured failure mode" (the
-                # tagged paths above) from "unknown loop branch"
-                # (this one). XREADGROUP timeouts / Redis impairment
-                # surface here when the inner try-except above didn't
-                # absorb them. Pre-F.29 every exception landed in this
-                # branch with the generic ``Shipper error`` umbrella.
-                logger.error(
-                    "Shipper loop catch-all (op=%s): %s",
-                    OP_LOOP_ITERATION, e,
-                )
-                _capture_op_exc(
-                    OP_LOOP_ITERATION,
-                    e,
-                    failure_kind=type(e).__name__,
-                )
-                shipper_metrics.record_ship("loop_error", batch_size=0)
-                await asyncio.sleep(2)
+                except Exception as e:
+                    # F.29 Sprint 1.3 — catch-all gets a distinct tag so
+                    # operators can split "structured failure mode" (the
+                    # tagged paths above) from "unknown loop branch"
+                    # (this one). XREADGROUP timeouts / Redis impairment
+                    # surface here when the inner try-except above didn't
+                    # absorb them. Pre-F.29 every exception landed in this
+                    # branch with the generic ``Shipper error`` umbrella.
+                    logger.error(
+                        "Shipper loop catch-all (op=%s): %s",
+                        OP_LOOP_ITERATION, e,
+                    )
+                    _capture_op_exc(
+                        OP_LOOP_ITERATION,
+                        e,
+                        failure_kind=type(e).__name__,
+                    )
+                    shipper_metrics.record_ship("loop_error", batch_size=0)
+                    await asyncio.sleep(2)
+    finally:
+        # Mirror of mark_running() above. Wrapped in try/except
+        # because shipper_metrics is a module singleton and an
+        # AttributeError here (e.g. module being torn down at
+        # interpreter exit) must NOT mask the underlying exception
+        # that caused the loop exit in the first place.
+        try:
+            shipper_metrics.mark_stopped()
+        except Exception:  # noqa: BLE001 — finalisation must not raise
+            pass

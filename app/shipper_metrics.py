@@ -138,7 +138,18 @@ metrics = ShipperMetrics()
 
 def _reset_for_tests() -> None:
     """Restore the singleton to default state. For unit tests only —
-    production lifecycle is single-init. Mirrors the pattern in
-    ``disk_queue._reset_state_for_tests``."""
-    global metrics
-    metrics = ShipperMetrics()
+    production lifecycle is single-init.
+
+    Mutates the existing object IN PLACE rather than rebinding the
+    module attribute. Importers that did ``from app.shipper_metrics
+    import metrics as shipper_metrics`` (notably shipper.py) hold a
+    reference to the original object; rebinding the module attribute
+    would leave those references pointing at the OLD object and
+    decouple test state from production state — a subtle bug caught
+    by Sprint 1.6 validation cycle test
+    ``test_run_shipper_marks_stopped_on_cancellation`` 2026-05-23.
+    """
+    metrics.running = False
+    metrics.last_ship_at = None
+    metrics.last_ship_status = "n/a"
+    metrics.last_batch_size = 0

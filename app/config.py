@@ -137,6 +137,38 @@ class Settings(BaseSettings):
     disk_queue_max_files: int = 100_000
     disk_queue_drain_interval_seconds: int = 30
 
+    # F.29 Sprint 1.5 (2026-05-23) — pre-flight disk-pressure threshold.
+    #
+    # Closes plan §3 G4: pre-F.29 the disk-queue fallback at
+    # main.py:659-674 would fall through to enqueue_click whenever the
+    # XADD path failed. The cap-by-file-count guard
+    # (``disk_queue_max_files``) bounds queue *cardinality*, but a
+    # disk-FULL condition fires BEFORE the file-count cap is hit
+    # (each click is ~500 B; 100k files × 500 B ≈ 50 MB, but if the
+    # mount has 0 free bytes for any other reason — log rotation,
+    # /var/lib runaway, etc. — the enqueue OSErrors and the click is
+    # "genuinely lost" per the pre-F.29 comment at main.py:674).
+    #
+    # The pre-flight check (``app.disk_queue.check_disk_pressure``)
+    # compares free bytes against THIS threshold before attempting
+    # the write. If under pressure:
+    #   - CRITICAL log + Sentry capture
+    #   - /decide returns 503 disk_pressure to the CF Worker
+    #   - Worker falls through to its own fallback URL → user still
+    #     gets redirected; click is recorded as visibly lost rather
+    #     than silently lost
+    #
+    # 1 GiB default is generous: at ~500 B/click the disk-queue would
+    # need to absorb 2M backlogged clicks to push the threshold —
+    # well above the file-count cap (100k). It's a SECOND-LINE
+    # defense against non-shipper disk consumers competing for the
+    # same mount (logs, sync_client downloads, ad-hoc files).
+    #
+    # Local env (TDS_ENVIRONMENT in {local, development}) skips the
+    # check — engineers may have small dev partitions and the disk
+    # fallback path isn't exercised in dev anyway.
+    disk_queue_min_free_bytes: int = 1_073_741_824  # 1 GiB
+
     # ------------------------------------------------------------------
     # Diagnostic mode toggles. All three default `False` — production
     # safety-first. Operator flips per-environment via `.env`:

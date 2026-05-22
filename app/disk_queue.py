@@ -64,13 +64,14 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 import time
 import uuid
 from pathlib import Path
 
 import sentry_sdk
 
-from app.config import settings
+from app.config import _LOCAL_ENVIRONMENTS, settings
 
 logger = logging.getLogger("tds.disk_queue")
 
@@ -232,6 +233,74 @@ async def get_queue_size() -> int:
     metrics emitters. Triggers lazy init on first call."""
     await _ensure_initialized()
     return _queue_size
+
+
+def check_disk_pressure() -> tuple[bool, int | None]:
+    """Synchronous pre-flight check for disk-queue mountpoint capacity.
+
+    F.29 Sprint 1.5 (2026-05-23). Returns a ``(is_pressured, free_bytes)``
+    tuple. The caller (``/decide`` handler in ``main.py``) uses this
+    BEFORE attempting :func:`enqueue_click` so a known-saturated mount
+    surfaces as a visible 503 rather than getting noticed only after
+    multiple write failures.
+
+    Policy:
+
+    * Local env (``environment ∈ _LOCAL_ENVIRONMENTS``) → always
+      return ``(False, free_or_None)``. Engineers may have small
+      dev partitions and the disk-fallback path isn't exercised in
+      dev anyway. Free bytes still returned for /health visibility.
+    * ``disk_queue_root`` empty or non-existent →
+      ``(False, None)``. Operator disabled disk fallback entirely;
+      no pressure to surface, no path to read.
+    * Otherwise → ``(free_bytes < disk_queue_min_free_bytes, free_bytes)``.
+
+    Synchronous because ``shutil.disk_usage`` is a single syscall
+    (~µs). Wrapping in ``asyncio.to_thread`` would add overhead
+    without latency benefit; the call site is the slow path
+    (post-XADD-failure), not the hot routing path.
+
+    Returns:
+        Tuple of ``(is_pressured, free_bytes)``. ``free_bytes`` is
+        ``None`` only when ``disk_queue_root`` cannot be read (path
+        absent, permission error). When ``None``, ``is_pressured`` is
+        always ``False`` (cannot determine pressure → don't block).
+    """
+    if not settings.disk_queue_root:
+        # Operator opted out of disk fallback (TDS_DISK_QUEUE_ROOT="").
+        # No pressure to surface; downstream caller will see
+        # enqueue_click return False on the cap path and handle
+        # accordingly.
+        return False, None
+
+    try:
+        usage = shutil.disk_usage(settings.disk_queue_root)
+    except (OSError, FileNotFoundError) as exc:
+        # Root path doesn't exist yet on first boot (the parent dir
+        # gets created lazily by ``_write_file_sync.mkdir``). The
+        # absence itself isn't pressure — it just means we cannot
+        # measure. Log at DEBUG only (not WARNING) because this is
+        # the expected state on a brand-new node before the first
+        # disk-fallback fires.
+        logger.debug(
+            "Disk-queue pressure check: %s unreadable (%s) — "
+            "treating as 'cannot measure', no pressure.",
+            settings.disk_queue_root, exc,
+        )
+        return False, None
+
+    free_bytes = usage.free
+
+    # Local env: always report "not pressured" so dev partitions
+    # don't trigger 503s on a laptop. Still return the free_bytes so
+    # /health surfaces the value (operator might want to see it
+    # even in dev).
+    if settings.environment in _LOCAL_ENVIRONMENTS:
+        return False, free_bytes
+
+    threshold = settings.disk_queue_min_free_bytes
+    is_pressured = free_bytes < threshold
+    return is_pressured, free_bytes
 
 
 async def enqueue_click(record: dict) -> bool:

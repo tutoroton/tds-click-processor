@@ -33,7 +33,11 @@ from app.redis_client import get_redis, close_redis
 from app.router import route, parse_device_type, parse_os, parse_browser, get_full_ua_info
 from app.shipper import assert_shipper_ready, run_shipper
 from app.shipper_metrics import metrics as shipper_metrics
-from app.disk_queue import enqueue_click as enqueue_click_to_disk, run_drainer as run_disk_drainer
+from app.disk_queue import (
+    check_disk_pressure,
+    enqueue_click as enqueue_click_to_disk,
+    run_drainer as run_disk_drainer,
+)
 from app.observability import run_observability_loop
 from app.sync_client import apply_snapshot, start_periodic_pull
 
@@ -664,6 +668,62 @@ async def decide(
     except Exception as e:
         logger.error("Failed to write click to stream: %s", e, extra={"click_id": req.click_id})
         sentry_sdk.capture_exception(e)
+        # F.29 Sprint 1.5 (2026-05-23) — pre-flight disk-pressure check.
+        # Plan §3 G4 closes the "disk full → enqueue OSErrors silently"
+        # gap. Pre-F.29 the disk-fallback path called enqueue_click
+        # blindly and accepted whatever bool came back; on a truly-full
+        # mount the write raised OSError, was caught inside enqueue_click,
+        # logged at ERROR + Sentry-captured, and returned False — but
+        # /decide kept going and responded 302 to the Worker. The click
+        # was "genuinely lost" per the pre-F.29 comment, with NO HTTP
+        # signal back to the Worker that storage was saturated.
+        #
+        # Post-F.29: check_disk_pressure() returns (is_pressured, free).
+        # If pressured (free < TDS_DISK_QUEUE_MIN_FREE_BYTES, default 1
+        # GiB), refuse the fallback and 503 to the Worker. Worker's
+        # AbortSignal fallback URL takes over → user still gets
+        # redirected via Worker fallback path → operator sees the 503
+        # signal in node logs + Sentry breadcrumb tagged
+        # ``op=disk_pressure``.
+        is_pressured, free_bytes = check_disk_pressure()
+        if is_pressured:
+            logger.critical(
+                "F.29 Sprint 1.5 — disk-queue under pressure: "
+                "%s free bytes < %s threshold on %s. REFUSING fallback "
+                "enqueue for click %s. Worker will receive 503 → falls "
+                "through to its own fallback URL (graceful degradation).",
+                free_bytes,
+                settings.disk_queue_min_free_bytes,
+                settings.disk_queue_root,
+                req.click_id,
+            )
+            with sentry_sdk.push_scope() as scope:
+                scope.set_tag("op", "disk_pressure")
+                scope.set_tag("node_id", settings.node_id)
+                scope.set_extra("free_bytes", free_bytes)
+                scope.set_extra(
+                    "threshold_bytes",
+                    settings.disk_queue_min_free_bytes,
+                )
+                scope.set_extra("disk_queue_root", settings.disk_queue_root)
+                scope.set_extra("click_id", req.click_id)
+                sentry_sdk.capture_message(
+                    f"Disk queue under pressure: free={free_bytes} < "
+                    f"threshold={settings.disk_queue_min_free_bytes} "
+                    f"on {settings.disk_queue_root}. Click {req.click_id} "
+                    "refused (503).",
+                    level="error",
+                )
+            emit_checkpoint("click.disk_pressure_503", {
+                "click_id": req.click_id,
+                "free_bytes": free_bytes,
+                "threshold_bytes": settings.disk_queue_min_free_bytes,
+            })
+            raise HTTPException(
+                status_code=503,
+                detail="disk_pressure",
+            )
+
         # T2.2 / G-23 — fall back to disk queue when Redis is
         # unreachable. Without this, every click during a Redis
         # outage was LOST: the log + Sentry capture above record

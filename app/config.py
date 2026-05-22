@@ -169,6 +169,36 @@ class Settings(BaseSettings):
     # fallback path isn't exercised in dev anyway.
     disk_queue_min_free_bytes: int = 1_073_741_824  # 1 GiB
 
+    # F.29 Sprint 2.2 (2026-05-23) — shipper retry policy for clicks
+    # the central collector REJECTED (per-click verdict in BatchResponse,
+    # Sprint 2.1). Each rejected click_id increments a Redis counter
+    # ``click:retry:{click_id}`` (24-hour TTL). When the counter reaches
+    # this maximum, the click is deadlettered (Sprint 2.3) — moved out
+    # of the shipper's retry rotation into a central deadletter stream
+    # for operator inspection.
+    #
+    # Default 5 chosen to balance:
+    #   * Tolerate transient collector blips (1-2 quick retries).
+    #   * Catch persistent rejects (validation failures, schema
+    #     regressions) within ~5 batch cycles ≈ 10s at default
+    #     2s batch timeout.
+    #   * Bound retry storms — a misconfigured collector returning
+    #     100% rejected won't keep ~1M clicks in PEL forever.
+    #
+    # Operator override:
+    #   TDS_SHIPPER_MAX_RETRY_ATTEMPTS=2 → quicker deadlettering
+    #     during a sustained incident (sacrifices some legitimate
+    #     transient retries for operator triage speed).
+    #   TDS_SHIPPER_MAX_RETRY_ATTEMPTS=10 → more patience for slow
+    #     central recovery (longer retry tail, larger backlog).
+    shipper_max_retry_attempts: int = 5
+
+    # F.29 Sprint 2.2 — retry counter TTL. 24h is plenty for a click
+    # to either deadletter or eventually succeed; setting too low
+    # would reset the counter mid-incident and let a stuck click
+    # retry forever.
+    shipper_retry_ttl_seconds: int = 86400  # 24 hours
+
     # ------------------------------------------------------------------
     # Diagnostic mode toggles. All three default `False` — production
     # safety-first. Operator flips per-environment via `.env`:

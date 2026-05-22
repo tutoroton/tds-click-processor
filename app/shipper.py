@@ -29,6 +29,21 @@ BATCH_SIZE = 500
 BATCH_TIMEOUT_MS = 2000  # 2 seconds
 MAX_RETRY_DELAY = 30
 
+# F.29 Sprint 2.2 (2026-05-23) — local Redis key prefix for per-click
+# retry-attempt counters. Each rejected click_id increments
+# ``click:retry:{click_id}`` (TTL = settings.shipper_retry_ttl_seconds).
+# At settings.shipper_max_retry_attempts the click is deadlettered.
+_RETRY_KEY_PREFIX = "click:retry:"
+
+# Local edge deadletter stream. Sprint 2.2 writes here as the
+# operator-visible holding pen for clicks that exceeded retry
+# attempts. Sprint 2.3 will additionally POST to central
+# /api/clicks/deadletter so the central operator dashboard sees it
+# too — until then, edge operators can XRANGE this stream + replay
+# manually via XADD-to-stream:clicks if needed.
+DEADLETTER_STREAM_KEY = "stream:clicks-deadletter"
+DEADLETTER_STREAM_MAXLEN = 10_000
+
 
 # ---------------------------------------------------------------------------
 # F.29 Sprint 1.3 — structured Sentry tagging (Sprint 1.6 — extracted)
@@ -160,6 +175,221 @@ def assert_shipper_ready() -> None:
     raise ShipperDisabledError(msg)
 
 
+# ---------------------------------------------------------------------------
+# F.29 Sprint 2.2 (2026-05-23) — per-click verdict handling helpers
+# ---------------------------------------------------------------------------
+# Sprint 2.1 introduced the collector response shape
+# ``{accepted: [...], rejected: [{click_id, reason}], duplicates: [...]}``.
+# These helpers consume that shape on the shipper side:
+#
+#   * :func:`_parse_collector_response` — robust JSON parse with the
+#     Sprint 2.5 backwards-compat shim. Returns a tuple
+#     ``(shape, parsed)`` where ``shape`` is one of ``"new"`` /
+#     ``"legacy"`` / ``"unknown"`` so the caller can branch.
+#   * :func:`_handle_rejected_click` — increments the per-click retry
+#     counter; on max-attempts hit, XADDs the click to the local
+#     deadletter stream + reports the OP_DEADLETTER op tag.
+#   * :func:`_retry_click` — re-XADDs a rejected click back to
+#     ``stream:clicks`` for the next iteration. The retry counter
+#     survives via Redis TTL.
+#
+# Sprint 2.5 shim semantics: a pre-F.29 collector returns
+# ``{"received": N, "queued": N, "stream_id": "X"}`` with NO
+# ``accepted`` key. The shim detects this and falls back to the
+# legacy ACK-all behavior (status 200/202 = success). One WARN-level
+# Sentry capture per shim-trigger keeps the operator aware of the
+# rolling-deploy gap without spamming the issue feed.
+
+from typing import Any
+
+
+def _parse_collector_response(
+    response_text: str,
+) -> tuple[str, dict[str, Any] | None]:
+    """Parse the collector's batch response with shim detection.
+
+    Returns:
+        Tuple of ``(shape, body)``:
+        * ``("new", body)`` — Sprint 2.1+ shape (has ``accepted`` key).
+        * ``("legacy", body)`` — pre-F.29 shape (has ``received`` /
+          ``queued`` keys but no ``accepted``). Used during rolling
+          deploy when shipper has been updated but collector hasn't.
+        * ``("unknown", None)`` — body unparseable as JSON OR has
+          no recognised keys. Caller falls back to status-code-only
+          decision (legacy ACK-all on 2xx).
+    """
+    if not response_text:
+        return ("unknown", None)
+    try:
+        body = json.loads(response_text)
+    except (json.JSONDecodeError, ValueError):
+        return ("unknown", None)
+    if not isinstance(body, dict):
+        return ("unknown", None)
+    if "accepted" in body:
+        return ("new", body)
+    if "received" in body or "queued" in body:
+        return ("legacy", body)
+    return ("unknown", body)
+
+
+async def _retry_click(
+    redis_pool,
+    click: dict[str, Any],
+) -> None:
+    """Re-XADD a rejected click back to ``stream:clicks`` for the
+    next iteration.
+
+    The retry counter (``click:retry:{click_id}`` in Redis) survives
+    across re-XADDs via TTL — it tracks attempts even though the
+    underlying stream entry gets a new msg_id each time. The old
+    msg_id of the rejected attempt MUST be ACKed by the caller AFTER
+    this re-XADD succeeds (otherwise PEL grows unbounded).
+    """
+    payload = json.dumps(click, default=str)
+    await redis_pool.xadd(
+        STREAM_KEY,
+        {"data": payload},
+        maxlen=settings.stream_clicks_maxlen,
+        approximate=True,
+    )
+
+
+async def _deadletter_click(
+    redis_pool,
+    click: dict[str, Any],
+    attempt: int,
+    reason: str,
+) -> None:
+    """Move a click to the local deadletter stream after max retries.
+
+    F.29 Sprint 2.2 (2026-05-23). The click sits in
+    ``stream:clicks-deadletter`` (local edge Redis, MAXLEN 10k) until
+    Sprint 2.3 adds central forwarding. Operator can inspect via
+    ``redis-cli XRANGE`` or the (future) ``/api/health/summary``
+    deadletter widget.
+
+    The deadletter record carries:
+      * ``data`` — original click JSON.
+      * ``attempt_count`` — final attempt number that triggered the
+        cap (operator can see "this click failed 5 times").
+      * ``last_rejection_reason`` — collector's reason string for
+        the last attempt (e.g. ``"queue_failure"``,
+        ``"validation_failed"``).
+      * ``deadlettered_at`` — UNIX timestamp.
+      * ``node_id`` — which edge node deadlettered the click. Sprint
+        2.3 central forwarding will use this to bucket by tenant.
+    """
+    import time as _time
+    record = {
+        "data": json.dumps(click, default=str),
+        "attempt_count": str(attempt),
+        "last_rejection_reason": reason[:64],  # bound reason length
+        "deadlettered_at": str(_time.time()),
+        "node_id": settings.node_id,
+    }
+    try:
+        await redis_pool.xadd(
+            DEADLETTER_STREAM_KEY,
+            record,
+            maxlen=DEADLETTER_STREAM_MAXLEN,
+            approximate=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        # Deadletter XADD failure is rare (separate stream, low rate)
+        # but not catastrophic — log + Sentry capture. The click is
+        # genuinely lost in this corner case; operator visibility is
+        # the only mitigation here. Future Sprint 2.3 central path
+        # provides redundancy.
+        logger.error(
+            "Shipper deadletter XADD failed for click_id=%s "
+            "(attempt=%d, reason=%s): %s",
+            click.get("click_id", "<unknown>"), attempt, reason, exc,
+        )
+        _capture_op_exc(
+            "deadletter",
+            exc,
+            click_id=click.get("click_id", "<unknown>"),
+            attempt=attempt,
+            reason=reason,
+        )
+
+
+async def _handle_rejected_click(
+    redis_pool,
+    click: dict[str, Any],
+    reason: str,
+) -> bool:
+    """Increment retry counter; return True if click should be retried,
+    False if it was deadlettered (max attempts hit).
+
+    The counter (``click:retry:{click_id}``) is per-click_id; the
+    Sprint 2.1 central dedup gate (``click:central_seen:{click_id}``)
+    is at the COLLECTOR side. Retries land at the collector and either:
+      * Get accepted (transient collector issue resolved).
+      * Get bucketed as ``duplicates`` if a sibling node won the race
+        in the meantime (idempotent convergence — shipper ACKs).
+      * Get rejected again (counter increments).
+    """
+    click_id = click.get("click_id")
+    if not click_id:
+        # Pathological — Sprint 2.1 collector returns
+        # missing_click_id reason. Cannot retry without an id; just
+        # deadletter immediately.
+        await _deadletter_click(
+            redis_pool, click, attempt=1, reason=reason,
+        )
+        return False
+
+    retry_key = f"{_RETRY_KEY_PREFIX}{click_id}"
+    try:
+        attempt = await redis_pool.incr(retry_key)
+        await redis_pool.expire(
+            retry_key, settings.shipper_retry_ttl_seconds,
+        )
+    except Exception as exc:  # noqa: BLE001
+        # Counter increment failed — Redis impairment. Default to
+        # deadletter conservatively rather than infinite-retry.
+        logger.warning(
+            "Shipper retry counter increment failed for click_id=%s: "
+            "%s. Deadlettering conservatively.",
+            click_id, exc,
+        )
+        await _deadletter_click(
+            redis_pool, click, attempt=-1, reason=f"counter_error:{reason}",
+        )
+        return False
+
+    if attempt >= settings.shipper_max_retry_attempts:
+        await _deadletter_click(
+            redis_pool, click, attempt=attempt, reason=reason,
+        )
+        # Clean up the retry counter — click is out of the loop now.
+        try:
+            await redis_pool.delete(retry_key)
+        except Exception:  # noqa: BLE001
+            pass  # TTL will eventually clean it up
+        return False
+
+    # Re-XADD for next iteration.
+    try:
+        await _retry_click(redis_pool, click)
+    except Exception as exc:  # noqa: BLE001
+        # Re-XADD failed (likely Redis impairment). Deadletter so the
+        # click isn't lost silently.
+        logger.warning(
+            "Shipper re-XADD failed for click_id=%s on attempt %d: "
+            "%s. Deadlettering.",
+            click_id, attempt, exc,
+        )
+        await _deadletter_click(
+            redis_pool, click, attempt=attempt, reason=f"requeue_error:{reason}",
+        )
+        return False
+
+    return True
+
+
 async def run_shipper(redis_pool):
     """Main shipper loop."""
     # F.29 Sprint 1.2 — synchronous boot validation. Replaces the
@@ -281,54 +511,251 @@ async def run_shipper(redis_pool):
                         headers={"X-Node-Key": settings.central_api_key},
                     )
 
-                    if response.status_code in (200, 202):
-                        # Success — ACK + XTRIM. Wrapped because a Redis
-                        # blip between the successful POST and ACK would
-                        # otherwise propagate to the outer ``except
-                        # Exception`` and tag this as ``op=loop_iteration``
-                        # — losing the fact that the batch DID reach
-                        # central. With ``op=xack_batch`` the operator can
-                        # see that at-least-once semantics were exercised
-                        # (clicks may be re-delivered next iteration via
-                        # PEL claim) and that the duplicate is benign.
-                        try:
-                            await redis_pool.xack(
-                                STREAM_KEY, GROUP_NAME, *msg_ids,
-                            )
-                            await redis_pool.xtrim(
-                                STREAM_KEY, maxlen=10000, approximate=True,
-                            )
-                        except Exception as ack_exc:  # noqa: BLE001
-                            logger.error(
-                                "Shipper xack/xtrim failure (op=%s) — batch was "
-                                "DELIVERED to central but local stream not "
-                                "ACKed. Clicks may be re-delivered (at-least-"
-                                "once contract — Sprint 2 deadletter will "
-                                "bound replays): %s",
-                                OP_XACK_BATCH, ack_exc,
-                            )
-                            _capture_op_exc(
-                                OP_XACK_BATCH,
-                                ack_exc,
-                                batch_size=len(clicks),
-                                collector_status=response.status_code,
-                            )
-                            # F.29 Sprint 1.4 — surface this distinct
-                            # outcome to /health so operators see "batch
-                            # got there but local ACK didn't" without
-                            # having to read logs.
-                            shipper_metrics.record_ship(
-                                "ack_failed", batch_size=len(clicks),
-                            )
-                        else:
-                            logger.info(
-                                "Shipped %d clicks to central (op=%s)",
-                                len(clicks), OP_BATCH_POST,
-                            )
-                            shipper_metrics.record_ship(
-                                "success", batch_size=len(clicks),
-                            )
+                    if response.status_code in (200, 202, 207):
+                        # F.29 Sprint 2.2 (2026-05-23) — per-click
+                        # verdict processing. Pre-F.29 we ACKed ALL
+                        # msg_ids regardless of body. Now we parse
+                        # ``{accepted, rejected, duplicates}``, ACK
+                        # only successful clicks, and retry / deadletter
+                        # the rejected ones. Status 207 is the new
+                        # multi-status (some rejected) signal.
+                        #
+                        # Shim (Sprint 2.5): if response body is the
+                        # pre-F.29 shape (no ``accepted`` key), fall
+                        # back to legacy ACK-all behavior + WARN log.
+                        # Handles the rolling-deploy window where the
+                        # shipper has been updated but the collector
+                        # hasn't yet.
                         retry_delay = 1  # Reset retry delay
+                        shape, body = _parse_collector_response(
+                            response.text,
+                        )
+                        click_id_to_msg_id = {
+                            c.get("click_id"): m
+                            for c, m in zip(clicks, msg_ids)
+                            if c.get("click_id")
+                        }
+
+                        if shape == "new":
+                            # Per-click verdict path.
+                            accepted_ids = body.get("accepted", []) or []
+                            rejected_items = body.get("rejected", []) or []
+                            duplicate_ids = body.get("duplicates", []) or []
+
+                            # ACK accepted ∪ duplicates — both groups
+                            # represent "click is at central" (just via
+                            # different paths). Use a set to avoid
+                            # double-ACK on the same msg_id if a
+                            # malformed response lists the same click
+                            # twice.
+                            ack_msg_ids = set()
+                            for cid in accepted_ids:
+                                if cid in click_id_to_msg_id:
+                                    ack_msg_ids.add(click_id_to_msg_id[cid])
+                            for cid in duplicate_ids:
+                                if cid in click_id_to_msg_id:
+                                    ack_msg_ids.add(click_id_to_msg_id[cid])
+
+                            # Process rejected: increment retry counter,
+                            # re-XADD OR deadletter. The msg_id of the
+                            # current (failed) attempt gets ACKed
+                            # regardless of outcome — either the click
+                            # is now in deadletter or it's been re-
+                            # XADDed under a new msg_id.
+                            deadletter_count = 0
+                            for rej in rejected_items:
+                                cid = rej.get("click_id")
+                                reason = rej.get("reason", "unknown")
+                                # Find the original click dict to retry.
+                                # Could be missing if the collector
+                                # echoed an unknown click_id — defensive.
+                                original_click = next(
+                                    (c for c in clicks if c.get("click_id") == cid),
+                                    None,
+                                )
+                                if original_click is None:
+                                    logger.warning(
+                                        "Shipper got reject for unknown "
+                                        "click_id=%s in batch (defensive): %s",
+                                        cid, reason,
+                                    )
+                                    if cid in click_id_to_msg_id:
+                                        ack_msg_ids.add(click_id_to_msg_id[cid])
+                                    continue
+                                retried = await _handle_rejected_click(
+                                    redis_pool, original_click, reason,
+                                )
+                                if not retried:
+                                    deadletter_count += 1
+                                # ACK the current msg_id either way.
+                                if cid in click_id_to_msg_id:
+                                    ack_msg_ids.add(click_id_to_msg_id[cid])
+
+                            # ACK all that we decided to ACK.
+                            if ack_msg_ids:
+                                try:
+                                    await redis_pool.xack(
+                                        STREAM_KEY, GROUP_NAME, *ack_msg_ids,
+                                    )
+                                    await redis_pool.xtrim(
+                                        STREAM_KEY, maxlen=10000,
+                                        approximate=True,
+                                    )
+                                except Exception as ack_exc:  # noqa: BLE001
+                                    logger.error(
+                                        "Shipper xack/xtrim failure (op=%s) "
+                                        "— batch was DELIVERED to central "
+                                        "but local stream not ACKed. "
+                                        "Clicks may be re-delivered "
+                                        "(at-least-once contract): %s",
+                                        OP_XACK_BATCH, ack_exc,
+                                    )
+                                    _capture_op_exc(
+                                        OP_XACK_BATCH,
+                                        ack_exc,
+                                        batch_size=len(clicks),
+                                        collector_status=response.status_code,
+                                    )
+                                    shipper_metrics.record_ship(
+                                        "ack_failed",
+                                        batch_size=len(clicks),
+                                    )
+                                    continue
+
+                            # Determine outcome status. Precedence:
+                            # deadlettered > partial_ack > success.
+                            if deadletter_count > 0:
+                                logger.warning(
+                                    "Shipped batch with %d/%d clicks "
+                                    "deadlettered (op=%s); accepted=%d, "
+                                    "duplicates=%d, rejected=%d",
+                                    deadletter_count, len(clicks),
+                                    OP_BATCH_POST,
+                                    len(accepted_ids),
+                                    len(duplicate_ids),
+                                    len(rejected_items),
+                                )
+                                shipper_metrics.record_ship(
+                                    "deadlettered",
+                                    batch_size=len(clicks),
+                                )
+                            elif rejected_items:
+                                logger.info(
+                                    "Shipped batch with %d/%d clicks "
+                                    "retried (op=%s); accepted=%d, "
+                                    "duplicates=%d",
+                                    len(rejected_items), len(clicks),
+                                    OP_BATCH_POST,
+                                    len(accepted_ids),
+                                    len(duplicate_ids),
+                                )
+                                shipper_metrics.record_ship(
+                                    "partial_ack",
+                                    batch_size=len(clicks),
+                                )
+                            else:
+                                logger.info(
+                                    "Shipped %d clicks to central (op=%s); "
+                                    "accepted=%d, duplicates=%d",
+                                    len(clicks), OP_BATCH_POST,
+                                    len(accepted_ids),
+                                    len(duplicate_ids),
+                                )
+                                shipper_metrics.record_ship(
+                                    "success",
+                                    batch_size=len(clicks),
+                                )
+                            continue  # next loop iteration
+
+                        # ── Sprint 2.5 backwards-compat shim ──────
+                        # ``shape`` is "legacy" or "unknown". Treat as
+                        # pre-F.29 collector — ACK ALL on 200/202 only.
+                        # 207 from a legacy collector cannot happen
+                        # (legacy never returns 207); if shape=="legacy"
+                        # and status==207 there's a contract violation,
+                        # fall through to error path.
+                        if response.status_code in (200, 202):
+                            logger.warning(
+                                "Shipper shim activated (op=%s) — collector "
+                                "returned %s shape (status=%d). Falling back "
+                                "to ACK-all legacy semantics. This is "
+                                "expected during rolling deploy and harmless; "
+                                "verify the collector reaches Sprint 2.1+ "
+                                "soon for per-click verdict visibility.",
+                                "legacy_collector", shape,
+                                response.status_code,
+                            )
+                            _capture_op_msg(
+                                "legacy_collector",
+                                f"Shipper got legacy ({shape}) response "
+                                f"shape from collector — falling back to "
+                                f"ACK-all (status={response.status_code}).",
+                                level="warning",
+                                shape=shape,
+                                collector_status=response.status_code,
+                                batch_size=len(clicks),
+                            )
+                            try:
+                                await redis_pool.xack(
+                                    STREAM_KEY, GROUP_NAME, *msg_ids,
+                                )
+                                await redis_pool.xtrim(
+                                    STREAM_KEY, maxlen=10000,
+                                    approximate=True,
+                                )
+                            except Exception as ack_exc:  # noqa: BLE001
+                                logger.error(
+                                    "Shipper xack/xtrim failure (op=%s) "
+                                    "during shim: %s",
+                                    OP_XACK_BATCH, ack_exc,
+                                )
+                                _capture_op_exc(
+                                    OP_XACK_BATCH,
+                                    ack_exc,
+                                    batch_size=len(clicks),
+                                    collector_status=response.status_code,
+                                    shim_active=True,
+                                )
+                                shipper_metrics.record_ship(
+                                    "ack_failed",
+                                    batch_size=len(clicks),
+                                )
+                                continue
+                            shipper_metrics.record_ship(
+                                "legacy_collector",
+                                batch_size=len(clicks),
+                            )
+                            continue
+
+                        # Status 207 from a legacy/unknown body shape —
+                        # contract violation. A pre-F.29 collector never
+                        # returns 207 (only 200), so 207 + legacy shape
+                        # means a Sprint 2.1+ collector returned a 207
+                        # but body parsing failed (corrupt JSON?) OR a
+                        # malicious proxy injected the status. Treat as
+                        # collector_error to be safe; the inner retry
+                        # loop will re-attempt.
+                        logger.warning(
+                            "Shipper got status=207 with non-new body shape=%s "
+                            "(contract violation, op=%s). Treating as "
+                            "collector_error — retrying. Body: %s",
+                            shape, OP_BATCH_POST, response.text[:200],
+                        )
+                        _capture_op_msg(
+                            OP_BATCH_POST,
+                            f"Contract violation: status 207 with shape={shape}",
+                            level="warning",
+                            collector_status=response.status_code,
+                            response_body=response.text[:500],
+                            batch_size=len(clicks),
+                            shape=shape,
+                        )
+                        shipper_metrics.record_ship(
+                            "collector_error", batch_size=len(clicks),
+                        )
+                        await asyncio.sleep(retry_delay)
+                        retry_delay = min(retry_delay * 2, MAX_RETRY_DELAY)
+                        continue
                     else:
                         # F.29 Sprint 1.3 — non-2xx response was warn-log
                         # only pre-F.29. Now tagged op=batch_post so the

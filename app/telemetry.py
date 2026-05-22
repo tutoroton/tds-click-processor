@@ -61,6 +61,11 @@ OP_LOOP_ITERATION = "loop_iteration"
 # Hot-path /decide failure modes (Sprint 1.5+)
 OP_DISK_PRESSURE = "disk_pressure"
 
+# Per-click verdict outcomes (Sprint 2.2+)
+OP_DEADLETTER = "deadletter"   # click hit max-attempts after rejections
+OP_PARTIAL_ACK = "partial_ack"  # batch had mixed accepted+rejected
+OP_LEGACY_COLLECTOR = "legacy_collector"  # shim absorbed pre-F.29 shape
+
 
 def capture_op_exc(op_name: str, exc: BaseException, **extras: object) -> None:
     """Capture an exception to Sentry with the F.29 ``op`` tag scheme.

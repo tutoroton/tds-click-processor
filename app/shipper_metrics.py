@@ -53,13 +53,18 @@ from dataclasses import dataclass
 from typing import Literal
 
 ShipStatus = Literal[
-    "success",
-    "ack_failed",
-    "collector_error",
-    "unreachable",
-    "parse_failed",
-    "loop_error",
-    "n/a",
+    "success",            # all clicks accepted, ACK + XTRIM succeeded
+    "ack_failed",         # POST succeeded but local XACK/XTRIM failed
+    "collector_error",    # non-2xx response body (or all rejected)
+    "unreachable",        # httpx connection failure
+    "parse_failed",       # corrupt stream payload (no POST attempted)
+    "loop_error",         # catch-all for unknown branches
+    "n/a",                # initial state, no attempt yet
+    # F.29 Sprint 2.2 (2026-05-23) — per-click verdict outcomes:
+    "partial_ack",        # some clicks accepted, some rejected (207)
+    "deadlettered",       # at least one click hit max retries this iter
+    "legacy_collector",   # collector returned pre-F.29 shape — shim
+                          # absorbed it as ACK-all + WARN log
 ]
 
 

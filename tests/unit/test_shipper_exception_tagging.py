@@ -93,14 +93,17 @@ def test_capture_op_exc_sets_op_and_node_tags():
     push_scope_mock.__enter__ = MagicMock(return_value=scope_mock)
     push_scope_mock.__exit__ = MagicMock(return_value=False)
 
-    with patch("app.shipper.sentry_sdk") as mock_sentry:
+    # Patch the canonical source (app.telemetry) — shipper re-exports
+    # ``_capture_op_exc`` as an alias of ``app.telemetry.capture_op_exc``,
+    # so mocking telemetry.sentry_sdk catches the actual Sentry call.
+    with patch("app.telemetry.sentry_sdk") as mock_sentry:
         mock_sentry.push_scope.return_value = push_scope_mock
         _capture_op_exc(OP_BATCH_POST, exc, batch_size=42)
 
         mock_sentry.capture_exception.assert_called_once_with(exc)
 
     scope_mock.set_tag.assert_any_call("op", OP_BATCH_POST)
-    scope_mock.set_tag.assert_any_call("shipper.node_id", "test-node-AU")
+    scope_mock.set_tag.assert_any_call("node_id", "test-node-AU")
     scope_mock.set_extra.assert_called_once_with("batch_size", 42)
 
 
@@ -115,7 +118,7 @@ def test_capture_op_exc_handles_multiple_extras():
     push_scope_mock.__enter__ = MagicMock(return_value=scope_mock)
     push_scope_mock.__exit__ = MagicMock(return_value=False)
 
-    with patch("app.shipper.sentry_sdk") as mock_sentry:
+    with patch("app.telemetry.sentry_sdk") as mock_sentry:
         mock_sentry.push_scope.return_value = push_scope_mock
         _capture_op_exc(
             OP_XACK,
@@ -149,7 +152,7 @@ def test_capture_op_msg_sets_op_tag_and_level():
     push_scope_mock.__enter__ = MagicMock(return_value=scope_mock)
     push_scope_mock.__exit__ = MagicMock(return_value=False)
 
-    with patch("app.shipper.sentry_sdk") as mock_sentry:
+    with patch("app.telemetry.sentry_sdk") as mock_sentry:
         mock_sentry.push_scope.return_value = push_scope_mock
         _capture_op_msg(
             OP_BATCH_POST,
@@ -163,7 +166,7 @@ def test_capture_op_msg_sets_op_tag_and_level():
         )
 
     scope_mock.set_tag.assert_any_call("op", OP_BATCH_POST)
-    scope_mock.set_tag.assert_any_call("shipper.node_id", "test-node-AU")
+    scope_mock.set_tag.assert_any_call("node_id", "test-node-AU")
     scope_mock.set_extra.assert_called_once_with("collector_status", 503)
 
 
@@ -177,7 +180,7 @@ def test_capture_op_msg_default_level_is_warning():
     push_scope_mock.__enter__ = MagicMock(return_value=scope_mock)
     push_scope_mock.__exit__ = MagicMock(return_value=False)
 
-    with patch("app.shipper.sentry_sdk") as mock_sentry:
+    with patch("app.telemetry.sentry_sdk") as mock_sentry:
         mock_sentry.push_scope.return_value = push_scope_mock
         _capture_op_msg(OP_PARSE_PAYLOAD, "Parse failure")
 

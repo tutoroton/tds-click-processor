@@ -31,83 +31,35 @@ MAX_RETRY_DELAY = 30
 
 
 # ---------------------------------------------------------------------------
-# F.29 Sprint 1.3 — structured Sentry tagging helpers (2026-05-23)
+# F.29 Sprint 1.3 — structured Sentry tagging (Sprint 1.6 — extracted)
 # ---------------------------------------------------------------------------
 # Pre-F.29 every shipper exception captured under the generic
-# "Shipper error" umbrella (services/click-processor/app/shipper.py:101-103
-# pre-F.29: ``except Exception as e: ... sentry_sdk.capture_exception(e)``).
-# This blended distinct failure modes — JSON-decode errors, httpx
-# request errors, XREADGROUP impairments, XACK race conditions — under
-# one Sentry issue group, defeating per-operation alert rules. JSON
-# decode failures even ACKed silently with NO Sentry signal at all
-# (lines 71-73 pre-F.29).
+# "Shipper error" umbrella, blending JSON-decode / httpx / XREADGROUP /
+# XACK failures into one Sentry issue group. Sprint 1.3 attached an
+# ``op`` tag to every exception path so issue grouping splits by
+# operation and Sprint 4.1 alert rules can key off specific tags.
 #
-# Sprint 1.3 attaches an ``op`` tag to every exception path so:
-#   - Sentry's issue grouping splits by operation (search "tag:op:xreadgroup"
-#     vs "tag:op:batch_post"),
-#   - the Sprint 4.1 alert rules (`shipper.batch.success_ratio` warn at
-#     >10/min) key off ``op=batch_post`` specifically,
-#   - operator dashboards filter by ``shipper.node_id`` tag to attribute
-#     errors to specific edge nodes.
+# Sprint 1.6 (2026-05-23 validation cycle) extracted the helpers +
+# constants to ``app.telemetry`` after Agent 1 caught a DRY violation:
+# main.py:688-725 (disk-pressure 503 block) reinvented the same
+# ``push_scope + set_tag("op", ...) + capture_*`` incantation. The
+# shared module ensures Sprint 4.1 alert rules bind to consistent tag
+# values across BOTH the shipper loop and the /decide hot-path failures.
 #
-# Helper functions keep ``run_shipper`` itself terse (rule
-# ``code-organization`` — function length cap 60 lines; run_shipper
-# was already past that pre-F.29 and the helpers prevent further bloat).
+# We re-export the names (with ``_capture_op_*`` underscore-prefix
+# aliases) to keep this module's public surface backwards-compatible
+# for the existing test_shipper_exception_tagging.py source-pin tests.
 
-# Canonical operation tags. Centralised so a typo in a string literal
-# can't silently shard the same logical operation across two Sentry
-# tag values.
-OP_XREADGROUP = "xreadgroup"
-OP_PARSE_PAYLOAD = "parse_payload"
-OP_BATCH_POST = "batch_post"
-OP_XACK = "xack"
-OP_XACK_BATCH = "xack_batch"
-OP_LOOP_ITERATION = "loop_iteration"
-
-
-def _capture_op_exc(op_name: str, exc: BaseException, **extras: object) -> None:
-    """Capture an exception to Sentry with the F.29 ``op`` tag scheme.
-
-    Centralises the ``push_scope`` + ``set_tag`` + ``capture_exception``
-    incantation so every shipper exception path tags consistently. The
-    ``shipper.node_id`` tag enables per-node filtering in Sentry +
-    alert-rule routing (different on-call teams for different regions).
-
-    Args:
-        op_name: One of the ``OP_*`` constants above.
-        exc: The exception object to report.
-        **extras: Additional context (e.g. ``msg_id``, ``batch_size``).
-            Each key becomes a Sentry "extras" entry — visible in the
-            issue detail but not searchable as a tag (cardinality is
-            often too high).
-    """
-    with sentry_sdk.push_scope() as scope:
-        scope.set_tag("op", op_name)
-        scope.set_tag("shipper.node_id", settings.node_id)
-        for key, value in extras.items():
-            scope.set_extra(key, value)
-        sentry_sdk.capture_exception(exc)
-
-
-def _capture_op_msg(
-    op_name: str,
-    message: str,
-    level: str = "warning",
-    **extras: object,
-) -> None:
-    """Capture a Sentry message with the same op-tag scheme.
-
-    Use this for non-exception signals (e.g. non-2xx HTTP responses,
-    parse failures where the exception is suppressed by an intentional
-    ACK). Same tag shape as :func:`_capture_op_exc` so alert rules
-    can pivot across both code paths uniformly.
-    """
-    with sentry_sdk.push_scope() as scope:
-        scope.set_tag("op", op_name)
-        scope.set_tag("shipper.node_id", settings.node_id)
-        for key, value in extras.items():
-            scope.set_extra(key, value)
-        sentry_sdk.capture_message(message, level=level)
+from app.telemetry import (
+    OP_BATCH_POST,
+    OP_LOOP_ITERATION,
+    OP_PARSE_PAYLOAD,
+    OP_XACK,
+    OP_XACK_BATCH,
+    OP_XREADGROUP,
+    capture_op_exc as _capture_op_exc,
+    capture_op_msg as _capture_op_msg,
+)
 
 
 class ShipperDisabledError(RuntimeError):

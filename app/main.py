@@ -33,6 +33,7 @@ from app.redis_client import get_redis, close_redis
 from app.router import route, parse_device_type, parse_os, parse_browser, get_full_ua_info
 from app.shipper import assert_shipper_ready, run_shipper
 from app.shipper_metrics import metrics as shipper_metrics
+from app.telemetry import OP_DISK_PRESSURE, capture_op_msg
 from app.disk_queue import (
     check_disk_pressure,
     enqueue_click as enqueue_click_to_disk,
@@ -697,23 +698,23 @@ async def decide(
                 settings.disk_queue_root,
                 req.click_id,
             )
-            with sentry_sdk.push_scope() as scope:
-                scope.set_tag("op", "disk_pressure")
-                scope.set_tag("node_id", settings.node_id)
-                scope.set_extra("free_bytes", free_bytes)
-                scope.set_extra(
-                    "threshold_bytes",
-                    settings.disk_queue_min_free_bytes,
-                )
-                scope.set_extra("disk_queue_root", settings.disk_queue_root)
-                scope.set_extra("click_id", req.click_id)
-                sentry_sdk.capture_message(
-                    f"Disk queue under pressure: free={free_bytes} < "
-                    f"threshold={settings.disk_queue_min_free_bytes} "
-                    f"on {settings.disk_queue_root}. Click {req.click_id} "
-                    "refused (503).",
-                    level="error",
-                )
+            # F.29 Sprint 1.6 — use the canonical telemetry helper +
+            # OP_DISK_PRESSURE constant rather than inlining the
+            # push_scope + set_tag dance. Single source of truth for
+            # the op-tag scheme means Sprint 4.1 alert rules bind to
+            # the same value here as in shipper's exception paths.
+            capture_op_msg(
+                OP_DISK_PRESSURE,
+                f"Disk queue under pressure: free={free_bytes} < "
+                f"threshold={settings.disk_queue_min_free_bytes} "
+                f"on {settings.disk_queue_root}. Click {req.click_id} "
+                "refused (503).",
+                level="error",
+                free_bytes=free_bytes,
+                threshold_bytes=settings.disk_queue_min_free_bytes,
+                disk_queue_root=settings.disk_queue_root,
+                click_id=req.click_id,
+            )
             emit_checkpoint("click.disk_pressure_503", {
                 "click_id": req.click_id,
                 "free_bytes": free_bytes,

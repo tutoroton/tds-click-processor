@@ -29,6 +29,86 @@ BATCH_TIMEOUT_MS = 2000  # 2 seconds
 MAX_RETRY_DELAY = 30
 
 
+# ---------------------------------------------------------------------------
+# F.29 Sprint 1.3 — structured Sentry tagging helpers (2026-05-23)
+# ---------------------------------------------------------------------------
+# Pre-F.29 every shipper exception captured under the generic
+# "Shipper error" umbrella (services/click-processor/app/shipper.py:101-103
+# pre-F.29: ``except Exception as e: ... sentry_sdk.capture_exception(e)``).
+# This blended distinct failure modes — JSON-decode errors, httpx
+# request errors, XREADGROUP impairments, XACK race conditions — under
+# one Sentry issue group, defeating per-operation alert rules. JSON
+# decode failures even ACKed silently with NO Sentry signal at all
+# (lines 71-73 pre-F.29).
+#
+# Sprint 1.3 attaches an ``op`` tag to every exception path so:
+#   - Sentry's issue grouping splits by operation (search "tag:op:xreadgroup"
+#     vs "tag:op:batch_post"),
+#   - the Sprint 4.1 alert rules (`shipper.batch.success_ratio` warn at
+#     >10/min) key off ``op=batch_post`` specifically,
+#   - operator dashboards filter by ``shipper.node_id`` tag to attribute
+#     errors to specific edge nodes.
+#
+# Helper functions keep ``run_shipper`` itself terse (rule
+# ``code-organization`` — function length cap 60 lines; run_shipper
+# was already past that pre-F.29 and the helpers prevent further bloat).
+
+# Canonical operation tags. Centralised so a typo in a string literal
+# can't silently shard the same logical operation across two Sentry
+# tag values.
+OP_XREADGROUP = "xreadgroup"
+OP_PARSE_PAYLOAD = "parse_payload"
+OP_BATCH_POST = "batch_post"
+OP_XACK = "xack"
+OP_XACK_BATCH = "xack_batch"
+OP_LOOP_ITERATION = "loop_iteration"
+
+
+def _capture_op_exc(op_name: str, exc: BaseException, **extras: object) -> None:
+    """Capture an exception to Sentry with the F.29 ``op`` tag scheme.
+
+    Centralises the ``push_scope`` + ``set_tag`` + ``capture_exception``
+    incantation so every shipper exception path tags consistently. The
+    ``shipper.node_id`` tag enables per-node filtering in Sentry +
+    alert-rule routing (different on-call teams for different regions).
+
+    Args:
+        op_name: One of the ``OP_*`` constants above.
+        exc: The exception object to report.
+        **extras: Additional context (e.g. ``msg_id``, ``batch_size``).
+            Each key becomes a Sentry "extras" entry — visible in the
+            issue detail but not searchable as a tag (cardinality is
+            often too high).
+    """
+    with sentry_sdk.push_scope() as scope:
+        scope.set_tag("op", op_name)
+        scope.set_tag("shipper.node_id", settings.node_id)
+        for key, value in extras.items():
+            scope.set_extra(key, value)
+        sentry_sdk.capture_exception(exc)
+
+
+def _capture_op_msg(
+    op_name: str,
+    message: str,
+    level: str = "warning",
+    **extras: object,
+) -> None:
+    """Capture a Sentry message with the same op-tag scheme.
+
+    Use this for non-exception signals (e.g. non-2xx HTTP responses,
+    parse failures where the exception is suppressed by an intentional
+    ACK). Same tag shape as :func:`_capture_op_exc` so alert rules
+    can pivot across both code paths uniformly.
+    """
+    with sentry_sdk.push_scope() as scope:
+        scope.set_tag("op", op_name)
+        scope.set_tag("shipper.node_id", settings.node_id)
+        for key, value in extras.items():
+            scope.set_extra(key, value)
+        sentry_sdk.capture_message(message, level=level)
+
+
 class ShipperDisabledError(RuntimeError):
     """Raised when the shipper refuses to start because ``central_url``
     is empty in a non-local environment AND ``require_central_url``
@@ -178,9 +258,49 @@ async def run_shipper(redis_pool):
                     try:
                         click = json.loads(data.get("data", "{}"))
                         clicks.append(click)
-                    except (json.JSONDecodeError, TypeError):
-                        # Invalid data — ACK to not block stream
-                        await redis_pool.xack(STREAM_KEY, GROUP_NAME, msg_id)
+                    except (json.JSONDecodeError, TypeError) as parse_exc:
+                        # F.29 Sprint 1.3 (2026-05-23) — visible parse
+                        # failure. Pre-F.29 the except branch silently
+                        # ACKed and continued, hiding corrupt payloads
+                        # from Sentry. Now we WARN-log + capture with
+                        # ``op=parse_payload`` so the parse-failure rate
+                        # is visible per node + alertable in Sprint 4.1.
+                        logger.warning(
+                            "Shipper parse failure (op=%s) for msg=%s: %s. "
+                            "ACKing to unblock stream — corrupt click "
+                            "payload, data is lost.",
+                            OP_PARSE_PAYLOAD, msg_id, parse_exc,
+                        )
+                        _capture_op_msg(
+                            OP_PARSE_PAYLOAD,
+                            f"Shipper parse failure for msg_id={msg_id}: "
+                            f"{parse_exc}",
+                            level="warning",
+                            msg_id=str(msg_id),
+                        )
+                        # Best-effort XACK. Wrapped because Redis
+                        # impairment is exactly the condition we are
+                        # recovering from; without the wrap an XACK
+                        # failure would propagate to the outer Exception
+                        # handler and lose the parse-payload tag. The
+                        # parse-failed message stays in the pending
+                        # entry list on XACK failure; XREADGROUP with
+                        # ``>`` moves past it on the consumer side.
+                        try:
+                            await redis_pool.xack(
+                                STREAM_KEY, GROUP_NAME, msg_id,
+                            )
+                        except Exception as xack_exc:  # noqa: BLE001
+                            logger.warning(
+                                "Shipper xack failure (op=%s) for msg=%s: %s",
+                                OP_XACK, msg_id, xack_exc,
+                            )
+                            _capture_op_exc(
+                                OP_XACK,
+                                xack_exc,
+                                msg_id=str(msg_id),
+                                context="post-parse-failure-ack",
+                            )
 
                 if not clicks:
                     continue
@@ -193,22 +313,97 @@ async def run_shipper(redis_pool):
                 )
 
                 if response.status_code in (200, 202):
-                    # Success — ACK all messages
-                    await redis_pool.xack(STREAM_KEY, GROUP_NAME, *msg_ids)
-                    # Trim stream (keep last 10K as buffer)
-                    await redis_pool.xtrim(STREAM_KEY, maxlen=10000, approximate=True)
-                    logger.info(f"Shipped {len(clicks)} clicks to central")
+                    # Success — ACK + XTRIM. Wrapped because a Redis
+                    # blip between the successful POST and ACK would
+                    # otherwise propagate to the outer ``except
+                    # Exception`` and tag this as ``op=loop_iteration``
+                    # — losing the fact that the batch DID reach
+                    # central. With ``op=xack_batch`` the operator can
+                    # see that at-least-once semantics were exercised
+                    # (clicks may be re-delivered next iteration via
+                    # PEL claim) and that the duplicate is benign.
+                    try:
+                        await redis_pool.xack(
+                            STREAM_KEY, GROUP_NAME, *msg_ids,
+                        )
+                        await redis_pool.xtrim(
+                            STREAM_KEY, maxlen=10000, approximate=True,
+                        )
+                    except Exception as ack_exc:  # noqa: BLE001
+                        logger.error(
+                            "Shipper xack/xtrim failure (op=%s) — batch was "
+                            "DELIVERED to central but local stream not "
+                            "ACKed. Clicks may be re-delivered (at-least-"
+                            "once contract — Sprint 2 deadletter will "
+                            "bound replays): %s",
+                            OP_XACK_BATCH, ack_exc,
+                        )
+                        _capture_op_exc(
+                            OP_XACK_BATCH,
+                            ack_exc,
+                            batch_size=len(clicks),
+                            collector_status=response.status_code,
+                        )
+                    else:
+                        logger.info(
+                            "Shipped %d clicks to central (op=%s)",
+                            len(clicks), OP_BATCH_POST,
+                        )
                     retry_delay = 1  # Reset retry delay
                 else:
-                    logger.warning(f"Central returned {response.status_code}: {response.text[:200]}")
+                    # F.29 Sprint 1.3 — non-2xx response was warn-log
+                    # only pre-F.29. Now tagged op=batch_post so the
+                    # Sprint 4.1 alert "shipper.batch.success_ratio<X"
+                    # has a queryable signal.
+                    logger.warning(
+                        "Central returned %s (op=%s): %s. Retry in %ss.",
+                        response.status_code, OP_BATCH_POST,
+                        response.text[:200], retry_delay,
+                    )
+                    _capture_op_msg(
+                        OP_BATCH_POST,
+                        f"Central returned {response.status_code}",
+                        level="warning",
+                        collector_status=response.status_code,
+                        response_body=response.text[:500],
+                        batch_size=len(clicks),
+                    )
                     await asyncio.sleep(retry_delay)
                     retry_delay = min(retry_delay * 2, MAX_RETRY_DELAY)
 
             except httpx.RequestError as e:
-                logger.warning(f"Central unreachable: {e}. Retry in {retry_delay}s")
+                # F.29 Sprint 1.3 — tagged op=batch_post (HTTP
+                # connectivity, not redis). Pre-F.29 warn-log only;
+                # central-unreachable was invisible in Sentry. Now
+                # the op tag groups these with HTTP 5xx for unified
+                # alerting on "batch_post failure rate".
+                logger.warning(
+                    "Central unreachable (op=%s): %s. Retry in %ss.",
+                    OP_BATCH_POST, e, retry_delay,
+                )
+                _capture_op_exc(
+                    OP_BATCH_POST,
+                    e,
+                    batch_size=len(clicks),
+                    failure_kind="httpx.RequestError",
+                )
                 await asyncio.sleep(retry_delay)
                 retry_delay = min(retry_delay * 2, MAX_RETRY_DELAY)
             except Exception as e:
-                logger.error(f"Shipper error: {e}")
-                sentry_sdk.capture_exception(e)
+                # F.29 Sprint 1.3 — catch-all gets a distinct tag so
+                # operators can split "structured failure mode" (the
+                # tagged paths above) from "unknown loop branch"
+                # (this one). XREADGROUP timeouts / Redis impairment
+                # surface here when the inner try-except above didn't
+                # absorb them. Pre-F.29 every exception landed in this
+                # branch with the generic ``Shipper error`` umbrella.
+                logger.error(
+                    "Shipper loop catch-all (op=%s): %s",
+                    OP_LOOP_ITERATION, e,
+                )
+                _capture_op_exc(
+                    OP_LOOP_ITERATION,
+                    e,
+                    failure_kind=type(e).__name__,
+                )
                 await asyncio.sleep(2)

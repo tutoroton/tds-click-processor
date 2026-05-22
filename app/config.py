@@ -25,9 +25,28 @@ class Settings(BaseSettings):
     # Auth (shared secret with CF Worker)
     tds_secret_key: str = ""
 
-    # Central server (for sync, optional for standalone mode)
+    # Central server (for sync + click shipping).
+    #
+    # F.29 Sprint 1.1 (2026-05-22) — central_url is no longer "optional"
+    # in non-local environments. The audit 2026-05-16 caught AU+CA edge
+    # nodes deployed with TDS_CENTRAL_URL="" for 50 days: the shipper
+    # silently returned at startup (services/click-processor/app/
+    # shipper.py:34-36 pre-F.29), accepted clicks into local Redis, but
+    # never delivered them upstream. Central PG `clicks` grew by 1 row
+    # in that window while edge stream:clicks accumulated thousands.
+    #
+    # `require_central_url` (gate flag, default True per F.29 plan §7.1)
+    # promotes the misconfig from silent-disable to boot-time fail-closed
+    # in staging / production / any non-local env. Mirrors the proven
+    # `_enforce_secret_presence` pattern (line ~168 below) — same shape,
+    # same env-tolerance carve-out, same loud-on-fail discipline.
+    # Operator escape hatch: set TDS_REQUIRE_CENTRAL_URL=false to revert
+    # to legacy silent-disable for emergency rollback (NOT recommended;
+    # use only if the boot-time refusal blocks a known-good node during
+    # incident recovery, then fix and flip back).
     central_url: str = ""
     central_api_key: str = ""
+    require_central_url: bool = True
 
     # Fallback URL when routing fails
     fallback_url: str = "https://adstudy.dev"
@@ -209,6 +228,76 @@ class Settings(BaseSettings):
                 f"(≥256 bits per `api-security.md` HS256 target; "
                 f"same length floor as admin-api). Current length: "
                 f"{len(self.tds_secret_key)}."
+            )
+
+        return self
+
+    @model_validator(mode="after")
+    def _enforce_central_url_presence(self) -> "Settings":
+        """Refuse to boot in non-local environments without a non-empty
+        ``central_url`` when ``require_central_url`` is True.
+
+        F.29 Sprint 1.1 (2026-05-23). Closes the catastrophic silent-disable
+        path surfaced by audit 2026-05-16: AU+CA edge nodes had
+        ``TDS_CENTRAL_URL=""`` → shipper silently returned at startup
+        (services/click-processor/app/shipper.py:34-36 pre-F.29) →
+        50-day click-persistence blackout. The shipper accepted clicks,
+        wrote to local stream:clicks (4637 + 271 stockpiled), but never
+        delivered to central. Central PG ``clicks`` table grew by ONE row
+        in that 50-day window. Catastrophic revenue/analytics blind spot
+        without any error signal — the service responded healthy on
+        ``/health`` the whole time.
+
+        Mirror of ``_enforce_secret_presence`` (above) — same shape, same
+        env-tolerance carve-out, same loud-on-fail discipline. Two
+        independent guards because the secret and the central URL are
+        independent failure modes (you can configure one without the
+        other; both must be present in non-local env).
+
+        Gate semantics:
+
+        * ``environment ∈ _LOCAL_ENVIRONMENTS`` → always pass (preserves
+          ``make dev`` workflow + standalone-mode click-processor where
+          the operator intentionally runs without a central collector,
+          e.g. for an isolated load-test rig).
+        * ``require_central_url == False`` → always pass (operator
+          escape hatch; emits a startup warning at lifespan boot, not
+          here in the validator — Pydantic validators run too early in
+          the import chain to reach the configured logger).
+        * Otherwise → ``central_url`` MUST be non-empty.
+
+        Error message names the EXACT remediation path so an operator
+        reading a boot-failure log can fix it without digging through
+        source. Length / scheme validation is intentionally NOT added
+        here — the shipper's ``httpx.AsyncClient.post`` will surface
+        any URL-format issues with their own specific errors, and we
+        don't want to forbid future operator-deployed proxy schemes
+        (e.g. unix sockets via httpx.URL parser extensions).
+        """
+        if self.environment in _LOCAL_ENVIRONMENTS:
+            return self
+
+        if not self.require_central_url:
+            # Operator opted out — legacy silent-disable behaviour.
+            # No validator error; the shipper's runtime check in
+            # ``run_shipper`` logs a WARNING when ``central_url`` is
+            # empty (see F.29 Sprint 1.2 in shipper.py).
+            return self
+
+        if not self.central_url:
+            raise ValueError(
+                f"TDS_CENTRAL_URL must be set when TDS_ENVIRONMENT="
+                f"'{self.environment}' (and TDS_REQUIRE_CENTRAL_URL is "
+                f"True, which is the default per F.29 Sprint 1.1). "
+                f"Empty central_url silently disabled the click shipper "
+                f"for 50 days on AU+CA nodes (audit 2026-05-16) — "
+                f"thousands of clicks accumulated on edge Redis with "
+                f"zero delivery to central. Remediation: set "
+                f"TDS_CENTRAL_URL=http://<central-host>:8200 in the "
+                f"node's .env file and restart. Emergency rollback: "
+                f"TDS_REQUIRE_CENTRAL_URL=false to revert to legacy "
+                f"silent-disable (not recommended — fix the misconfig "
+                f"instead)."
             )
 
         return self

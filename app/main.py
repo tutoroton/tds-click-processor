@@ -31,7 +31,7 @@ from app.diag import (
 from app.models import ClickRequest, ClickResponse, HealthResponse
 from app.redis_client import get_redis, close_redis
 from app.router import route, parse_device_type, parse_os, parse_browser, get_full_ua_info
-from app.shipper import run_shipper
+from app.shipper import assert_shipper_ready, run_shipper
 from app.disk_queue import enqueue_click as enqueue_click_to_disk, run_drainer as run_disk_drainer
 from app.observability import run_observability_loop
 from app.sync_client import apply_snapshot, start_periodic_pull
@@ -80,6 +80,21 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.critical("Redis unreachable at startup: %s", e)
         raise
+
+    # F.29 Sprint 1.2 — synchronous shipper-config validation BEFORE
+    # task creation. If shipper cannot safely start (empty central_url
+    # in non-local env + TDS_REQUIRE_CENTRAL_URL=true) this raises
+    # ShipperDisabledError. The exception propagates out of lifespan
+    # so uvicorn fails boot with the traceback visible — exactly the
+    # behaviour audit 2026-05-16 demanded (the 50-day silent-disable
+    # of AU+CA shippers must be impossible to repeat).
+    #
+    # Defense-in-depth check (the Settings._enforce_central_url_presence
+    # validator above already catches the case at config-construction
+    # time). Reaching the raise here means env was mutated post-boot
+    # OR a test bypassed validation via Settings.model_construct() —
+    # in either case fail-closed is correct.
+    assert_shipper_ready()
 
     # Start click shipper
     shipper_task = asyncio.create_task(run_shipper(r))

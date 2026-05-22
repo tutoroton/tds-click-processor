@@ -92,12 +92,27 @@ def test_non_local_env_rejects_short_secret(env):
 
 @pytest.mark.parametrize("env", ["staging", "production"])
 def test_non_local_env_accepts_compliant_secret(env):
-    """32+ chars + non-local env → boot succeeds. Sanity-pin the
-    happy path so a future tightening of the validator (e.g.,
-    char-class restriction) doesn't accidentally break compliant
-    secrets."""
+    """32+ chars + non-local env + valid central_url → boot succeeds.
+    Sanity-pin the happy path so a future tightening of the validator
+    (e.g., char-class restriction) doesn't accidentally break compliant
+    secrets.
+
+    F.29 Sprint 1.1 cascade (2026-05-23): the new
+    ``_enforce_central_url_presence`` validator (config.py, sibling of
+    ``_enforce_secret_presence``) ALSO refuses non-local boots with
+    empty ``central_url`` when ``require_central_url`` is True (default).
+    The original pre-F.29 form of this test relied on the implicit
+    ``central_url: str = ""`` default passing in non-local env — that's
+    now a misconfig. Explicitly provide a valid central_url so this
+    test pins ONLY the secret-guard happy path, leaving the central_url
+    guard to ``test_config_central_url_guard.py``.
+    """
     secret = "x" * 32
-    s = Settings(environment=env, tds_secret_key=secret)
+    s = Settings(
+        environment=env,
+        tds_secret_key=secret,
+        central_url="http://central:8200",
+    )
     assert s.tds_secret_key == secret
     assert s.environment == env
 

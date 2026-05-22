@@ -2,6 +2,8 @@
 
 from pydantic import BaseModel, Field, field_validator
 
+from app.shipper_metrics import ShipStatus
+
 
 # Resource-exhaustion caps on query_params (security audit
 # 2026-04-28 MEDIUM-004). Module-level constants — Pydantic v2
@@ -186,7 +188,15 @@ class HealthResponse(BaseModel):
     # Outcome literal (see app.shipper_metrics.ShipStatus). "n/a" until
     # first attempt; one of {success, ack_failed, collector_error,
     # unreachable, parse_failed, loop_error, n/a} after.
-    last_ship_status: str = "n/a"
+    #
+    # Sprint 1.6 (validation cycle): typed as the canonical
+    # ShipStatus Literal rather than bare str. This makes the dict
+    # keys returned by ShipperMetrics.to_health_dict() round-trip
+    # through Pydantic validation — a stale status value from a
+    # future refactor (e.g. "loop-error" vs "loop_error") would now
+    # fail validation at /health response build time rather than
+    # silently propagating to dashboards as a typo.
+    last_ship_status: ShipStatus = "n/a"
 
     # F.29 Sprint 1.4 storage visibility ---------------------------------
     # XLEN of stream:clicks. Steady-state ~0-10k (shipper XTRIMs to 10k

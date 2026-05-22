@@ -10,6 +10,7 @@ import hashlib
 import hmac
 import json
 import logging
+import shutil
 import time
 from urllib.parse import quote
 
@@ -37,6 +38,7 @@ from app.telemetry import OP_DISK_PRESSURE, capture_op_msg
 from app.disk_queue import (
     check_disk_pressure,
     enqueue_click as enqueue_click_to_disk,
+    get_queue_size,
     run_drainer as run_disk_drainer,
 )
 from app.observability import run_observability_loop
@@ -812,12 +814,12 @@ async def health():
         stream_length = 0
 
     # F.29 Sprint 1.4 — disk-queue file count. Reads the in-memory
-    # counter (no FS scan) — see app.disk_queue. Independent guard:
-    # the disk_queue module may not be initialised on a brand-new
-    # node before the first /decide hits, in which case
-    # ``get_queue_size()`` returns 0.
+    # counter (no FS scan) — see app.disk_queue. ``get_queue_size`` is
+    # imported at module top (Sprint 1.6 — removed the redundant
+    # in-function import). Wrapped independently so an early-lifecycle
+    # call (before first /decide initialises the counter) returns 0
+    # rather than 500'ing the probe.
     try:
-        from app.disk_queue import get_queue_size
         disk_queue_size = await get_queue_size()
     except Exception:
         disk_queue_size = 0
@@ -826,14 +828,11 @@ async def health():
     # Used by Sprint 4.1 alert "disk_free_bytes < 1GB → warn". Returns
     # None when the root path does not exist (operator opted out of
     # disk fallback via empty TDS_DISK_QUEUE_ROOT, or first-boot before
-    # the directory was created). Imported here (not at module top) to
-    # avoid coupling /health to ``shutil`` if a future refactor moves
-    # disk handling elsewhere.
-    import shutil as _shutil
+    # the directory was created).
     disk_free_bytes: int | None = None
     if settings.disk_queue_root:
         try:
-            disk_free_bytes = _shutil.disk_usage(
+            disk_free_bytes = shutil.disk_usage(
                 settings.disk_queue_root
             ).free
         except (OSError, FileNotFoundError):

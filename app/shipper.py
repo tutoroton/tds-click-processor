@@ -622,6 +622,16 @@ async def run_shipper(redis_pool):
                                     )
                                     continue
 
+                            # F.29 Sprint 2.4 — feed the rolling 5-min
+                            # success-ratio window. Accepted+duplicates
+                            # count as success; rejected (including the
+                            # deadlettered ones for this iteration)
+                            # count as non-delivery.
+                            shipper_metrics.record_outcome(
+                                accepted=len(accepted_ids) + len(duplicate_ids),
+                                rejected=len(rejected_items),
+                            )
+
                             # Determine outcome status. Precedence:
                             # deadlettered > partial_ack > success.
                             if deadletter_count > 0:
@@ -725,6 +735,15 @@ async def run_shipper(redis_pool):
                                 "legacy_collector",
                                 batch_size=len(clicks),
                             )
+                            # F.29 Sprint 2.4 — legacy shim path treats
+                            # the batch as fully accepted (legacy
+                            # collector returns 2xx = all delivered).
+                            # Counted in success_ratio window so the
+                            # operator sees consistent ratios during a
+                            # rolling-deploy window.
+                            shipper_metrics.record_outcome(
+                                accepted=len(clicks), rejected=0,
+                            )
                             continue
 
                         # Status 207 from a legacy/unknown body shape —
@@ -753,6 +772,12 @@ async def run_shipper(redis_pool):
                         shipper_metrics.record_ship(
                             "collector_error", batch_size=len(clicks),
                         )
+                        # Sprint 2.4 — count whole batch as rejected
+                        # in the success-ratio window (clicks didn't
+                        # land, will be retried after sleep).
+                        shipper_metrics.record_outcome(
+                            accepted=0, rejected=len(clicks),
+                        )
                         await asyncio.sleep(retry_delay)
                         retry_delay = min(retry_delay * 2, MAX_RETRY_DELAY)
                         continue
@@ -777,6 +802,11 @@ async def run_shipper(redis_pool):
                         shipper_metrics.record_ship(
                             "collector_error", batch_size=len(clicks),
                         )
+                        # Sprint 2.4 — non-2xx outer path: batch fully
+                        # un-delivered for this iteration.
+                        shipper_metrics.record_outcome(
+                            accepted=0, rejected=len(clicks),
+                        )
                         await asyncio.sleep(retry_delay)
                         retry_delay = min(retry_delay * 2, MAX_RETRY_DELAY)
 
@@ -798,6 +828,10 @@ async def run_shipper(redis_pool):
                     )
                     shipper_metrics.record_ship(
                         "unreachable", batch_size=len(clicks),
+                    )
+                    # Sprint 2.4 — central unreachable: nothing landed.
+                    shipper_metrics.record_outcome(
+                        accepted=0, rejected=len(clicks),
                     )
                     await asyncio.sleep(retry_delay)
                     retry_delay = min(retry_delay * 2, MAX_RETRY_DELAY)

@@ -140,7 +140,11 @@ def test_to_health_dict_has_all_expected_keys():
     """HealthResponse uses ``**shipper_metrics.to_health_dict()`` to
     spread the metrics into the response. Drift in the key set
     breaks Pydantic validation at the /health response layer with
-    a confusing error. Pin the key set explicitly here."""
+    a confusing error. Pin the key set explicitly here.
+
+    F.29 Sprint 2.4 (2026-05-23) added ``shipper_success_ratio_5m``
+    to the dict — cascade-updated in the same commit.
+    """
     m = ShipperMetrics()
     d = m.to_health_dict()
     assert set(d.keys()) == {
@@ -149,6 +153,7 @@ def test_to_health_dict_has_all_expected_keys():
         "last_ship_at",
         "last_ship_status",
         "last_batch_size",
+        "shipper_success_ratio_5m",
     }
 
 

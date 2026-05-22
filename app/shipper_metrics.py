@@ -49,8 +49,23 @@ not pure).
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from collections import deque
+from dataclasses import dataclass, field
 from typing import Literal
+
+# F.29 Sprint 2.4 (2026-05-23) — rolling success-ratio window.
+#
+# The shipper records every batch outcome as a triple (timestamp,
+# accepted, rejected). Entries older than this window are discarded
+# when a new entry is added. ``success_ratio_5m`` then computes
+# sum(accepted) / sum(accepted + rejected) over the surviving
+# entries.
+#
+# 5 minutes matches typical Sentry alert evaluation cadences (the
+# alert rule in Sprint 4.1 will warn when ratio < 0.95 sustained).
+# A shorter window would oscillate too much during transient
+# collector blips; a longer window would dampen real outage signal.
+_SUCCESS_RATIO_WINDOW_SECONDS = 300
 
 ShipStatus = Literal[
     "success",            # all clicks accepted, ACK + XTRIM succeeded
@@ -83,6 +98,17 @@ class ShipperMetrics:
     last_ship_status: ShipStatus = "n/a"
     last_batch_size: int = 0
 
+    # F.29 Sprint 2.4 — rolling 5-min success-ratio window.
+    #
+    # ``deque`` of (timestamp, accepted, rejected) triples. Older
+    # entries are pruned lazily on each :meth:`record_outcome` call;
+    # the in-memory list is bounded by traffic volume × window
+    # length, not by an arbitrary maxlen, so a slow node holds fewer
+    # entries (good).
+    outcomes: deque[tuple[float, int, int]] = field(
+        default_factory=deque,
+    )
+
     def mark_running(self) -> None:
         """Called at the top of ``run_shipper``'s main loop."""
         self.running = True
@@ -104,6 +130,54 @@ class ShipperMetrics:
         self.last_ship_at = time.time()
         self.last_ship_status = status
         self.last_batch_size = batch_size
+
+    def record_outcome(
+        self, accepted: int, rejected: int, _now: float | None = None,
+    ) -> None:
+        """F.29 Sprint 2.4 — append batch outcome + prune stale entries.
+
+        Distinct from :meth:`record_ship` (which captures the most
+        recent attempt as a single snapshot for ``last_ship_status``).
+        ``record_outcome`` feeds the rolling-window success ratio that
+        Sprint 4.1 will alert on.
+
+        Args:
+            accepted: Count of clicks accepted (or duplicates — both
+                are "delivered" from the operator's perspective).
+            rejected: Count of clicks rejected by the collector OR
+                deadlettered locally. Both count as "non-delivery"
+                in the success ratio.
+            _now: Test seam — overrides ``time.time()`` for
+                deterministic pruning tests.
+        """
+        now = time.time() if _now is None else _now
+        self.outcomes.append((now, accepted, rejected))
+        # Lazy-prune entries older than the window.
+        cutoff = now - _SUCCESS_RATIO_WINDOW_SECONDS
+        while self.outcomes and self.outcomes[0][0] < cutoff:
+            self.outcomes.popleft()
+
+    @property
+    def success_ratio_5m(self) -> float | None:
+        """Rolling-5-min success ratio = accepted / (accepted + rejected).
+
+        Returns:
+            ``None`` when no outcomes recorded yet (initial state) OR
+            when the total denominator is 0 (only zero-size batches
+            recorded — e.g. shipper running but stream empty). ``None``
+            is JSON-serialisable to ``null`` so dashboards can
+            distinguish "no data" from "0% success".
+            ``1.0`` when all clicks accepted.
+            ``0.0`` when all clicks rejected.
+        """
+        if not self.outcomes:
+            return None
+        total_accepted = sum(a for _, a, _ in self.outcomes)
+        total_rejected = sum(r for _, _, r in self.outcomes)
+        denominator = total_accepted + total_rejected
+        if denominator == 0:
+            return None
+        return round(total_accepted / denominator, 4)
 
     @property
     def lag_seconds(self) -> float | None:
@@ -132,6 +206,8 @@ class ShipperMetrics:
             "last_ship_at": self.last_ship_at,
             "last_ship_status": self.last_ship_status,
             "last_batch_size": self.last_batch_size,
+            # F.29 Sprint 2.4 — rolling success-ratio window.
+            "shipper_success_ratio_5m": self.success_ratio_5m,
         }
 
 
@@ -158,3 +234,4 @@ def _reset_for_tests() -> None:
     metrics.last_ship_at = None
     metrics.last_ship_status = "n/a"
     metrics.last_batch_size = 0
+    metrics.outcomes.clear()

@@ -198,6 +198,13 @@ class HealthResponse(BaseModel):
     # silently propagating to dashboards as a typo.
     last_ship_status: ShipStatus = "n/a"
 
+    # F.29 Sprint 2.4 (2026-05-23) rolling-window batch success ratio.
+    # accepted / (accepted + rejected) over the last 5 minutes per
+    # node. None when no outcomes recorded yet OR when the denominator
+    # is 0 (e.g. shipper running but stream empty). 1.0 = all delivered;
+    # 0.0 = all rejected. Sprint 4.1 alert rule: warn at <0.95 sustained.
+    shipper_success_ratio_5m: float | None = None
+
     # F.29 Sprint 1.4 storage visibility ---------------------------------
     # XLEN of stream:clicks. Steady-state ~0-10k (shipper XTRIMs to 10k
     # after success). Sustained > 50k = shipper failing.

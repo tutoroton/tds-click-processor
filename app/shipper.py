@@ -18,6 +18,7 @@ import httpx
 import sentry_sdk
 
 from app.config import _LOCAL_ENVIRONMENTS, settings
+from app.shipper_metrics import metrics as shipper_metrics
 
 logger = logging.getLogger("tds.shipper")
 
@@ -233,6 +234,13 @@ async def run_shipper(redis_pool):
             raise
 
     logger.info(f"Shipper started → {settings.central_url}/api/clicks/batch")
+    # F.29 Sprint 1.4 — surface "shipper is alive" to /health. Pre-F.29
+    # /health returned redis=true even when the shipper task had crashed
+    # silently; running=true here flips ON only after the consumer group
+    # is established. The matching mark_stopped() lives in the finally
+    # block at the end of this function so cancellation on lifespan
+    # shutdown surfaces correctly in /health right up to process exit.
+    shipper_metrics.mark_running()
 
     retry_delay = 1
     async with httpx.AsyncClient(timeout=15.0) as client:
@@ -344,10 +352,20 @@ async def run_shipper(redis_pool):
                             batch_size=len(clicks),
                             collector_status=response.status_code,
                         )
+                        # F.29 Sprint 1.4 — surface this distinct
+                        # outcome to /health so operators see "batch
+                        # got there but local ACK didn't" without
+                        # having to read logs.
+                        shipper_metrics.record_ship(
+                            "ack_failed", batch_size=len(clicks),
+                        )
                     else:
                         logger.info(
                             "Shipped %d clicks to central (op=%s)",
                             len(clicks), OP_BATCH_POST,
+                        )
+                        shipper_metrics.record_ship(
+                            "success", batch_size=len(clicks),
                         )
                     retry_delay = 1  # Reset retry delay
                 else:
@@ -368,6 +386,9 @@ async def run_shipper(redis_pool):
                         response_body=response.text[:500],
                         batch_size=len(clicks),
                     )
+                    shipper_metrics.record_ship(
+                        "collector_error", batch_size=len(clicks),
+                    )
                     await asyncio.sleep(retry_delay)
                     retry_delay = min(retry_delay * 2, MAX_RETRY_DELAY)
 
@@ -386,6 +407,9 @@ async def run_shipper(redis_pool):
                     e,
                     batch_size=len(clicks),
                     failure_kind="httpx.RequestError",
+                )
+                shipper_metrics.record_ship(
+                    "unreachable", batch_size=len(clicks),
                 )
                 await asyncio.sleep(retry_delay)
                 retry_delay = min(retry_delay * 2, MAX_RETRY_DELAY)
@@ -406,4 +430,5 @@ async def run_shipper(redis_pool):
                     e,
                     failure_kind=type(e).__name__,
                 )
+                shipper_metrics.record_ship("loop_error", batch_size=0)
                 await asyncio.sleep(2)

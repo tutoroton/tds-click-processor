@@ -32,6 +32,7 @@ from app.models import ClickRequest, ClickResponse, HealthResponse
 from app.redis_client import get_redis, close_redis
 from app.router import route, parse_device_type, parse_os, parse_browser, get_full_ua_info
 from app.shipper import assert_shipper_ready, run_shipper
+from app.shipper_metrics import metrics as shipper_metrics
 from app.disk_queue import enqueue_click as enqueue_click_to_disk, run_drainer as run_disk_drainer
 from app.observability import run_observability_loop
 from app.sync_client import apply_snapshot, start_periodic_pull
@@ -710,7 +711,26 @@ async def decide(
 
 @app.get("/health", response_model=HealthResponse)
 async def health():
-    """Health check."""
+    """Health check.
+
+    F.29 Sprint 1.4 (2026-05-23) — extended with shipper + storage
+    visibility (plan §3 G5). Pre-F.29 a silently-disabled shipper task
+    still produced ``redis=true`` and ``campaigns_loaded>0`` because
+    the redis ping itself worked; the fact that clicks were never
+    delivered upstream was invisible. The new fields expose:
+
+      * shipper_running / shipper_lag_seconds / last_ship_at /
+        last_ship_status / last_batch_size — live from
+        ``app.shipper_metrics`` (the shipper task updates it).
+      * stream_clicks_length — current XLEN of stream:clicks.
+      * disk_queue_size — count of files awaiting drainer replay.
+      * disk_free_bytes — free bytes on the disk-queue mountpoint
+        (None when the path does not exist).
+
+    Each ancillary read is wrapped — a probe must never crash on a
+    component that's only-partially-up, because /health itself is what
+    the orchestrator polls to DECIDE whether the service is up.
+    """
     r = await get_redis()
     try:
         redis_ok = await r.ping()
@@ -721,6 +741,44 @@ async def health():
         campaigns_count = 0
         sync_ver = None
 
+    # F.29 Sprint 1.4 — stream:clicks length. Independent try/except
+    # so a Redis blip on XLEN does not cascade to making /health
+    # respond 500 (orchestrators interpret that as "service down"
+    # and may restart the container, blowing local state).
+    try:
+        stream_length = await r.xlen("stream:clicks") if redis_ok else 0
+    except Exception:
+        stream_length = 0
+
+    # F.29 Sprint 1.4 — disk-queue file count. Reads the in-memory
+    # counter (no FS scan) — see app.disk_queue. Independent guard:
+    # the disk_queue module may not be initialised on a brand-new
+    # node before the first /decide hits, in which case
+    # ``get_queue_size()`` returns 0.
+    try:
+        from app.disk_queue import get_queue_size
+        disk_queue_size = await get_queue_size()
+    except Exception:
+        disk_queue_size = 0
+
+    # F.29 Sprint 1.4 — free bytes on the disk-queue mountpoint.
+    # Used by Sprint 4.1 alert "disk_free_bytes < 1GB → warn". Returns
+    # None when the root path does not exist (operator opted out of
+    # disk fallback via empty TDS_DISK_QUEUE_ROOT, or first-boot before
+    # the directory was created). Imported here (not at module top) to
+    # avoid coupling /health to ``shutil`` if a future refactor moves
+    # disk handling elsewhere.
+    import shutil as _shutil
+    disk_free_bytes: int | None = None
+    if settings.disk_queue_root:
+        try:
+            disk_free_bytes = _shutil.disk_usage(
+                settings.disk_queue_root
+            ).free
+        except (OSError, FileNotFoundError):
+            # Directory may not exist yet on first boot — leave as None.
+            disk_free_bytes = None
+
     return HealthResponse(
         node_id=settings.node_id,
         region=settings.node_region,
@@ -728,6 +786,13 @@ async def health():
         campaigns_loaded=campaigns_count,
         sync_version=int(sync_ver) if sync_ver else 0,
         uptime_seconds=round(time.time() - START_TIME, 1),
+        # F.29 Sprint 1.4 — shipper visibility (single source of truth
+        # in ShipperMetrics dataclass; ``to_health_dict`` ensures any
+        # future field added there is wired into the response).
+        **shipper_metrics.to_health_dict(),
+        stream_clicks_length=stream_length,
+        disk_queue_size=disk_queue_size,
+        disk_free_bytes=disk_free_bytes,
     )
 
 

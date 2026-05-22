@@ -144,9 +144,59 @@ class ClickResponse(BaseModel):
 
 
 class HealthResponse(BaseModel):
+    """Click-processor health snapshot for operator dashboards.
+
+    F.29 Sprint 1.4 (2026-05-23) extended this with shipper + storage
+    visibility (plan §3 G5). Pre-F.29 a shipper task that had crashed
+    silently still produced /health=200 with redis=true — the very
+    50-day silent-shipper-disable that audit-2026-05-16 caught. New
+    fields expose the shipper's live state and the local storage
+    capacity so the operator can spot trouble before clicks queue up.
+
+    All new fields are OPTIONAL with safe defaults so:
+      * Legacy consumers that don't know about them keep working.
+      * Sub-modules unavailable during early lifespan (e.g. /health
+        hit during graceful shutdown after Redis closed) can still
+        return a coherent shape.
+
+    Field semantics — see ``app.shipper_metrics.ShipperMetrics`` +
+    ``app.disk_queue.get_queue_size`` for the canonical definitions.
+    """
+
+    # Pre-F.29 fields — preserved verbatim, callers depend on them.
     node_id: str
     region: str
     redis: bool
     campaigns_loaded: int
     sync_version: int = 0
     uptime_seconds: float
+
+    # F.29 Sprint 1.4 shipper visibility ---------------------------------
+    # Whether the click shipper task is actively shipping. False on
+    # standalone/escape-hatch modes (intentional) AND on silent task
+    # crashes (the catastrophic case the operator must see).
+    shipper_running: bool = False
+    # Seconds since the last ship attempt (None until first attempt).
+    # Sprint 4.1 page rule: lag > 5min → page.
+    shipper_lag_seconds: float | None = None
+    # Wall-clock UNIX timestamp of last ship attempt (None until first).
+    last_ship_at: float | None = None
+    # Number of clicks in the last batch attempt. 0 = stream was empty.
+    last_batch_size: int = 0
+    # Outcome literal (see app.shipper_metrics.ShipStatus). "n/a" until
+    # first attempt; one of {success, ack_failed, collector_error,
+    # unreachable, parse_failed, loop_error, n/a} after.
+    last_ship_status: str = "n/a"
+
+    # F.29 Sprint 1.4 storage visibility ---------------------------------
+    # XLEN of stream:clicks. Steady-state ~0-10k (shipper XTRIMs to 10k
+    # after success). Sustained > 50k = shipper failing.
+    stream_clicks_length: int = 0
+    # Count of files in /var/tds/click-queue/ awaiting drainer replay.
+    # Steady-state = 0 (disk fallback fires only on Redis outage).
+    disk_queue_size: int = 0
+    # Free bytes on the disk-queue mountpoint. None when the path does
+    # not exist (local dev without TDS_DISK_QUEUE_ROOT). Sprint 1.5
+    # pre-flight check uses this against
+    # ``settings.disk_queue_min_free_bytes``.
+    disk_free_bytes: int | None = None

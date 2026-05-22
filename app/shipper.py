@@ -255,19 +255,91 @@ async def _retry_click(
     )
 
 
+async def _forward_deadletter_to_central(
+    http_client: httpx.AsyncClient,
+    record: dict[str, str],
+) -> bool:
+    """F.29 Sprint 2.3 — forward a deadletter record to the central
+    collector so the operator dashboard sees deadletters across the
+    whole edge fleet.
+
+    Best-effort: the click is ALREADY preserved in the edge local
+    ``stream:clicks-deadletter`` ring buffer (the primary durability
+    guarantee). Central forwarding failure is logged but never
+    propagated — the caller's flow continues. Sprint 4.1 alert rule
+    "central deadletter depth > 100 → warn" surfaces persistent
+    central failures separately.
+
+    Returns:
+        True on successful central XADD (collector returned 202).
+        False on failure (logged + Sentry-captured by the caller via
+        the existing op=deadletter helper).
+    """
+    if not settings.central_url:
+        # Standalone-mode shipper has no central URL configured. The
+        # local deadletter is sufficient.
+        return False
+    payload = {
+        "click_id": record.get("click_id", ""),
+        "data": record.get("data", "{}"),
+        "attempt_count": int(record.get("attempt_count", "0")),
+        "last_rejection_reason": record.get("last_rejection_reason", ""),
+        "deadlettered_at": float(record.get("deadlettered_at", "0")),
+        "node_id": record.get("node_id", settings.node_id),
+    }
+    try:
+        response = await http_client.post(
+            f"{settings.central_url}/api/clicks/deadletter",
+            json=payload,
+            headers={"X-Node-Key": settings.central_api_key},
+            timeout=5.0,
+        )
+        if response.status_code == 202:
+            return True
+        logger.warning(
+            "Shipper central deadletter forward returned %s for "
+            "click_id=%s: %s",
+            response.status_code,
+            payload["click_id"],
+            response.text[:200],
+        )
+        return False
+    except Exception as exc:  # noqa: BLE001
+        # Central forwarding is best-effort. Log + Sentry capture
+        # with op=deadletter so operators see the forward-failure
+        # rate distinct from the deadletter rate itself.
+        logger.warning(
+            "Shipper central deadletter forward failed for click_id=%s: "
+            "%s. Click is preserved at edge local deadletter stream.",
+            payload["click_id"], exc,
+        )
+        _capture_op_exc(
+            "deadletter",
+            exc,
+            click_id=payload["click_id"],
+            stage="central_forward",
+        )
+        return False
+
+
 async def _deadletter_click(
     redis_pool,
     click: dict[str, Any],
     attempt: int,
     reason: str,
+    http_client: httpx.AsyncClient | None = None,
 ) -> None:
     """Move a click to the local deadletter stream after max retries.
 
-    F.29 Sprint 2.2 (2026-05-23). The click sits in
-    ``stream:clicks-deadletter`` (local edge Redis, MAXLEN 10k) until
-    Sprint 2.3 adds central forwarding. Operator can inspect via
-    ``redis-cli XRANGE`` or the (future) ``/api/health/summary``
-    deadletter widget.
+    F.29 Sprint 2.2 (2026-05-23) introduced the local edge deadletter
+    stream. Sprint 2.3 (2026-05-23) added the optional ``http_client``
+    parameter so the caller (run_shipper) can additionally forward
+    the record to the central collector for fleet-wide visibility.
+
+    The local XADD is the durability primitive — central forwarding
+    is best-effort observability. If both fail the click is
+    genuinely lost; operators see this via Sentry op=deadletter
+    captures.
 
     The deadletter record carries:
       * ``data`` — original click JSON.
@@ -277,17 +349,21 @@ async def _deadletter_click(
         the last attempt (e.g. ``"queue_failure"``,
         ``"validation_failed"``).
       * ``deadlettered_at`` — UNIX timestamp.
-      * ``node_id`` — which edge node deadlettered the click. Sprint
-        2.3 central forwarding will use this to bucket by tenant.
+      * ``node_id`` — which edge node deadlettered the click. Used
+        for per-tenant bucketing at the central dashboard.
     """
     import time as _time
+    click_id = click.get("click_id", "<unknown>")
     record = {
+        "click_id": str(click_id),
         "data": json.dumps(click, default=str),
         "attempt_count": str(attempt),
         "last_rejection_reason": reason[:64],  # bound reason length
         "deadlettered_at": str(_time.time()),
         "node_id": settings.node_id,
     }
+
+    # Local edge deadletter stream — primary durability path.
     try:
         await redis_pool.xadd(
             DEADLETTER_STREAM_KEY,
@@ -296,29 +372,36 @@ async def _deadletter_click(
             approximate=True,
         )
     except Exception as exc:  # noqa: BLE001
-        # Deadletter XADD failure is rare (separate stream, low rate)
-        # but not catastrophic — log + Sentry capture. The click is
-        # genuinely lost in this corner case; operator visibility is
-        # the only mitigation here. Future Sprint 2.3 central path
-        # provides redundancy.
+        # Local deadletter XADD failure is rare (separate stream, low
+        # rate) but not catastrophic. Log + Sentry capture; central
+        # forwarding (below) is the redundancy.
         logger.error(
-            "Shipper deadletter XADD failed for click_id=%s "
+            "Shipper local deadletter XADD failed for click_id=%s "
             "(attempt=%d, reason=%s): %s",
-            click.get("click_id", "<unknown>"), attempt, reason, exc,
+            click_id, attempt, reason, exc,
         )
         _capture_op_exc(
             "deadletter",
             exc,
-            click_id=click.get("click_id", "<unknown>"),
+            click_id=click_id,
             attempt=attempt,
             reason=reason,
+            stage="local_xadd",
         )
+
+    # F.29 Sprint 2.3 — best-effort central forward. Caller passes
+    # the active httpx.AsyncClient when available (inside the main
+    # loop). When None (e.g. early helper unit tests), we skip the
+    # forward step — local deadletter is sufficient on its own.
+    if http_client is not None:
+        await _forward_deadletter_to_central(http_client, record)
 
 
 async def _handle_rejected_click(
     redis_pool,
     click: dict[str, Any],
     reason: str,
+    http_client: httpx.AsyncClient | None = None,
 ) -> bool:
     """Increment retry counter; return True if click should be retried,
     False if it was deadlettered (max attempts hit).
@@ -338,6 +421,7 @@ async def _handle_rejected_click(
         # deadletter immediately.
         await _deadletter_click(
             redis_pool, click, attempt=1, reason=reason,
+            http_client=http_client,
         )
         return False
 
@@ -357,12 +441,14 @@ async def _handle_rejected_click(
         )
         await _deadletter_click(
             redis_pool, click, attempt=-1, reason=f"counter_error:{reason}",
+            http_client=http_client,
         )
         return False
 
     if attempt >= settings.shipper_max_retry_attempts:
         await _deadletter_click(
             redis_pool, click, attempt=attempt, reason=reason,
+            http_client=http_client,
         )
         # Clean up the retry counter — click is out of the loop now.
         try:
@@ -384,6 +470,7 @@ async def _handle_rejected_click(
         )
         await _deadletter_click(
             redis_pool, click, attempt=attempt, reason=f"requeue_error:{reason}",
+            http_client=http_client,
         )
         return False
 
@@ -584,6 +671,7 @@ async def run_shipper(redis_pool):
                                     continue
                                 retried = await _handle_rejected_click(
                                     redis_pool, original_click, reason,
+                                    http_client=client,
                                 )
                                 if not retried:
                                     deadletter_count += 1

@@ -53,6 +53,10 @@ class FakeRedis:
     async def smembers(self, key):
         return set(self.sets.get(key, set()))
 
+    async def sismember(self, key, member):
+        # Mirrors redis SISMEMBER (1/0); resolver wraps in bool().
+        return 1 if member in self.sets.get(key, set()) else 0
+
     async def get(self, key):
         return self.strings.get(key)
 
@@ -708,3 +712,136 @@ class TestCapPreCheck:
         result = _route_with(redis, click)
         assert result is not None
         assert "lp.example" in result["url"]
+
+
+class TestWildcardSubdomainFailClosed:
+    """§6 (F.30 security): unmatched subdomains of a wildcard-enabled base
+    fail closed — no base-key inheritance, no geo fall-through.
+
+    The `domains:wildcard` SET (admin-api sync builder) marks every base
+    that has a `*.{base}` wildcard DNS (auto-provisioned when ≥1
+    subdomain binding exists). Click-processor decides what is a
+    wildcard subdomain by SET membership, not naive label count — so
+    multi-label bases (`tds.adstudy.dev`) used directly are never
+    mis-classified. Empty / absent SET ⇒ exactly the pre-§6 behaviour.
+    """
+
+    def _routable(self, campaign_id, flow_id, url, *, sets=None, strings=None):
+        """Minimal campaign+flow snapshot that redirects to `url`."""
+        return FakeRedis(
+            hashes={
+                f"campaign:{campaign_id}": {"company_id": "1", "priority": "0"},
+                f"flow:{flow_id}": {
+                    "campaign_id": campaign_id,
+                    "scope_type": "company",
+                    "scope_id": "1",
+                    "seq_id": "1",
+                    "is_default": "0",
+                    "criteria": "[]",
+                    "action_type": "redirect",
+                    "action_config": json.dumps({"url": url}),
+                },
+            },
+            lists={f"campaign:{campaign_id}:flows": [flow_id]},
+            sets=sets or {},
+            strings=strings or {},
+        )
+
+    def _click(self, hostname, **kw):
+        return ClickRequest(
+            click_id="t", country="US", user_agent="Mozilla/5.0",
+            hostname=hostname, query_params=kw.get("query_params", {}),
+        )
+
+    def test_unmatched_subdomain_of_wildcard_base_blocks(self):
+        """`evil.adstudy.dev` with no subdomain binding → block, even
+        though the base carries a root binding (must NOT inherit it)."""
+        redis = FakeRedis(
+            sets={"domains:wildcard": {"adstudy.dev"}},
+            strings={"domain:adstudy.dev:root": "10"},  # base root — must NOT leak
+        )
+        result = _route_with(redis, self._click("evil.adstudy.dev"))
+        assert result is not None
+        assert result["blocked"] is True
+        assert result["url"] is None
+        assert result["timing"]["result"] == "blocked_unmatched_subdomain"
+
+    def test_unmatched_subdomain_does_not_fall_through_to_geo(self):
+        """Wildcard-subdomain miss must NOT route to a geo-matched
+        campaign — the strongest §6 guarantee."""
+        redis = self._routable(
+            "10", "100", "https://geo-lp.example",
+            sets={"domains:wildcard": {"adstudy.dev"}},
+        )
+        # A campaign that WOULD win the geo branch (active, no targeting
+        # flags = matches all) if we wrongly fell through.
+        redis.sets["campaigns:active"] = {"10"}
+        redis.sets["geo:US"] = {"10"}
+        result = _route_with(redis, self._click("evil.adstudy.dev"))
+        assert result["blocked"] is True
+        assert result["url"] is None
+
+    def test_matched_wildcard_subdomain_routes(self):
+        """`gambling.adstudy.dev` with a subdomain binding → routes."""
+        redis = self._routable(
+            "10", "100", "https://sub-lp.example",
+            sets={"domains:wildcard": {"adstudy.dev"}},
+            strings={"domain:adstudy.dev:subdomain:gambling": "10"},
+        )
+        result = _route_with(redis, self._click("gambling.adstudy.dev"))
+        assert result is not None
+        assert result.get("blocked") is not True
+        assert "sub-lp.example" in result["url"]
+        assert result["timing"]["domain_matched"] is True
+
+    def test_exact_host_root_wins_over_wildcard_subdomain_binding(self):
+        """A subdomain that is itself a registered domain (own root
+        binding) resolves to its own root, not the parent's subdomain
+        binding — exact-host precedence."""
+        redis = self._routable(
+            "20", "200", "https://own-root.example",
+            sets={"domains:wildcard": {"adstudy.dev"}},
+            strings={
+                "domain:special.adstudy.dev:root": "20",       # exact host wins
+                "domain:adstudy.dev:subdomain:special": "10",  # parent binding
+            },
+        )
+        result = _route_with(redis, self._click("special.adstudy.dev"))
+        assert result.get("blocked") is not True
+        assert "own-root.example" in result["url"]  # campaign 20, not 10
+
+    def test_multilabel_base_used_directly_not_blocked(self):
+        """`tds.adstudy.dev` as a root domain — its parent `adstudy.dev`
+        is NOT a wildcard base, so it resolves normally and is never
+        mis-read as a subdomain of `adstudy.dev`."""
+        redis = self._routable(
+            "30", "300", "https://multi.example",
+            strings={"domain:tds.adstudy.dev:root": "30"},  # no wildcard set
+        )
+        result = _route_with(redis, self._click("tds.adstudy.dev"))
+        assert result.get("blocked") is not True
+        assert "multi.example" in result["url"]
+
+    def test_empty_wildcard_set_preserves_legacy_fallthrough(self):
+        """No wildcard marker (pre-deploy / absent) → `x.adstudy.dev`
+        resolves via the base root exactly as the pre-§6 resolver did
+        (3-deploy safety)."""
+        redis = self._routable(
+            "40", "400", "https://legacy.example",
+            strings={"domain:adstudy.dev:root": "40"},  # no domains:wildcard
+        )
+        result = _route_with(redis, self._click("x.adstudy.dev"))
+        assert result.get("blocked") is not True
+        assert "legacy.example" in result["url"]
+
+    def test_wildcard_base_itself_resolves_normally(self):
+        """The base domain itself (2-label) is never its own subdomain —
+        resolves via root even while present in the wildcard set."""
+        redis = self._routable(
+            "50", "500", "https://base.example",
+            sets={"domains:wildcard": {"adstudy.dev"}},
+            strings={"domain:adstudy.dev:root": "50"},
+        )
+        result = _route_with(redis, self._click("adstudy.dev"))
+        assert result.get("blocked") is not True
+        assert "base.example" in result["url"]

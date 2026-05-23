@@ -81,8 +81,26 @@ async def route(req: ClickRequest) -> dict | None:
 
     # Stage 0: Domain-based campaign resolution (highest priority)
     t0 = time.perf_counter()
-    domain_campaign_id = await resolve_domain_campaign(r, req)
+    domain_campaign_id, domain_blocked = await resolve_domain_campaign(r, req)
     timing["domain_resolve_ms"] = _ms_since(t0)
+
+    # §6 (F.30 security): an unmatched subdomain of a wildcard-enabled
+    # base fails closed — it must NOT inherit the base's binding nor
+    # fall through to geo targeting. The `*.{base}` wildcard DNS (F.30
+    # A.1) makes arbitrary subdomains reachable; pre-F.30 they were
+    # NXDOMAIN. A block sentinel (404) is the only safe disposition.
+    # See `resolve_domain_campaign` + plan §6.
+    if domain_blocked:
+        timing["domain_matched"] = False
+        timing["route_total_ms"] = _ms_since(t_start)
+        timing["result"] = "blocked_unmatched_subdomain"
+        return {
+            "url": None,
+            "campaign_id": None,
+            "offer_id": None,
+            "timing": timing,
+            "blocked": True,
+        }
 
     if domain_campaign_id:
         # Domain resolved — skip geo targeting, go straight to flow cascade.
@@ -619,31 +637,115 @@ def _safe_id_sort_key(rid: Any) -> tuple[int, int, str]:
         return (1, 0, str(rid))
 
 
-async def resolve_domain_campaign(r, req: ClickRequest) -> str | None:
+# §6 (F.30 security) — cross-service contract key. The admin-api sync
+# builder (`app/sync/builders/domains.py`, constant
+# `keys.DOMAINS_WILDCARD`) publishes into this SET every base domain
+# that has ≥1 active subdomain binding — i.e. every base for which
+# admin-api auto-provisioned a `*.{base}` wildcard DNS record (F.30
+# A.1). Membership, NOT a naive label count, decides what is a wildcard
+# subdomain, so multi-label bases (`tds.adstudy.dev`, `base.co.uk`)
+# used directly are never mis-classified as subdomains of their parent.
+# 3-deploy safe: an absent / empty set makes every branch below behave
+# exactly as the pre-§6 resolver did, so reader (this) and writer
+# (admin-api) can deploy in any order.
+_WILDCARD_BASES_KEY = "domains:wildcard"
+
+
+async def _first_match(r, keys_to_check: list[str]) -> str | None:
+    """Batch-GET `keys_to_check` in one pipeline; first non-empty wins."""
+    if not keys_to_check:
+        return None
+    pipe = r.pipeline()
+    for key in keys_to_check:
+        pipe.get(key)
+    results = await pipe.execute()
+    for val in results:
+        if val:
+            return val
+    return None
+
+
+async def resolve_domain_campaign(r, req: ClickRequest) -> tuple[str | None, bool]:
     """Resolve campaign_id from domain bindings in Redis.
 
     Priority order: subdomain > path > param > root (first match wins).
+
+    Returns `(campaign_id, blocked)`:
+      - `(cid, False)`  — a binding matched; caller routes to `cid`.
+      - `(None, False)` — no domain match; caller falls through to geo
+        targeting (legitimate for a non-wildcard host that resolved via
+        its own explicit DNS).
+      - `(None, True)`  — the hostname is an UNMATCHED subdomain of a
+        wildcard-enabled base (§6 fail-closed). The caller MUST emit a
+        404 and MUST NOT fall through to geo targeting. See the
+        `_WILDCARD_BASES_KEY` contract above and
+        `docs/development/F.30-F.31-domain-bindings-plan.md` §6.
     """
     hostname = req.hostname
     if not hostname:
-        return None
+        return None, False
 
     path = (req.path or "").strip("/")
     first_segment = path.split("/")[0] if path else ""
     param_c = (req.query_params or {}).get("c", "")
 
-    # Extract subdomain: if hostname has more parts than 2, the prefix is the subdomain
-    # e.g., "gambling-tier-1.tds.adstudy.dev" → subdomain = "gambling-tier-1", base = "tds.adstudy.dev"
+    # Split off the first label as the candidate subdomain. A wildcard
+    # subdomain needs ≥3 labels (`{label}.{base}` where the base itself
+    # is a registrable ≥2-label domain) — `len(parts) >= 3` excludes a
+    # bare 2-label base (`adstudy.dev`) from being read as a subdomain
+    # of its TLD.
     parts = hostname.split(".")
+    sub_label = parts[0] if len(parts) >= 3 else ""
+    sub_base = ".".join(parts[1:]) if len(parts) >= 3 else ""
+
+    # §6: is the candidate base a wildcard-enabled base? Only then does
+    # the fail-closed discipline apply. SISMEMBER is O(1) and skipped
+    # entirely for root-domain (2-label) clicks — the common case keeps
+    # its single pipeline round-trip.
+    is_wildcard_subdomain = False
+    if sub_base:
+        try:
+            is_wildcard_subdomain = bool(
+                await r.sismember(_WILDCARD_BASES_KEY, sub_base)
+            )
+        except Exception:  # pragma: no cover — Redis transient → fail open to legacy path
+            is_wildcard_subdomain = False
+
+    if is_wildcard_subdomain:
+        # The base has a `*.{base}` wildcard DNS, so this host reaches
+        # the edge even though it may have no binding. We must NOT
+        # inherit the base's root/path/param keys (that would let
+        # `random.{base}` ride the base campaign) and must NOT fall
+        # through to geo. Resolution, then fail closed:
+        #   1. Exact-hostname bindings — the subdomain is itself a
+        #      registered domain in its own right (rare; takes
+        #      precedence over the wildcard binding). path > param > root.
+        #   2. The wildcard subdomain binding for this label.
+        #   3. No match → block (404).
+        keys_to_check = []
+        if first_segment:
+            keys_to_check.append(f"domain:{hostname}:path:{first_segment}")
+        if param_c:
+            keys_to_check.append(f"domain:{hostname}:param:{param_c}")
+        keys_to_check.append(f"domain:{hostname}:root")
+        keys_to_check.append(f"domain:{sub_base}:subdomain:{sub_label}")
+
+        cid = await _first_match(r, keys_to_check)
+        if cid:
+            return cid, False
+        return None, True  # §6 fail-closed
+
+    # Non-wildcard host — behaviour identical to the pre-§6 resolver.
+    # The legacy subdomain heuristic is retained for any base that has
+    # subdomain bindings but no wildcard marker yet (pre-deploy window);
+    # geo fall-through on miss is preserved because a non-wildcard
+    # 3-label host only reaches the edge via its own explicit DNS.
     subdomain = ""
     base_domain = hostname
     if len(parts) > 2:
-        # Could be sub.domain.tld or sub.domain.co.uk
-        # Try: first part as subdomain, rest as base
         subdomain = parts[0]
         base_domain = ".".join(parts[1:])
 
-    # Build lookup keys in priority order
     keys_to_check = []
     if subdomain:
         keys_to_check.append(f"domain:{base_domain}:subdomain:{subdomain}")
@@ -659,20 +761,8 @@ async def resolve_domain_campaign(r, req: ClickRequest) -> str | None:
     if base_domain != hostname:
         keys_to_check.append(f"domain:{base_domain}:root")
 
-    if not keys_to_check:
-        return None
-
-    # Batch lookup — single pipeline round-trip
-    pipe = r.pipeline()
-    for key in keys_to_check:
-        pipe.get(key)
-    results = await pipe.execute()
-
-    for val in results:
-        if val:
-            return val  # First match wins
-
-    return None
+    cid = await _first_match(r, keys_to_check)
+    return cid, False
 
 
 async def select_offer(r, campaign_id: str) -> dict | None:

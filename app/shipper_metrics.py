@@ -105,8 +105,17 @@ class ShipperMetrics:
     # the in-memory list is bounded by traffic volume × window
     # length, not by an arbitrary maxlen, so a slow node holds fewer
     # entries (good).
+    #
+    # F.29 Sprint 2.7d (2026-05-23) — added explicit ``maxlen=2000``
+    # hard ceiling per Agent 1 validation finding. At 1000 req/s with
+    # 500-click batches the steady-state size is ~600 entries (2 per
+    # sec × 300s window). Maxlen 2000 gives 3x headroom for traffic
+    # spikes while bounding worst-case memory if the time-based
+    # pruning fails (e.g. record_outcome called with non-monotonic
+    # _now in a future test bug). Without maxlen, a misconfigured
+    # call site could grow the deque unbounded.
     outcomes: deque[tuple[float, int, int]] = field(
-        default_factory=deque,
+        default_factory=lambda: deque(maxlen=2000),
     )
 
     def mark_running(self) -> None:
@@ -141,6 +150,14 @@ class ShipperMetrics:
         ``record_outcome`` feeds the rolling-window success ratio that
         Sprint 4.1 will alert on.
 
+        F.29 Sprint 2.7d (2026-05-23) — also emits a Sentry breadcrumb
+        per call. This closes the Sprint 2.4 acceptance criterion
+        (plan §4 row 2.4: "Sentry breadcrumb shows
+        shipper.batch.success_ratio value per batch") which the
+        original Sprint 2.4 commit shipped /health-only. Breadcrumbs
+        are bounded to ~100 per request scope (Sentry SDK default)
+        so the per-batch emission rate is safe.
+
         Args:
             accepted: Count of clicks accepted (or duplicates — both
                 are "delivered" from the operator's perspective).
@@ -156,6 +173,32 @@ class ShipperMetrics:
         cutoff = now - _SUCCESS_RATIO_WINDOW_SECONDS
         while self.outcomes and self.outcomes[0][0] < cutoff:
             self.outcomes.popleft()
+
+        # F.29 Sprint 2.7d — Sentry breadcrumb emission for the
+        # plan §4 row 2.4 acceptance criterion. Bounded volume:
+        # each shipper batch records ONE breadcrumb. Sentry's default
+        # max_breadcrumbs is 100; the per-event scope auto-rotates.
+        # We import sentry_sdk lazily here to avoid coupling
+        # shipper_metrics.py to sentry_sdk at module-import time
+        # (this module is also imported by tests that mock Sentry).
+        try:
+            import sentry_sdk
+            sentry_sdk.add_breadcrumb(
+                category="shipper.batch",
+                level="info",
+                message="batch outcome recorded",
+                data={
+                    "accepted": accepted,
+                    "rejected": rejected,
+                    "success_ratio_5m": self.success_ratio_5m,
+                    "window_entries": len(self.outcomes),
+                },
+            )
+        except Exception:  # noqa: BLE001
+            # Breadcrumb emission must never fail the shipper.
+            # Sentry SDK errors here are non-fatal — the /health
+            # surface is the canonical signal.
+            pass
 
     @property
     def success_ratio_5m(self) -> float | None:

@@ -234,3 +234,63 @@ def test_reset_clears_outcomes(monkeypatch):
     smm._reset_for_tests()
     assert smm.metrics.success_ratio_5m is None
     assert len(smm.metrics.outcomes) == 0
+
+
+# ---------------------------------------------------------------------------
+# F.29 Sprint 2.7d (2026-05-23) — deque maxlen + Sentry breadcrumb
+# ---------------------------------------------------------------------------
+
+
+def test_deque_has_maxlen_2000():
+    """Sprint 2.7d (Agent 1 validation finding) — explicit maxlen
+    bounds worst-case memory if time-based pruning fails (e.g. a
+    test bug passes non-monotonic _now). At 1000 req/s ×500-click
+    batches the steady-state size is ~600 entries; maxlen=2000
+    gives 3x headroom while ruling out unbounded growth."""
+    m = ShipperMetrics()
+    assert m.outcomes.maxlen == 2000
+
+
+def test_record_outcome_emits_sentry_breadcrumb(monkeypatch):
+    """Sprint 2.7d — close the Sprint 2.4 acceptance criterion that
+    was under-delivered: plan §4 row 2.4 said "Sentry breadcrumb
+    shows shipper.batch.success_ratio value per batch", but the
+    original Sprint 2.4 commit shipped /health-only. This test
+    pins the breadcrumb call shape so Sprint 4.1 alert rules + the
+    Sentry UI can rely on consistent breadcrumb categories/data."""
+    breadcrumbs = []
+
+    def _fake_add_breadcrumb(**kwargs):
+        breadcrumbs.append(kwargs)
+
+    import sentry_sdk as real_sentry
+    monkeypatch.setattr(real_sentry, "add_breadcrumb", _fake_add_breadcrumb)
+
+    m = ShipperMetrics()
+    m.record_outcome(accepted=80, rejected=20)
+
+    assert len(breadcrumbs) == 1
+    bc = breadcrumbs[0]
+    assert bc["category"] == "shipper.batch"
+    assert bc["level"] == "info"
+    assert bc["data"]["accepted"] == 80
+    assert bc["data"]["rejected"] == 20
+    assert bc["data"]["success_ratio_5m"] == 0.8
+    assert bc["data"]["window_entries"] == 1
+
+
+def test_record_outcome_swallows_sentry_failure(monkeypatch):
+    """Breadcrumb emission MUST be non-fatal. If Sentry SDK is
+    misconfigured / unavailable / raises, the shipper continues —
+    /health is the canonical signal, breadcrumbs are best-effort."""
+
+    def _failing_add_breadcrumb(**kwargs):
+        raise RuntimeError("simulated sentry failure")
+
+    import sentry_sdk as real_sentry
+    monkeypatch.setattr(real_sentry, "add_breadcrumb", _failing_add_breadcrumb)
+
+    m = ShipperMetrics()
+    # Must not raise.
+    m.record_outcome(accepted=5, rejected=5)
+    assert m.success_ratio_5m == 0.5

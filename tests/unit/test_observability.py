@@ -370,3 +370,145 @@ class TestLifespanIntegration:
             "Lifespan must cancel observability_task on shutdown — "
             "otherwise the task leaks and blocks clean exit."
         )
+
+
+# ---------------------------------------------------------------------------
+# F.29 Sprint 4.1 — emit_shipper_health (independent shipper watchdog)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def _fresh_shipper_metrics():
+    """Reset the shipper-metrics singleton around each watchdog test."""
+    from app.shipper_metrics import _reset_for_tests
+    _reset_for_tests()
+    yield observability.shipper_metrics
+    _reset_for_tests()
+
+
+def _set_env(monkeypatch, *, environment="production", central_url="https://c:8200"):
+    monkeypatch.setattr(observability.settings, "environment", environment)
+    monkeypatch.setattr(observability.settings, "central_url", central_url)
+    monkeypatch.setattr(observability.settings, "shipper_lag_alert_seconds", 300)
+    monkeypatch.setattr(observability.settings, "shipper_success_ratio_alert_min", 0.95)
+    monkeypatch.setattr(observability.settings, "shipper_success_ratio_alert_min_sample", 20)
+
+
+@pytest.mark.asyncio
+async def test_shipper_health_not_running_pages(monkeypatch, _fresh_shipper_metrics):
+    """The blackout detector: non-local env + central_url set + shipper
+    NOT running → ERROR capture_message (page). This is the
+    audit-2026-05-16 pathology the independent watchdog exists to catch."""
+    _set_env(monkeypatch)
+    _fresh_shipper_metrics.running = False
+    fake_sentry = MagicMock()
+    with patch("app.observability.sentry_sdk", fake_sentry):
+        await observability.emit_shipper_health()
+    fake_sentry.capture_message.assert_called_once()
+    assert fake_sentry.capture_message.call_args.kwargs["level"] == "error"
+    assert "not running" in fake_sentry.capture_message.call_args.args[0].lower()
+
+
+@pytest.mark.asyncio
+async def test_shipper_health_local_env_not_running_silent(monkeypatch, _fresh_shipper_metrics):
+    """A local/standalone node legitimately runs no shipper → no signal."""
+    _set_env(monkeypatch, environment="local")
+    _fresh_shipper_metrics.running = False
+    fake_sentry = MagicMock()
+    with patch("app.observability.sentry_sdk", fake_sentry):
+        await observability.emit_shipper_health()
+    fake_sentry.capture_message.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_shipper_health_no_central_url_not_running_silent(monkeypatch, _fresh_shipper_metrics):
+    """No central_url configured (standalone) → not-running is expected."""
+    _set_env(monkeypatch, central_url="")
+    _fresh_shipper_metrics.running = False
+    fake_sentry = MagicMock()
+    with patch("app.observability.sentry_sdk", fake_sentry):
+        await observability.emit_shipper_health()
+    fake_sentry.capture_message.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_shipper_health_running_healthy_silent(monkeypatch, _fresh_shipper_metrics):
+    """Running, just-shipped, no outcomes → no signal."""
+    import time as _t
+    _set_env(monkeypatch)
+    m = _fresh_shipper_metrics
+    m.running = True
+    m.last_ship_at = _t.time()  # lag ~0
+    fake_sentry = MagicMock()
+    with patch("app.observability.sentry_sdk", fake_sentry):
+        await observability.emit_shipper_health()
+    fake_sentry.capture_message.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_shipper_health_lag_pages(monkeypatch, _fresh_shipper_metrics):
+    """Running but last ship > threshold ago → ERROR (page) for stall."""
+    import time as _t
+    _set_env(monkeypatch)
+    m = _fresh_shipper_metrics
+    m.running = True
+    m.last_ship_at = _t.time() - 400  # > 300s threshold
+    fake_sentry = MagicMock()
+    with patch("app.observability.sentry_sdk", fake_sentry):
+        await observability.emit_shipper_health()
+    fake_sentry.capture_message.assert_called_once()
+    assert fake_sentry.capture_message.call_args.kwargs["level"] == "error"
+    assert "lag" in fake_sentry.capture_message.call_args.args[0].lower()
+
+
+@pytest.mark.asyncio
+async def test_shipper_health_low_success_ratio_warns(monkeypatch, _fresh_shipper_metrics):
+    """Running, fresh ship, but success_ratio_5m < 0.95 with a meaningful
+    sample → WARNING."""
+    import time as _t
+    _set_env(monkeypatch)
+    m = _fresh_shipper_metrics
+    m.running = True
+    m.last_ship_at = _t.time()
+    m.record_outcome(accepted=15, rejected=10)  # ratio 0.6, sample 25
+    fake_sentry = MagicMock()
+    with patch("app.observability.sentry_sdk", fake_sentry):
+        await observability.emit_shipper_health()
+    fake_sentry.capture_message.assert_called_once()
+    assert fake_sentry.capture_message.call_args.kwargs["level"] == "warning"
+    assert "success_ratio" in fake_sentry.capture_message.call_args.args[0].lower()
+
+
+@pytest.mark.asyncio
+async def test_shipper_health_low_ratio_small_sample_silent(monkeypatch, _fresh_shipper_metrics):
+    """A lone rejected click (ratio 0.0 but sample < min) must NOT page —
+    that's statistical noise, not an outage."""
+    import time as _t
+    _set_env(monkeypatch)
+    m = _fresh_shipper_metrics
+    m.running = True
+    m.last_ship_at = _t.time()
+    m.record_outcome(accepted=0, rejected=1)  # ratio 0.0, sample 1 < 20
+    fake_sentry = MagicMock()
+    with patch("app.observability.sentry_sdk", fake_sentry):
+        await observability.emit_shipper_health()
+    fake_sentry.capture_message.assert_not_called()
+
+
+def test_window_sample_size_property():
+    """ShipperMetrics.window_sample_size sums accepted+rejected over the
+    rolling window."""
+    from app.shipper_metrics import ShipperMetrics
+    m = ShipperMetrics()
+    assert m.window_sample_size == 0
+    m.record_outcome(accepted=10, rejected=5)
+    m.record_outcome(accepted=3, rejected=2)
+    assert m.window_sample_size == 20
+
+
+class TestShipperHealthLifespanWiring:
+    def test_loop_invokes_emit_shipper_health(self):
+        """The observability loop body must call emit_shipper_health —
+        otherwise the watchdog never runs."""
+        source = inspect.getsource(observability.run_observability_loop)
+        assert "emit_shipper_health" in source

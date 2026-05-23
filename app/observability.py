@@ -54,8 +54,9 @@ import logging
 
 import sentry_sdk
 
-from app.config import settings
+from app.config import _LOCAL_ENVIRONMENTS, settings
 from app.disk_queue import get_queue_size
+from app.shipper_metrics import metrics as shipper_metrics
 
 logger = logging.getLogger("tds.observability")
 
@@ -196,6 +197,90 @@ async def emit_disk_queue_size() -> int:
     return size
 
 
+async def emit_shipper_health() -> None:
+    """F.29 Sprint 4.1 — emit Sentry signals on shipper degradation.
+
+    Runs on the observability loop's OWN asyncio task, independent of the
+    shipper coroutine, so it can detect the shipper being WEDGED or dead —
+    the audit-2026-05-16 50-day blackout case the shipper loop itself
+    cannot self-report (a dead loop emits nothing). Reads the in-memory
+    :data:`shipper_metrics` singleton (no Redis needed) and emits stable-
+    message ``capture_message`` events that Sentry issue-alert rules
+    page/warn on. The rule configs live in the capacity/alert runbook
+    (``docs/development/capacity-validation-1000rps.md``) because the
+    Sentry MCP cannot create alert rules.
+
+    Levels: ``error`` = page-worthy (pipeline halted / stalled), ``warning``
+    = degraded (success ratio dipping). "Sustained" framing is enforced by
+    the Sentry alert rule's evaluation window, not here — this emits the
+    per-tick signal; Sentry groups + escalates.
+
+    Emits at most one signal per tick: the "not running" blackout signal
+    dominates (lag + ratio are moot when the loop is dead), so it returns
+    early. Otherwise lag (page) and success-ratio (warn) are independent.
+    """
+    m = shipper_metrics
+    is_local = settings.environment in _LOCAL_ENVIRONMENTS
+
+    # (1) Blackout detector — shipper NOT running while it MUST be. Only
+    # meaningful in a non-local env WITH a central_url configured (a
+    # standalone / local node legitimately runs no shipper). This is the
+    # exact pathology behind the 50-day silent click loss (audit
+    # 2026-05-16): /health=200 (Redis ping fine) while clicks never reach
+    # central. The independent task is the only thing that can see it.
+    if not is_local and settings.central_url and not m.running:
+        logger.error(
+            "shipper.health — shipper NOT running (env=%s, central_url set); "
+            "clicks are NOT being delivered to central. This is the "
+            "audit-2026-05-16 blackout pattern.",
+            settings.environment,
+            extra={"area": "observability", "metric": "shipper.running"},
+        )
+        sentry_sdk.capture_message(
+            "shipper not running — click delivery to central HALTED",
+            level="error",
+        )
+        return
+
+    # (2) Lag — the click pipeline has stalled. Only meaningful once a
+    # batch has been attempted (lag_seconds is None before the first).
+    lag = m.lag_seconds
+    if lag is not None and lag > settings.shipper_lag_alert_seconds:
+        logger.error(
+            "shipper.health — last ship %.0fs ago exceeds %ds threshold "
+            "(status=%s); central delivery stalled.",
+            lag, settings.shipper_lag_alert_seconds, m.last_ship_status,
+            extra={"area": "observability", "metric": "shipper.lag_seconds"},
+        )
+        sentry_sdk.capture_message(
+            f"shipper lag {lag:.0f}s exceeds "
+            f"{settings.shipper_lag_alert_seconds}s — central delivery stalled",
+            level="error",
+        )
+
+    # (3) Success ratio — warn when delivery is degrading, but only with a
+    # meaningful sample (a lone rejected click reads as ratio=0.0).
+    ratio = m.success_ratio_5m
+    if (
+        ratio is not None
+        and m.window_sample_size >= settings.shipper_success_ratio_alert_min_sample
+        and ratio < settings.shipper_success_ratio_alert_min
+    ):
+        logger.warning(
+            "shipper.health — success_ratio_5m=%.4f below %.2f over %d "
+            "clicks; collector rejecting/deadlettering an elevated share.",
+            ratio, settings.shipper_success_ratio_alert_min,
+            m.window_sample_size,
+            extra={"area": "observability", "metric": "shipper.success_ratio_5m"},
+        )
+        sentry_sdk.capture_message(
+            f"shipper success_ratio_5m {ratio:.4f} below "
+            f"{settings.shipper_success_ratio_alert_min} "
+            f"(sample={m.window_sample_size})",
+            level="warning",
+        )
+
+
 async def run_observability_loop(redis, interval: int = 60) -> None:
     """Periodic emission loop. Started in FastAPI lifespan,
     cancelled on shutdown.
@@ -231,6 +316,12 @@ async def run_observability_loop(redis, interval: int = 60) -> None:
             except Exception:  # noqa: BLE001
                 logger.exception(
                     "emit_disk_queue_size raised — continuing",
+                )
+            try:
+                await emit_shipper_health()
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "emit_shipper_health raised — continuing",
                 )
         except asyncio.CancelledError:
             logger.info("Observability loop cancelled — shutting down")

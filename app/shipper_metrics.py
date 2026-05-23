@@ -223,6 +223,18 @@ class ShipperMetrics:
         return round(total_accepted / denominator, 4)
 
     @property
+    def window_sample_size(self) -> int:
+        """Total clicks (accepted + rejected) in the rolling success-ratio
+        window. F.29 Sprint 4.1 — the shipper-health watchdog
+        (``observability.emit_shipper_health``) uses this to gate the
+        success-ratio alert: a single rejected click in an otherwise-quiet
+        window yields ``success_ratio_5m == 0.0`` but is NOT a real outage
+        signal. Requiring a minimum sample avoids paging on statistical
+        noise. Returns 0 when no outcomes recorded.
+        """
+        return sum(a + r for _, a, r in self.outcomes)
+
+    @property
     def lag_seconds(self) -> float | None:
         """Seconds since the last ship attempt — or ``None`` if no
         attempt has happened yet (initial state).

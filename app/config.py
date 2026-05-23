@@ -161,6 +161,29 @@ class Settings(BaseSettings):
     disk_queue_max_files: int = 100_000
     disk_queue_drain_interval_seconds: int = 30
 
+    # F.29 Sprint 4.1 (2026-05-23) — shipper-health alert thresholds.
+    #
+    # The observability loop (`emit_shipper_health`) runs on its OWN task,
+    # independent of the shipper coroutine, so it can detect the shipper
+    # being WEDGED/dead — the audit-2026-05-16 50-day blackout case the
+    # shipper loop cannot self-report. On breach it emits a Sentry
+    # capture_message (error=page, warning=warn) that Sentry issue-alert
+    # rules fire on (rule configs: docs/development/capacity-validation-
+    # 1000rps.md alert runbook — Sentry MCP cannot create alert rules).
+    #
+    # - lag > 300s (5 min) while a batch HAS shipped → page (the click
+    #   pipeline has stalled — the canonical F.29 G5 alert).
+    # - success_ratio_5m < 0.95 with a meaningful sample → warn.
+    # "Sustained" is enforced by the Sentry alert rule (fires when the
+    # condition recurs over its evaluation window), not here — this loop
+    # just emits the per-tick signal.
+    shipper_lag_alert_seconds: int = 300
+    shipper_success_ratio_alert_min: float = 0.95
+    # Minimum window sample before the success-ratio alert can fire —
+    # avoids paging on a single rejected click in an otherwise-quiet
+    # window (which would read as ratio=0.0).
+    shipper_success_ratio_alert_min_sample: int = 20
+
     # F.29 Sprint 1.5 (2026-05-23) — pre-flight disk-pressure threshold.
     #
     # Closes plan §3 G4: pre-F.29 the disk-queue fallback at

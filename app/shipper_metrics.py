@@ -169,10 +169,7 @@ class ShipperMetrics:
         """
         now = time.time() if _now is None else _now
         self.outcomes.append((now, accepted, rejected))
-        # Lazy-prune entries older than the window.
-        cutoff = now - _SUCCESS_RATIO_WINDOW_SECONDS
-        while self.outcomes and self.outcomes[0][0] < cutoff:
-            self.outcomes.popleft()
+        self._prune_stale(now)
 
         # F.29 Sprint 2.7d — Sentry breadcrumb emission for the
         # plan §4 row 2.4 acceptance criterion. Bounded volume:
@@ -200,6 +197,22 @@ class ShipperMetrics:
             # surface is the canonical signal.
             pass
 
+    def _prune_stale(self, _now: float | None = None) -> None:
+        """Drop outcomes older than the rolling window.
+
+        F.29 Sprint 4.1 (validation-cycle-2 fix): pruning previously only
+        ran inside :meth:`record_outcome`. When the shipper stops processing
+        (idle / low traffic), no new ``record_outcome`` fires, so the
+        read-side properties below would compute over a STALE, wider-than-
+        5-min window — and the Sprint 4.1 shipper-health watchdog reads them
+        on its OWN independent task, so it could alert on ancient data.
+        Pruning lazily at every read closes that.
+        """
+        now = time.time() if _now is None else _now
+        cutoff = now - _SUCCESS_RATIO_WINDOW_SECONDS
+        while self.outcomes and self.outcomes[0][0] < cutoff:
+            self.outcomes.popleft()
+
     @property
     def success_ratio_5m(self) -> float | None:
         """Rolling-5-min success ratio = accepted / (accepted + rejected).
@@ -213,6 +226,7 @@ class ShipperMetrics:
             ``1.0`` when all clicks accepted.
             ``0.0`` when all clicks rejected.
         """
+        self._prune_stale()
         if not self.outcomes:
             return None
         total_accepted = sum(a for _, a, _ in self.outcomes)
@@ -232,6 +246,7 @@ class ShipperMetrics:
         signal. Requiring a minimum sample avoids paging on statistical
         noise. Returns 0 when no outcomes recorded.
         """
+        self._prune_stale()
         return sum(a + r for _, a, r in self.outcomes)
 
     @property

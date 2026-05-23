@@ -23,6 +23,7 @@ Reference: F.29 plan §4 Sprint 2.4 row.
 from __future__ import annotations
 
 import time
+from unittest.mock import patch
 
 import pytest
 
@@ -150,22 +151,28 @@ def test_entries_inside_window_are_kept():
     assert len(m.outcomes) == 3
 
 
-def test_boundary_entry_at_exactly_5_minutes_old_is_pruned():
-    """Entries with timestamp <= (now - window_seconds) are pruned.
-    Strictly-less-than would leak one boundary entry per pruning
-    pass. Pin the comparison via a deterministic test."""
+def test_boundary_entry_at_exactly_5_minutes_old_is_kept():
+    """The prune comparison is strict ``<`` — an entry whose timestamp is
+    EXACTLY ``now - window`` is KEPT (a ``<=`` would leak/drop it
+    inconsistently). F.29 Sprint 4.1 validation-cycle-2 added read-side
+    pruning (which uses the live ``time.time()``), so we FREEZE the clock
+    here: otherwise micro-drift between record-time and read-time would
+    move the boundary entry just past the cutoff and prune it. Freezing
+    pins the exact ``<`` boundary semantics deterministically."""
     m = ShipperMetrics()
-    now = time.time()
+    now = 1_700_000_000.0
     exactly_5min_ago = now - 300
 
-    m.record_outcome(accepted=100, rejected=0, _now=exactly_5min_ago)
-    m.record_outcome(accepted=0, rejected=10, _now=now)
-
-    # The 5min-old entry is at the boundary. cutoff = now - 300 =
-    # exactly_5min_ago. Comparison ``< cutoff`` keeps it (not less).
-    # So we expect BOTH entries.
-    # 100 + 0 = 100 accepted; 0 + 10 = 10 rejected; 100/110 = 0.9091
-    assert m.success_ratio_5m == 0.9091
+    # Freeze the clock for the WHOLE body: record_outcome's Sentry-breadcrumb
+    # internally reads success_ratio_5m (which now prunes on the live clock),
+    # so without freezing, the backdated entries would be pruned during
+    # recording. Frozen, cutoff = now - 300 = exactly_5min_ago, and the
+    # strict ``<`` keeps the boundary entry.
+    with patch("app.shipper_metrics.time.time", return_value=now):
+        m.record_outcome(accepted=100, rejected=0, _now=exactly_5min_ago)
+        m.record_outcome(accepted=0, rejected=10, _now=now)
+        # 100 accepted / 110 total = 0.9091 (both entries counted).
+        assert m.success_ratio_5m == 0.9091
 
 
 # ---------------------------------------------------------------------------

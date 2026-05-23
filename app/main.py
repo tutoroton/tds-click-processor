@@ -459,6 +459,11 @@ _SMOKE_TEST_CLICK_ID_PREFIX = "smoke-test-"
 # replayed. A replay within the window only re-confirms an already-targeted
 # node anyway (the signature binds the node_id-embedding smoke_id).
 _SMOKE_PROBE_FRESHNESS_SECONDS = 120
+# Tolerance for a probe whose issued_at is slightly AHEAD of this node's
+# clock (admin-api vs node clock skew). Freshness is a ONE-DIRECTIONAL
+# bound on PAST replay — a far-future issued_at must NOT be accepted (an
+# `abs()` check would let a future-dated probe live for 2× the window).
+_SMOKE_PROBE_CLOCK_SKEW_SECONDS = 5
 
 
 def _verify_smoke_probe(click_id: str, probe_header: str) -> tuple[bool, str]:
@@ -487,10 +492,15 @@ def _verify_smoke_probe(click_id: str, probe_header: str) -> tuple[bool, str]:
         issued_at = int(issued_raw)
     except ValueError:
         return False, "probe issued_at is not an integer"
-    age = abs(time.time() - issued_at)
-    if age > _SMOKE_PROBE_FRESHNESS_SECONDS:
+    # Asymmetric freshness: reject far-future issued_at (clock-skew bounded)
+    # AND anything older than the window. Do NOT use abs() — that would let
+    # a future-dated probe stay valid for 2× the window.
+    skew = time.time() - issued_at  # > 0 ⇒ probe is in the past
+    if skew < -_SMOKE_PROBE_CLOCK_SKEW_SECONDS:
+        return False, "probe issued_at is in the future (clock skew / forgery?)"
+    if skew > _SMOKE_PROBE_FRESHNESS_SECONDS:
         return False, (
-            f"probe expired (age {age:.0f}s > "
+            f"probe expired (age {skew:.0f}s > "
             f"{_SMOKE_PROBE_FRESHNESS_SECONDS}s freshness window)"
         )
     expected_sig = hmac.new(

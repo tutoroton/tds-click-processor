@@ -345,6 +345,31 @@ def test_smoke_probe_tampered_click_id_refused(client, patched_auth, enforce_pro
     fake_redis.xadd.assert_not_awaited()
 
 
+def test_smoke_probe_future_dated_refused(client, patched_auth, enforce_probe):
+    """F.29 validation-cycle-2 — a probe dated far in the FUTURE is rejected
+    (asymmetric freshness). An abs()-based window would have accepted it for
+    up to 2× the freshness window."""
+    fake_redis = MagicMock()
+    fake_redis.xadd = AsyncMock(return_value="1-0")
+    click_id = "smoke-test-99-deadbeef00112233"
+    future = int(time.time()) + 9999
+
+    with patch("app.main.get_redis", new=AsyncMock(return_value=fake_redis)), \
+         patch("app.main.route", new=AsyncMock()):
+        r = client.post(
+            "/decide",
+            json=_smoke_payload(click_id),
+            headers={
+                "X-TDS-Key": "ignored-by-patched-auth",
+                "X-TDS-Smoke-Probe": _make_probe(_PROBE_SECRET, click_id, issued_at=future),
+            },
+        )
+
+    assert r.status_code == 403
+    assert "future" in r.json()["detail"].lower()
+    fake_redis.xadd.assert_not_awaited()
+
+
 def test_smoke_probe_malformed_header_refused(client, patched_auth, enforce_probe):
     """A header without the ``<issued_at>.<sig>`` shape → 403 (malformed)."""
     fake_redis = MagicMock()

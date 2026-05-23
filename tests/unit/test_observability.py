@@ -506,6 +506,22 @@ def test_window_sample_size_property():
     assert m.window_sample_size == 20
 
 
+def test_read_side_prunes_stale_outcomes():
+    """F.29 Sprint 4.1 validation-cycle-2 — outcomes older than the window
+    are pruned on READ even when record_outcome is NOT called again (idle
+    shipper). Without this the watchdog (which reads on its own task) would
+    alert on a stale, over-counted window."""
+    import time as _t
+    from app.shipper_metrics import ShipperMetrics, _SUCCESS_RATIO_WINDOW_SECONDS
+    m = ShipperMetrics()
+    stale_ts = _t.time() - _SUCCESS_RATIO_WINDOW_SECONDS - 100
+    # Record a stale low-ratio outcome; no further record_outcome fires.
+    m.record_outcome(accepted=0, rejected=30, _now=stale_ts)
+    # Read-side properties must prune it → no false "ratio 0.0" signal.
+    assert m.window_sample_size == 0
+    assert m.success_ratio_5m is None
+
+
 class TestShipperHealthLifespanWiring:
     def test_loop_invokes_emit_shipper_health(self):
         """The observability loop body must call emit_shipper_health —

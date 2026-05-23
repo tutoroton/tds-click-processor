@@ -28,25 +28,29 @@ class Settings(BaseSettings):
     # Central server (for sync + click shipping).
     #
     # F.29 Sprint 1.1 (2026-05-22) — central_url is no longer "optional"
-    # in non-local environments. The audit 2026-05-16 caught AU+CA edge
-    # nodes deployed with TDS_CENTRAL_URL="" for 50 days: the shipper
-    # silently returned at startup (services/click-processor/app/
-    # shipper.py:34-36 pre-F.29), accepted clicks into local Redis, but
-    # never delivered them upstream. Central PG `clicks` grew by 1 row
-    # in that window while edge stream:clicks accumulated thousands.
+    # in non-local environments. See `_enforce_central_url_presence` for
+    # full incident context.
     #
-    # `require_central_url` (gate flag, default True per F.29 plan §7.1)
-    # promotes the misconfig from silent-disable to boot-time fail-closed
-    # in staging / production / any non-local env. Mirrors the proven
-    # `_enforce_secret_presence` pattern (line ~168 below) — same shape,
-    # same env-tolerance carve-out, same loud-on-fail discipline.
-    # Operator escape hatch: set TDS_REQUIRE_CENTRAL_URL=false to revert
-    # to legacy silent-disable for emergency rollback (NOT recommended;
-    # use only if the boot-time refusal blocks a known-good node during
-    # incident recovery, then fix and flip back).
+    # F.29 Sprint 2.7b (2026-05-23) — HTTPS enforcement layer. Edge nodes
+    # are deployed across WAN (Sydney + Toronto staging today; future
+    # tenants will deploy across geographic regions). Plain HTTP exposes
+    # the click pipeline to MITM attacks: an on-path attacker can
+    # intercept request bodies (PII — IP/geo/UA) AND downgrade response
+    # to the pre-F.29 legacy shape (`{"received":N,"queued":N}` with
+    # status 200) → Sprint 2.5 backwards-compat shim activates → shipper
+    # ACKs all clicks → SILENT LOSS. Sprint 2 validation cycle (Agent 2
+    # HIGH S2-002, 2026-05-23) caught this load-bearing path.
+    #
+    # `require_central_url_https` (default True in non-local env) refuses
+    # boot when TDS_CENTRAL_URL doesn't start with "https://" — closing
+    # the MITM-shim attack surface. Local env exempt (HTTP fine for
+    # localhost dev). Operator escape hatch:
+    # TDS_REQUIRE_CENTRAL_URL_HTTPS=false to revert (NOT recommended;
+    # use only for transitional rolling deploy of TLS termination).
     central_url: str = ""
     central_api_key: str = ""
     require_central_url: bool = True
+    require_central_url_https: bool = True
 
     # Fallback URL when routing fails
     fallback_url: str = "https://adstudy.dev"
@@ -355,11 +359,34 @@ class Settings(BaseSettings):
                 f"for 50 days on AU+CA nodes (audit 2026-05-16) — "
                 f"thousands of clicks accumulated on edge Redis with "
                 f"zero delivery to central. Remediation: set "
-                f"TDS_CENTRAL_URL=http://<central-host>:8200 in the "
+                f"TDS_CENTRAL_URL=https://<central-host>:8200 in the "
                 f"node's .env file and restart. Emergency rollback: "
                 f"TDS_REQUIRE_CENTRAL_URL=false to revert to legacy "
                 f"silent-disable (not recommended — fix the misconfig "
                 f"instead)."
+            )
+
+        # F.29 Sprint 2.7b (2026-05-23) — HTTPS enforcement.
+        # Plain http:// over WAN exposes the Sprint 2.5 shim path to
+        # MITM downgrade: attacker intercepts response, replaces with
+        # legacy shape, shipper ACKs all → silent click loss.
+        # ``require_central_url_https`` defaults True; operator escape
+        # hatch for transitional TLS rollout sets it to False.
+        if self.require_central_url_https and not self.central_url.startswith("https://"):
+            raise ValueError(
+                f"TDS_CENTRAL_URL must use HTTPS in env="
+                f"'{self.environment}' (got: {self.central_url!r}). "
+                f"Plain HTTP exposes the click pipeline to MITM attacks: "
+                f"an on-path attacker can downgrade the response to the "
+                f"pre-F.29 legacy shape and trigger the Sprint 2.5 "
+                f"backwards-compat shim → shipper ACKs all clicks as "
+                f"delivered → SILENT LOSS. Remediation: configure HTTPS "
+                f"termination at the central collector (reverse proxy or "
+                f"direct cert) and set TDS_CENTRAL_URL=https://... "
+                f"Emergency rollback for TLS-rollout transition: "
+                f"TDS_REQUIRE_CENTRAL_URL_HTTPS=false (security-degraded "
+                f"mode; track rolling-deploy completion in operator "
+                f"runbook and flip back ASAP)."
             )
 
         return self

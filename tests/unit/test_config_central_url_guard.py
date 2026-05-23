@@ -111,10 +111,10 @@ def test_non_local_env_accepts_configured_central_url(env):
     s = Settings(
         environment=env,
         tds_secret_key=_VALID_SECRET,
-        central_url="http://167.99.246.6:8200",
+        central_url="https://167.99.246.6:8200",
         require_central_url=True,
     )
-    assert s.central_url == "http://167.99.246.6:8200"
+    assert s.central_url == "https://167.99.246.6:8200"
     assert s.environment == env
 
 
@@ -164,6 +164,87 @@ def test_unknown_env_treated_as_non_local_for_central_url():
 # ---------------------------------------------------------------------------
 # require_central_url default value — pinned per F.29 plan §7.1
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# F.29 Sprint 2.7b (2026-05-23) — HTTPS enforcement validator
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("env", ["staging", "production"])
+def test_non_local_env_rejects_http_url(env):
+    """The Sprint 2.7b security finding (Agent 2 HIGH S2-002): plain
+    HTTP exposes the click pipeline to MITM downgrade attacks that
+    trigger the Sprint 2.5 shim → silent click loss. Validator must
+    refuse boot when central_url uses http:// in non-local env."""
+    with pytest.raises(ValidationError) as exc:
+        Settings(
+            environment=env,
+            tds_secret_key=_VALID_SECRET,
+            central_url="http://central:8200",
+            require_central_url=True,
+        )
+    msg = str(exc.value)
+    assert "HTTPS" in msg
+    # Error message must mention the security risk so operators
+    # understand WHY HTTPS is required, not just THAT it's required.
+    assert "MITM" in msg or "silent" in msg.lower()
+    # And it must hand the operator the rollback flag for transitional
+    # TLS deployment scenarios.
+    assert "TDS_REQUIRE_CENTRAL_URL_HTTPS" in msg
+
+
+@pytest.mark.parametrize("env", ["staging", "production"])
+def test_non_local_env_accepts_https_url(env):
+    """Happy path post-Sprint-2.7b: https:// in non-local env →
+    Settings constructs cleanly."""
+    s = Settings(
+        environment=env,
+        tds_secret_key=_VALID_SECRET,
+        central_url="https://central:8200",
+        require_central_url=True,
+    )
+    assert s.central_url == "https://central:8200"
+    assert s.require_central_url_https is True
+
+
+@pytest.mark.parametrize("env", ["staging", "production"])
+def test_non_local_env_with_https_escape_hatch(env):
+    """Operator escape hatch — TDS_REQUIRE_CENTRAL_URL_HTTPS=false
+    permits http:// for transitional TLS-rollout deployments. Settings
+    must NOT raise; the runtime risk is documented in the validator
+    error message but accepted by the operator."""
+    s = Settings(
+        environment=env,
+        tds_secret_key=_VALID_SECRET,
+        central_url="http://central:8200",
+        require_central_url=True,
+        require_central_url_https=False,
+    )
+    assert s.central_url == "http://central:8200"
+    assert s.require_central_url_https is False
+
+
+@pytest.mark.parametrize("env", ["local", "development"])
+def test_local_env_accepts_http_url(env):
+    """Local + development envs are exempt from HTTPS enforcement —
+    localhost dev workflows use plain http:// against a local
+    collector. Mirrors the existing tolerance for empty
+    tds_secret_key / central_url in local env."""
+    s = Settings(
+        environment=env,
+        tds_secret_key="x",  # short OK in local
+        central_url="http://localhost:8200",
+        require_central_url=True,
+    )
+    assert s.central_url == "http://localhost:8200"
+
+
+def test_require_central_url_https_default_is_true():
+    """Pin the default — flipping to False silently broadens MITM
+    attack surface. Operator must explicitly opt out."""
+    s = Settings(environment="local")
+    assert s.require_central_url_https is True
 
 
 def test_require_central_url_default_is_true():

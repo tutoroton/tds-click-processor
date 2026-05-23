@@ -111,7 +111,11 @@ def test_non_local_env_accepts_compliant_secret(env):
     s = Settings(
         environment=env,
         tds_secret_key=secret,
-        central_url="http://central:8200",
+        # F.29 Sprint 2.7b — HTTPS now required by default in non-local
+        # env. Use https:// here so the test pins ONLY the secret-guard
+        # happy path, not the URL scheme validator (covered separately
+        # in test_config_central_url_guard.py).
+        central_url="https://central:8200",
     )
     assert s.tds_secret_key == secret
     assert s.environment == env

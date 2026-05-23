@@ -3,12 +3,13 @@
 set -euo pipefail
 
 PORT="${TDS_PORT:-8100}"
+NODE_DIR="${NODE_DIR:-/opt/tds-node}"
 
 echo "=== TDS Node Health ==="
 
 # Container status
 echo "--- Containers ---"
-docker compose -f /opt/tds-node/docker-compose.node.yml ps 2>/dev/null || echo "Containers not running"
+docker compose -f "$NODE_DIR/docker-compose.node.yml" ps 2>/dev/null || echo "Containers not running"
 
 echo ""
 

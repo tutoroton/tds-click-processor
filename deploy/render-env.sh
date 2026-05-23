@@ -57,6 +57,8 @@ TDS_ENVIRONMENT=${env_name}
 TDS_PORT=${TDS_PORT:-8100}
 CADDY_DOMAIN=${CADDY_DOMAIN:-localhost}
 TDS_SECRET_KEY=${TDS_SECRET_KEY}
+# Double-write: pydantic env_prefix="TDS_" + field `tds_secret_key` reads
+# TDS_TDS_SECRET_KEY (not TDS_SECRET_KEY). Both written so the boot guard finds it.
 TDS_TDS_SECRET_KEY=${TDS_SECRET_KEY}
 TDS_CENTRAL_URL=${TDS_CENTRAL_URL}
 TDS_CENTRAL_API_KEY=${central_api_key}

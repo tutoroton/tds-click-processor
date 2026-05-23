@@ -68,7 +68,11 @@ if settings.sentry_dsn:
         traces_sampler=diag_traces_sampler,
         before_send=diag_before_send,
         environment=settings.environment,
-        release=f"geo-tds-backend@0.1.0",
+        # F.32 — release = the node's running git SHA (settings.code_version,
+        # stamped by render-env/update.sh), so Sentry events map to the exact
+        # deployed revision per env (was a hardcoded "0.1.0" → every node looked
+        # identical in Sentry regardless of code). "unknown" for pre-F.32/local.
+        release=f"geo-tds-backend@{settings.code_version}",
         server_name=f"{settings.node_id}",
     )
 

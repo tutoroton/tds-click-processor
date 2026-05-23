@@ -59,12 +59,13 @@ services:
       - .env
     environment:
       - TDS_REDIS_URL=redis://redis:6379/0
-      # Defensive double-write: pydantic env_prefix="TDS_" + field
-      # `tds_secret_key` consumes TDS_TDS_SECRET_KEY (NOT TDS_SECRET_KEY). The
-      # render-env .env already writes both, but this guard means a hand-edited
-      # .env that set only TDS_SECRET_KEY still boots (its `_enforce_secret_
-      # presence` guard would otherwise fail in non-local env).
-      - TDS_TDS_SECRET_KEY=${TDS_TDS_SECRET_KEY:-${TDS_SECRET_KEY:-}}
+      # TDS_TDS_SECRET_KEY (the name pydantic env_prefix="TDS_" + field
+      # `tds_secret_key` actually reads) comes from the env_file: render-env.sh
+      # ALWAYS writes BOTH TDS_SECRET_KEY and TDS_TDS_SECRET_KEY into .env, so no
+      # compose-level fallback is needed here. (A nested `${A:-${B}}` default does
+      # NOT work in Docker Compose interpolation — it would inject a literal
+      # string — so we deliberately do not attempt one. A hand-edited .env that
+      # sets only TDS_SECRET_KEY must add TDS_TDS_SECRET_KEY too, or re-render.)
       # M7: absolute path for the disk fallback queue (Settings validator
       # refuses a relative value → loud boot failure over silent data loss).
       - TDS_DISK_QUEUE_ROOT=/var/tds/click-queue

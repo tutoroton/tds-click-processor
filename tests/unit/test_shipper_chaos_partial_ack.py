@@ -312,3 +312,77 @@ async def test_all_rejected_all_deadletter(fake_redis, monkeypatch):
     assert ratio == 0.0, (
         f"Expected ratio=0.0 for all-rejected stress test; got {ratio}"
     )
+
+
+# ---------------------------------------------------------------------------
+# F.29 Sprint 3.7.1 (TD-17 / validation-cycle-2) — unknown-shape on 2xx
+# must NOT silent-ACK (it is a silent-loss vector). Tighten the shim:
+# only an explicit ``legacy`` shape ACK-alls; ``unknown`` retries.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_unknown_shape_200_does_not_silent_ack(fake_redis):
+    """Pre-3.7.1 the Sprint 2.5 shim ACK-all'd any 2xx whose body
+    didn't parse as the new verdict shape — INCLUDING ``unknown``
+    (malformed / truncated / proxy-mangled JSON). That silently lost
+    the whole batch. Post-3.7.1, only an explicit ``legacy`` shape
+    (``received``/``queued`` keys) ACK-alls; ``unknown`` is treated as
+    a collector_error and the batch is RETRIED (clicks stay in the
+    stream PEL, never ACKed).
+
+    This test serves a 200 with a body that has neither ``accepted``
+    NOR ``received``/``queued`` (→ shape='unknown') and asserts the
+    clicks are NOT removed from the stream (XLEN stays = N) and the
+    ship status reflects an error, not legacy_collector."""
+    n_clicks = 4
+    click_ids = [f"unknown-shape-{i}" for i in range(n_clicks)]
+    for cid in click_ids:
+        await fake_redis.xadd(
+            STREAM_KEY,
+            {"data": json.dumps({"click_id": cid})},
+        )
+
+    def _unknown_shape_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/clicks/deadletter":
+            return httpx.Response(status_code=202, json={"status": "accepted"})
+        # 200 OK but a body that is neither new-shape (accepted) nor
+        # legacy-shape (received/queued) — e.g. a proxy error page that
+        # happened to return 200, or a truncated/mangled JSON object.
+        return httpx.Response(
+            status_code=200,
+            json={"unexpected": "body", "from": "a-broken-middlebox"},
+        )
+
+    transport = httpx.MockTransport(_unknown_shape_handler)
+    original_init = httpx.AsyncClient.__init__
+
+    def _patched_init(self, *args, **kwargs):
+        kwargs["transport"] = transport
+        original_init(self, *args, **kwargs)
+
+    with patch.object(httpx.AsyncClient, "__init__", _patched_init):
+        task = asyncio.create_task(shipper.run_shipper(fake_redis))
+        await asyncio.sleep(0.4)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    # The batch was NOT ACKed — all clicks remain in the stream
+    # (XLEN unchanged). Pre-3.7.1 these would have been silent-ACKed
+    # + XTRIM'd to 0.
+    stream_len = await fake_redis.xlen(STREAM_KEY)
+    assert stream_len == n_clicks, (
+        f"Unknown-shape 200 must NOT ACK/trim the batch (silent loss). "
+        f"Expected XLEN={n_clicks}, got {stream_len}."
+    )
+
+    # Ship status reflects collector_error, NOT legacy_collector.
+    assert smm.metrics.last_ship_status == "collector_error", (
+        f"Unknown shape on 200 must record collector_error, not "
+        f"legacy_collector. Got {smm.metrics.last_ship_status!r}."
+    )
+    # Nothing deadlettered (collector_error retries the whole batch;
+    # it does not deadletter individual clicks).
+    deadletter_entries = await fake_redis.xrange(DEADLETTER_STREAM_KEY)
+    assert len(deadletter_entries) == 0

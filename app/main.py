@@ -477,6 +477,17 @@ async def decide(
     # the right X-TDS-Key secret). Length + charset already validated
     # by ClickRequest's regex ``^[a-zA-Z0-9_\\-]+$``.
     if req.click_id.startswith(_SMOKE_TEST_CLICK_ID_PREFIX):
+        # F.29 Sprint 3.7.1 (SEC-H001 leak-surface reduction) — do NOT
+        # log the FULL smoke click_id. The admin-api smoke gate matches
+        # on the exact `smoke-test-{node_id}-{hex}` value; the 64-bit
+        # hex is the only thing standing between a collector-key holder
+        # and a forged false-positive activation. Logging it at INFO
+        # widens the leak surface (log shipping, log search, ops
+        # tooling). Log only a sha256-derived 8-char correlation token —
+        # enough to grep-correlate one smoke run across services, but
+        # it reveals NONE of the actual hex (one-way). Full HMAC
+        # authenticator is the durable fix (TD-13, Sprint 4.1).
+        smoke_fp = hashlib.sha256(req.click_id.encode()).hexdigest()[:8]
         try:
             r = await get_redis()
             smoke_record = {
@@ -492,16 +503,16 @@ async def decide(
                 approximate=True,
             )
             logger.info(
-                "Smoke-test click bypassed routing: click_id=%s node_id=%s",
-                req.click_id, settings.node_id,
+                "Smoke-test click bypassed routing: click_id_fp=%s node_id=%s",
+                smoke_fp, settings.node_id,
             )
         except Exception as exc:  # noqa: BLE001
             # Smoke XADD failure is itself a signal — the admin-api
             # smoke gate will time out and report the misconfig. Log
-            # + Sentry so operators have both signals.
+            # + Sentry so operators have both signals. Fingerprint only.
             logger.error(
-                "Smoke-test XADD failed for click_id=%s: %s",
-                req.click_id, exc,
+                "Smoke-test XADD failed for click_id_fp=%s: %s",
+                smoke_fp, exc,
             )
             sentry_sdk.capture_exception(exc)
         # Return a benign 302 to the fallback URL. The smoke gate

@@ -1192,13 +1192,29 @@ async def run_shipper(redis_pool):
                                 redis_pool, client, response, body,
                                 clicks, msg_ids,
                             )
-                        elif response.status_code in (200, 202):
-                            # Sprint 2.5 shim: legacy/unknown body + 2xx.
+                        elif shape == "legacy" and response.status_code in (200, 202):
+                            # Sprint 2.5 shim: ONLY an explicit pre-F.29
+                            # legacy shape (has ``received``/``queued``
+                            # keys) on 200/202 → ACK-all backwards-compat.
                             await _process_legacy_shape_batch(
                                 redis_pool, response, shape, clicks, msg_ids,
                             )
                         else:
-                            # 207 + non-new shape — contract violation.
+                            # F.29 Sprint 3.7.1 (TD-17 / validation-cycle-2
+                            # Agent 4) — tighten the shim. Everything else
+                            # routes to collector_error (retry
+                            # conservatively, do NOT ACK-all):
+                            #   * ``unknown`` shape on ANY 2xx — pre-3.7.1
+                            #     this fell into the shim and silent-ACKed
+                            #     the whole batch. If collector middleware
+                            #     mutates the body (compression strip,
+                            #     proxy error page, truncated JSON) the
+                            #     shipper would lose the batch silently.
+                            #     Now it retries → at-least-once preserved.
+                            #   * ``legacy`` shape on 207 — contract
+                            #     violation (legacy collectors never emit
+                            #     207); retry.
+                            #   * ``unknown`` shape on 207 — same.
                             retry_delay = await _process_collector_error(
                                 response, clicks, retry_delay, shape=shape,
                             )

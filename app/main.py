@@ -434,6 +434,24 @@ async def _acquire_click_dedup(click_id: str) -> bool | None:
         return None
 
 
+# F.29 Sprint 3.6 (2026-05-23) — smoke-test click_id prefix.
+#
+# Synthetic clicks emitted by the admin-api ``EdgeNodeService._run_smoke_test``
+# carry a ``smoke-test-<hex>`` ``click_id``. The /decide handler short-
+# circuits these BEFORE the routing pipeline:
+#   * skip campaign matching / Redis lookups / postback queue / dedup
+#   * XADD a minimal payload to ``stream:clicks`` so the shipper sends
+#     it to central; the central collector's deadletter forward is the
+#     only behaviour-sensitive surface for smoke clicks (Sprint 3.6
+#     also requires the collector to skip per-tenant deadletter
+#     forwarding for this prefix — see services/collector/app/main.py).
+#
+# Operator-visible analytics (Sprint 4.2 dashboard widgets) MUST filter
+# this prefix from real-traffic counters; the convention is pinned here
+# and surfaced in skill `provisioning-edge-node`.
+_SMOKE_TEST_CLICK_ID_PREFIX = "smoke-test-"
+
+
 @app.post("/decide")
 async def decide(
     req: ClickRequest,
@@ -445,6 +463,54 @@ async def decide(
 
     # Auth check (timing-safe + fail-closed per H6 fix).
     await _check_tds_key(x_tds_key)
+
+    # F.29 Sprint 3.6 — smoke-test bypass. Synthetic clicks from
+    # ``EdgeNodeService._run_smoke_test`` carry a ``smoke-test-<hex>``
+    # ``click_id``. We XADD a minimal record to ``stream:clicks`` so the
+    # shipper delivers it to central (where the admin-api smoke gate is
+    # polling ``stream:clicks-incoming``), then short-circuit the
+    # routing path — no campaign matching, no postback, no dedup. The
+    # synthetic click is purely a pipeline-liveness probe.
+    #
+    # Auth is still enforced above (smoke clicks come from operator-
+    # invoked tooling against a legitimately deployed edge node with
+    # the right X-TDS-Key secret). Length + charset already validated
+    # by ClickRequest's regex ``^[a-zA-Z0-9_\\-]+$``.
+    if req.click_id.startswith(_SMOKE_TEST_CLICK_ID_PREFIX):
+        try:
+            r = await get_redis()
+            smoke_record = {
+                "click_id": req.click_id,
+                "node_id": settings.node_id,
+                "created_at_ms": int(time.time() * 1000),
+                "smoke_test": True,
+            }
+            await r.xadd(
+                "stream:clicks",
+                {"data": json.dumps(smoke_record)},
+                maxlen=settings.stream_clicks_maxlen,
+                approximate=True,
+            )
+            logger.info(
+                "Smoke-test click bypassed routing: click_id=%s node_id=%s",
+                req.click_id, settings.node_id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            # Smoke XADD failure is itself a signal — the admin-api
+            # smoke gate will time out and report the misconfig. Log
+            # + Sentry so operators have both signals.
+            logger.error(
+                "Smoke-test XADD failed for click_id=%s: %s",
+                req.click_id, exc,
+            )
+            sentry_sdk.capture_exception(exc)
+        # Return a benign 302 to the fallback URL. The smoke gate
+        # doesn't inspect the response body — only the central stream.
+        return ClickResponse(
+            url=f"{settings.fallback_url}?reason=smoke_test"
+                f"&click_id={quote(req.click_id, safe='')}",
+            status=302,
+        )
 
     # Traffic simulation framework (Phase 1, 2026-05-09) +
     # diagnostic toolkit (Phase 1, 2026-05-10).

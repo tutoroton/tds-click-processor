@@ -28,7 +28,7 @@ import json
 import logging
 import random
 import time
-from typing import Any
+from typing import Any, NamedTuple
 
 import sentry_sdk
 from app import action_executor, cascade
@@ -81,7 +81,7 @@ async def route(req: ClickRequest) -> dict | None:
 
     # Stage 0: Domain-based campaign resolution (highest priority)
     t0 = time.perf_counter()
-    domain_campaign_id, domain_blocked = await resolve_domain_campaign(r, req)
+    resolution = await resolve_domain_campaign(r, req)
     timing["domain_resolve_ms"] = _ms_since(t0)
 
     # §6 (F.30 security): an unmatched subdomain of a wildcard-enabled
@@ -90,7 +90,7 @@ async def route(req: ClickRequest) -> dict | None:
     # A.1) makes arbitrary subdomains reachable; pre-F.30 they were
     # NXDOMAIN. A block sentinel (404) is the only safe disposition.
     # See `resolve_domain_campaign` + plan §6.
-    if domain_blocked:
+    if resolution.blocked:
         timing["domain_matched"] = False
         timing["route_total_ms"] = _ms_since(t_start)
         timing["result"] = "blocked_unmatched_subdomain"
@@ -98,10 +98,13 @@ async def route(req: ClickRequest) -> dict | None:
             "url": None,
             "campaign_id": None,
             "offer_id": None,
+            "binding_id": 0,
+            "binding_alias": None,
             "timing": timing,
             "blocked": True,
         }
 
+    domain_campaign_id = resolution.campaign_id
     if domain_campaign_id:
         # Domain resolved — skip geo targeting, go straight to flow cascade.
         timing["domain_matched"] = True
@@ -114,9 +117,14 @@ async def route(req: ClickRequest) -> dict | None:
         if campaign:
             campaign["_id"] = domain_campaign_id
 
+            # F.31 — thread the resolved binding's id + alias so the click
+            # record can attribute analytics to the exact binding the
+            # click arrived through.
             routed = await _route_via_campaign(
                 r, campaign, domain_campaign_id, req, timing,
                 result_label="domain_matched",
+                binding_id=resolution.binding_id,
+                binding_alias=resolution.binding_alias,
             )
             if routed is not None:
                 return routed
@@ -241,6 +249,8 @@ async def _route_via_campaign(
     timing: dict[str, Any],
     *,
     result_label: str,
+    binding_id: int = 0,
+    binding_alias: str | None = None,
 ) -> dict[str, Any] | None:
     """Drive the routing tail end for one resolved campaign.
 
@@ -308,6 +318,8 @@ async def _route_via_campaign(
                 "url": None,
                 "campaign_id": campaign_id,
                 "offer_id": None,
+                "binding_id": binding_id,
+                "binding_alias": binding_alias,
                 "timing": timing,
                 "blocked": True,
             }
@@ -327,6 +339,8 @@ async def _route_via_campaign(
             "url": url,
             "campaign_id": campaign_id,
             "offer_id": offer_id if offer_id is not None else "",
+            "binding_id": binding_id,
+            "binding_alias": binding_alias,
             "timing": timing,
         }
 
@@ -359,6 +373,8 @@ async def _route_via_campaign(
         "url": url,
         "campaign_id": campaign_id,
         "offer_id": offer.get("_id", ""),
+        "binding_id": binding_id,
+        "binding_alias": binding_alias,
         "timing": timing,
     }
 
@@ -651,6 +667,56 @@ def _safe_id_sort_key(rid: Any) -> tuple[int, int, str]:
 _WILDCARD_BASES_KEY = "domains:wildcard"
 
 
+class DomainResolution(NamedTuple):
+    """Outcome of domain-binding resolution for one click.
+
+    - matched:  `campaign_id` set, `blocked=False`, binding metadata filled.
+    - no match: `campaign_id=None`, `blocked=False` → caller falls through
+      to geo targeting.
+    - blocked:  `campaign_id=None`, `blocked=True` (§6) → caller emits 404,
+      no geo fall-through.
+    """
+    campaign_id: str | None
+    binding_id: int
+    binding_alias: str | None
+    blocked: bool
+
+
+_NO_DOMAIN_MATCH = DomainResolution(None, 0, None, False)
+_DOMAIN_BLOCKED = DomainResolution(None, 0, None, True)
+
+
+def _parse_binding_value(raw: str | None) -> tuple[str, int, str | None]:
+    """Parse a `domain:...` Redis value → (campaign_id, binding_id, binding_alias).
+
+    F.31 shape is JSON `{"campaign_id","binding_id","binding_alias"}`. A
+    legacy bare campaign_id scalar (pre-F.31 sync — the 3-deploy window)
+    parses to `binding_id=0, binding_alias=None`. Defensive: malformed JSON
+    is treated as a legacy scalar so a bad value never crashes routing.
+    """
+    if not raw:
+        return "", 0, None
+    s = raw.strip()
+    if s[:1] == "{":
+        try:
+            obj = json.loads(s)
+            cid = obj.get("campaign_id")
+            bid = obj.get("binding_id") or 0
+            alias = obj.get("binding_alias")
+            try:
+                bid = int(bid)
+            except (ValueError, TypeError):
+                bid = 0
+            return (
+                str(cid) if cid is not None else "",
+                bid,
+                str(alias) if alias is not None else None,
+            )
+        except (json.JSONDecodeError, TypeError, AttributeError):
+            return s, 0, None
+    return s, 0, None
+
+
 async def _first_match(r, keys_to_check: list[str]) -> str | None:
     """Batch-GET `keys_to_check` in one pipeline; first non-empty wins."""
     if not keys_to_check:
@@ -665,25 +731,27 @@ async def _first_match(r, keys_to_check: list[str]) -> str | None:
     return None
 
 
-async def resolve_domain_campaign(r, req: ClickRequest) -> tuple[str | None, bool]:
-    """Resolve campaign_id from domain bindings in Redis.
+async def resolve_domain_campaign(r, req: ClickRequest) -> DomainResolution:
+    """Resolve a campaign + binding from domain bindings in Redis.
 
     Priority order: subdomain > path > param > root (first match wins).
 
-    Returns `(campaign_id, blocked)`:
-      - `(cid, False)`  — a binding matched; caller routes to `cid`.
-      - `(None, False)` — no domain match; caller falls through to geo
-        targeting (legitimate for a non-wildcard host that resolved via
-        its own explicit DNS).
-      - `(None, True)`  — the hostname is an UNMATCHED subdomain of a
-        wildcard-enabled base (§6 fail-closed). The caller MUST emit a
-        404 and MUST NOT fall through to geo targeting. See the
-        `_WILDCARD_BASES_KEY` contract above and
+    Returns a `DomainResolution`:
+      - matched  — `campaign_id` set, `blocked=False`, `binding_id` +
+        `binding_alias` parsed from the binding value (F.31 JSON, or
+        legacy scalar → 0/None).
+      - no match — `campaign_id=None`, `blocked=False`; caller falls
+        through to geo targeting (legitimate for a non-wildcard host that
+        resolved via its own explicit DNS).
+      - blocked  — `campaign_id=None`, `blocked=True`; the hostname is an
+        UNMATCHED subdomain of a wildcard-enabled base (§6 fail-closed).
+        The caller MUST emit a 404 and MUST NOT fall through to geo. See
+        the `_WILDCARD_BASES_KEY` contract above and
         `docs/development/F.30-F.31-domain-bindings-plan.md` §6.
     """
     hostname = req.hostname
     if not hostname:
-        return None, False
+        return _NO_DOMAIN_MATCH
 
     path = (req.path or "").strip("/")
     first_segment = path.split("/")[0] if path else ""
@@ -730,10 +798,12 @@ async def resolve_domain_campaign(r, req: ClickRequest) -> tuple[str | None, boo
         keys_to_check.append(f"domain:{hostname}:root")
         keys_to_check.append(f"domain:{sub_base}:subdomain:{sub_label}")
 
-        cid = await _first_match(r, keys_to_check)
-        if cid:
-            return cid, False
-        return None, True  # §6 fail-closed
+        raw = await _first_match(r, keys_to_check)
+        if raw:
+            cid, bid, alias = _parse_binding_value(raw)
+            if cid:
+                return DomainResolution(cid, bid, alias, False)
+        return _DOMAIN_BLOCKED  # §6 fail-closed
 
     # Non-wildcard host — behaviour identical to the pre-§6 resolver.
     # The legacy subdomain heuristic is retained for any base that has
@@ -761,8 +831,12 @@ async def resolve_domain_campaign(r, req: ClickRequest) -> tuple[str | None, boo
     if base_domain != hostname:
         keys_to_check.append(f"domain:{base_domain}:root")
 
-    cid = await _first_match(r, keys_to_check)
-    return cid, False
+    raw = await _first_match(r, keys_to_check)
+    if raw:
+        cid, bid, alias = _parse_binding_value(raw)
+        if cid:
+            return DomainResolution(cid, bid, alias, False)
+    return _NO_DOMAIN_MATCH
 
 
 async def select_offer(r, campaign_id: str) -> dict | None:

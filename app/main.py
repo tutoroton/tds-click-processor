@@ -726,6 +726,11 @@ async def decide(
         "node_id": settings.node_id,
         "campaign_id": result.get("campaign_id"),
         "offer_id": result.get("offer_id"),
+        # F.31 — per-binding analytics attribution. Domain-resolved clicks
+        # carry the matched binding's id + alias; geo-resolved clicks (no
+        # domain binding) default to 0 / "" (the "(default)" bucket).
+        "binding_id": result.get("binding_id", 0),
+        "binding_alias": result.get("binding_alias") or "",
         "landing_url": result["url"],
         "ip": req.ip,
         "country": req.country,

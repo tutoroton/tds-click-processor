@@ -845,3 +845,94 @@ class TestWildcardSubdomainFailClosed:
         result = _route_with(redis, self._click("adstudy.dev"))
         assert result.get("blocked") is not True
         assert "base.example" in result["url"]
+
+
+class TestParseBindingValue:
+    """F.31 B.3: `_parse_binding_value` dual-reads the F.31 JSON payload
+    and the legacy bare-scalar campaign_id (3-deploy window)."""
+
+    def test_json_full_payload(self):
+        assert router._parse_binding_value(
+            json.dumps({"campaign_id": "5", "binding_id": 9, "binding_alias": "x"})
+        ) == ("5", 9, "x")
+
+    def test_legacy_scalar(self):
+        assert router._parse_binding_value("42") == ("42", 0, None)
+
+    def test_malformed_json_treated_as_scalar(self):
+        # Defensive: a value that opens with `{` but isn't valid JSON must
+        # not crash routing — fall back to treating it as a scalar.
+        assert router._parse_binding_value("{bad") == ("{bad", 0, None)
+
+    def test_empty_and_none(self):
+        assert router._parse_binding_value("") == ("", 0, None)
+        assert router._parse_binding_value(None) == ("", 0, None)
+
+    def test_json_null_alias_and_missing_binding_id(self):
+        assert router._parse_binding_value(
+            json.dumps({"campaign_id": "5", "binding_alias": None})
+        ) == ("5", 0, None)
+
+    def test_json_non_numeric_binding_id_coerces_to_zero(self):
+        assert router._parse_binding_value(
+            json.dumps({"campaign_id": "5", "binding_id": "oops"})
+        ) == ("5", 0, None)
+
+
+class TestBindingMetadataInResult:
+    """F.31 B.3: domain-resolved clicks thread binding_id + binding_alias
+    into the route() result so the click record can attribute analytics to
+    the exact binding the click arrived through."""
+
+    def _routable(self, domain_value):
+        return FakeRedis(
+            hashes={
+                "campaign:10": {"company_id": "1", "priority": "0"},
+                "flow:100": {
+                    "campaign_id": "10", "scope_type": "company",
+                    "scope_id": "1", "seq_id": "1", "is_default": "0",
+                    "criteria": "[]", "action_type": "redirect",
+                    "action_config": json.dumps({"url": "https://lp.example"}),
+                },
+            },
+            lists={"campaign:10:flows": ["100"]},
+            strings={"domain:promo.example:root": domain_value},
+        )
+
+    def _click(self):
+        return ClickRequest(
+            click_id="t", country="US", user_agent="Mozilla/5.0",
+            hostname="promo.example", query_params={},
+        )
+
+    def test_json_value_carries_binding_metadata(self):
+        value = json.dumps(
+            {"campaign_id": "10", "binding_id": 77, "binding_alias": "spring"}
+        )
+        result = _route_with(self._routable(value), self._click())
+        assert "lp.example" in result["url"]
+        assert result["binding_id"] == 77
+        assert result["binding_alias"] == "spring"
+
+    def test_legacy_scalar_value_defaults_metadata(self):
+        result = _route_with(self._routable("10"), self._click())
+        assert "lp.example" in result["url"]
+        assert result["binding_id"] == 0
+        assert result["binding_alias"] is None
+
+    def test_geo_resolved_click_has_default_binding(self):
+        """A click with no domain binding routes via geo → binding_id 0,
+        alias None (the '(default)' analytics bucket)."""
+        redis = self._routable("10")
+        redis.sets["campaigns:active"] = {"10"}
+        redis.sets["geo:US"] = {"10"}
+        # No hostname → domain resolution returns no match → geo branch.
+        click = ClickRequest(
+            click_id="t", country="US", user_agent="Mozilla/5.0",
+            hostname="", query_params={},
+        )
+        result = _route_with(redis, click)
+        assert result is not None
+        assert "lp.example" in result["url"]
+        assert result["binding_id"] == 0
+        assert result["binding_alias"] is None

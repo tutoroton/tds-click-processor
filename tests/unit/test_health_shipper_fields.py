@@ -225,6 +225,50 @@ def test_health_response_disk_free_bytes_can_be_none():
 
 
 # ---------------------------------------------------------------------------
+# F.32 Track 1 — code_version drift-visibility field
+# ---------------------------------------------------------------------------
+
+
+def test_health_response_code_version_defaults_to_unknown():
+    """A node provisioned before F.32 (or local dev) has no
+    TDS_CODE_VERSION → /health must still build, reporting "unknown"
+    rather than raising."""
+    h = HealthResponse(
+        node_id="test-node",
+        region="eu",
+        redis=True,
+        campaigns_loaded=0,
+        uptime_seconds=0.0,
+    )
+    assert h.code_version == "unknown"
+
+
+def test_health_response_carries_code_version():
+    """When the node .env stamps TDS_CODE_VERSION (a git short SHA, or
+    "local-dirty" for a --dev rsync), /health surfaces it verbatim so
+    operators can compare a node against the expected release tip."""
+    for value in ("a1b2c3d", "local-dirty"):
+        h = HealthResponse(
+            node_id="test-node",
+            region="eu",
+            redis=True,
+            campaigns_loaded=0,
+            uptime_seconds=0.0,
+            code_version=value,
+        )
+        assert h.code_version == value
+
+
+def test_settings_reads_code_version_from_env(monkeypatch):
+    """Settings.code_version is fed by TDS_CODE_VERSION (env_prefix=TDS_),
+    which render-env.sh / update.sh write into the node .env."""
+    from app.config import Settings
+
+    monkeypatch.setenv("TDS_CODE_VERSION", "deadbee")
+    assert Settings().code_version == "deadbee"
+
+
+# ---------------------------------------------------------------------------
 # Module singleton — production lifecycle pin
 # ---------------------------------------------------------------------------
 

@@ -165,6 +165,12 @@ class HealthResponse(BaseModel):
     ``app.disk_queue.get_queue_size`` for the canonical definitions.
     """
 
+    # F.32 Track 1 — running code version (git short SHA from the node .env via
+    # settings.code_version). Lets `tds-deploy node status` + the admin node list
+    # compare each node against the expected release tip → drift one-glance.
+    # "unknown" (pre-F.32 / local) or "local-dirty" (--dev rsync) are valid.
+    code_version: str = "unknown"
+
     # Pre-F.29 fields — preserved verbatim, callers depend on them.
     node_id: str
     region: str

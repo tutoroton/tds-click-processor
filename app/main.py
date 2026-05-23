@@ -1020,6 +1020,8 @@ async def health():
             disk_free_bytes = None
 
     return HealthResponse(
+        # F.32 Track 1 — drift visibility: the git SHA the node is running.
+        code_version=settings.code_version,
         node_id=settings.node_id,
         region=settings.node_region,
         redis=redis_ok,

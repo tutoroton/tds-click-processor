@@ -19,6 +19,14 @@ class Settings(BaseSettings):
     environment: str = "development"
     port: int = 8100
 
+    # F.32 Track 1 — running code version (git short SHA), stamped into the node
+    # .env at provision/update time (deploy/render-env.sh + deploy/update.sh) and
+    # surfaced in /health so operators can spot drift between nodes at a glance
+    # (the "pereviryty ne mozhemo" pain). "unknown" = local dev or a node
+    # provisioned before F.32; "local-dirty" = a tds-deploy --dev rsync (WIP, not
+    # a clean git ref).
+    code_version: str = "unknown"
+
     # Redis (local, same machine/container)
     redis_url: str = "redis://redis:6379/0"
 

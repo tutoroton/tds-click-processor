@@ -846,6 +846,42 @@ class TestWildcardSubdomainFailClosed:
         assert result.get("blocked") is not True
         assert "base.example" in result["url"]
 
+    def test_uppercase_hostname_still_fails_closed(self):
+        """§6 must not be case-bypassable: an UPPERCASE unmatched subdomain
+        is normalised to lowercase before the wildcard membership check, so
+        it still blocks (the wildcard set + keys are stored lowercased)."""
+        redis = FakeRedis(
+            sets={"domains:wildcard": {"adstudy.dev"}},
+            strings={"domain:adstudy.dev:root": "10"},
+        )
+        result = _route_with(redis, self._click("EVIL.ADSTUDY.DEV"))
+        assert result is not None
+        assert result["blocked"] is True
+        assert result["url"] is None
+
+    def test_trailing_dot_hostname_normalised(self):
+        """FQDN trailing-dot form resolves identically (no spurious block)."""
+        redis = self._routable(
+            "10", "100", "https://sub-lp.example",
+            sets={"domains:wildcard": {"adstudy.dev"}},
+            strings={"domain:adstudy.dev:subdomain:gambling": "10"},
+        )
+        result = _route_with(redis, self._click("gambling.adstudy.dev."))
+        assert result.get("blocked") is not True
+        assert "sub-lp.example" in result["url"]
+
+    def test_corrupt_json_on_wildcard_base_blocks(self):
+        """A corrupt JSON binding value on a wildcard subdomain is a MISS →
+        fail closed, not route-to-bogus-campaign."""
+        redis = FakeRedis(
+            sets={"domains:wildcard": {"adstudy.dev"}},
+            strings={"domain:adstudy.dev:subdomain:gambling": "{corrupt"},
+        )
+        result = _route_with(redis, self._click("gambling.adstudy.dev"))
+        assert result is not None
+        assert result["blocked"] is True
+        assert result["url"] is None
+
 
 class TestParseBindingValue:
     """F.31 B.3: `_parse_binding_value` dual-reads the F.31 JSON payload
@@ -859,10 +895,11 @@ class TestParseBindingValue:
     def test_legacy_scalar(self):
         assert router._parse_binding_value("42") == ("42", 0, None)
 
-    def test_malformed_json_treated_as_scalar(self):
-        # Defensive: a value that opens with `{` but isn't valid JSON must
-        # not crash routing — fall back to treating it as a scalar.
-        assert router._parse_binding_value("{bad") == ("{bad", 0, None)
+    def test_malformed_json_treated_as_miss(self):
+        # A value that opens with `{` is unambiguously meant to be the F.31
+        # JSON shape; if it's corrupt, return an EMPTY cid (a MISS) so the
+        # caller fails closed — never route to a bogus `campaign:{...` id.
+        assert router._parse_binding_value("{bad") == ("", 0, None)
 
     def test_empty_and_none(self):
         assert router._parse_binding_value("") == ("", 0, None)

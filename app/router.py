@@ -691,8 +691,14 @@ def _parse_binding_value(raw: str | None) -> tuple[str, int, str | None]:
 
     F.31 shape is JSON `{"campaign_id","binding_id","binding_alias"}`. A
     legacy bare campaign_id scalar (pre-F.31 sync — the 3-deploy window)
-    parses to `binding_id=0, binding_alias=None`. Defensive: malformed JSON
-    is treated as a legacy scalar so a bad value never crashes routing.
+    is a value that does NOT start with `{` and parses to
+    `(scalar, 0, None)`.
+
+    A value that DOES start with `{` is unambiguously meant to be the
+    F.31 JSON shape; if it fails to parse it is a corrupt write, NOT a
+    legacy scalar — return an empty campaign_id (a MISS) so the caller
+    fails closed (block on a wildcard base, geo-fall-through otherwise)
+    rather than routing to a bogus `campaign:{...` id. Never crashes.
     """
     if not raw:
         return "", 0, None
@@ -713,7 +719,8 @@ def _parse_binding_value(raw: str | None) -> tuple[str, int, str | None]:
                 str(alias) if alias is not None else None,
             )
         except (json.JSONDecodeError, TypeError, AttributeError):
-            return s, 0, None
+            logger.error("corrupt JSON domain-binding value, treating as miss: %r", s[:80])
+            return "", 0, None
     return s, 0, None
 
 
@@ -749,7 +756,14 @@ async def resolve_domain_campaign(r, req: ClickRequest) -> DomainResolution:
         the `_WILDCARD_BASES_KEY` contract above and
         `docs/development/F.30-F.31-domain-bindings-plan.md` §6.
     """
-    hostname = req.hostname
+    # Normalise the hostname before any key lookup or wildcard-membership
+    # check. The CF Worker already emits a lowercased hostname, but the
+    # F.30 §6 fail-closed contract depends on the live hostname matching
+    # the stored (lowercased) `base_domain` keys + `domains:wildcard`
+    # members — so we don't leave that security property silently relying
+    # on the edge. Trailing dot (FQDN form `example.com.`) is stripped so
+    # `example.com.` resolves identically to `example.com`.
+    hostname = (req.hostname or "").strip().rstrip(".").lower()
     if not hostname:
         return _NO_DOMAIN_MATCH
 
@@ -776,7 +790,13 @@ async def resolve_domain_campaign(r, req: ClickRequest) -> DomainResolution:
             is_wildcard_subdomain = bool(
                 await r.sismember(_WILDCARD_BASES_KEY, sub_base)
             )
-        except Exception:  # pragma: no cover — Redis transient → fail open to legacy path
+        except Exception as e:  # pragma: no cover — Redis transient
+            # Fail OPEN to the legacy path on a transient Redis error, but
+            # LOG it: a deterministic failure here (e.g. WRONGTYPE on the
+            # `domains:wildcard` key) would silently disable §6 fail-closed
+            # for every subdomain while the wildcard DNS stays live, so ops
+            # must be able to see it rather than have it pass unnoticed.
+            logger.warning("domains:wildcard membership check failed (§6 fail-open): %s", e)
             is_wildcard_subdomain = False
 
     if is_wildcard_subdomain:

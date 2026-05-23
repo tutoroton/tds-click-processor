@@ -191,44 +191,58 @@ def test_capture_op_msg_default_level_is_warning():
 
 
 # ---------------------------------------------------------------------------
-# Source-level pinning — every exception path in run_shipper uses
-# a helper. A regression that introduces a bare capture_exception
-# would defeat the tagging scheme.
+# Source-level pinning — every exception path in the shipper module
+# uses an op-tag helper. A regression that introduces a bare
+# capture_exception / capture_message would defeat the tagging scheme.
 # ---------------------------------------------------------------------------
 
 
-def test_run_shipper_source_uses_op_helpers_not_bare_capture():
+def test_shipper_module_source_uses_op_helpers_not_bare_capture():
     """Source-level pin. Pre-F.29 ``except Exception as e:
     sentry_sdk.capture_exception(e)`` was untagged. After Sprint 1.3,
-    every ``capture_exception`` call inside ``run_shipper`` should
-    use the helpers (which guarantee the op tag).
+    every ``capture_exception`` / ``capture_message`` call inside the
+    shipper module's loop paths should use the helpers (which guarantee
+    the op tag).
 
-    This is a static check — counts call patterns in the source.
+    Updated 2026-05-23 (F.29 TD-1 decomposition): pre-TD-1 the entire
+    loop body was in ``run_shipper`` so scanning ``run_shipper`` source
+    was sufficient. Post-TD-1 the body is split across
+    ``_drain_batch_from_stream``, ``_post_batch_to_central``,
+    ``_process_new_shape_batch``, ``_process_legacy_shape_batch``,
+    ``_process_collector_error``, ``_handle_central_unreachable``,
+    ``_handle_shipper_loop_error`` + ``run_shipper`` dispatcher. We
+    scan the full module source minus the exempt ``assert_shipper_ready``
+    function (which legitimately uses bare ``sentry_sdk.capture_message``
+    at boot-time, outside the tagged loop).
+
     Catches drift from someone hand-adding a bare capture that skips
-    the helper. The ``assert_shipper_ready`` function legitimately
-    uses ``sentry_sdk.capture_message`` directly (it's not inside the
-    tagged loop), so we only inspect the ``run_shipper`` body.
+    the helper.
     """
     import inspect
 
-    src = inspect.getsource(shipper.run_shipper)
+    module_src = inspect.getsource(shipper)
+    # Strip the exempt function body via exact substring removal so
+    # the scope of the check is precisely "everything else".
+    exempt_src = inspect.getsource(shipper.assert_shipper_ready)
+    scoped_src = module_src.replace(exempt_src, "")
 
-    # Inside run_shipper, every Sentry signal must go through the
-    # helpers — no bare capture_exception / capture_message calls.
-    assert "sentry_sdk.capture_exception(" not in src, (
+    # In the scoped module source, every Sentry signal must go through
+    # the helpers — no bare capture_exception / capture_message calls.
+    assert "sentry_sdk.capture_exception(" not in scoped_src, (
         "F.29 Sprint 1.3 regression: bare sentry_sdk.capture_exception "
-        "call inside run_shipper — must use _capture_op_exc helper to "
-        "guarantee the op tag is set."
+        "call inside shipper loop paths — must use _capture_op_exc "
+        "helper to guarantee the op tag is set."
     )
-    assert "sentry_sdk.capture_message(" not in src, (
+    assert "sentry_sdk.capture_message(" not in scoped_src, (
         "F.29 Sprint 1.3 regression: bare sentry_sdk.capture_message "
-        "call inside run_shipper — must use _capture_op_msg helper."
+        "call inside shipper loop paths — must use _capture_op_msg helper."
     )
 
-    # Positive pin: each major op-tag constant is referenced in
-    # run_shipper. Drift here means a code path lost its tagging.
-    assert "OP_PARSE_PAYLOAD" in src
-    assert "OP_BATCH_POST" in src
-    assert "OP_XACK" in src
-    assert "OP_XACK_BATCH" in src
-    assert "OP_LOOP_ITERATION" in src
+    # Positive pin: each major op-tag constant is referenced somewhere
+    # in the shipper module. Drift here means a code path lost its
+    # tagging — the Sprint 4.1 alert rule keyed on that op stops firing.
+    assert "OP_PARSE_PAYLOAD" in module_src
+    assert "OP_BATCH_POST" in module_src
+    assert "OP_XACK" in module_src
+    assert "OP_XACK_BATCH" in module_src
+    assert "OP_LOOP_ITERATION" in module_src

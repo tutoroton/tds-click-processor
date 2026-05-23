@@ -3,7 +3,7 @@
 # SINGLE SOURCE OF TRUTH for how a click-processor node runs in
 # production/staging. Consumed identically by BOTH provisioning paths:
 #   * admin-panel cloud-init  → git clone the public mirror → here
-#   * `tds-deploy node update` / deploy/node-package/scripts/update.sh
+#   * `tds-deploy node update` / deploy/update.sh
 # so a freshly-created node and an updated existing node are byte-identical.
 #
 # WHY a separate file (not docker-compose.yml): the root docker-compose.yml
@@ -14,7 +14,7 @@
 # the Dockerfile + app/ live) — correct in the mirror clone at /opt/tds-node.
 #
 # Reconciled UNION of the three pre-F.32 variants:
-#   - build-based (was image: in deploy/node-package) so the node builds the
+#   - build-based (was image: in the retired deploy/node-package) so the node builds the
 #     cloned source — no registry, no pinned-tag drift.
 #   - M7 disk-fallback queue volume + TDS_DISK_QUEUE_ROOT (was MISSING from
 #     the admin cloud-init compose → those nodes had no zero-loss fallback).

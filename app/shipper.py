@@ -44,6 +44,16 @@ _RETRY_KEY_PREFIX = "click:retry:"
 DEADLETTER_STREAM_KEY = "stream:clicks-deadletter"
 DEADLETTER_STREAM_MAXLEN = 10_000
 
+# F.29 Sprint 2.7a (2026-05-23) — one-shot flag for Sprint 2.5
+# backwards-compat shim warning. Pre-2.7 the shim fired a Sentry
+# capture_message on EVERY batch with a legacy-shape response,
+# generating ~30 events/min during a sustained rolling-deploy
+# window → Sentry quota concern. Now the Sentry event fires only on
+# the FIRST shim activation per shipper task lifetime; subsequent
+# batches still log at WARN level (operator visibility preserved)
+# but skip the Sentry breadcrumb to bound quota.
+_shim_warned_this_session: bool = False
+
 
 # ---------------------------------------------------------------------------
 # F.29 Sprint 1.3 — structured Sentry tagging (Sprint 1.6 — extracted)
@@ -67,6 +77,8 @@ DEADLETTER_STREAM_MAXLEN = 10_000
 
 from app.telemetry import (
     OP_BATCH_POST,
+    OP_DEADLETTER,
+    OP_LEGACY_COLLECTOR,
     OP_LOOP_ITERATION,
     OP_PARSE_PAYLOAD,
     OP_XACK,
@@ -427,20 +439,31 @@ async def _handle_rejected_click(
 
     retry_key = f"{_RETRY_KEY_PREFIX}{click_id}"
     try:
-        attempt = await redis_pool.incr(retry_key)
-        await redis_pool.expire(
-            retry_key, settings.shipper_retry_ttl_seconds,
-        )
+        # F.29 Sprint 2.7a (2026-05-23) — atomic INCR + EXPIRE via
+        # pipeline. Pre-2.7 these were two sequential awaits; a
+        # shipper crash or Redis disconnect BETWEEN them left the
+        # counter without a TTL → permanent key in Redis under
+        # ``noeviction`` policy. Pipelining drops the window to a
+        # single round-trip (server-side execution sequence is
+        # still two ops but client cannot observe a partial state).
+        pipe = redis_pool.pipeline()
+        pipe.incr(retry_key)
+        pipe.expire(retry_key, settings.shipper_retry_ttl_seconds)
+        incr_result, _ = await pipe.execute()
+        attempt = incr_result
     except Exception as exc:  # noqa: BLE001
         # Counter increment failed — Redis impairment. Default to
         # deadletter conservatively rather than infinite-retry.
+        # F.29 Sprint 2.7a — use attempt=0 sentinel (was -1 pre-2.7
+        # which violated DeadletterRecord.ge=0 Pydantic constraint
+        # on central forward, causing a silent 422 reject).
         logger.warning(
             "Shipper retry counter increment failed for click_id=%s: "
             "%s. Deadlettering conservatively.",
             click_id, exc,
         )
         await _deadletter_click(
-            redis_pool, click, attempt=-1, reason=f"counter_error:{reason}",
+            redis_pool, click, attempt=0, reason=f"counter_error:{reason}",
             http_client=http_client,
         )
         return False
@@ -773,6 +796,15 @@ async def run_shipper(redis_pool):
                         # and status==207 there's a contract violation,
                         # fall through to error path.
                         if response.status_code in (200, 202):
+                            # F.29 Sprint 2.7a — use canonical
+                            # OP_LEGACY_COLLECTOR constant; pre-2.7
+                            # used inline string "legacy_collector"
+                            # which bypassed the OP_* drift guard
+                            # established in Sprint 1.6. Same string
+                            # value, but now sourced from telemetry
+                            # module so rename + Sentry alert rules
+                            # stay synchronised.
+                            global _shim_warned_this_session
                             logger.warning(
                                 "Shipper shim activated (op=%s) — collector "
                                 "returned %s shape (status=%d). Falling back "
@@ -780,19 +812,32 @@ async def run_shipper(redis_pool):
                                 "expected during rolling deploy and harmless; "
                                 "verify the collector reaches Sprint 2.1+ "
                                 "soon for per-click verdict visibility.",
-                                "legacy_collector", shape,
+                                OP_LEGACY_COLLECTOR, shape,
                                 response.status_code,
                             )
-                            _capture_op_msg(
-                                "legacy_collector",
-                                f"Shipper got legacy ({shape}) response "
-                                f"shape from collector — falling back to "
-                                f"ACK-all (status={response.status_code}).",
-                                level="warning",
-                                shape=shape,
-                                collector_status=response.status_code,
-                                batch_size=len(clicks),
-                            )
+                            # F.29 Sprint 2.7a — one-shot Sentry
+                            # capture per shipper lifetime. Pre-2.7
+                            # this fired on every batch during rolling
+                            # deploy → ~30 events/min → Sentry quota
+                            # risk. WARN log above still fires per
+                            # batch (operator visibility); Sentry
+                            # event only on first activation.
+                            if not _shim_warned_this_session:
+                                _shim_warned_this_session = True
+                                _capture_op_msg(
+                                    OP_LEGACY_COLLECTOR,
+                                    f"Shipper got legacy ({shape}) response "
+                                    f"shape from collector — falling back to "
+                                    f"ACK-all (status={response.status_code}). "
+                                    "This message fires ONCE per shipper "
+                                    "lifetime to bound Sentry quota during "
+                                    "rolling deploys; subsequent batches log "
+                                    "WARN-only.",
+                                    level="warning",
+                                    shape=shape,
+                                    collector_status=response.status_code,
+                                    batch_size=len(clicks),
+                                )
                             try:
                                 await redis_pool.xack(
                                     STREAM_KEY, GROUP_NAME, *msg_ids,

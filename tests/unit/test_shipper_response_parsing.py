@@ -21,7 +21,7 @@ Reference: F.29 plan §3 G2-HIGH, §4 Sprint 2.2 + 2.5 rows.
 from __future__ import annotations
 
 import json
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -219,26 +219,50 @@ async def test_deadletter_swallows_xadd_failure():
 # ---------------------------------------------------------------------------
 
 
+def _make_pipeline_mock(incr_result, raise_on_execute=None):
+    """Build a redis pipeline mock that mirrors the Sprint 2.7a atomic
+    INCR+EXPIRE pattern. Returns an object with sync ``incr/expire``
+    methods (chainable, no-op) and async ``execute`` that returns
+    ``[incr_result, True]`` (mirroring real redis-py pipeline output)
+    OR raises ``raise_on_execute`` exception.
+    """
+    pipe = MagicMock()
+    pipe.incr = MagicMock(return_value=pipe)  # chainable per redis-py
+    pipe.expire = MagicMock(return_value=pipe)
+    if raise_on_execute is not None:
+        pipe.execute = AsyncMock(side_effect=raise_on_execute)
+    else:
+        pipe.execute = AsyncMock(return_value=[incr_result, True])
+    return pipe
+
+
 @pytest.mark.asyncio
 async def test_handle_rejected_retries_when_under_max(monkeypatch):
     """First few rejections increment counter + re-XADD. Returns
     True (caller should ACK the old msg_id; new attempt is in
-    queue)."""
+    queue).
+
+    F.29 Sprint 2.7a refactor: INCR+EXPIRE is now atomic via
+    pipeline (was two sequential awaits pre-2.7). Test asserts the
+    pipeline was called and incr_result honoured.
+    """
     monkeypatch.setattr(shipper.settings, "shipper_max_retry_attempts", 5)
 
+    pipe_mock = _make_pipeline_mock(incr_result=3)  # 3 < 5
     redis_mock = AsyncMock()
-    redis_mock.incr = AsyncMock(return_value=3)  # 3 < 5
-    redis_mock.expire = AsyncMock()
+    redis_mock.pipeline = MagicMock(return_value=pipe_mock)
     redis_mock.xadd = AsyncMock()
     click = {"click_id": "x"}
 
     retried = await _handle_rejected_click(redis_mock, click, "queue_failure")
 
     assert retried is True
-    redis_mock.incr.assert_awaited_once_with("click:retry:x")
-    redis_mock.expire.assert_awaited_once_with("click:retry:x", 86400)
-    redis_mock.xadd.assert_awaited_once()
+    # Pipeline was used (atomic INCR+EXPIRE).
+    pipe_mock.incr.assert_called_once_with("click:retry:x")
+    pipe_mock.expire.assert_called_once_with("click:retry:x", 86400)
+    pipe_mock.execute.assert_awaited_once()
     # The XADD goes to stream:clicks (retry), NOT the deadletter stream.
+    redis_mock.xadd.assert_awaited_once()
     assert redis_mock.xadd.call_args.args[0] == STREAM_KEY
 
 
@@ -249,9 +273,9 @@ async def test_handle_rejected_deadletters_at_max(monkeypatch):
     deadletter)."""
     monkeypatch.setattr(shipper.settings, "shipper_max_retry_attempts", 5)
 
+    pipe_mock = _make_pipeline_mock(incr_result=5)  # == max
     redis_mock = AsyncMock()
-    redis_mock.incr = AsyncMock(return_value=5)  # == max
-    redis_mock.expire = AsyncMock()
+    redis_mock.pipeline = MagicMock(return_value=pipe_mock)
     redis_mock.xadd = AsyncMock()
     redis_mock.delete = AsyncMock()
     click = {"click_id": "x"}
@@ -283,11 +307,19 @@ async def test_handle_rejected_missing_click_id_deadletters_immediately():
 
 @pytest.mark.asyncio
 async def test_handle_rejected_counter_failure_deadletters(monkeypatch):
-    """Redis INCR failure during counter increment — conservatively
-    deadletter rather than infinite-retry. Logged + captured but
-    flow continues."""
+    """Redis pipeline failure during counter increment —
+    conservatively deadletter rather than infinite-retry. Logged +
+    captured but flow continues.
+
+    F.29 Sprint 2.7a — uses attempt=0 sentinel (was -1 pre-2.7
+    which violated DeadletterRecord.ge=0 Pydantic constraint).
+    """
+    pipe_mock = _make_pipeline_mock(
+        incr_result=None,
+        raise_on_execute=ConnectionError("redis down"),
+    )
     redis_mock = AsyncMock()
-    redis_mock.incr = AsyncMock(side_effect=ConnectionError("redis down"))
+    redis_mock.pipeline = MagicMock(return_value=pipe_mock)
     redis_mock.xadd = AsyncMock()
     click = {"click_id": "x"}
 
@@ -297,6 +329,10 @@ async def test_handle_rejected_counter_failure_deadletters(monkeypatch):
     # Deadletter XADD called even though counter failed.
     redis_mock.xadd.assert_awaited_once()
     assert redis_mock.xadd.call_args.args[0] == DEADLETTER_STREAM_KEY
+    # Verify the deadletter record carries the Sprint 2.7a attempt=0
+    # sentinel (passes the central forward's ge=0 Pydantic gate).
+    deadletter_record = redis_mock.xadd.call_args.args[1]
+    assert deadletter_record["attempt_count"] == "0"
 
 
 @pytest.mark.asyncio
@@ -306,10 +342,10 @@ async def test_handle_rejected_requeue_failure_deadletters(monkeypatch):
     silently."""
     monkeypatch.setattr(shipper.settings, "shipper_max_retry_attempts", 5)
 
+    pipe_mock = _make_pipeline_mock(incr_result=2)
     redis_mock = AsyncMock()
-    redis_mock.incr = AsyncMock(return_value=2)
-    redis_mock.expire = AsyncMock()
-    # First xadd call is _retry_click (raises); second would be
+    redis_mock.pipeline = MagicMock(return_value=pipe_mock)
+    # First xadd call is _retry_click (raises); second is
     # deadletter. We use side_effect with two values.
     redis_mock.xadd = AsyncMock(side_effect=[
         ConnectionError("redis down on retry"),

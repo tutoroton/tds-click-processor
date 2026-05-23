@@ -451,12 +451,64 @@ async def _acquire_click_dedup(click_id: str) -> bool | None:
 # and surfaced in skill `provisioning-edge-node`.
 _SMOKE_TEST_CLICK_ID_PREFIX = "smoke-test-"
 
+# F.29 Sprint 4.1 (TD-13, 2026-05-23) — HMAC smoke-probe freshness window.
+# The admin-api stamps `issued_at` (unix seconds) into the probe header and
+# signs it; /decide rejects probes older than this. The smoke-test timeout
+# itself is 30s (admin-api side), so 120s gives generous clock-skew + retry
+# headroom while bounding how long a captured (smoke_id, sig) pair can be
+# replayed. A replay within the window only re-confirms an already-targeted
+# node anyway (the signature binds the node_id-embedding smoke_id).
+_SMOKE_PROBE_FRESHNESS_SECONDS = 120
+
+
+def _verify_smoke_probe(click_id: str, probe_header: str) -> tuple[bool, str]:
+    """Verify the ``X-TDS-Smoke-Probe`` HMAC for a smoke-test click (TD-13).
+
+    Only consulted when ``settings.smoke_probe_secret`` is configured
+    (enforce mode). The header format is ``<issued_at>.<hexsig>`` where
+    ``hexsig = HMAC-SHA256(smoke_probe_secret, f"{click_id}.{issued_at}")``.
+
+    Binding the signature to ``click_id`` (which embeds the activating
+    node_id) means a captured header cannot be retargeted to another node;
+    binding ``issued_at`` plus the freshness check bounds replay. The
+    comparison is constant-time.
+
+    Returns ``(ok, detail)`` — ``detail`` is a non-sensitive reason string
+    safe to log / surface in the 403 body (it never echoes the secret or
+    the expected signature).
+    """
+    secret = settings.smoke_probe_secret
+    if not probe_header:
+        return False, "missing X-TDS-Smoke-Probe header"
+    issued_raw, sep, provided_sig = probe_header.partition(".")
+    if not sep or not issued_raw or not provided_sig:
+        return False, "malformed probe header (expected '<issued_at>.<sig>')"
+    try:
+        issued_at = int(issued_raw)
+    except ValueError:
+        return False, "probe issued_at is not an integer"
+    age = abs(time.time() - issued_at)
+    if age > _SMOKE_PROBE_FRESHNESS_SECONDS:
+        return False, (
+            f"probe expired (age {age:.0f}s > "
+            f"{_SMOKE_PROBE_FRESHNESS_SECONDS}s freshness window)"
+        )
+    expected_sig = hmac.new(
+        secret.encode(),
+        f"{click_id}.{issued_at}".encode(),
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(expected_sig, provided_sig):
+        return False, "probe signature mismatch"
+    return True, "ok"
+
 
 @app.post("/decide")
 async def decide(
     req: ClickRequest,
     x_tds_key: str = Header("", alias="X-TDS-Key"),
     x_test_id: str = Header("", alias="X-Test-Id"),
+    x_tds_smoke_probe: str = Header("", alias="X-TDS-Smoke-Probe"),
 ):
     """Main routing endpoint. Called by CF Worker for every click."""
     t_endpoint_start = time.perf_counter()
@@ -485,9 +537,50 @@ async def decide(
         # widens the leak surface (log shipping, log search, ops
         # tooling). Log only a sha256-derived 8-char correlation token —
         # enough to grep-correlate one smoke run across services, but
-        # it reveals NONE of the actual hex (one-way). Full HMAC
-        # authenticator is the durable fix (TD-13, Sprint 4.1).
+        # it reveals NONE of the actual hex (one-way).
         smoke_fp = hashlib.sha256(req.click_id.encode()).hexdigest()[:8]
+
+        # F.29 Sprint 4.1 (TD-13) — HMAC smoke-probe enforcement. This is
+        # the DURABLE fix for the forge vector (the sha256 fingerprint
+        # above only shrank the leak surface). When a dedicated
+        # `smoke_probe_secret` is configured, the bypass REQUIRES a valid
+        # `X-TDS-Smoke-Probe` HMAC that only admin-api can produce — so a
+        # holder of X-TDS-Key / the collector key / the central-stream hex
+        # cannot drive a false-positive activation. Fail CLOSED: a
+        # missing/invalid/expired probe → 403 (the admin-api smoke gate
+        # then reports a clear "node /decide returned HTTP 403", which an
+        # operator reads as a probe-secret rollout mismatch — recoverable
+        # via ?skip_smoke=true). When the secret is UNSET we fall back to
+        # the pre-Sprint-4.1 behaviour (bypass on X-TDS-Key alone) so
+        # nodes that predate the rollout keep working, but WARN so the gap
+        # is visible.
+        if settings.smoke_probe_secret:
+            probe_ok, probe_detail = _verify_smoke_probe(
+                req.click_id, x_tds_smoke_probe,
+            )
+            if not probe_ok:
+                logger.warning(
+                    "Smoke-probe auth FAILED click_id_fp=%s node_id=%s: %s "
+                    "— bypass REFUSED",
+                    smoke_fp, settings.node_id, probe_detail,
+                )
+                sentry_sdk.add_breadcrumb(
+                    category="smoke.probe",
+                    level="warning",
+                    message="smoke probe authentication failed",
+                    data={"detail": probe_detail, "node_id": settings.node_id},
+                )
+                raise HTTPException(
+                    status_code=403,
+                    detail=f"smoke probe authentication failed: {probe_detail}",
+                )
+        else:
+            logger.warning(
+                "Smoke bypass UNAUTHENTICATED (TDS_SMOKE_PROBE_SECRET unset) "
+                "click_id_fp=%s node_id=%s — configure the probe secret to "
+                "close the TD-13 forge vector",
+                smoke_fp, settings.node_id,
+            )
         try:
             r = await get_redis()
             smoke_record = {

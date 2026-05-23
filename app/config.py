@@ -25,6 +25,26 @@ class Settings(BaseSettings):
     # Auth (shared secret with CF Worker)
     tds_secret_key: str = ""
 
+    # F.29 Sprint 4.1 (TD-13, 2026-05-23) — HMAC smoke-probe authenticator.
+    #
+    # Dedicated secret shared between admin-api and every edge node, but
+    # DISTINCT from `tds_secret_key` (X-TDS-Key) and the collector api key.
+    # When set, the /decide smoke-test bypass (the `smoke-test-` prefix
+    # short-circuit) REQUIRES a valid `X-TDS-Smoke-Probe` HMAC header that
+    # only admin-api can produce — closing the forge vector where a holder
+    # of X-TDS-Key (or the 64-bit hex observable in logs / the central
+    # stream) drives a false-positive activation of another tenant's node.
+    #
+    # Opt-in / fail-closed-when-set: empty (default) preserves the
+    # pre-Sprint-4.1 behaviour (bypass on X-TDS-Key alone) so existing
+    # nodes don't break before the secret is rolled out — a WARN fires on
+    # every unauthenticated bypass so operators know to configure it. Once
+    # set, a missing/invalid/expired probe is REFUSED (403) — the smoke
+    # gate then surfaces it as a clear "node /decide returned HTTP 403".
+    # No boot guard: smoke probing is an onboarding-only path, so an
+    # unset secret degrades gracefully rather than refusing service.
+    smoke_probe_secret: str = ""
+
     # Central server (for sync + click shipping).
     #
     # F.29 Sprint 1.1 (2026-05-22) — central_url is no longer "optional"

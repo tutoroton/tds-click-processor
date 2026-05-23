@@ -192,3 +192,195 @@ def test_smoke_xadd_failure_does_not_raise(client, patched_auth):
     fake_sentry.capture_exception.assert_called_once()
     # Route path NOT taken — smoke bypass short-circuited before raising.
     fake_route.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# F.29 Sprint 4.1 (TD-13) — HMAC smoke-probe enforcement
+# ---------------------------------------------------------------------------
+#
+# When ``settings.smoke_probe_secret`` is configured, the smoke bypass
+# REQUIRES a valid ``X-TDS-Smoke-Probe: <issued_at>.<sig>`` header. These
+# tests pin the fail-closed contract: valid → bypass, anything else → 403
+# (no XADD, no routing). The default empty secret (covered by the tests
+# above) preserves the pre-Sprint-4.1 fallback behaviour.
+
+import hashlib
+import hmac
+import time
+
+from app.config import settings
+
+
+_PROBE_SECRET = "smoke-probe-secret-distinct-from-x-tds-key-0001"
+
+
+def _make_probe(secret: str, click_id: str, issued_at: int | None = None) -> str:
+    """Construct an ``X-TDS-Smoke-Probe`` header value (mirrors the
+    admin-api signing in ``EdgeNodeService._run_smoke_test``)."""
+    issued_at = int(time.time()) if issued_at is None else issued_at
+    sig = hmac.new(
+        secret.encode(), f"{click_id}.{issued_at}".encode(), hashlib.sha256,
+    ).hexdigest()
+    return f"{issued_at}.{sig}"
+
+
+@pytest.fixture
+def enforce_probe():
+    """Enable TD-13 enforce mode by configuring the probe secret."""
+    with patch.object(settings, "smoke_probe_secret", _PROBE_SECRET):
+        yield
+
+
+def test_smoke_probe_valid_allows_bypass(client, patched_auth, enforce_probe):
+    """Valid HMAC probe → bypass proceeds (XADD + 302), exactly as the
+    unauthenticated path did before TD-13."""
+    fake_redis = MagicMock()
+    fake_redis.xadd = AsyncMock(return_value="1-0")
+    fake_route = AsyncMock()
+    click_id = "smoke-test-99-deadbeef00112233"
+
+    with patch("app.main.get_redis", new=AsyncMock(return_value=fake_redis)), \
+         patch("app.main.route", new=fake_route):
+        r = client.post(
+            "/decide",
+            json=_smoke_payload(click_id),
+            headers={
+                "X-TDS-Key": "ignored-by-patched-auth",
+                "X-TDS-Smoke-Probe": _make_probe(_PROBE_SECRET, click_id),
+            },
+        )
+
+    assert r.status_code == 200
+    assert r.json()["status"] == 302
+    fake_redis.xadd.assert_awaited_once()
+    fake_route.assert_not_awaited()
+
+
+def test_smoke_probe_missing_refused(client, patched_auth, enforce_probe):
+    """Enforce mode + no probe header → 403, NO XADD, NO routing."""
+    fake_redis = MagicMock()
+    fake_redis.xadd = AsyncMock(return_value="1-0")
+    fake_route = AsyncMock()
+
+    with patch("app.main.get_redis", new=AsyncMock(return_value=fake_redis)), \
+         patch("app.main.route", new=fake_route):
+        r = client.post(
+            "/decide",
+            json=_smoke_payload("smoke-test-99-deadbeef00112233"),
+            headers={"X-TDS-Key": "ignored-by-patched-auth"},
+        )
+
+    assert r.status_code == 403
+    assert "probe" in r.json()["detail"].lower()
+    fake_redis.xadd.assert_not_awaited()
+    fake_route.assert_not_awaited()
+
+
+def test_smoke_probe_invalid_signature_refused(client, patched_auth, enforce_probe):
+    """A probe signed with the WRONG secret → 403 (signature mismatch)."""
+    fake_redis = MagicMock()
+    fake_redis.xadd = AsyncMock(return_value="1-0")
+    click_id = "smoke-test-99-deadbeef00112233"
+
+    with patch("app.main.get_redis", new=AsyncMock(return_value=fake_redis)), \
+         patch("app.main.route", new=AsyncMock()):
+        r = client.post(
+            "/decide",
+            json=_smoke_payload(click_id),
+            headers={
+                "X-TDS-Key": "ignored-by-patched-auth",
+                "X-TDS-Smoke-Probe": _make_probe("the-wrong-secret-xxxxxxxxxxxxxxx", click_id),
+            },
+        )
+
+    assert r.status_code == 403
+    fake_redis.xadd.assert_not_awaited()
+
+
+def test_smoke_probe_expired_refused(client, patched_auth, enforce_probe):
+    """A probe whose ``issued_at`` is outside the freshness window → 403.
+    Bounds replay of a captured (smoke_id, sig) pair."""
+    fake_redis = MagicMock()
+    fake_redis.xadd = AsyncMock(return_value="1-0")
+    click_id = "smoke-test-99-deadbeef00112233"
+    stale = int(time.time()) - 9999  # well past the 120s window
+
+    with patch("app.main.get_redis", new=AsyncMock(return_value=fake_redis)), \
+         patch("app.main.route", new=AsyncMock()):
+        r = client.post(
+            "/decide",
+            json=_smoke_payload(click_id),
+            headers={
+                "X-TDS-Key": "ignored-by-patched-auth",
+                "X-TDS-Smoke-Probe": _make_probe(_PROBE_SECRET, click_id, issued_at=stale),
+            },
+        )
+
+    assert r.status_code == 403
+    assert "expired" in r.json()["detail"].lower()
+    fake_redis.xadd.assert_not_awaited()
+
+
+def test_smoke_probe_tampered_click_id_refused(client, patched_auth, enforce_probe):
+    """A probe signed for a DIFFERENT click_id → 403. Prevents retargeting
+    a captured header (which binds the node_id-embedding smoke_id) to a
+    victim node."""
+    fake_redis = MagicMock()
+    fake_redis.xadd = AsyncMock(return_value="1-0")
+    # Probe signed for node 42, but the request targets node 99.
+    probe_for_other = _make_probe(_PROBE_SECRET, "smoke-test-42-aaaaaaaaaaaaaaaa")
+
+    with patch("app.main.get_redis", new=AsyncMock(return_value=fake_redis)), \
+         patch("app.main.route", new=AsyncMock()):
+        r = client.post(
+            "/decide",
+            json=_smoke_payload("smoke-test-99-deadbeef00112233"),
+            headers={
+                "X-TDS-Key": "ignored-by-patched-auth",
+                "X-TDS-Smoke-Probe": probe_for_other,
+            },
+        )
+
+    assert r.status_code == 403
+    fake_redis.xadd.assert_not_awaited()
+
+
+def test_smoke_probe_malformed_header_refused(client, patched_auth, enforce_probe):
+    """A header without the ``<issued_at>.<sig>`` shape → 403 (malformed)."""
+    fake_redis = MagicMock()
+    fake_redis.xadd = AsyncMock(return_value="1-0")
+
+    with patch("app.main.get_redis", new=AsyncMock(return_value=fake_redis)), \
+         patch("app.main.route", new=AsyncMock()):
+        r = client.post(
+            "/decide",
+            json=_smoke_payload("smoke-test-99-deadbeef00112233"),
+            headers={
+                "X-TDS-Key": "ignored-by-patched-auth",
+                "X-TDS-Smoke-Probe": "garbage-no-dot",
+            },
+        )
+
+    assert r.status_code == 403
+    fake_redis.xadd.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# _verify_smoke_probe — direct unit tests (no HTTP layer)
+# ---------------------------------------------------------------------------
+
+
+def test_verify_smoke_probe_helper_paths():
+    """Direct coverage of the verifier's branches with the secret set."""
+    from app.main import _verify_smoke_probe
+
+    with patch.object(settings, "smoke_probe_secret", _PROBE_SECRET):
+        cid = "smoke-test-1-abcabcabcabcabca"
+        ok, _ = _verify_smoke_probe(cid, _make_probe(_PROBE_SECRET, cid))
+        assert ok is True
+
+        assert _verify_smoke_probe(cid, "")[0] is False             # missing
+        assert _verify_smoke_probe(cid, "nodot")[0] is False         # malformed
+        assert _verify_smoke_probe(cid, "notanint.deadbeef")[0] is False  # bad ts
+        # Non-hex/short sig of the right shape → mismatch (not a crash).
+        assert _verify_smoke_probe(cid, f"{int(time.time())}.zz")[0] is False

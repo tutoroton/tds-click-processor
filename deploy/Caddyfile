@@ -1,0 +1,27 @@
+{
+	log {
+		output stdout
+		format console
+	}
+}
+
+# Canonical edge-node Caddyfile (F.32). Mounted by docker-compose.node.yml.
+# Matches the shape running on the live AU/CA nodes (do not regress):
+#   - {$CADDY_DOMAIN} public HTTPS vhost — Caddy obtains a cert; the node sits
+#     behind a Cloudflare-proxied api-{node}.{base} record (CF SSL=full), so
+#     CF terminates the browser-facing TLS and validates only that the origin
+#     answers 443 with TLS.
+#   - :8100 plain HTTP — health checks + the admin-api smoke-probe POST to
+#     /decide (intra-region / CF-origin fetch).
+#   - :80 — ACME http-01 challenge + CF proxy fallback.
+{$CADDY_DOMAIN} {
+	reverse_proxy click-processor:8100
+}
+
+:8100 {
+	reverse_proxy click-processor:8100
+}
+
+:80 {
+	reverse_proxy click-processor:8100
+}

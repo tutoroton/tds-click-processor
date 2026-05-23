@@ -1,0 +1,103 @@
+# Canonical EDGE-NODE deployment compose (F.32 Track 1).
+#
+# SINGLE SOURCE OF TRUTH for how a click-processor node runs in
+# production/staging. Consumed identically by BOTH provisioning paths:
+#   * admin-panel cloud-init  → git clone the public mirror → here
+#   * `tds-deploy node update` / deploy/node-package/scripts/update.sh
+# so a freshly-created node and an updated existing node are byte-identical.
+#
+# WHY a separate file (not docker-compose.yml): the root docker-compose.yml
+# is the LOCAL dev compose (2 services, no Caddy, env=development, ports
+# published). Keeping them separate means `make dev` / local `docker compose
+# up` is untouched. Cloud-init + update.sh invoke this explicitly with
+# `-f docker-compose.node.yml`. `build: .` resolves to the repo root (where
+# the Dockerfile + app/ live) — correct in the mirror clone at /opt/tds-node.
+#
+# Reconciled UNION of the three pre-F.32 variants:
+#   - build-based (was image: in deploy/node-package) so the node builds the
+#     cloned source — no registry, no pinned-tag drift.
+#   - M7 disk-fallback queue volume + TDS_DISK_QUEUE_ROOT (was MISSING from
+#     the admin cloud-init compose → those nodes had no zero-loss fallback).
+#   - TDS_CENTRAL_API_KEY + smoke-probe + diag toggles via env_file (.env is
+#     rendered once at provision by deploy/render-env.sh, preserved on update).
+#   - the TDS_TDS_SECRET_KEY double-write guard (pydantic env_prefix=TDS_ makes
+#     field `tds_secret_key` read `TDS_TDS_SECRET_KEY`, not `TDS_SECRET_KEY`).
+
+services:
+  caddy:
+    image: caddy:2-alpine
+    container_name: tds-caddy
+    ports:
+      - "80:80"
+      - "443:443"
+      - "${TDS_PORT:-8100}:8100"
+    environment:
+      - CADDY_DOMAIN=${CADDY_DOMAIN:-localhost}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - tds-caddy-data:/data
+      - tds-caddy-config:/config
+    depends_on:
+      click-processor:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8100/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  click-processor:
+    build: .
+    container_name: tds-click-processor
+    expose:
+      - "8100"
+    # All node config (secrets + central_url + node id/region + smoke probe +
+    # diag toggles + TDS_CODE_VERSION) is rendered into .env at provision time
+    # by deploy/render-env.sh and PRESERVED across updates. Never committed.
+    env_file:
+      - .env
+    environment:
+      - TDS_REDIS_URL=redis://redis:6379/0
+      # Defensive double-write: pydantic env_prefix="TDS_" + field
+      # `tds_secret_key` consumes TDS_TDS_SECRET_KEY (NOT TDS_SECRET_KEY). The
+      # render-env .env already writes both, but this guard means a hand-edited
+      # .env that set only TDS_SECRET_KEY still boots (its `_enforce_secret_
+      # presence` guard would otherwise fail in non-local env).
+      - TDS_TDS_SECRET_KEY=${TDS_TDS_SECRET_KEY:-${TDS_SECRET_KEY:-}}
+      # M7: absolute path for the disk fallback queue (Settings validator
+      # refuses a relative value → loud boot failure over silent data loss).
+      - TDS_DISK_QUEUE_ROOT=/var/tds/click-queue
+    volumes:
+      # M7: persist the disk fallback queue across `up -d --build` recreates,
+      # otherwise clicks queued during a Redis outage are lost on image swap.
+      - tds-click-queue:/var/tds/click-queue
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8100/health')"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 15s
+
+  redis:
+    image: redis:7-alpine
+    container_name: tds-redis
+    command: redis-server --maxmemory 256mb --maxmemory-policy volatile-lru --appendonly yes
+    volumes:
+      - tds-redis-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+
+volumes:
+  tds-redis-data:
+  tds-caddy-data:
+  tds-caddy-config:
+  tds-click-queue:

@@ -1,0 +1,4 @@
+# F.32 — never let a rendered node .env (real secrets) get staged into the
+# public mirror. The .env is generated on the node by render-env.sh.
+.env
+*.env.local

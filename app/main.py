@@ -527,8 +527,45 @@ async def decide(
     """Main routing endpoint. Called by CF Worker for every click."""
     t_endpoint_start = time.perf_counter()
 
-    # Auth check (timing-safe + fail-closed per H6 fix).
-    await _check_tds_key(x_tds_key)
+    is_smoke = req.click_id.startswith(_SMOKE_TEST_CLICK_ID_PREFIX)
+
+    # ── Auth ────────────────────────────────────────────────────────────
+    # F.33 (2026-05-24) — a smoke-test click authenticates via the TD-13
+    # X-TDS-Smoke-Probe HMAC, NOT the per-Worker X-TDS-Key index. This is
+    # essential: `_check_tds_key` resolves X-TDS-Key against the LOCAL
+    # `worker_secret_hash` index, which is EMPTY on a freshly-provisioned node
+    # (it's populated by sync/seed — and the activation smoke gate runs BEFORE
+    # seed). So a per-Worker check 403s EVERY smoke on a fresh node, making the
+    # gate impossible to pass without ?skip_smoke (the chicken-and-egg the
+    # F.33 drill surfaced). The probe is a stronger, CONFIG-INDEPENDENT auth
+    # (node_id-bound HMAC only admin-api can mint, replay-bounded) and the
+    # smoke click short-circuits routing anyway — so authenticating it via the
+    # probe and skipping `_check_tds_key` is strictly safer than the prior
+    # "bypass on X-TDS-Key alone" path. Real (non-smoke) traffic is unchanged.
+    smoke_probe_authed = False
+    if is_smoke and settings.smoke_probe_secret:
+        probe_ok, probe_detail = _verify_smoke_probe(req.click_id, x_tds_smoke_probe)
+        if not probe_ok:
+            _fp = hashlib.sha256(req.click_id.encode()).hexdigest()[:8]
+            logger.warning(
+                "Smoke-probe auth FAILED click_id_fp=%s node_id=%s: %s — REFUSED",
+                _fp, settings.node_id, probe_detail,
+            )
+            sentry_sdk.add_breadcrumb(
+                category="smoke.probe", level="warning",
+                message="smoke probe authentication failed",
+                data={"detail": probe_detail, "node_id": settings.node_id},
+            )
+            raise HTTPException(
+                status_code=403,
+                detail=f"smoke probe authentication failed: {probe_detail}",
+            )
+        smoke_probe_authed = True  # the probe IS the auth — skip per-Worker check
+    if not smoke_probe_authed:
+        # Normal traffic, AND the legacy smoke-without-probe case (a node or
+        # admin-api predating the probe rollout). On a FRESH node the latter
+        # still 403s here — that is the documented `?skip_smoke=true` case.
+        await _check_tds_key(x_tds_key)
 
     # F.29 Sprint 3.6 — smoke-test bypass. Synthetic clicks from
     # ``EdgeNodeService._run_smoke_test`` carry a ``smoke-test-<hex>``
@@ -542,57 +579,28 @@ async def decide(
     # invoked tooling against a legitimately deployed edge node with
     # the right X-TDS-Key secret). Length + charset already validated
     # by ClickRequest's regex ``^[a-zA-Z0-9_\\-]+$``.
-    if req.click_id.startswith(_SMOKE_TEST_CLICK_ID_PREFIX):
+    if is_smoke:
         # F.29 Sprint 3.7.1 (SEC-H001 leak-surface reduction) — do NOT
         # log the FULL smoke click_id. The admin-api smoke gate matches
         # on the exact `smoke-test-{node_id}-{hex}` value; the 64-bit
         # hex is the only thing standing between a collector-key holder
-        # and a forged false-positive activation. Logging it at INFO
-        # widens the leak surface (log shipping, log search, ops
-        # tooling). Log only a sha256-derived 8-char correlation token —
-        # enough to grep-correlate one smoke run across services, but
-        # it reveals NONE of the actual hex (one-way).
+        # and a forged false-positive activation. Log only a sha256-derived
+        # 8-char correlation token — enough to grep-correlate one smoke run
+        # across services, but it reveals NONE of the actual hex (one-way).
         smoke_fp = hashlib.sha256(req.click_id.encode()).hexdigest()[:8]
 
-        # F.29 Sprint 4.1 (TD-13) — HMAC smoke-probe enforcement. This is
-        # the DURABLE fix for the forge vector (the sha256 fingerprint
-        # above only shrank the leak surface). When a dedicated
-        # `smoke_probe_secret` is configured, the bypass REQUIRES a valid
-        # `X-TDS-Smoke-Probe` HMAC that only admin-api can produce — so a
-        # holder of X-TDS-Key / the collector key / the central-stream hex
-        # cannot drive a false-positive activation. Fail CLOSED: a
-        # missing/invalid/expired probe → 403 (the admin-api smoke gate
-        # then reports a clear "node /decide returned HTTP 403", which an
-        # operator reads as a probe-secret rollout mismatch — recoverable
-        # via ?skip_smoke=true). When the secret is UNSET we fall back to
-        # the pre-Sprint-4.1 behaviour (bypass on X-TDS-Key alone) so
-        # nodes that predate the rollout keep working, but WARN so the gap
-        # is visible.
-        if settings.smoke_probe_secret:
-            probe_ok, probe_detail = _verify_smoke_probe(
-                req.click_id, x_tds_smoke_probe,
-            )
-            if not probe_ok:
-                logger.warning(
-                    "Smoke-probe auth FAILED click_id_fp=%s node_id=%s: %s "
-                    "— bypass REFUSED",
-                    smoke_fp, settings.node_id, probe_detail,
-                )
-                sentry_sdk.add_breadcrumb(
-                    category="smoke.probe",
-                    level="warning",
-                    message="smoke probe authentication failed",
-                    data={"detail": probe_detail, "node_id": settings.node_id},
-                )
-                raise HTTPException(
-                    status_code=403,
-                    detail=f"smoke probe authentication failed: {probe_detail}",
-                )
-        else:
+        # The TD-13 X-TDS-Smoke-Probe HMAC was already verified in the auth
+        # section above (when `smoke_probe_secret` is set it IS the auth for
+        # this click). When the secret is UNSET, this click reached here via
+        # `_check_tds_key` on X-TDS-Key alone (legacy / pre-rollout) — WARN so
+        # the unauthenticated-bypass gap is visible. Configure
+        # TDS_SMOKE_PROBE_SECRET on admin-api + the node to close it AND to let
+        # a fresh (unseeded) node pass smoke at all.
+        if not settings.smoke_probe_secret:
             logger.warning(
-                "Smoke bypass UNAUTHENTICATED (TDS_SMOKE_PROBE_SECRET unset) "
-                "click_id_fp=%s node_id=%s — configure the probe secret to "
-                "close the TD-13 forge vector",
+                "Smoke bypass authenticated by X-TDS-Key only (TDS_SMOKE_PROBE_"
+                "SECRET unset) click_id_fp=%s node_id=%s — set the probe secret "
+                "to close the TD-13 forge vector + let fresh nodes pass smoke",
                 smoke_fp, settings.node_id,
             )
         try:

@@ -395,6 +395,97 @@ def test_smoke_probe_malformed_header_refused(client, patched_auth, enforce_prob
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# F.33 (2026-05-24) — smoke probe authenticates a FRESH node (chicken-and-egg)
+# ---------------------------------------------------------------------------
+#
+# The activation smoke gate runs BEFORE seed, so a freshly-provisioned node's
+# per-Worker `worker_secret_hash` index is EMPTY → `_check_tds_key` 403s every
+# X-TDS-Key. The fix: a smoke click authenticates via the X-TDS-Smoke-Probe
+# HMAC and SKIPS `_check_tds_key` entirely. These pin that the per-Worker
+# check is bypassed when a valid probe is present, and still enforced
+# otherwise.
+
+
+def test_valid_probe_skips_per_worker_check_on_fresh_node():
+    """THE chicken-and-egg fix: with the probe secret set + a valid probe, the
+    smoke click succeeds EVEN WHEN `_check_tds_key` would 403 (a fresh node's
+    empty worker index). Proven by making `_check_tds_key` raise 403 — the
+    request must still return 200 because the probe path skips it."""
+    from fastapi import HTTPException
+    from app.main import app
+    client = TestClient(app)
+    click_id = "smoke-test-99-deadbeef00112233"
+    fake_redis = MagicMock()
+    fake_redis.xadd = AsyncMock(return_value="1-0")
+    # Simulate a FRESH node: the per-Worker check fail-closes (403).
+    fresh_node_403 = AsyncMock(side_effect=HTTPException(status_code=403, detail="Invalid TDS key"))
+
+    with patch.object(settings, "smoke_probe_secret", _PROBE_SECRET), \
+         patch("app.main._check_tds_key", new=fresh_node_403), \
+         patch("app.main.get_redis", new=AsyncMock(return_value=fake_redis)), \
+         patch("app.main.route", new=AsyncMock()):
+        r = client.post(
+            "/decide",
+            json=_smoke_payload(click_id),
+            headers={"X-TDS-Smoke-Probe": _make_probe(_PROBE_SECRET, click_id)},
+        )
+
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == 302
+    # The per-Worker check was NOT consulted — the probe is the auth.
+    fresh_node_403.assert_not_awaited()
+    fake_redis.xadd.assert_awaited_once()
+
+
+def test_invalid_probe_does_not_fall_through_to_per_worker_check():
+    """Enforce mode + a smoke click with a BAD probe → 403 from the probe
+    check; it must NOT fall through to `_check_tds_key` (which could
+    accidentally authenticate on a seeded node and mask the probe failure)."""
+    from fastapi import HTTPException
+    from app.main import app
+    client = TestClient(app)
+    click_id = "smoke-test-99-deadbeef00112233"
+    would_pass = AsyncMock(return_value=7)  # if reached, would auth — must NOT be reached
+
+    with patch.object(settings, "smoke_probe_secret", _PROBE_SECRET), \
+         patch("app.main._check_tds_key", new=would_pass), \
+         patch("app.main.get_redis", new=AsyncMock(return_value=MagicMock(xadd=AsyncMock()))), \
+         patch("app.main.route", new=AsyncMock()):
+        r = client.post(
+            "/decide",
+            json=_smoke_payload(click_id),
+            headers={"X-TDS-Smoke-Probe": _make_probe("wrong-secret-xxxxxxxxxxxxxxxxx", click_id)},
+        )
+
+    assert r.status_code == 403
+    would_pass.assert_not_awaited()  # probe failure is terminal, no fall-through
+
+
+def test_smoke_without_probe_secret_still_uses_per_worker_check():
+    """Backward-compat: when the probe secret is UNSET, a smoke click is NOT
+    probe-authed — it goes through `_check_tds_key` like any click (legacy /
+    pre-rollout). On a fresh node that 403s (the documented skip_smoke case);
+    here we assert the check IS consulted."""
+    from app.main import app
+    client = TestClient(app)
+    check = AsyncMock(return_value=1)  # seeded node — passes
+
+    # smoke_probe_secret defaults empty in the test env; assert behaviour.
+    with patch.object(settings, "smoke_probe_secret", ""), \
+         patch("app.main._check_tds_key", new=check), \
+         patch("app.main.get_redis", new=AsyncMock(return_value=MagicMock(xadd=AsyncMock(return_value="1-0")))), \
+         patch("app.main.route", new=AsyncMock()):
+        r = client.post(
+            "/decide",
+            json=_smoke_payload("smoke-test-1-aaaaaaaaaaaaaaaa"),
+            headers={"X-TDS-Key": "global-secret"},
+        )
+
+    assert r.status_code == 200
+    check.assert_awaited_once()  # legacy path still consults the per-Worker auth
+
+
 def test_verify_smoke_probe_helper_paths():
     """Direct coverage of the verifier's branches with the secret set."""
     from app.main import _verify_smoke_probe

@@ -335,6 +335,46 @@ async def _check_tds_key(x_tds_key: str) -> int:
     raise HTTPException(status_code=403, detail="Invalid TDS key")
 
 
+def _sync_secret_matches(x_tds_key: str) -> bool:
+    """Constant-time check of the static admin→node sync credential.
+
+    The config push on ``/admin/sync`` is authenticated by the node's
+    STATIC shared secret (``settings.tds_secret_key``) — exactly the
+    credential the ``_check_tds_key`` docstring designates: "the global
+    secret … remains the sync push/pull + edge-node channel credential
+    (admin-api sync auth …)". This is a DIFFERENT trust model from
+    ``/decide`` Worker→backend routing, which resolves a *per-Worker*
+    secret via the local ``worker_secret_hash`` index.
+
+    Why this exists (F.33, 2026-05-24): gating ``/admin/sync`` solely on
+    ``_check_tds_key`` was a chicken-and-egg. That index is EMPTY on a
+    freshly-provisioned node — it is populated *by* a sync (the snapshot
+    ships ``worker_secret_hash:*`` keys). So the very first config push,
+    the one that would seed the index, was rejected 403, and a fresh node
+    could never bootstrap its routing config (it went ``active`` via the
+    smoke probe yet stayed config-empty, mis-routing live traffic). The
+    node validating the push against the secret it baked at provision
+    time — the same value admin-api signs the push with — breaks the
+    cycle. Direct analogue of the ``/decide`` smoke-probe bypass.
+
+    Safe re F.25: that change removed the global-secret fallback from
+    ``/decide`` ROUTING auth (per-Worker secrets so a leaked global key
+    cannot route Worker traffic). The admin→node push channel is a
+    distinct threat model where the shared edge-node secret IS the
+    legitimate credential — the body-sig verifier (T2.4) already trusts
+    the same ``settings.tds_secret_key``.
+
+    Returns True iff the presented key equals the baked secret. Empty
+    header or empty/unset secret → False (fail-closed). Constant-time
+    compare — no secret-length or content timing leak.
+    """
+    provided = x_tds_key or ""
+    expected = settings.tds_secret_key or ""
+    if not provided or not expected:
+        return False
+    return hmac.compare_digest(provided, expected)
+
+
 # ============================================================================
 # Click event-time resolution (F.24 Phase 5.1b)
 # ============================================================================
@@ -1116,8 +1156,16 @@ async def receive_sync(
         ~500MB worth of JSON in ~50MB on the wire (~85-90% ratio
         for routing config payloads).
     """
-    # Auth (timing-safe + fail-closed per H6 fix).
-    await _check_tds_key(x_tds_key)
+    # Auth (timing-safe + fail-closed per H6 fix). The sync channel
+    # credential is the node's STATIC shared secret — gate on it FIRST,
+    # then fall back to the per-Worker index for defense in depth. This
+    # is essential for fresh-node bootstrap: the worker_secret_hash index
+    # is empty until the first sync populates it, so gating SOLELY on
+    # _check_tds_key 403'd the very push meant to seed it (a fresh node
+    # went active via the smoke probe yet could never receive config).
+    # See _sync_secret_matches for the full rationale + F.25 safety note.
+    if not _sync_secret_matches(x_tds_key):
+        await _check_tds_key(x_tds_key)
 
     # Diagnostic correlation — when admin-api propagated X-Test-Id (per
     # `_build_push_headers` in admin-api SyncService), bind it so the

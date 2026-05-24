@@ -80,6 +80,19 @@ class Settings(BaseSettings):
     require_central_url: bool = True
     require_central_url_https: bool = True
 
+    # F.32 Track 2 — config-snapshot pull URL, SEPARATE from `central_url`.
+    #
+    # `central_url` is the COLLECTOR (the F.29 shipper POSTs clicks to
+    # `{central_url}/api/clicks/batch`, X-Node-Key auth). The periodic
+    # config-snapshot pull (`sync_client.pull_from_central`) hits a
+    # DIFFERENT service — the admin-api `{sync_url}/api/system/sync/snapshot`
+    # (X-TDS-Key auth). Before this split the pull reused `central_url`, so
+    # once F.29 pointed `central_url` at the collector the pull 403'd every
+    # cycle (the collector has no snapshot endpoint). Config still flows via
+    # PUSH, so the pull is a best-effort safety net: empty `sync_url` ⇒ pull
+    # disabled (push-only); set it to the admin-api host to re-enable.
+    sync_url: str = ""
+
     # Fallback URL when routing fails
     fallback_url: str = "https://adstudy.dev"
 

@@ -21,6 +21,7 @@ BASE = {
     "TDS_NODE_REGION": "au",
     "TDS_SECRET_KEY": "shared-secret-xyz",
     "TDS_CENTRAL_URL": "https://api-collector.example.com",
+    "TDS_CENTRAL_API_KEY": "collector-shared-key",
     "TDS_ENVIRONMENT": "production",
     "CADDY_DOMAIN": "api-au.example.com",
 }
@@ -50,7 +51,8 @@ def test_writes_full_canonical_key_set(tmp_path):
     for key in (
         "TDS_NODE_ID", "TDS_NODE_REGION", "TDS_ENVIRONMENT", "TDS_PORT",
         "CADDY_DOMAIN", "TDS_SECRET_KEY", "TDS_TDS_SECRET_KEY",
-        "TDS_CENTRAL_URL", "TDS_CENTRAL_API_KEY", "TDS_SMOKE_PROBE_SECRET",
+        "TDS_CENTRAL_URL", "TDS_CENTRAL_API_KEY", "TDS_SYNC_URL",
+        "TDS_SMOKE_PROBE_SECRET",
         "TDS_SENTRY_DSN", "TDS_DIAG_TRACES_BOOST", "TDS_DIAG_OBS_STREAM",
         "TDS_DIAG_VERBOSE_LOGS", "TDS_CODE_VERSION",
     ):
@@ -65,15 +67,34 @@ def test_secret_double_write(tmp_path):
     assert env["TDS_TDS_SECRET_KEY"] == "shared-secret-xyz"
 
 
-def test_central_api_key_defaults_to_secret(tmp_path):
-    """Q5 (F.32): collector auth value == shared secret_key by default."""
-    _run(tmp_path)
-    assert _env_dict(tmp_path)["TDS_CENTRAL_API_KEY"] == "shared-secret-xyz"
+def test_central_api_key_required_not_secret(tmp_path):
+    """Q5 (F.32 Track 2 CORRECTED): the collector key is a SHARED deployment
+    secret (collector_api_key), NOT the node secret_key. It is REQUIRED — the
+    old `:-$TDS_SECRET_KEY` default produced the wrong value and the collector
+    rejected the shipper with 403. Dropping it must fail loud and write no .env."""
+    r = _run(tmp_path, drop=("TDS_CENTRAL_API_KEY",))
+    assert r.returncode != 0
+    assert "TDS_CENTRAL_API_KEY" in r.stderr
+    assert not (tmp_path / ".env").exists()
 
 
-def test_central_api_key_override(tmp_path):
+def test_central_api_key_uses_passed_value_not_secret(tmp_path):
+    """The rendered key is the passed collector key — never the node secret."""
     _run(tmp_path, {"TDS_CENTRAL_API_KEY": "distinct-collector-key"})
-    assert _env_dict(tmp_path)["TDS_CENTRAL_API_KEY"] == "distinct-collector-key"
+    env = _env_dict(tmp_path)
+    assert env["TDS_CENTRAL_API_KEY"] == "distinct-collector-key"
+    assert env["TDS_CENTRAL_API_KEY"] != env["TDS_SECRET_KEY"]
+
+
+def test_sync_url_empty_by_default(tmp_path):
+    """TDS_SYNC_URL (admin-api config-pull host) defaults empty ⇒ pull disabled."""
+    _run(tmp_path)
+    assert _env_dict(tmp_path)["TDS_SYNC_URL"] == ""
+
+
+def test_sync_url_passthrough(tmp_path):
+    _run(tmp_path, {"TDS_SYNC_URL": "https://api-tds.example.com"})
+    assert _env_dict(tmp_path)["TDS_SYNC_URL"] == "https://api-tds.example.com"
 
 
 def test_https_guard_rejects_http_in_production(tmp_path):

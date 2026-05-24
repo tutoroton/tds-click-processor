@@ -189,12 +189,17 @@ async def apply_snapshot(redis, snapshot: dict) -> dict:
 
 
 async def pull_from_central(redis) -> dict | None:
-    """Pull snapshot from central admin-api and apply to local Redis."""
-    central_url = settings.central_url
-    if not central_url:
+    """Pull snapshot from the admin-api and apply to local Redis.
+
+    Uses `sync_url` (the admin-api), NOT `central_url` (the collector) —
+    the snapshot endpoint lives on the admin-api. Empty `sync_url` ⇒
+    pull disabled (config flows via push). See `Settings.sync_url`.
+    """
+    sync_url = settings.sync_url
+    if not sync_url:
         return None
 
-    snapshot_url = f"{central_url.rstrip('/')}/api/system/sync/snapshot"
+    snapshot_url = f"{sync_url.rstrip('/')}/api/system/sync/snapshot"
 
     try:
         req = Request(
@@ -215,17 +220,17 @@ async def pull_from_central(redis) -> dict | None:
         return stats
 
     except (URLError, OSError, json.JSONDecodeError) as e:
-        logger.warning("Failed to pull from central %s: %s", central_url, e)
+        logger.warning("Failed to pull snapshot from %s: %s", sync_url, e)
         return None
 
 
 async def start_periodic_pull(redis, interval: int = 60):
-    """Background task: periodically pull from central."""
-    if not settings.central_url:
-        logger.info("No CENTRAL_URL configured — periodic pull disabled")
+    """Background task: periodically pull config snapshot from the admin-api."""
+    if not settings.sync_url:
+        logger.info("No TDS_SYNC_URL configured — periodic config pull disabled (push-only)")
         return
 
-    logger.info("Periodic pull started (every %ds from %s)", interval, settings.central_url)
+    logger.info("Periodic pull started (every %ds from %s)", interval, settings.sync_url)
 
     # Initial pull on startup — immediate, with retry
     await asyncio.sleep(3)

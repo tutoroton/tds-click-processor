@@ -22,6 +22,7 @@ require TDS_NODE_ID
 require TDS_NODE_REGION
 require TDS_SECRET_KEY
 require TDS_CENTRAL_URL
+require TDS_CENTRAL_API_KEY
 
 env_name="${TDS_ENVIRONMENT:-production}"
 
@@ -43,9 +44,14 @@ if [ -z "$code_version" ]; then
   code_version="$(git -C "$ENV_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 fi
 
-# Q5 (F.32): the collector auth value == the shared secret_key (the X-TDS-Key the
-# shipper presents). Matches the existing tds-deploy parity. Override via env.
-central_api_key="${TDS_CENTRAL_API_KEY:-$TDS_SECRET_KEY}"
+# Q5 (F.32, CORRECTED Track 2): the shipper's X-Node-Key MUST equal the
+# collector's `collector_api_key` (TDS_COLLECTOR_API_KEY on the collector) — a
+# SHARED deployment secret, NOT the node's `secret_key`. The old default
+# `${TDS_CENTRAL_API_KEY:-$TDS_SECRET_KEY}` produced the node secret_key, which
+# the collector rejects with 403 "Invalid node key" → shipper fails closed →
+# backlog stockpiles (the exact AU/CA symptom). Now REQUIRED (see `require`
+# above) — the caller (cloud-init / tds-deploy) MUST pass the collector key.
+central_api_key="${TDS_CENTRAL_API_KEY}"
 
 umask 077  # .env holds secrets — owner-only perms
 cat > "$ENV_FILE" <<EOF
@@ -62,6 +68,10 @@ TDS_SECRET_KEY=${TDS_SECRET_KEY}
 TDS_TDS_SECRET_KEY=${TDS_SECRET_KEY}
 TDS_CENTRAL_URL=${TDS_CENTRAL_URL}
 TDS_CENTRAL_API_KEY=${central_api_key}
+# F.32 Track 2 — admin-api host for the config-snapshot pull (separate from
+# TDS_CENTRAL_URL=collector). Empty ⇒ pull disabled (push-only). Set to the
+# admin-api (e.g. https://api-tds.<base>) to enable the pull safety net.
+TDS_SYNC_URL=${TDS_SYNC_URL:-}
 TDS_SMOKE_PROBE_SECRET=${TDS_SMOKE_PROBE_SECRET:-}
 TDS_SENTRY_DSN=${TDS_SENTRY_DSN:-}
 TDS_DIAG_TRACES_BOOST=${TDS_DIAG_TRACES_BOOST:-false}

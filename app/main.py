@@ -1288,15 +1288,44 @@ async def receive_sync(
 
     raw_body = await request.body()
 
+    # F-4 HIGH-003 (audit 2026-05-25) — require the sig in non-local.
+    # The legacy contract was "verify if present, accept if absent",
+    # which let an on-path attacker simply STRIP the header to bypass
+    # the body-integrity check entirely. In a non-local env where this
+    # node has a tds_secret_key (so the sig CAN be verified), a missing
+    # header is now a hard 401. admin-api signs on every push path, so
+    # this rejects only tampered/forged (header-stripped) pushes — never
+    # a legitimate one. Gated on tds_secret_key so a fresh node that has
+    # not yet received its shared secret still bootstraps. Escape hatch:
+    # TDS_REQUIRE_BODY_SIG=false reverts to lenient (incident rollback to
+    # a non-signing producer). Local/dev is always lenient.
+    _non_local = settings.environment not in _LOCAL_ENVIRONMENTS
+    if (
+        settings.require_body_sig
+        and _non_local
+        and settings.tds_secret_key
+        and not x_tds_body_sig
+    ):
+        logger.warning(
+            "X-TDS-Body-Sig ABSENT on /admin/sync in env=%s — rejecting "
+            "(HIGH-003 require-sig). Set TDS_REQUIRE_BODY_SIG=false only "
+            "for an incident rollback to a non-signing producer.",
+            settings.environment,
+        )
+        raise HTTPException(
+            status_code=401,
+            detail="Body signature required",
+        )
+
     # T2.4 — body integrity check. Verify BEFORE decompression so
     # a corrupt gzip body fails the sig check (cleaner error
     # surface) rather than the gunzip step. Sig is over the EXACT
     # bytes that arrived on the wire — independent of compression.
     #
-    # Lenient on absent header (older admin-api builds + dev mode
-    # without tds_secret_key configured). Strict on present-but-
-    # mismatched: that's the active-MITM scenario the sig defends
-    # against, so 401 with no further processing.
+    # Lenient on absent header ONLY in local/dev or when require_body_sig
+    # is disabled (the enforcement block above handles non-local). Strict
+    # on present-but-mismatched: that's the active-MITM scenario the sig
+    # defends against, so 401 with no further processing.
     if x_tds_body_sig and settings.tds_secret_key:
         # Format `sha256=<hex>` mirrors GitHub webhook signature
         # convention. Future algos (sha512) can ship under the

@@ -33,6 +33,19 @@ class Settings(BaseSettings):
     # Auth (shared secret with CF Worker)
     tds_secret_key: str = ""
 
+    # F-4 HIGH-003 (audit 2026-05-25) — require the X-TDS-Body-Sig header
+    # on /admin/sync in non-local envs (defense-in-depth vs an on-path
+    # attacker who keeps the valid X-TDS-Key but tampers with the snapshot
+    # body). Enforcement is GATED on the node also having a tds_secret_key
+    # (without it the sig cannot be verified, and a fresh node mid-bootstrap
+    # may legitimately lack it). admin-api signs on BOTH push paths
+    # (SyncService._build_push_headers + the seed_data fallback), so this
+    # never rejects a legitimate push. Escape hatch: set
+    # TDS_REQUIRE_BODY_SIG=false to fall back to lenient verify-if-present —
+    # for an incident where a non-signing producer (e.g. a rolled-back
+    # admin-api) must push. Mismatched sigs are ALWAYS rejected regardless.
+    require_body_sig: bool = True
+
     # F.29 Sprint 4.1 (TD-13, 2026-05-23) — HMAC smoke-probe authenticator.
     #
     # Dedicated secret shared between admin-api and every edge node, but

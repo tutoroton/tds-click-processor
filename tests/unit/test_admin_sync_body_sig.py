@@ -1,12 +1,13 @@
 """Tests for the click-processor side of T2.4 — HMAC-SHA256 body
 integrity verification on `/admin/sync`.
 
-Defends the plain-HTTP edge sync path against active MITM. Sig is
-optional today (lenient on absent header for backward compat with
-older admin-api builds + dev mode without a configured secret),
-but when present it MUST verify byte-exact against
-``hmac_sha256(tds_secret_key, raw_body)``. Mismatch → 401, no
-snapshot apply.
+Defends the plain-HTTP edge sync path against active MITM. When a sig
+is present it MUST verify byte-exact against
+``hmac_sha256(tds_secret_key, raw_body)`` — mismatch → 401, no snapshot
+apply. F-4 HIGH-003 (audit 2026-05-25): in non-local envs with a
+configured ``tds_secret_key`` the sig is now REQUIRED (an absent header
+→ 401), closing the header-strip bypass; local/dev and the
+``TDS_REQUIRE_BODY_SIG=false`` escape hatch stay lenient-on-absent.
 
 Coverage:
 
@@ -117,19 +118,41 @@ class TestReceiveSyncSource:
             "sig errors."
         )
 
-    def test_lenient_on_absent_header(self):
-        """Backward compat — older admin-api builds don't ship the
-        sig header. We must NOT 401 in that case; the X-TDS-Key
-        check is the existing auth surface and remains the
-        primary gate."""
+    def test_verify_if_present_branch_preserved(self):
+        """The verify-if-present branch MUST remain: a present sig is
+        always checked byte-exact (the MITM defence). This is the gate
+        for local/dev and for the require_body_sig-disabled escape
+        hatch; non-local enforcement is a SEPARATE prior block."""
         source = self._source()
-        # The branch we want is "if x_tds_body_sig and ..." —
-        # absent (empty) header skips the verifier entirely.
-        # Pin the canonical condition shape.
         assert "if x_tds_body_sig and settings.tds_secret_key" in source, (
-            "Handler must be lenient on absent X-TDS-Body-Sig "
-            "(older admin-api builds). Required gate is "
+            "Handler must keep the verify-if-present gate "
             "`if x_tds_body_sig and settings.tds_secret_key:`."
+        )
+
+    def test_require_sig_enforced_in_nonlocal(self):
+        """F-4 HIGH-003 (audit 2026-05-25) — the legacy "accept on absent
+        header" was a bypass (an on-path attacker just STRIPS the sig).
+        In non-local with a tds_secret_key set, an ABSENT sig is now a
+        hard 401. Gated on `require_body_sig` (escape hatch) and on the
+        node having a secret (fresh-node bootstrap). Local/dev stays
+        lenient."""
+        source = self._source()
+        assert "settings.require_body_sig" in source, (
+            "Handler must gate the require-sig enforcement on the "
+            "TDS_REQUIRE_BODY_SIG escape-hatch flag."
+        )
+        assert "Body signature required" in source, (
+            "Handler must 401 with 'Body signature required' when a "
+            "non-local push omits X-TDS-Body-Sig (HIGH-003)."
+        )
+        # Enforcement must precede the verify-if-present block so an
+        # absent header is rejected before the lenient branch is reached.
+        idx_enforce = source.find("settings.require_body_sig")
+        idx_lenient = source.find("if x_tds_body_sig and settings.tds_secret_key")
+        assert idx_enforce != -1 and idx_lenient != -1
+        assert idx_enforce < idx_lenient, (
+            "require-sig enforcement must run before the verify-if-present "
+            "block."
         )
 
 
@@ -205,6 +228,82 @@ class TestSigMath:
         sig_a = _expected_sig(body, "k")
         sig_b = _expected_sig(body, "k")
         assert sig_a == sig_b, "Determinism must hold for any size"
+
+
+class TestRequireSigEnforcement:
+    """F-4 HIGH-003 — behavioural test of the non-local require-sig gate.
+
+    The enforcement fires after auth but before any Redis/snapshot work,
+    so a matching X-TDS-Key (== tds_secret_key, accepted by
+    _sync_secret_matches) reaches it with no other mocking needed.
+    """
+
+    def _client(self):
+        from fastapi.testclient import TestClient
+        from app.main import app
+        return TestClient(app, raise_server_exceptions=False)
+
+    def test_nonlocal_absent_sig_rejected_401(self, monkeypatch):
+        from app.config import settings
+        secret = "k" * 40
+        monkeypatch.setattr(settings, "environment", "production")
+        monkeypatch.setattr(settings, "tds_secret_key", secret)
+        monkeypatch.setattr(settings, "require_body_sig", True)
+        r = self._client().post(
+            "/admin/sync",
+            content=b'{"data":{}}',
+            headers={"X-TDS-Key": secret},  # no X-TDS-Body-Sig
+        )
+        assert r.status_code == 401
+        assert "signature required" in r.json()["detail"].lower()
+
+    def test_local_absent_sig_allowed(self, monkeypatch):
+        """Local/dev stays lenient — absent sig must NOT 401 (it proceeds
+        past the gate; downstream apply is out of scope here)."""
+        from app.config import settings
+        secret = "k" * 40
+        monkeypatch.setattr(settings, "environment", "development")
+        monkeypatch.setattr(settings, "tds_secret_key", secret)
+        monkeypatch.setattr(settings, "require_body_sig", True)
+        r = self._client().post(
+            "/admin/sync",
+            content=b'{"data":{}}',
+            headers={"X-TDS-Key": secret},
+        )
+        assert r.status_code != 401
+
+    def test_escape_hatch_disables_enforcement(self, monkeypatch):
+        """TDS_REQUIRE_BODY_SIG=false reverts to lenient even in non-local
+        (incident rollback to a non-signing producer)."""
+        from app.config import settings
+        secret = "k" * 40
+        monkeypatch.setattr(settings, "environment", "production")
+        monkeypatch.setattr(settings, "tds_secret_key", secret)
+        monkeypatch.setattr(settings, "require_body_sig", False)
+        r = self._client().post(
+            "/admin/sync",
+            content=b'{"data":{}}',
+            headers={"X-TDS-Key": secret},
+        )
+        assert r.status_code != 401
+
+    def test_nonlocal_no_secret_skips_enforcement(self, monkeypatch):
+        """A fresh node without tds_secret_key cannot verify a sig, so
+        enforcement is skipped — but then auth (which also needs the
+        secret) governs. We assert it does NOT 401 specifically on the
+        'signature required' path."""
+        from app.config import settings
+        monkeypatch.setattr(settings, "environment", "production")
+        monkeypatch.setattr(settings, "tds_secret_key", "")
+        monkeypatch.setattr(settings, "require_body_sig", True)
+        r = self._client().post(
+            "/admin/sync",
+            content=b'{"data":{}}',
+            headers={"X-TDS-Key": ""},
+        )
+        # Whatever the auth outcome, it must not be the require-sig 401.
+        if r.status_code == 401:
+            assert "signature required" not in r.json().get("detail", "").lower()
 
 
 class TestUnsupportedAlgoRejection:

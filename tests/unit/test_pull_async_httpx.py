@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import inspect
 
+import pytest
+
 
 def test_pull_from_central_uses_async_httpx():
     from app.sync_client import pull_from_central
@@ -34,3 +36,62 @@ def test_sync_client_module_does_not_import_urllib():
     src = inspect.getsource(sync_client)
     assert "from urllib.request import" not in src
     assert "import httpx" in src
+
+
+@pytest.mark.asyncio
+async def test_pull_catches_timeout_returns_none(monkeypatch):
+    """A network timeout (httpx.TimeoutException ⊂ httpx.HTTPError) must be
+    caught → return None, never crash the periodic-pull task."""
+    import httpx
+    from app import sync_client
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "sync_url", "http://central:8101")
+
+    class _Boom:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, *a, **k):
+            raise httpx.TimeoutException("timed out")
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda *a, **k: _Boom())
+    result = await sync_client.pull_from_central(object())
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_pull_catches_http_500_returns_none(monkeypatch):
+    """raise_for_status() on a 5xx raises HTTPStatusError ⊂ httpx.HTTPError
+    → caught → None."""
+    import httpx
+    from app import sync_client
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "sync_url", "http://central:8101")
+
+    class _Resp:
+        def raise_for_status(self):
+            raise httpx.HTTPStatusError(
+                "500", request=None, response=None,
+            )
+
+        def json(self):
+            return {}
+
+    class _Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, *a, **k):
+            return _Resp()
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda *a, **k: _Client())
+    result = await sync_client.pull_from_central(object())
+    assert result is None

@@ -49,11 +49,19 @@ class TestStatsAuthGate:
         assert r.status_code == 200
         assert r.json()["redis_keys"] == 42
 
+    def test_loopback_set_covers_v4_v6_and_mapped(self):
+        """All loopback peer forms uvicorn can report (incl. the
+        IPv4-mapped-IPv6 dual-stack form) must be in the carve-out set,
+        else a dual-stack node would falsely gate the health probe."""
+        from app.main import _LOOPBACK_HOSTS
+        assert {"127.0.0.1", "::1", "::ffff:127.0.0.1"} <= _LOOPBACK_HOSTS
+
     def test_nonlocal_non_loopback_no_key_rejected(self, client, monkeypatch):
         from app.config import settings
         monkeypatch.setattr(settings, "environment", "production")
         monkeypatch.setattr(settings, "tds_secret_key", _SECRET)
-        # TestClient's client host is "testclient" (non-loopback) → auth required.
+        # TestClient's client host is "testclient" (non-loopback) → auth
+        # required. This same branch covers request.client == None (→ "").
         r = client.get("/stats")  # no X-TDS-Key
         assert r.status_code == 403
 

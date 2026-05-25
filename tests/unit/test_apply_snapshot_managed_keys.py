@@ -91,13 +91,16 @@ class TestNoScanInApplySnapshot:
         """The literal 'fold _MANAGED_KEY into the write MULTI' was
         REJECTED — committing the new managed set before the Step-3
         stale deletes regresses orphan cleanup. Pin that the write
-        pipeline does NOT touch _MANAGED_KEY (it stays a post-delete
-        rebuild)."""
+        pipeline (`write_pipe`) NEVER touches _MANAGED_KEY; the only
+        _MANAGED_KEY mutations are on the `track_pipe` (post-delete)."""
         source = self._source()
-        # Everything up to the Step-3 delete block is the write phase.
-        write_phase = source.split("Step 3:")[0]
-        assert "write_pipe.sadd(_MANAGED_KEY" not in write_phase
-        assert "write_pipe.delete(_MANAGED_KEY" not in write_phase
+        # Robust against comment/step renumbering: assert directly that
+        # the write pipeline never references _MANAGED_KEY.
+        assert "write_pipe.sadd(_MANAGED_KEY" not in source
+        assert "write_pipe.delete(_MANAGED_KEY" not in source
+        assert "write_pipe.set(_MANAGED_KEY" not in source
+        # And _MANAGED_KEY IS rebuilt on the dedicated tracking pipe.
+        assert "track_pipe.sadd(_MANAGED_KEY" in source
 
     def test_routing_prefixes_are_documentation_only(self):
         """`_ROUTING_PREFIXES` must remain in the module (operator
@@ -263,6 +266,36 @@ async def test_upgraded_node_deletes_only_the_delta():
     assert set(sadd_args.args[1:]) == {
         "campaign:1", "campaign:2", "offer:1", "offer:5",
     }
+
+
+@pytest.mark.asyncio
+async def test_crash_recovery_self_heals_stale_keys():
+    """HIGH-004 invariant: the track-AFTER-delete ordering is what makes
+    a crash mid-sync self-healing. Simulate the recovery: a prior apply
+    crashed after the writes but before the stale-delete, so this node's
+    `_MANAGED_KEY` still carries the OLD set. The NEXT apply must still
+    discover and delete the now-stale keys via `all_existing` (= the old
+    managed set). This is the entire correctness argument for NOT folding
+    `_MANAGED_KEY` into the write MULTI."""
+    from app.sync_client import apply_snapshot
+
+    # Old managed set from before the (crashed) prior apply.
+    old = {"campaign:1", "offer:1", "offer:OLD"}
+    redis = _make_redis_mock(initial_managed=old)
+    # New snapshot drops offer:OLD.
+    snapshot = _snapshot(
+        {"campaign:1": {"name": "C1"}, "offer:1": {"url": "https://x"}},
+    )
+
+    stats = await apply_snapshot(redis, snapshot)
+
+    assert stats["stale_removed"] == 1
+    delete_pipe = redis._pipelines[1]
+    deleted = [c.args[0] for c in delete_pipe.delete.call_args_list]
+    assert deleted == ["offer:OLD"], (
+        "A crash that left _MANAGED_KEY = old set MUST still let the next "
+        "apply clean the stale key — the self-healing property."
+    )
 
 
 @pytest.mark.asyncio

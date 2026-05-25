@@ -1215,7 +1215,20 @@ async def health():
     )
 
 
-_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+# Loopback peer addresses for the /stats health-probe carve-out.
+# `::ffff:127.0.0.1` is the IPv4-mapped-IPv6 form a dual-stack uvicorn
+# bind can report for a localhost connection — included so the deploy
+# health.sh probe is not falsely gated on a dual-stack node. All forms
+# are kernel-set socket peers; an external client cannot spoof them.
+#
+# INVARIANT: this carve-out is sound ONLY while click-processor :8100 is
+# reached DIRECTLY (no L7 reverse-proxy on the same host). A front proxy
+# would make every caller's peer == loopback → unauthenticated /stats.
+# Recorded in rule `architecture` ("/stats loopback trust"). Re-evaluate
+# before fronting a node with a proxy.
+_LOOPBACK_HOSTS = frozenset(
+    {"127.0.0.1", "::1", "localhost", "::ffff:127.0.0.1"}
+)
 
 
 @app.get("/stats")

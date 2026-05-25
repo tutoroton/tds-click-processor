@@ -154,7 +154,14 @@ async def apply_snapshot(redis, snapshot: dict) -> dict:
     # Execute writes
     await write_pipe.execute()
 
-    # Step 3: THEN delete stale keys (routing data is already live)
+    # Step 3: THEN delete stale keys (routing data is already live).
+    # Deliberately NON-transactional: these are DELETEs of mutually
+    # independent keys that need no atomicity with each other, and the
+    # "delete AFTER the Step-2 writes commit" ordering is what guarantees
+    # no routing-empty window. Wrapping them in a MULTI would add no
+    # correctness and only enlarge the block — do NOT "tighten" this to
+    # transaction=True. (HIGH-004 keeps the managed-keys rebuild, not the
+    # deletes, as the atomic unit — see Step 4.)
     stale_keys = all_existing - new_keys
     if stale_keys:
         delete_pipe = redis.pipeline()

@@ -78,6 +78,27 @@ class TestNoScanInApplySnapshot:
             "as the stale-key-discovery primitive (T1.3 / G-21)."
         )
 
+    def test_managed_key_rebuild_is_transactional(self):
+        """F-4 HIGH-004 — the _MANAGED_KEY DELETE+SADD rebuild must be a
+        MULTI/EXEC so a concurrent reader never sees an empty set."""
+        source = self._source()
+        assert "track_pipe = redis.pipeline(transaction=True)" in source, (
+            "The managed-keys tracking pipeline must be transactional "
+            "(HIGH-004) so DELETE + SADD commit atomically."
+        )
+
+    def test_managed_key_not_folded_into_write_pipe(self):
+        """The literal 'fold _MANAGED_KEY into the write MULTI' was
+        REJECTED — committing the new managed set before the Step-3
+        stale deletes regresses orphan cleanup. Pin that the write
+        pipeline does NOT touch _MANAGED_KEY (it stays a post-delete
+        rebuild)."""
+        source = self._source()
+        # Everything up to the Step-3 delete block is the write phase.
+        write_phase = source.split("Step 3:")[0]
+        assert "write_pipe.sadd(_MANAGED_KEY" not in write_phase
+        assert "write_pipe.delete(_MANAGED_KEY" not in write_phase
+
     def test_routing_prefixes_are_documentation_only(self):
         """`_ROUTING_PREFIXES` must remain in the module (operator
         debug breadcrumb for `redis-cli --scan --pattern <prefix>*`)

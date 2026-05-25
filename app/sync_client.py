@@ -32,8 +32,8 @@ import asyncio
 import json
 import logging
 import time
-from urllib.request import Request, urlopen
-from urllib.error import URLError
+
+import httpx
 
 from app.config import settings
 
@@ -162,8 +162,25 @@ async def apply_snapshot(redis, snapshot: dict) -> dict:
             delete_pipe.delete(key)
         await delete_pipe.execute()
 
-    # Step 4: Update managed keys tracking
-    track_pipe = redis.pipeline()
+    # Step 4: Update managed keys tracking.
+    #
+    # F-4 HIGH-004 (audit 2026-05-25): `transaction=True` makes the
+    # DELETE + SADD rebuild atomic, so a concurrent reader never sees an
+    # empty `_MANAGED_KEY` between the two commands.
+    #
+    # The audit's literal suggestion — "fold _MANAGED_KEY into the Step-2
+    # write MULTI" — was REJECTED: committing the new managed set BEFORE
+    # the Step-3 stale deletes would, on a crash between the two, leave
+    # the old stale keys un-deleted AND absent from `_MANAGED_KEY` (=new
+    # set) → they would never be discovered for cleanup again (an orphan
+    # leak). The CURRENT order (track AFTER deletes) is deliberately
+    # self-healing: a crash leaves `_MANAGED_KEY` = old set, so the next
+    # sync's `all_existing` still contains the stale keys and deletes
+    # them. A fully-atomic alternative (writes + deletes + tracking in
+    # ONE MULTI) is the only correct way to also fold the deletes; it is
+    # a larger change to this load-bearing, proven, self-healing path and
+    # is deferred — not worth the risk for the marginal gain.
+    track_pipe = redis.pipeline(transaction=True)
     track_pipe.delete(_MANAGED_KEY)
     if new_keys:
         track_pipe.sadd(_MANAGED_KEY, *new_keys)
@@ -202,14 +219,20 @@ async def pull_from_central(redis) -> dict | None:
     snapshot_url = f"{sync_url.rstrip('/')}/api/system/sync/snapshot"
 
     try:
-        req = Request(
-            snapshot_url,
-            headers={
-                "X-TDS-Key": settings.tds_secret_key or "",
-                "Accept": "application/json",
-            },
-        )
-        resp_data = json.loads(urlopen(req, timeout=15).read())
+        # F-4 MEDIUM (audit 2026-05-25) — async httpx, not blocking
+        # urllib.urlopen. This runs on the periodic-pull task inside the
+        # event loop; a blocking urlopen stalled every other coroutine
+        # (shipper, observability, /decide) for the request duration.
+        async with httpx.AsyncClient(timeout=15) as http_client:
+            resp = await http_client.get(
+                snapshot_url,
+                headers={
+                    "X-TDS-Key": settings.tds_secret_key or "",
+                    "Accept": "application/json",
+                },
+            )
+            resp.raise_for_status()
+            resp_data = resp.json()
 
         if not resp_data.get("data"):
             logger.warning("Central snapshot has no data")
@@ -219,7 +242,7 @@ async def pull_from_central(redis) -> dict | None:
         logger.info("Pull from central complete: %d keys", stats["keys_written"])
         return stats
 
-    except (URLError, OSError, json.JSONDecodeError) as e:
+    except (httpx.HTTPError, json.JSONDecodeError) as e:
         logger.warning("Failed to pull snapshot from %s: %s", sync_url, e)
         return None
 

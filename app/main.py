@@ -86,6 +86,27 @@ async def lifespan(app: FastAPI):
     if settings.environment == "production" and not settings.tds_secret_key:
         logger.warning("TDS_SECRET_KEY is empty in production — auth disabled!")
 
+    # F-4 MEDIUM (audit 2026-05-25) — smoke-probe authenticator visibility.
+    # When `smoke_probe_secret` is unset in a non-local env, the /decide
+    # smoke-test bypass falls back to X-TDS-Key alone (a forge vector — a
+    # key-holder or log/stream observer can drive a false activation). The
+    # design deliberately does NOT boot-guard this (onboarding-only path,
+    # graceful degradation) and already WARNs on each bypass — but surface
+    # it ONCE at startup too (log + Sentry) so the misconfig is visible
+    # before any probe arrives, without changing the graceful behaviour.
+    if settings.environment not in _LOCAL_ENVIRONMENTS and not settings.smoke_probe_secret:
+        logger.warning(
+            "TDS_SMOKE_PROBE_SECRET is empty in env=%s — /decide smoke bypass "
+            "is authenticated by X-TDS-Key alone (forgeable). Configure the "
+            "shared smoke-probe secret to close the false-activation vector.",
+            settings.environment,
+        )
+        sentry_sdk.capture_message(
+            "smoke-probe secret unset in non-local — /decide smoke bypass "
+            "forgeable via X-TDS-Key alone",
+            level="warning",
+        )
+
     r = await get_redis()
     try:
         await r.ping()
@@ -1194,9 +1215,31 @@ async def health():
     )
 
 
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+
+
 @app.get("/stats")
-async def stats():
-    """Quick stats."""
+async def stats(
+    request: Request,
+    x_tds_key: str = Header("", alias="X-TDS-Key"),
+):
+    """Quick operational stats (node id, region, redis size).
+
+    F-4 MEDIUM (audit 2026-05-25): previously fully unauthenticated,
+    leaking node identity + config/memory size to any reachable caller.
+    Gated in non-local — but the deploy ``health.sh`` probe curls this
+    from LOOPBACK, so loopback stays open (zero-config health check) and
+    any OTHER caller must present the node's X-TDS-Key (same credential
+    as /admin/sync: static sync secret OR the per-Worker index).
+    Local/dev is fully open for convenience.
+    """
+    if settings.environment not in _LOCAL_ENVIRONMENTS:
+        client_host = request.client.host if request.client else ""
+        if client_host not in _LOOPBACK_HOSTS:
+            # Mirrors the /admin/sync auth ladder: static secret first,
+            # per-Worker index fallback (raises 403 on a miss).
+            if not _sync_secret_matches(x_tds_key):
+                await _check_tds_key(x_tds_key)
     r = await get_redis()
     try:
         info = await r.info("memory")

@@ -379,6 +379,20 @@ def _sync_secret_matches(x_tds_key: str) -> bool:
 # Click event-time resolution (F.24 Phase 5.1b)
 # ============================================================================
 
+def _resolve_fallback_url() -> str:
+    """Resolve the global fallback URL for blocked / no-match clicks.
+
+    Single chokepoint so the fallback destination is configurable. Today it
+    returns the node's env-configured ``settings.fallback_url``. GROUNDWORK
+    (F-1, 2026-05-25): this is the one place an admin-pushed override will be
+    read from synced config (delivered via the snapshot push) — wiring the
+    admin settings UI is a tracked roadmap item. Centralising the three call
+    sites (route_error / no_match / blocked) here means that future change is a
+    one-function edit with NO behavioural change today.
+    """
+    return settings.fallback_url
+
+
 def _resolve_click_timestamp(click_ts: str | None) -> str:
     """Canonical click instant for the click record / collector created_at.
 
@@ -730,22 +744,37 @@ async def decide(
                 "endpoint_total_ms": round((time.perf_counter() - t_endpoint_start) * 1000, 2),
             })
         return ClickResponse(
-            url=f"{settings.fallback_url}?reason=error&click_id={quote(req.click_id, safe='')}",
+            url=f"{_resolve_fallback_url()}?reason=error&click_id={quote(req.click_id, safe='')}",
             status=302,
         )
 
-    if result is None:
-        emit_checkpoint("click.no_match", {"click_id": req.click_id})
-        if x_test_id:
-            emit_checkpoint("click.decide_out", {
-                "click_id": req.click_id,
-                "outcome": "no_match",
-                "endpoint_total_ms": round((time.perf_counter() - t_endpoint_start) * 1000, 2),
-            })
-        return ClickResponse(
-            url=f"{settings.fallback_url}?reason=no_match&click_id={quote(req.click_id, safe='')}",
-            status=302,
-        )
+    # F-1 (2026-05-25): no_match AND blocked clicks are NOT dropped — they
+    # become full, RECORDED clicks routed to the (admin-configurable) fallback
+    # URL, tagged with their routing outcome, then fall through to the SAME
+    # record-build → dedup → XADD → 302 path as a matched click. Previously
+    # no_match early-returned (never recorded) and the blocked sentinel
+    # (`{"url": None, "blocked": True}` from router.route) crashed at the
+    # action_resolved checkpoint below (`None[:200]` → HTTP 500 → Worker
+    # "All backends failed" → fallback). The matched path is byte-identical
+    # (it never enters this branch). `result is None` is checked first so
+    # `result.get("blocked")` is only evaluated on a dict.
+    if result is None or result.get("blocked"):
+        reason = "no_match" if result is None else "blocked"
+        fb_timing = {} if result is None else (result.get("timing") or {})
+        fb_timing.setdefault("result", reason)
+        result = {
+            "url": f"{_resolve_fallback_url()}?reason={reason}"
+                   f"&click_id={quote(req.click_id, safe='')}",
+            "campaign_id": None if result is None else result.get("campaign_id"),
+            "offer_id": None,
+            "binding_id": 0 if result is None else result.get("binding_id", 0),
+            "binding_alias": None if result is None else result.get("binding_alias"),
+            "timing": fb_timing,
+            # Surfaced into click_record.extra_params below so the fallback
+            # click is queryable (extra_params->>'routing_status').
+            "routing_status": reason,
+        }
+        emit_checkpoint(f"click.{reason}", {"click_id": req.click_id})
 
     # Routing decision resolved — emit summary checkpoint with the
     # selected campaign / offer / final URL so the trace timeline
@@ -755,7 +784,9 @@ async def decide(
     emit_checkpoint("click.action_resolved", {
         "campaign_id": result.get("campaign_id"),
         "offer_id": result.get("offer_id"),
-        "url": result.get("url", "")[:200],
+        # Defensive: `.get("url", "")` returns None when the key is present
+        # with value None (the old block-sentinel crash) — `or ""` guards it.
+        "url": (result.get("url") or "")[:200],
     })
 
     # Extract routing timing
@@ -779,7 +810,10 @@ async def decide(
         # domain binding) default to 0 / "" (the "(default)" bucket).
         "binding_id": result.get("binding_id", 0),
         "binding_alias": result.get("binding_alias") or "",
-        "landing_url": result["url"],
+        # Defensive: every path that reaches here now sets a string url
+        # (matched offer OR fallback) — `.get` guards a hypothetical None
+        # from becoming a KeyError (it lands as SQL NULL instead).
+        "landing_url": result.get("url"),
         "ip": req.ip,
         "country": req.country,
         "city": req.city,
@@ -815,6 +849,11 @@ async def decide(
                         if k not in ("source", "creative", "buyer", "campaign_ext",
                                      "utm_campaign", "adgroup", "adset", "app", "team", "debug")},
     }
+    # F-1: tag fallback (no_match / blocked) clicks so they are queryable
+    # (extra_params->>'routing_status'). Only set on the fallback path — a
+    # matched click's record is byte-identical to before.
+    if result.get("routing_status"):
+        click_record["extra_params"]["routing_status"] = result["routing_status"]
     record_build_ms = round((time.perf_counter() - t_record_start) * 1000, 2)
 
     # Assemble timing before stream write (stream_write_ms added after)

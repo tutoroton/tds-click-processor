@@ -461,6 +461,180 @@ async def test_shipper_health_lag_pages(monkeypatch, _fresh_shipper_metrics):
     assert "lag" in fake_sentry.capture_message.call_args.args[0].lower()
 
 
+# F-3 (audit 2026-05-25) — lag-alert de-noise: gate on actual backlog.
+
+def _redis_with_group(pending=0, lag=0, *, raise_exc=None, groups=None):
+    """AsyncMock redis whose xinfo_groups returns the shipper group with
+    the given pending/lag (or a custom groups list, or raises)."""
+    r = AsyncMock()
+    if raise_exc is not None:
+        r.xinfo_groups = AsyncMock(side_effect=raise_exc)
+    elif groups is not None:
+        r.xinfo_groups = AsyncMock(return_value=groups)
+    else:
+        r.xinfo_groups = AsyncMock(return_value=[
+            {"name": observability._SHIPPER_GROUP, "pending": pending, "lag": lag},
+        ])
+    return r
+
+
+@pytest.mark.asyncio
+async def test_shipper_health_lag_drained_suppressed(monkeypatch, _fresh_shipper_metrics):
+    """THE fix: lag over threshold but the shipper group is fully drained
+    (pending=0, lag=0) → idle, not a stall → NO page. This is the
+    low-traffic false-alarm the audit found (2498 false pages/13h)."""
+    import time as _t
+    _set_env(monkeypatch)
+    m = _fresh_shipper_metrics
+    m.running = True
+    m.last_ship_at = _t.time() - 400  # > 300s threshold
+    redis = _redis_with_group(pending=0, lag=0)
+    fake_sentry = MagicMock()
+    with patch("app.observability.sentry_sdk", fake_sentry):
+        await observability.emit_shipper_health(redis)
+    fake_sentry.capture_message.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_shipper_health_lag_pending_backlog_pages(monkeypatch, _fresh_shipper_metrics):
+    """Lag over threshold AND clicks delivered-but-unacked (PEL>0) → a
+    genuine in-flight stall → page."""
+    import time as _t
+    _set_env(monkeypatch)
+    m = _fresh_shipper_metrics
+    m.running = True
+    m.last_ship_at = _t.time() - 400
+    redis = _redis_with_group(pending=5, lag=0)
+    fake_sentry = MagicMock()
+    with patch("app.observability.sentry_sdk", fake_sentry):
+        await observability.emit_shipper_health(redis)
+    fake_sentry.capture_message.assert_called_once()
+    assert fake_sentry.capture_message.call_args.kwargs["level"] == "error"
+    assert "backlog=5" in fake_sentry.capture_message.call_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_shipper_health_lag_undelivered_backlog_pages(monkeypatch, _fresh_shipper_metrics):
+    """Lag over threshold AND unread entries (group lag>0) → page."""
+    import time as _t
+    _set_env(monkeypatch)
+    m = _fresh_shipper_metrics
+    m.running = True
+    m.last_ship_at = _t.time() - 400
+    redis = _redis_with_group(pending=0, lag=7)
+    fake_sentry = MagicMock()
+    with patch("app.observability.sentry_sdk", fake_sentry):
+        await observability.emit_shipper_health(redis)
+    fake_sentry.capture_message.assert_called_once()
+    assert "backlog=7" in fake_sentry.capture_message.call_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_shipper_health_lag_redis_error_fails_open(monkeypatch, _fresh_shipper_metrics):
+    """Backlog UNKNOWN (xinfo_groups raises) → FAIL OPEN: the legacy
+    lag alert still fires so a real stall is never silenced by the gate."""
+    import time as _t
+    _set_env(monkeypatch)
+    m = _fresh_shipper_metrics
+    m.running = True
+    m.last_ship_at = _t.time() - 400
+    redis = _redis_with_group(raise_exc=ConnectionError("redis down"))
+    fake_sentry = MagicMock()
+    with patch("app.observability.sentry_sdk", fake_sentry):
+        await observability.emit_shipper_health(redis)
+    fake_sentry.capture_message.assert_called_once()
+    assert "backlog=unknown" in fake_sentry.capture_message.call_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_shipper_health_lag_group_absent_fails_open(monkeypatch, _fresh_shipper_metrics):
+    """Group not present in xinfo_groups → backlog unknown → fail open."""
+    import time as _t
+    _set_env(monkeypatch)
+    m = _fresh_shipper_metrics
+    m.running = True
+    m.last_ship_at = _t.time() - 400
+    redis = _redis_with_group(groups=[{"name": "other", "pending": 9, "lag": 9}])
+    fake_sentry = MagicMock()
+    with patch("app.observability.sentry_sdk", fake_sentry):
+        await observability.emit_shipper_health(redis)
+    fake_sentry.capture_message.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_shipper_health_lag_no_redis_fails_open(monkeypatch, _fresh_shipper_metrics):
+    """No redis handle passed (legacy caller) → no gate → legacy page."""
+    import time as _t
+    _set_env(monkeypatch)
+    m = _fresh_shipper_metrics
+    m.running = True
+    m.last_ship_at = _t.time() - 400
+    fake_sentry = MagicMock()
+    with patch("app.observability.sentry_sdk", fake_sentry):
+        await observability.emit_shipper_health()  # no redis
+    fake_sentry.capture_message.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_shipper_health_lag_below_threshold_with_backlog_silent(monkeypatch, _fresh_shipper_metrics):
+    """Backlog>0 but lag under threshold → still NO page (the threshold
+    is the first gate; backlog only refines the over-threshold case)."""
+    import time as _t
+    _set_env(monkeypatch)
+    m = _fresh_shipper_metrics
+    m.running = True
+    m.last_ship_at = _t.time() - 10  # well under 300s
+    redis = _redis_with_group(pending=100, lag=100)
+    fake_sentry = MagicMock()
+    with patch("app.observability.sentry_sdk", fake_sentry):
+        await observability.emit_shipper_health(redis)
+    fake_sentry.capture_message.assert_not_called()
+
+
+class TestShipperBacklogHelper:
+    @pytest.mark.asyncio
+    async def test_sums_pending_and_lag(self):
+        redis = _redis_with_group(pending=3, lag=4)
+        assert await observability._shipper_backlog(redis) == 7
+
+    @pytest.mark.asyncio
+    async def test_lag_none_treated_as_zero(self):
+        redis = _redis_with_group(groups=[
+            {"name": observability._SHIPPER_GROUP, "pending": 2, "lag": None},
+        ])
+        assert await observability._shipper_backlog(redis) == 2
+
+    @pytest.mark.asyncio
+    async def test_zero_backlog(self):
+        redis = _redis_with_group(pending=0, lag=0)
+        assert await observability._shipper_backlog(redis) == 0
+
+    @pytest.mark.asyncio
+    async def test_group_absent_returns_none(self):
+        redis = _redis_with_group(groups=[{"name": "other", "pending": 1, "lag": 1}])
+        assert await observability._shipper_backlog(redis) is None
+
+    @pytest.mark.asyncio
+    async def test_redis_error_returns_none(self):
+        redis = _redis_with_group(raise_exc=RuntimeError("boom"))
+        assert await observability._shipper_backlog(redis) is None
+
+    @pytest.mark.asyncio
+    async def test_decodes_bytes_group_name(self):
+        redis = _redis_with_group(groups=[
+            {"name": observability._SHIPPER_GROUP.encode(), "pending": 1, "lag": 2},
+        ])
+        assert await observability._shipper_backlog(redis) == 3
+
+
+def test_observability_constants_match_shipper():
+    """Parity guard — the mirrored stream/group constants MUST track
+    shipper.py (they are duplicated to avoid a circular import)."""
+    from app import shipper
+    assert observability._STREAM_KEY == shipper.STREAM_KEY
+    assert observability._SHIPPER_GROUP == shipper.GROUP_NAME
+
+
 @pytest.mark.asyncio
 async def test_shipper_health_low_success_ratio_warns(monkeypatch, _fresh_shipper_metrics):
     """Running, fresh ship, but success_ratio_5m < 0.95 with a meaningful

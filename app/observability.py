@@ -61,11 +61,14 @@ from app.shipper_metrics import metrics as shipper_metrics
 logger = logging.getLogger("tds.observability")
 
 
-# Stream key — duplicated from `shipper.py` to avoid a circular
-# import (shipper imports from app.config, observability would
-# end up cross-importing). The string is a stable Redis-protocol
-# constant and only this module reads it.
+# Stream key + shipper consumer-group name — duplicated from
+# `shipper.py` to avoid a circular import (shipper imports from
+# app.config, observability would end up cross-importing). These are
+# stable Redis-protocol constants. A parity test
+# (`test_observability.py`) asserts they stay equal to
+# `shipper.STREAM_KEY` / `shipper.GROUP_NAME` so drift is caught.
 _STREAM_KEY = "stream:clicks"
+_SHIPPER_GROUP = "shippers"
 
 # Threshold ratio for the warn-level alert. 0.5 = "at 50% of cap".
 # Hardcoded rather than env-configurable because the threshold's
@@ -197,7 +200,47 @@ async def emit_disk_queue_size() -> int:
     return size
 
 
-async def emit_shipper_health() -> None:
+async def _shipper_backlog(redis) -> int | None:
+    """Unshipped-click backlog for the shipper consumer group.
+
+    F-3 (audit 2026-05-25). The shipper consumes ``stream:clicks`` via a
+    consumer group (``XREADGROUP {STREAM_KEY: ">"}``). "Work the shipper
+    has not delivered" therefore has two parts:
+      * ``pending`` — entries delivered to the group but not yet XACKed
+        (read but ship+ack failed → genuinely stuck in flight).
+      * ``lag`` — entries in the stream the group has not read yet
+        (transient when the shipper is alive; the blackout detector in
+        :func:`emit_shipper_health` covers a dead shipper).
+    ``XINFO GROUPS`` returns both in one round-trip; backlog = their sum.
+
+    Returns the backlog count (``>= 0``) when known, or ``None`` when it
+    cannot be determined — group absent, ``lag`` unavailable in a way
+    that raises, or Redis impaired. ``None`` means "unknown" and the
+    caller FAILS OPEN (keeps the legacy lag-only alert) so the real
+    stall signal is never weakened by this gate. Redis ``lag`` may be
+    nil after stream trims/deletes; that nil is treated as 0 (pending is
+    always exact), so a missing nil-lag degrades to a pending-only gate
+    rather than failing open.
+    """
+    try:
+        groups = await redis.xinfo_groups(_STREAM_KEY)
+    except Exception:  # noqa: BLE001 — unknown → caller fails open
+        return None
+    for g in groups:
+        name = g.get("name")
+        if isinstance(name, bytes):
+            name = name.decode("utf-8")
+        if name == _SHIPPER_GROUP:
+            pending = int(g.get("pending") or 0)
+            lag = g.get("lag")
+            lag = int(lag) if lag is not None else 0
+            return pending + lag
+    # Group not created yet → no backlog can be attributed to it; but a
+    # not-yet-started shipper is the blackout detector's job. Unknown.
+    return None
+
+
+async def emit_shipper_health(redis=None) -> None:
     """F.29 Sprint 4.1 — emit Sentry signals on shipper degradation.
 
     Runs on the observability loop's OWN asyncio task, independent of the
@@ -244,19 +287,41 @@ async def emit_shipper_health() -> None:
 
     # (2) Lag — the click pipeline has stalled. Only meaningful once a
     # batch has been attempted (lag_seconds is None before the first).
+    #
+    # F-3 (audit 2026-05-25) — de-noise. `lag_seconds` is `now -
+    # last_ship_at`, and `last_ship_at` only advances on a real ship
+    # (an idle XREADGROUP poll does not refresh it). So in low-traffic
+    # staging the lag grows simply because there was nothing to ship —
+    # firing ~2498 false pages/13h and burying real stalls. Gate the
+    # alert on actual unshipped backlog: page only when lag exceeds the
+    # threshold AND the shipper group still holds undelivered/unacked
+    # clicks. When the group is fully drained (backlog == 0), idle time
+    # is NOT a stall → suppress. Backlog UNKNOWN (no redis handle, group
+    # absent, Redis impaired) → fail OPEN, preserving the legacy alert.
     lag = m.lag_seconds
     if lag is not None and lag > settings.shipper_lag_alert_seconds:
-        logger.error(
-            "shipper.health — last ship %.0fs ago exceeds %ds threshold "
-            "(status=%s); central delivery stalled.",
-            lag, settings.shipper_lag_alert_seconds, m.last_ship_status,
-            extra={"area": "observability", "metric": "shipper.lag_seconds"},
-        )
-        sentry_sdk.capture_message(
-            f"shipper lag {lag:.0f}s exceeds "
-            f"{settings.shipper_lag_alert_seconds}s — central delivery stalled",
-            level="error",
-        )
+        backlog = await _shipper_backlog(redis) if redis is not None else None
+        if backlog == 0:
+            logger.debug(
+                "shipper.health — lag %.0fs over threshold but group fully "
+                "drained (backlog=0); idle, not a stall — alert suppressed.",
+                lag,
+            )
+        else:
+            backlog_desc = "unknown" if backlog is None else str(backlog)
+            logger.error(
+                "shipper.health — last ship %.0fs ago exceeds %ds threshold "
+                "(status=%s, backlog=%s); central delivery stalled.",
+                lag, settings.shipper_lag_alert_seconds, m.last_ship_status,
+                backlog_desc,
+                extra={"area": "observability", "metric": "shipper.lag_seconds"},
+            )
+            sentry_sdk.capture_message(
+                f"shipper lag {lag:.0f}s exceeds "
+                f"{settings.shipper_lag_alert_seconds}s with backlog="
+                f"{backlog_desc} — central delivery stalled",
+                level="error",
+            )
 
     # (3) Success ratio — warn when delivery is degrading, but only with a
     # meaningful sample (a lone rejected click reads as ratio=0.0).
@@ -318,7 +383,7 @@ async def run_observability_loop(redis, interval: int = 60) -> None:
                     "emit_disk_queue_size raised — continuing",
                 )
             try:
-                await emit_shipper_health()
+                await emit_shipper_health(redis)
             except Exception:  # noqa: BLE001
                 logger.exception(
                     "emit_shipper_health raised — continuing",

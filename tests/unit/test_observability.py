@@ -447,15 +447,20 @@ async def test_shipper_health_running_healthy_silent(monkeypatch, _fresh_shipper
 
 @pytest.mark.asyncio
 async def test_shipper_health_lag_pages(monkeypatch, _fresh_shipper_metrics):
-    """Running but last ship > threshold ago → ERROR (page) for stall."""
+    """Running, last ship > threshold ago, AND a real backlog → ERROR
+    (page) for stall. Passes a redis with backlog>0 so this exercises
+    the GATE (not the no-redis fail-open path, which is covered
+    separately) — i.e. it would catch a regression that removed the
+    gate's page-on-backlog behaviour."""
     import time as _t
     _set_env(monkeypatch)
     m = _fresh_shipper_metrics
     m.running = True
     m.last_ship_at = _t.time() - 400  # > 300s threshold
+    redis = _redis_with_group(pending=3, lag=0)
     fake_sentry = MagicMock()
     with patch("app.observability.sentry_sdk", fake_sentry):
-        await observability.emit_shipper_health()
+        await observability.emit_shipper_health(redis)
     fake_sentry.capture_message.assert_called_once()
     assert fake_sentry.capture_message.call_args.kwargs["level"] == "error"
     assert "lag" in fake_sentry.capture_message.call_args.args[0].lower()
@@ -625,6 +630,15 @@ class TestShipperBacklogHelper:
             {"name": observability._SHIPPER_GROUP.encode(), "pending": 1, "lag": 2},
         ])
         assert await observability._shipper_backlog(redis) == 3
+
+    @pytest.mark.asyncio
+    async def test_decodes_bytes_lag_value(self):
+        # Some redis-py configs return numeric fields as bytes — the
+        # helper must normalise `lag` like it does the group name.
+        redis = _redis_with_group(groups=[
+            {"name": observability._SHIPPER_GROUP, "pending": 2, "lag": b"5"},
+        ])
+        assert await observability._shipper_backlog(redis) == 7
 
 
 def test_observability_constants_match_shipper():

@@ -213,6 +213,19 @@ class TestCreatedAtFromClickId:
         b = _created_at_from_click_id(_CANONICAL_CLICK_ID)
         assert a == b == _CANONICAL_DERIVED_TS
 
+    def test_plausibility_fence_boundaries(self):
+        # The fence is inclusive [2020-01-01, 2100-01-01] in ms. Pin both
+        # edges: just-inside accepts, just-outside falls back to None.
+        from app.main import _CLICK_ID_MS_MIN, _CLICK_ID_MS_MAX
+
+        def _id_for_ms(ms: int) -> str:
+            return f"{ms:012x}" + "0" * 12  # 12-hex ms-prefix + 12-hex suffix
+
+        assert _created_at_from_click_id(_id_for_ms(_CLICK_ID_MS_MIN)) is not None
+        assert _created_at_from_click_id(_id_for_ms(_CLICK_ID_MS_MAX)) is not None
+        assert _created_at_from_click_id(_id_for_ms(_CLICK_ID_MS_MIN - 1)) is None
+        assert _created_at_from_click_id(_id_for_ms(_CLICK_ID_MS_MAX + 1)) is None
+
     def test_result_is_collector_parseable(self):
         # The derived string must round-trip through the collector's
         # datetime.fromisoformat(ts.replace("Z","+00:00")) parse so it

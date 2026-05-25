@@ -233,6 +233,10 @@ async def _shipper_backlog(redis) -> int | None:
         if name == _SHIPPER_GROUP:
             pending = int(g.get("pending") or 0)
             lag = g.get("lag")
+            # `lag` may be bytes on a redis-py without decode_responses
+            # (same as the group name above) — normalise before int().
+            if isinstance(lag, bytes):
+                lag = lag.decode("utf-8")
             lag = int(lag) if lag is not None else 0
             return pending + lag
     # Group not created yet → no backlog can be attributed to it; but a

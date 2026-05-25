@@ -815,7 +815,9 @@ async def decide(
     # `result.get("blocked")` is only evaluated on a dict.
     if result is None or result.get("blocked"):
         reason = "no_match" if result is None else "blocked"
-        fb_timing = {} if result is None else (result.get("timing") or {})
+        # Copy the timing dict — `setdefault` below would otherwise mutate
+        # the object `route()` returned (benign today, fragile on reuse).
+        fb_timing = {} if result is None else dict(result.get("timing") or {})
         fb_timing.setdefault("result", reason)
         result = {
             "url": f"{_resolve_fallback_url()}?reason={reason}"
@@ -1304,7 +1306,7 @@ async def receive_sync(
         settings.require_body_sig
         and _non_local
         and settings.tds_secret_key
-        and not x_tds_body_sig
+        and not x_tds_body_sig.strip()  # whitespace-only counts as absent
     ):
         logger.warning(
             "X-TDS-Body-Sig ABSENT on /admin/sync in env=%s — rejecting "

@@ -124,19 +124,19 @@ class Settings(BaseSettings):
 
     # H1 fix (2026-05-11): TTL for the per-click idempotency marker
     # `click:seen:<click_id>` set by `acquire_click_dedup` in main.py.
-    # The marker MUST outlive the realistic Worker→edge retry window
-    # but eventually expire to bound Redis memory growth. 30 days
-    # aligns with `data-flow.md`'s `click:{click_id}` TTL — the click
-    # record itself is referenced by postbacks up to 30d after the
-    # initial 302, so any genuine duplicate within that window is a
-    # retry / replay, not a fresh click. After 30d the same click_id
-    # is practically guaranteed to be a new generation (UUID v7-class
-    # rollover bound is in the centuries; collision is impossible at
-    # observed traffic). Operator override path: env var
-    # `TDS_CLICK_DEDUP_TTL_SECONDS`. Set to 0 to DISABLE dedup
-    # entirely (operator escape hatch for Redis OOM or extreme
-    # retry-storm incidents during a deploy).
-    click_dedup_ttl_seconds: int = 86400 * 30  # 30 days, 0 = disabled
+    # This is the NODE-LOCAL gate — it only suppresses a redundant XADD
+    # for a SAME-NODE retry (the Worker's sequential fallback re-hitting
+    # this node within its 2s AbortSignal window). A genuine duplicate
+    # therefore arrives within SECONDS, not days; the shipper has long
+    # deadlettered anything older. The marker is also write-only (a
+    # SETNX flag, never read back). 24h is a generous margin over the
+    # real retry window and bounds Redis memory (audit 2026-05-25 F-4,
+    # lowered from 30d). Cross-node / late duplicates are independently
+    # caught by the COLLECTOR's central dedup, so this expiring early is
+    # fully backstopped. Operator override: env `TDS_CLICK_DEDUP_TTL_SECONDS`;
+    # 0 DISABLES dedup entirely (escape hatch for Redis OOM / extreme
+    # retry-storm during a deploy).
+    click_dedup_ttl_seconds: int = 86400  # 24 hours, 0 = disabled
 
     # T2.2 / G-23 — disk fallback queue for clicks when XADD fails.
     # The MAXLEN cap above defends against unbounded growth, but

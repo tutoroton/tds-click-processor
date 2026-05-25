@@ -12,6 +12,7 @@ import json
 import logging
 import shutil
 import time
+from datetime import datetime, timezone
 from urllib.parse import quote
 
 import sentry_sdk
@@ -393,25 +394,79 @@ def _resolve_fallback_url() -> str:
     return settings.fallback_url
 
 
-def _resolve_click_timestamp(click_ts: str | None) -> str:
+# Plausibility window for a click_id-derived ms epoch: 2020-01-01 ..
+# 2100-01-01. A genuine edge click_id always decodes inside this; a
+# random/legacy 24-hex string whose prefix happens to be valid hex but
+# is NOT an ms epoch almost always lands outside → we fall back to
+# node-local time rather than fabricate an absurd created_at.
+_CLICK_ID_MS_MIN = 1_577_836_800_000  # 2020-01-01T00:00:00Z
+_CLICK_ID_MS_MAX = 4_102_444_800_000  # 2100-01-01T00:00:00Z
+
+
+def _created_at_from_click_id(click_id: str | None) -> str | None:
+    """Reconstruct the edge click instant from a UUIDv7-style click_id.
+
+    The CF Worker's `generateClickId()` encodes `Date.now()` (ms epoch)
+    in the first 12 hex chars and 6 random bytes (12 hex) after it — a
+    fixed 24-hex-char id, identical across every racing node for one
+    click. When the Worker did NOT forward an explicit `click_ts`
+    header (an older Worker in the dual-deploy window), every node can
+    still derive the SAME instant from the shared click_id, keeping the
+    collector's `(click_id, created_at)` PK skew-immune — instead of
+    each node stamping its own `gmtime()` and inflating one click into N
+    rows.
+
+    Returns an ISO-8601 ms-precision UTC string (matching JS
+    `Date.toISOString()`) for a canonical 24-hex click_id whose prefix
+    decodes to a plausible epoch; otherwise None so the caller falls
+    back to node-local time. `smoke-test-*` ids and any legacy
+    non-canonical id are NOT subject to true-racing fan-out, so
+    per-node time is acceptable for them.
+
+    Pure (no I/O) — unit-tested directly.
+    """
+    if click_id is None or len(click_id) != 24:
+        return None
+    try:
+        ms = int(click_id[:12], 16)
+    except ValueError:
+        return None
+    if not (_CLICK_ID_MS_MIN <= ms <= _CLICK_ID_MS_MAX):
+        return None
+    dt = datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
+    return f"{dt.strftime('%Y-%m-%dT%H:%M:%S')}.{dt.microsecond // 1000:03d}Z"
+
+
+def _resolve_click_timestamp(click_ts: str | None, click_id: str | None = None) -> str:
     """Canonical click instant for the click record / collector created_at.
 
-    Returns the EDGE-generated `click_ts` verbatim when the CF Worker
-    supplied it (the F.24-Phase-5.1b path: one value, captured once at
-    the edge, serialised once in raceBackends → byte-identical across
-    every node in a true-racing fan-out, so the collector's
-    `ON CONFLICT (click_id, created_at)` collapses N raced inserts to
-    ONE row). Falls back to this node's own UTC second when absent —
-    non-Worker callers (smoke scripts, integration tests) and the
-    dual-deploy window where an older Worker has not yet rolled out;
-    those are not subject to racing fan-out so per-node time is
-    acceptable. `or` intentionally treats "" the same as None (a
-    Pydantic-stripped empty string must not become the click's time).
+    Resolution order (each step byte-identical across a racing fan-out):
+      1. EDGE-generated `click_ts` verbatim when the CF Worker supplied
+         it (the F.24-Phase-5.1b path: one value, captured once at the
+         edge, serialised once in raceBackends → identical across every
+         node, so the collector's `ON CONFLICT (click_id, created_at)`
+         collapses N raced inserts to ONE row).
+      2. F-4 (audit 2026-05-25): when `click_ts` is absent but the
+         click_id is the canonical UUIDv7-style form, derive the instant
+         from its shared ms-prefix — still identical across nodes, so a
+         click from an older Worker (no header) is ALSO skew-immune
+         rather than fanning out into N per-node-`gmtime()` rows.
+      3. Last resort — this node's own UTC second. Reached only by
+         non-Worker callers (smoke scripts, integration tests) and
+         non-canonical ids, which are not subject to racing fan-out so
+         per-node time is acceptable.
+
+    `or` intentionally treats "" the same as None (a Pydantic-stripped
+    empty string must not become the click's time).
 
     Pure (no I/O) so it is unit-tested directly rather than through the
     full /decide path — mirrors the worker `fetchImpl` testability seam.
     """
-    return click_ts or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    return (
+        click_ts
+        or _created_at_from_click_id(click_id)
+        or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    )
 
 
 # ============================================================================
@@ -801,7 +856,7 @@ async def decide(
         # F.24 Phase 5.1b — EDGE-generated canonical click instant (the
         # cross-node dedup anchor for true racing). Full rationale +
         # fallback semantics in `_resolve_click_timestamp`.
-        "timestamp": _resolve_click_timestamp(req.click_ts),
+        "timestamp": _resolve_click_timestamp(req.click_ts, req.click_id),
         "node_id": settings.node_id,
         "campaign_id": result.get("campaign_id"),
         "offer_id": result.get("offer_id"),
@@ -880,10 +935,13 @@ async def decide(
     # the other returns `False` (marker existed) and skips its XADD.
     # Both calls STILL return the routing URL to the Worker so the
     # user-facing 302 is unaffected — only the analytics-side
-    # double-write is prevented. This matches the data-flow.md
-    # design intent of `click:{click_id}` TTL 30d and aligns the
-    # postback dedup pattern (event:{click_id}:{type} SETNX 30d)
-    # already documented in data-flow.md.
+    # double-write is prevented. F-4 (audit 2026-05-25): this marker's
+    # TTL is 24h, decoupled from the 30d `click:{click_id}` /
+    # `event:{click_id}:{type}` retention — it only needs to outlive the
+    # same-node retry window (seconds), and is fully backstopped by the
+    # collector's central dedup + ClickHouse natural-key dedup, so a
+    # short bounded TTL costs nothing in correctness while cutting Redis
+    # memory ~30×.
     #
     # Fail-open semantics: if the SET call itself fails (Redis
     # impaired), we LOG + skip dedup and proceed with XADD. A

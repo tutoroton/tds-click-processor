@@ -15,8 +15,9 @@ to the stream.
 
 Three layers of defense covered here:
 
-  1. Settings field exists and defaults to a 30-day TTL (matches
-     `data-flow.md` `click:{click_id}` retention).
+  1. Settings field exists and defaults to a 24-hour TTL (F-4, audit
+     2026-05-25; lowered from 30d — node-local marker only needs to
+     cover the same-node retry window of seconds).
   2. The `_acquire_click_dedup` helper returns the documented
      three-state result (True / False / None).
   3. Disabled path (`click_dedup_ttl_seconds=0`) short-circuits
@@ -49,15 +50,18 @@ class TestSettingsField:
             "(H1 escape hatch)."
         )
 
-    def test_default_is_30_days(self):
-        """Default 30 days matches `data-flow.md` `click:{click_id}`
-        TTL. Genuine duplicates fall in the retry window; new
-        click_ids after 30d are guaranteed to be new generations."""
+    def test_default_is_24_hours(self):
+        """Default 24h (F-4, audit 2026-05-25, lowered from 30d). This
+        NODE-LOCAL marker only suppresses a same-node retry — which
+        arrives within SECONDS (the Worker's 2s AbortSignal window), not
+        days. It is also write-only and fully backstopped by the
+        collector's central dedup, so a generous 24h amply covers the
+        real window while bounding Redis memory ~30×."""
         from app.config import settings
 
-        assert settings.click_dedup_ttl_seconds == 86400 * 30, (
-            "Default dedup TTL should be 30 days (86400 * 30 = "
-            "2592000 seconds) per H1 fix design rationale."
+        assert settings.click_dedup_ttl_seconds == 86400, (
+            "Default dedup TTL should be 24 hours (86400 seconds) per "
+            "F-4 (audit 2026-05-25)."
         )
 
 
@@ -89,7 +93,7 @@ class TestAcquireClickDedup:
             "click:seen:test-click-001",
             "1",
             nx=True,
-            ex=86400 * 30,  # default TTL
+            ex=86400,  # default TTL — 24h (F-4, lowered from 30d)
         )
 
     @pytest.mark.asyncio

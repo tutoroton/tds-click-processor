@@ -17,6 +17,14 @@ import os
 import httpx
 import sentry_sdk
 
+# Audit 2026-05-27 — narrow Redis-protocol error type for NOGROUP
+# detection in :func:`_drain_batch_from_stream`. Imported via the
+# unconditional ``redis`` path (not optional like enrichment.py)
+# because the shipper module unconditionally needs the type at
+# runtime; the redis dependency is in services/click-processor's
+# requirements.txt and is always present.
+from redis.exceptions import ResponseError as RedisResponseError
+
 from app.config import _LOCAL_ENVIRONMENTS, settings
 from app.shipper_metrics import metrics as shipper_metrics
 
@@ -547,6 +555,38 @@ async def _handle_rejected_click(
 # to find the I/O boundary points.
 
 
+async def _ensure_local_consumer_group(redis_pool) -> None:
+    """Idempotently create the local-stream consumer group.
+
+    Audit 2026-05-27 — extracted from the inline block in
+    :func:`run_shipper` (lines 1142-1149 pre-refactor) so it can be
+    reused by the NOGROUP recovery branch inside
+    :func:`_drain_batch_from_stream`. ``mkstream=True`` handles the
+    case where the stream itself disappeared; ``BUSYGROUP`` is
+    absorbed silently for the racing-creator case.
+    """
+    try:
+        await redis_pool.xgroup_create(
+            STREAM_KEY, GROUP_NAME, id="0", mkstream=True,
+        )
+    except Exception as e:
+        if "BUSYGROUP" not in str(e):
+            raise
+
+
+def _is_nogroup_error(exc: BaseException) -> bool:
+    """True iff ``exc`` is a Redis ResponseError whose message indicates
+    the consumer group (or stream) is missing.
+
+    Audit 2026-05-27 — mirrors the writer's classification helper in
+    ``services/collector/app/writer.py``. Narrowed to
+    ``RedisResponseError`` to avoid false-positive recovery on
+    transient connection/timeout errors that have their own backoff
+    semantics in ``_handle_shipper_loop_error``.
+    """
+    return isinstance(exc, RedisResponseError) and "NOGROUP" in str(exc)
+
+
 async def _drain_batch_from_stream(
     redis_pool,
 ) -> tuple[list[dict[str, Any]], list[str]]:
@@ -573,13 +613,54 @@ async def _drain_batch_from_stream(
       * The XREADGROUP timeout (``BATCH_TIMEOUT_MS``) is the natural
         loop heartbeat; empty results → return ``([], [])`` so the
         caller's ``if not clicks: continue`` path keeps working.
+      * **NOGROUP auto-heal** (audit 2026-05-27): if the local
+        consumer group disappears mid-flight (operator XGROUP DESTROY
+        during incident triage, Redis restart with corrupt AOF,
+        FLUSHDB), ``XREADGROUP`` raises ``ResponseError: NOGROUP …``.
+        Pre-fix that bubbled to :func:`_handle_shipper_loop_error`
+        which slept 2s and retried — same infinite NOGROUP loop the
+        writer suffered. Now we catch NOGROUP HERE, re-create the
+        group via :func:`_ensure_local_consumer_group` (idempotent),
+        retry the XREADGROUP exactly ONCE, and on any other failure
+        re-raise so the outer ``_handle_shipper_loop_error`` records
+        it under the canonical OP_LOOP_ITERATION op tag. Non-NOGROUP
+        ResponseErrors propagate unchanged.
     """
-    results = await redis_pool.xreadgroup(
-        GROUP_NAME, CONSUMER_NAME,
-        {STREAM_KEY: ">"},
-        count=BATCH_SIZE,
-        block=BATCH_TIMEOUT_MS,
-    )
+    try:
+        results = await redis_pool.xreadgroup(
+            GROUP_NAME, CONSUMER_NAME,
+            {STREAM_KEY: ">"},
+            count=BATCH_SIZE,
+            block=BATCH_TIMEOUT_MS,
+        )
+    except RedisResponseError as exc:
+        if not _is_nogroup_error(exc):
+            raise
+        # Audit 2026-05-27 — NOGROUP auto-heal.
+        logger.error(
+            "Local consumer group missing (op=%s) — recreating '%s' "
+            "on '%s': %s",
+            OP_XREADGROUP, GROUP_NAME, STREAM_KEY, exc,
+        )
+        _capture_op_msg(
+            OP_XREADGROUP,
+            f"Shipper NOGROUP recovery — recreating group '{GROUP_NAME}' "
+            f"on '{STREAM_KEY}'",
+            level="error",
+        )
+        await _ensure_local_consumer_group(redis_pool)
+        # Retry the XREADGROUP exactly once after recovery. A second
+        # NOGROUP would indicate a more fundamental issue (e.g.
+        # permissions on xgroup_create silently failed, cluster slot
+        # migration mid-recovery); propagate to the outer catch-all
+        # for the 2s back-off rather than tight-spinning here.
+        results = await redis_pool.xreadgroup(
+            GROUP_NAME, CONSUMER_NAME,
+            {STREAM_KEY: ">"},
+            count=BATCH_SIZE,
+            block=BATCH_TIMEOUT_MS,
+        )
+
     if not results:
         return [], []
 
@@ -1139,14 +1220,10 @@ async def run_shipper(redis_pool):
     if not settings.central_url:
         return
 
-    # Create consumer group.
-    try:
-        await redis_pool.xgroup_create(
-            STREAM_KEY, GROUP_NAME, id="0", mkstream=True,
-        )
-    except Exception as e:
-        if "BUSYGROUP" not in str(e):
-            raise
+    # Create consumer group (audit 2026-05-27 — extracted to helper
+    # so the NOGROUP auto-heal in _drain_batch_from_stream can reuse
+    # the same idempotent creation logic).
+    await _ensure_local_consumer_group(redis_pool)
 
     logger.info(f"Shipper started → {settings.central_url}/api/clicks/batch")
     # F.29 Sprint 1.4 — surface "shipper is alive" to /health. Pre-F.29

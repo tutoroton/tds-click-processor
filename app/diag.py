@@ -76,6 +76,7 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import ipaddress
 import json
 import logging
 import re
@@ -394,6 +395,24 @@ def traces_sampler(sampling_context: dict) -> float:
     return 0.1
 
 
+def _truncate_ip(ip: str) -> str:
+    """IPv4 → /24 (zero the host octet); IPv6 → /48. Malformed → ``""``.
+
+    F.40 PII minimisation — keep the network prefix (coarse locality for
+    "is this whole subnet erroring?" triage) while dropping the host-
+    level identifier. Same algorithm as the central collector's
+    ``app/pii.py:_truncate_ip`` (reimplemented here — separate service /
+    container, no shared import).
+    """
+    try:
+        addr = ipaddress.ip_address(ip.strip())
+    except (ValueError, AttributeError):
+        return ""
+    prefix = 24 if addr.version == 4 else 48
+    network = ipaddress.ip_network(f"{addr}/{prefix}", strict=False)
+    return str(network.network_address)
+
+
 def before_send(event: dict, hint: dict) -> dict | None:
     """Sentry beforeSend — redact known-sensitive fields from headers,
     cookies, and query strings before the event leaves the process.
@@ -408,6 +427,13 @@ def before_send(event: dict, hint: dict) -> dict | None:
     services in different code paths). Audit MED-2: expanded query-
     key set to cover common credential-bearing variations
     (api_key/access_token/bearer/etc).
+
+    F.40 PII hardening (CRIT-001): once a node is attached to a tenant
+    Sentry account, events ship to a THIRD-PARTY org — so we must not
+    leak the visitor's identity. In addition to the secret scrub below,
+    this strips the request body (click payloads carry IP / geo / sub-
+    ids) and truncates any IP the SDK / code attached to the network
+    prefix. Paired with ``send_default_pii=False`` at init.
     """
     SENSITIVE_HEADERS = {
         "x-tds-key", "x-tds-body-sig", "authorization",
@@ -440,4 +466,27 @@ def before_send(event: dict, hint: dict) -> dict | None:
             else:
                 parts.append(piece)
         request["query_string"] = "&".join(parts)
+
+    # F.40 PII hardening — strip the request body (click payloads carry
+    # visitor IP / geo / sub-ids) and truncate any IP the SDK or code
+    # attached. Bounded + total-failure-safe (a malformed event must
+    # never crash the SDK send path).
+    try:
+        if isinstance(request, dict) and request.get("data") is not None:
+            request["data"] = "[stripped]"
+        # Env-level remote address (WSGI/ASGI `REMOTE_ADDR`).
+        env = request.get("env") if isinstance(request, dict) else None
+        if isinstance(env, dict) and env.get("REMOTE_ADDR"):
+            env["REMOTE_ADDR"] = _truncate_ip(str(env["REMOTE_ADDR"]))
+        user = event.get("user")
+        if isinstance(user, dict) and user.get("ip_address"):
+            truncated = _truncate_ip(str(user["ip_address"]))
+            # Sentry treats ip_address="{{auto}}" specially; a blank
+            # would re-trigger auto-fill, so drop the key when unparseable.
+            if truncated:
+                user["ip_address"] = truncated
+            else:
+                user.pop("ip_address", None)
+    except Exception:  # noqa: BLE001 — never let scrubbing crash the send
+        pass
     return event

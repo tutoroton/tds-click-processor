@@ -74,6 +74,10 @@ TDS_CENTRAL_API_KEY=${central_api_key}
 TDS_SYNC_URL=${TDS_SYNC_URL:-}
 TDS_SMOKE_PROBE_SECRET=${TDS_SMOKE_PROBE_SECRET:-}
 TDS_SENTRY_DSN=${TDS_SENTRY_DSN:-}
+# F.40 — per-instance Sentry environment tag (= node_id when attached to
+# a tenant Sentry account). Optional (NOT in the `require` block) — empty
+# ⇒ click-processor falls back to TDS_ENVIRONMENT.
+TDS_SENTRY_ENVIRONMENT=${TDS_SENTRY_ENVIRONMENT:-}
 TDS_DIAG_TRACES_BOOST=${TDS_DIAG_TRACES_BOOST:-false}
 TDS_DIAG_OBS_STREAM=${TDS_DIAG_OBS_STREAM:-false}
 TDS_DIAG_VERBOSE_LOGS=${TDS_DIAG_VERBOSE_LOGS:-false}

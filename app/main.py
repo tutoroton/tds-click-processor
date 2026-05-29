@@ -75,7 +75,16 @@ if settings.sentry_dsn:
         ],
         traces_sampler=diag_traces_sampler,
         before_send=diag_before_send,
-        environment=settings.environment,
+        # F.40 — when attached to a tenant Sentry account, provisioning
+        # bakes `sentry_environment` = node_id so events split by instance
+        # within one shared project. Empty → the deploy environment
+        # (TDS_ENVIRONMENT) — unattached / legacy nodes unchanged.
+        environment=settings.sentry_environment or settings.environment,
+        # F.40 PII hardening (CRIT-001) — never let the SDK auto-attach
+        # the visitor IP / request body to events that may now ship to a
+        # third-party tenant Sentry. `before_send` additionally truncates
+        # any IP the code attaches + strips the request body.
+        send_default_pii=False,
         # F.32 — release = the node's running git SHA (settings.code_version,
         # stamped by render-env/update.sh), so Sentry events map to the exact
         # deployed revision per env (was a hardcoded "0.1.0" → every node looked

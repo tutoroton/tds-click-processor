@@ -116,3 +116,64 @@ def test_drain_batch_emits_click_processor_service_field():
     assert entry["service"] == "click-processor"
     # node_id mirrors settings.node_id; default in tests is "local"
     assert "node_id" in entry
+
+
+# --------------------------------------------------------------------------- #
+# F.40 PII hardening (C14 / CRIT-001) — before_send strips body + truncates IP #
+# --------------------------------------------------------------------------- #
+
+
+class TestF40PiiScrub:
+    """Once a node attaches to a tenant Sentry account, events ship to a
+    THIRD-PARTY org. The `before_send` hook MUST strip the request body
+    (click payloads carry visitor IP / geo / sub-ids) and truncate any IP
+    to its network prefix. This is the CRIT-001 gate — Phase 3 is blocked
+    on it being verified green."""
+
+    def test_truncate_ipv4_to_24(self):
+        from app.diag import _truncate_ip
+        assert _truncate_ip("203.0.113.77") == "203.0.113.0"
+
+    def test_truncate_ipv6_to_48(self):
+        from app.diag import _truncate_ip
+        assert _truncate_ip("2001:db8:abcd:1234::1") == "2001:db8:abcd::"
+
+    def test_truncate_malformed_returns_empty(self):
+        from app.diag import _truncate_ip
+        assert _truncate_ip("not-an-ip") == ""
+        assert _truncate_ip("") == ""
+
+    def test_request_body_stripped(self):
+        from app.diag import before_send
+        event = {"request": {"data": {"ip": "203.0.113.7", "sub_id": "aff42"}}}
+        out = before_send(event, {})
+        assert out["request"]["data"] == "[stripped]"
+
+    def test_env_remote_addr_truncated(self):
+        from app.diag import before_send
+        event = {"request": {"env": {"REMOTE_ADDR": "203.0.113.77"}}}
+        out = before_send(event, {})
+        assert out["request"]["env"]["REMOTE_ADDR"] == "203.0.113.0"
+
+    def test_user_ip_truncated(self):
+        from app.diag import before_send
+        event = {"user": {"ip_address": "2001:db8:abcd:1234::9"}}
+        out = before_send(event, {})
+        assert out["user"]["ip_address"] == "2001:db8:abcd::"
+
+    def test_user_ip_unparseable_dropped_not_blanked(self):
+        # A blank ip_address re-triggers Sentry {{auto}} fill — so an
+        # unparseable value must be DROPPED, not set to "".
+        from app.diag import before_send
+        event = {"user": {"ip_address": "garbage", "id": "u1"}}
+        out = before_send(event, {})
+        assert "ip_address" not in out["user"]
+        assert out["user"]["id"] == "u1"
+
+    def test_scrub_never_crashes_on_malformed_event(self):
+        # Total-failure-safe: a weird event shape must not raise (the SDK
+        # send path must never blow up on scrubbing).
+        from app.diag import before_send
+        weird = {"request": {"data": object()}, "user": "not-a-dict"}
+        out = before_send(weird, {})
+        assert out is weird  # returned, not dropped

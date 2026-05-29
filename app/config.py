@@ -111,6 +111,12 @@ class Settings(BaseSettings):
 
     # Sentry (from env, never hardcode)
     sentry_dsn: str = ""
+    # F.40 — per-instance Sentry environment tag. When a node is attached
+    # to a tenant Sentry account, provisioning bakes this = the node_id
+    # (e.g. "fra-myedge") so the tenant filters their fleet by environment
+    # in one shared project. Empty → fall back to `environment`
+    # (TDS_ENVIRONMENT) so unattached / legacy nodes are unchanged.
+    sentry_environment: str = ""
 
     # Sync
     sync_interval_seconds: int = 30

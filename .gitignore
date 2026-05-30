@@ -7,3 +7,6 @@ __pycache__/
 dist/
 build/
 .venv/
+
+# F.41 perf-harness outputs (golden snapshots, latency json) — artifacts, not source
+scripts/perf/results/

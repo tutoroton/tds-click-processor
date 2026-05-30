@@ -40,6 +40,7 @@ from app.diag import (
 from app.models import ClickRequest, ClickResponse, HealthResponse
 from app.redis_client import get_redis, close_redis
 from app.router import route, parse_device_type, parse_os, parse_browser, get_full_ua_info
+from app.ua_parser import warmup as warmup_ua_parser
 from app.shipper import assert_shipper_ready, run_shipper
 from app.shipper_metrics import metrics as shipper_metrics
 from app.telemetry import OP_DISK_PRESSURE, capture_op_msg
@@ -130,6 +131,30 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.critical("Redis unreachable at startup: %s", e)
         raise
+
+    # F.41 — warm the UA parser BEFORE the node accepts traffic.
+    # device_detector lazy-loads its regex bundles on first use; an un-warmed
+    # first parse can take ~720ms and cross the CF Worker's 2000ms race
+    # deadline, sending the first click after every boot/deploy to the worker
+    # fallback URL instead of the offer (finding F1, Sentry GEO-TDS-WORKERS-2).
+    # Running here — after Redis is up, before the node serves traffic (health
+    # stays gated until lifespan yields) — means the first real click is warm.
+    # NON-FATAL by design: a warm-up failure must never block boot. Worst case
+    # the node degrades to the old cold-first-parse behaviour, not an outage.
+    try:
+        _t_warm = time.perf_counter()
+        _warmed = warmup_ua_parser()
+        _warm_ms = (time.perf_counter() - _t_warm) * 1000.0
+        logger.info("UA parser warm: %d entries in %.0fms", _warmed, _warm_ms)
+        sentry_sdk.add_breadcrumb(
+            category="startup",
+            message=f"ua_parser warm: {_warmed} entries in {_warm_ms:.0f}ms",
+            level="info",
+        )
+    except Exception as e:  # noqa: BLE001 — best-effort warm-up, never fatal
+        logger.warning(
+            "UA parser warm-up failed (non-fatal, continuing cold): %s", e
+        )
 
     # F.29 Sprint 1.2 — synchronous shipper-config validation BEFORE
     # task creation. If shipper cannot safely start (empty central_url

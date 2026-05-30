@@ -9,8 +9,15 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application
 COPY app/ ./app/
 
-# Run with uvicorn
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8100", "--workers", "2", "--log-level", "info"]
+# Run with uvicorn.
+# F.41 — worker count is env-driven (WEB_CONCURRENCY, default 2 = unchanged).
+# device_detector is GIL-bound CPU work, so real parse concurrency scales with
+# PROCESSES, not threads; WEB_CONCURRENCY lets ops size it to the node's cores/RAM
+# without a rebuild (each worker holds its own ~20MB device_detector + UA LRU —
+# size against droplet RAM before raising). Shell form with `exec` so ${VAR}
+# expands AND uvicorn still becomes PID 1 (receives SIGTERM directly → the
+# lifespan graceful shutdown / background-task cancellation is preserved).
+CMD ["/bin/sh", "-c", "exec uvicorn app.main:app --host 0.0.0.0 --port 8100 --workers ${WEB_CONCURRENCY:-2} --log-level info"]
 
 EXPOSE 8100
 

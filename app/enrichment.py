@@ -59,7 +59,7 @@ EMPTY_ENRICHMENT: types.MappingProxyType[str, str | None] = types.MappingProxyTy
 })
 
 
-async def enrich_buyer(redis, buyer_id: Any) -> dict[str, str | None]:
+async def enrich_buyer(redis, buyer_id: Any, company_id: Any = None) -> dict[str, str | None]:
     """Resolve `clicks.buyer_id` to the canonical attribution chain.
 
     Args:
@@ -67,6 +67,11 @@ async def enrich_buyer(redis, buyer_id: Any) -> dict[str, str | None]:
         buyer_id: The buyer_id value from the click — typically a
             string (resolved via `resolve_slots` for the `buyer_id`
             slot). Numeric inputs are coerced to string.
+        company_id: The CAMPAIGN's tenant anchor (HIGH-001) — NEVER the
+            buyer's own claim. When provided, the tenant-scoped key
+            `user:{company_id}:{buyer_id}` is preferred so a same
+            `buyer_id` in another tenant cannot resolve here. `None`
+            (legacy callers / tests) falls straight to the global key.
 
     Returns:
         `{team_id, department_id, custom_group_id, company_id}` —
@@ -114,8 +119,28 @@ async def enrich_buyer(redis, buyer_id: Any) -> dict[str, str | None]:
     # 2026-04-28 HIGH: readability hardening for security-critical guard).
     validated_buyer_id = bid_str
 
+    # HIGH-001 (03 §3) — prefer the tenant-scoped key
+    # `user:{company_id}:{buyer_id}`. The legacy global `user:{buyer_id}`
+    # is tried ONLY as a fallback for the migration overlap (builder
+    # emits both). Once the builder stops emitting the legacy key the
+    # fallback simply misses and the scoped key becomes the sole
+    # resolver — at which point a buyer_id from another tenant can no
+    # longer resolve here (structural prevention; the company-mismatch
+    # assertion in `_resolve_buyer_chain` remains the backstop meanwhile).
+    # `company_id` is the CAMPAIGN anchor — same digit-only gate as the
+    # buyer to keep the key construction injection-safe (LOW-002).
+    cid_str = str(company_id).strip() if company_id is not None else ""
+    candidate_keys: list[str] = []
+    if cid_str.isdigit():
+        candidate_keys.append(f"user:{cid_str}:{validated_buyer_id}")
+    candidate_keys.append(f"user:{validated_buyer_id}")  # legacy (overlap)
+
     try:
-        user = await redis.hgetall(f"user:{validated_buyer_id}")
+        user = {}
+        for user_key in candidate_keys:
+            user = await redis.hgetall(user_key)
+            if user:
+                break
     except (RedisError, ConnectionError, TimeoutError, OSError) as exc:
         # Narrow catch — log Redis-layer faults, let programming
         # errors (`AttributeError`, `TypeError`, etc.) propagate so

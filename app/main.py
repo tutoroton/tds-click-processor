@@ -39,7 +39,7 @@ from app.diag import (
 )
 from app.models import ClickRequest, ClickResponse, HealthResponse
 from app.redis_client import get_redis, close_redis
-from app.router import route, parse_device_type, parse_os, parse_browser, get_full_ua_info
+from app.router import route, get_full_ua_info, parse_accept_language
 from app.ua_parser import warmup as warmup_ua_parser
 from app.shipper import assert_shipper_ready, run_shipper
 from app.shipper_metrics import metrics as shipper_metrics
@@ -688,6 +688,98 @@ def _verify_smoke_probe(click_id: str, probe_header: str) -> tuple[bool, str]:
     return True, "ok"
 
 
+# Stage 3 / Phase 3 — RESERVED slots that become dedicated `clicks`
+# columns (CH §11 / 01-schema). Slot name == column name 1:1. `buyer_id`
+# is intentionally absent: it is resolved to the org-chain integer
+# `buyer_id` column (NOT a free-text reserved string). Keep in lockstep
+# with click-processor `parameters.RESERVED_SLOTS` and the CH
+# `CH_CLICK_COLUMNS` mapping (collector/app/clickhouse.py).
+_RESERVED_SLOT_COLUMNS: tuple[str, ...] = (
+    "source", "host", "placement",
+    "ad_campaign_id", "adset_id", "ad_id", "creative_id", "keyword",
+    "source_click_id", "pixel_id",
+    "funnel_id", "funnel_type", "funnel_click_id", "subscribe_id", "landing_id",
+    "user_id", "external_id", "app_id",
+)
+
+# Schema version the producer stamps on every click_record. Bumped to 2
+# for Phase 3 (org-chain + routing metadata + reserved slots + infra
+# columns). The collector's §4b skew detector tolerates an OLD producer
+# (version 1 / absent) against a NEW consumer during a rolling deploy —
+# absent columns simply land as CH defaults. Keep in lockstep with
+# collector `writer.KNOWN_CLICK_SCHEMA_VERSION`.
+_CLICK_SCHEMA_VERSION = 2
+
+
+def _phase3_attribution_fields(
+    result: dict, req: ClickRequest, timing: dict,
+) -> dict:
+    """Build the Phase-3 column additions for one click record.
+
+    Pure + side-effect-free so it is unit-testable in isolation. Reads
+    the `attribution` dict threaded up by `router._route_via_campaign`
+    (org chain + routing ids + resolved `slots`) plus worker-auto
+    request fields. Returns a flat dict the caller merges into
+    `click_record`.
+
+    Guardrail (rule `multi-tenant-isolation`): `company_id` is taken
+    from the attribution chain, which the router pins to the CAMPAIGN
+    tenant — never the buyer. This helper never re-derives it.
+    """
+    attr = result.get("attribution") or {}
+    slots = attr.get("slots") or {}
+
+    fields: dict = {
+        # Org-attribution chain (resolved at click time; company_id =
+        # campaign anchor). int | None — collector coerces None → 0/NULL.
+        "buyer_id": attr.get("buyer_id"),
+        "team_id": attr.get("team_id"),
+        "department_id": attr.get("department_id"),
+        "custom_group_id": attr.get("custom_group_id"),
+        "company_id": attr.get("company_id"),
+        # Routing-decision ids.
+        "source_id": attr.get("source_id"),
+        "flow_id": attr.get("flow_id"),
+        "offer_target_id": attr.get("offer_target_id"),
+        "traffic_target_id": attr.get("traffic_target_id"),
+        # routing_result is already on `timing`; promote to a column so
+        # it is queryable without unpacking the timing JSON.
+        "routing_result": timing.get("result", ""),
+        # Worker-auto infra/audit columns cleanly available on the
+        # request today. (cf_ray / request_id / arrival_ts need worker
+        # header propagation — DEFERRED, see 03 §5 + the Phase-3 report.)
+        "worker_colo": req.colo or "",
+        "tls_version": req.tls_version or "",
+        "http_protocol": req.http_protocol or "",
+        "hostname": req.hostname or "",
+        "path": req.path or "",
+        "language": parse_accept_language(req.accept_language) or "",
+        # routing decision instant (this node finished routing). ISO —
+        # collector parses to the Nullable(DateTime64(3)) column.
+        "routing_decision_ts": datetime.now(timezone.utc).isoformat(),
+        # cost: advertiser-supplied per-click value (same source build_url
+        # uses; campaign-hardcoded fallback still DEFERRED — no schema col).
+        "cost": (req.query_params or {}).get("cost") or 0,
+    }
+
+    # Reserved slots → dedicated columns (canonical param_mappings
+    # resolution — NO extra Redis round-trip, the source HASH was already
+    # fetched). Absent/unmapped slots resolve to None → CH default ''.
+    for col in _RESERVED_SLOT_COLUMNS:
+        fields[col] = slots.get(col)
+
+    # sub9..20 from the canonical resolution (sub1..8 keep their legacy
+    # hardcoded GET mapping for live-PG continuity — redefining them is a
+    # field-semantics change that needs a 1-cycle consumer overlap, 03
+    # §4 additive guardrail). sub9..20 were previously empty, so this is
+    # purely additive.
+    for i in range(9, 21):
+        key = f"sub{i}"
+        fields[key] = slots.get(key)
+
+    return fields
+
+
 @app.post("/decide")
 async def decide(
     req: ClickRequest,
@@ -983,6 +1075,15 @@ async def decide(
 
     # Include timing in click record for PG storage
     click_record["timing"] = timing
+
+    # Stage 3 / Phase 3 — populate the org-chain, routing-decision,
+    # reserved-slot + infra columns now that routing + timing are final.
+    # Additive: every key here is either NEW (CH-only columns the PG
+    # writer never reads) or a previously-empty field (company_id /
+    # source_id / flow_id / sub9..20 / cost — PG now gets them populated
+    # too). sub1..8 + extra_params are intentionally NOT touched.
+    click_record["click_schema_version"] = _CLICK_SCHEMA_VERSION
+    click_record.update(_phase3_attribution_fields(result, req, timing))
 
     # H1 fix (2026-05-11): idempotency gate BEFORE XADD.
     #

@@ -289,9 +289,42 @@ async def _route_via_campaign(
 
     # Resolve param-mapping context once — used by both cascade action
     # execution and legacy fallback for URL substitution.
-    source_mappings, campaign_mappings = await _fetch_resolution_context(
+    source_mappings, campaign_mappings, source_id = await _fetch_resolution_context(
         r, campaign_id, campaign, req.query_params or {},
     )
+
+    # Stage 3 / Phase 3 — attribution population. Resolve the canonical
+    # slots + org-hierarchy chain ONCE here and thread them (plus the
+    # routing-decision ids surfaced by the cascade) up to the click
+    # record via a mutable `attribution` dict — the same by-reference
+    # pattern the `timing` dict already uses. This is LATENCY-NEUTRAL:
+    # `_resolve_buyer_chain` (one Redis HGETALL) previously ran INSIDE
+    # `_try_flow_cascade` on EVERY routed click (before the no-flow
+    # check), so lifting it here adds no new round-trip — it just stops
+    # the already-computed result from being discarded.
+    #
+    # `slots` is pure-Python over the source∪campaign param_mappings
+    # (the source HASH was already fetched in `_fetch_resolution_context`)
+    # — no extra Redis op (03 §5 open-Q #3 / 03 §4 hot-path guardrail).
+    slots, _slot_extras = resolve_slots(
+        query_params=req.query_params or {},
+        source_mappings=source_mappings,
+        campaign_mappings=campaign_mappings,
+    )
+    buyer_chain = await _resolve_buyer_chain(r, slots, campaign)
+
+    # `company_id` ALWAYS from the campaign anchor (never buyer) — the
+    # chain already enforces this (router.py:536-539). Reserved slots +
+    # source_id ride along; the cascade fills in flow/target ids below.
+    attribution: dict[str, Any] = {
+        "buyer_id": buyer_chain["buyer_id"],
+        "team_id": buyer_chain["team_id"],
+        "department_id": buyer_chain["department_id"],
+        "custom_group_id": buyer_chain["custom_group_id"],
+        "company_id": buyer_chain["company_id"],
+        "source_id": source_id,
+        "slots": slots,
+    }
 
     # Stage 6.5 — flow cascade.
     t0 = time.perf_counter()
@@ -299,6 +332,8 @@ async def _route_via_campaign(
         r, campaign, campaign_id, req,
         source_mappings=source_mappings,
         campaign_mappings=campaign_mappings,
+        buyer_chain=buyer_chain,
+        attribution=attribution,
     )
     timing["cascade_ms"] = _ms_since(t0)
 
@@ -321,6 +356,7 @@ async def _route_via_campaign(
                 "binding_id": binding_id,
                 "binding_alias": binding_alias,
                 "timing": timing,
+                "attribution": attribution,
                 "blocked": True,
             }
 
@@ -342,6 +378,7 @@ async def _route_via_campaign(
             "binding_id": binding_id,
             "binding_alias": binding_alias,
             "timing": timing,
+            "attribution": attribution,
         }
 
     # Stage 7 — legacy fallback (no flow matched).
@@ -376,6 +413,7 @@ async def _route_via_campaign(
         "binding_id": binding_id,
         "binding_alias": binding_alias,
         "timing": timing,
+        "attribution": attribution,
     }
 
 
@@ -387,6 +425,8 @@ async def _try_flow_cascade(
     *,
     source_mappings,
     campaign_mappings,
+    buyer_chain: dict[str, int | None],
+    attribution: dict[str, Any],
 ) -> dict[str, Any] | None:
     """Run scope cascade + action execution. Returns None if no flow.
 
@@ -405,13 +445,11 @@ async def _try_flow_cascade(
     the cascade-hit shape. Within the per-click 10ms total budget on
     healthy Redis.
     """
-    slots, _extras = resolve_slots(
-        query_params=req.query_params or {},
-        source_mappings=source_mappings,
-        campaign_mappings=campaign_mappings,
-    )
-    buyer_chain = await _resolve_buyer_chain(r, slots, campaign)
-
+    # `buyer_chain` is resolved once by the caller (`_route_via_campaign`)
+    # and passed in — see the latency-neutral rationale there. Steps a/b
+    # (slot resolve + buyer enrich) happen there now; this function owns
+    # steps c (cascade) + d (action) and records the routing-decision ids
+    # it discovers into the shared `attribution` dict (Phase 3).
     flow = await cascade.resolve_flow(
         r,
         campaign_id=campaign_id,
@@ -440,12 +478,26 @@ async def _try_flow_cascade(
     if flow is None:
         return None
 
-    return await action_executor.execute_action(
+    # Phase 3 — record routing-decision attribution from the winning
+    # flow. `traffic_target_id` is carried on the flow HASH (sync
+    # builder flows.py:94); `flow_version_id` is DEFERRED (no current-
+    # version pointer on the flows table / flow HASH yet — needs a sync-
+    # builder addition; see 03 §2 deferral + the Phase-3 report).
+    attribution["flow_id"] = _to_int(flow.get("_id"))
+    attribution["traffic_target_id"] = _to_int(flow.get("traffic_target_id"))
+
+    result = await action_executor.execute_action(
         r, flow, req, campaign_id,
         source_mappings=source_mappings,
         campaign_mappings=campaign_mappings,
         build_url_fn=build_url,
     )
+    # `offer_target_id` = the destination target the action resolved to.
+    # Read from a COPY-safe `.get` — never mutate `result` (it may be the
+    # shared module-level `BLOCK_RESULT` singleton on a block action).
+    if result is not None:
+        attribution["offer_target_id"] = _to_int(result.get("target_id"))
+    return result
 
 
 async def _resolve_buyer_chain(
@@ -480,9 +532,14 @@ async def _resolve_buyer_chain(
     source and this assertion becomes pure defense in depth.
     """
     raw_buyer = (slots or {}).get("buyer_id")
-    enriched = await enrich_buyer(r, raw_buyer)
-
     campaign_company_id = _to_int(campaign.get("company_id"))
+
+    # HIGH-001 (03 §3) — scope the Redis lookup to the CAMPAIGN tenant so
+    # a same `buyer_id` registered in another tenant cannot resolve here
+    # (structural prevention once the legacy global key is retired; the
+    # company-mismatch assertion below stays as defence-in-depth).
+    enriched = await enrich_buyer(r, raw_buyer, company_id=campaign_company_id)
+
     enriched_company_id = _to_int(enriched.get("company_id"))
 
     # If enrichment yielded a tenant that doesn't match the campaign,
@@ -1065,17 +1122,22 @@ async def _fetch_resolution_context(
     campaign_id: str,
     campaign: dict[str, Any],
     query_params: dict[str, Any],
-) -> tuple[list[dict[str, Any]] | None, list[dict[str, Any]] | None]:
+) -> tuple[list[dict[str, Any]] | None, list[dict[str, Any]] | None, int | None]:
     """Resolve which source matched + parse both mapping layers.
 
-    Returns `(source_mappings, campaign_mappings)` ready to pass to
-    `build_url(...)`. `None` for source_mappings indicates "no source
-    matched" — `resolve_slots` then drives the campaign-only chain.
+    Returns `(source_mappings, campaign_mappings, source_id)` ready to
+    pass to `build_url(...)`. `None` for source_mappings indicates "no
+    source matched" — `resolve_slots` then drives the campaign-only
+    chain. `source_id` (Stage 3 / Phase 3) is the matched source's PK —
+    `None` when no `?source=` matched — surfaced so the click record can
+    attribute the click to its source without a second lookup (the HASH
+    was already fetched here).
     """
     src = await _resolve_source_for_click(r, campaign_id, query_params)
     source_mappings = parse_param_mappings(src.get("param_mappings")) if src else None
     campaign_mappings = parse_param_mappings(campaign.get("default_param_mappings"))
-    return source_mappings, campaign_mappings
+    source_id = _to_int(src.get("_id")) if src else None
+    return source_mappings, campaign_mappings, source_id
 
 
 def build_url(

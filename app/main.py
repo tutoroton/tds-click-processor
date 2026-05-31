@@ -702,13 +702,15 @@ _RESERVED_SLOT_COLUMNS: tuple[str, ...] = (
     "user_id", "external_id", "app_id",
 )
 
-# Schema version the producer stamps on every click_record. Bumped to 2
-# for Phase 3 (org-chain + routing metadata + reserved slots + infra
-# columns). The collector's §4b skew detector tolerates an OLD producer
-# (version 1 / absent) against a NEW consumer during a rolling deploy —
+# Schema version the producer stamps on every click_record.
+#   v2 — Phase 3 (org-chain + routing metadata + reserved slots + infra).
+#   v3 — Phase 4 S1: `flow_version_id` (the flow's current published
+#        version, now joined by the sync builder).
+# The collector's §4b skew detector tolerates an OLD producer (lower
+# version / absent) against a NEW consumer during a rolling deploy —
 # absent columns simply land as CH defaults. Keep in lockstep with
 # collector `writer.KNOWN_CLICK_SCHEMA_VERSION`.
-_CLICK_SCHEMA_VERSION = 2
+_CLICK_SCHEMA_VERSION = 3
 
 
 def _utc_now_ms_iso() -> str:
@@ -751,6 +753,9 @@ def _phase3_attribution_fields(
         # Routing-decision ids.
         "source_id": attr.get("source_id"),
         "flow_id": attr.get("flow_id"),
+        # Stage 3 / Phase 4 (S1) — the flow's current published version,
+        # resolved by the router from the flow HASH (no longer DEFERRED).
+        "flow_version_id": attr.get("flow_version_id"),
         "offer_target_id": attr.get("offer_target_id"),
         "traffic_target_id": attr.get("traffic_target_id"),
         # routing_result is already on `timing`; promote to a column so

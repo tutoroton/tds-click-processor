@@ -58,7 +58,7 @@ class TestPhase3AttributionFields:
             "attribution": {
                 "buyer_id": 7, "team_id": 3, "department_id": 2,
                 "custom_group_id": 9, "company_id": 42,
-                "source_id": 5, "flow_id": 11,
+                "source_id": 5, "flow_id": 11, "flow_version_id": 33,
                 "offer_target_id": 4, "traffic_target_id": 8,
                 "slots": {
                     "source": "fb", "ad_id": "a1", "app_id": "com.x",
@@ -79,6 +79,7 @@ class TestPhase3AttributionFields:
         assert f["custom_group_id"] == 9
         assert f["source_id"] == 5
         assert f["flow_id"] == 11
+        assert f["flow_version_id"] == 33    # S1 — flow's current version
         assert f["offer_target_id"] == 4
         assert f["traffic_target_id"] == 8
         assert f["routing_result"] == "matched"
@@ -164,12 +165,14 @@ class TestPhase3AttributionFields:
         f = _phase3_attribution_fields({}, ClickRequest(click_id="c1"), {}, _RDT)
         assert f["company_id"] is None
         assert f["buyer_id"] is None
+        assert f["flow_version_id"] is None   # S1 — absent → CH default 0
         assert f["source"] is None
         assert f["routing_result"] == ""
         assert f["cost"] == 0
 
-    def test_schema_version_constant_is_2(self):
-        assert _CLICK_SCHEMA_VERSION == 2
+    def test_schema_version_constant(self):
+        # v3 — Phase 4 S1 added flow_version_id to the producer contract.
+        assert _CLICK_SCHEMA_VERSION == 3
 
     def test_utc_now_ms_iso_format(self):
         # FIX-1 — millisecond precision (3 digits), trailing Z, NOT the

@@ -59,6 +59,27 @@ class ClickRequest(BaseModel):
     )
     visitor_id: str | None = Field(default=None, max_length=128, pattern=r'^[a-zA-Z0-9_\-]*$')
     is_returning: bool = False
+    # Stage 3 · Phase 4 S2 — edge quality signals from CF Bot Management
+    # (fail-open false at the worker on a non-Enterprise zone). Bools so a
+    # missing field defaults cleanly; collector maps each to a CH UInt8.
+    is_bot: bool = False
+    is_proxy: bool = False
+    # CF request ray (correlate with CF logs) + a worker-generated edge
+    # correlation id, distinct from click_id. Both bounded; charset is not
+    # constrained beyond length (cf_ray is CF-shaped hex-dash, request_id a
+    # UUID) so a future edge format change does not 422 a live click.
+    cf_ray: str = Field(default="", max_length=64)
+    request_id: str = Field(default="", max_length=64)
+    # Worker edge-arrival instant (OQ-D). Same strict ISO-8601 UTC shape as
+    # click_ts; optional → absent (old worker) lands as CH NULL, never now().
+    arrival_ts: str | None = Field(
+        default=None,
+        max_length=40,
+        pattern=(
+            r'^20\d{2}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])'
+            r'T([01]\d|2[0-3]):[0-5]\d:[0-5]\d(\.\d{1,6})?Z$'
+        ),
+    )
     # Geo
     ip: str = ""
     country: str = ""

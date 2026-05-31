@@ -171,8 +171,48 @@ class TestPhase3AttributionFields:
         assert f["cost"] == 0
 
     def test_schema_version_constant(self):
-        # v3 — Phase 4 S1 added flow_version_id to the producer contract.
-        assert _CLICK_SCHEMA_VERSION == 3
+        # v4 — Phase 4 S2 added is_unique/is_bot/is_proxy/cf_ray/
+        # request_id/arrival_ts to the producer contract.
+        assert _CLICK_SCHEMA_VERSION == 4
+
+    def test_is_unique_derived_from_visitor_cookie(self):
+        # S2 — is_unique is a click-processor derivation: a NEW visitor
+        # (no cookie → is_returning False) is unique; a returning one isn't.
+        new = _phase3_attribution_fields(
+            {"attribution": {}}, ClickRequest(click_id="c1", is_returning=False),
+            {}, _RDT)
+        ret = _phase3_attribution_fields(
+            {"attribution": {}}, ClickRequest(click_id="c1", is_returning=True),
+            {}, _RDT)
+        assert new["is_unique"] is True
+        assert ret["is_unique"] is False
+
+    def test_edge_quality_and_correlation_from_request(self):
+        # S2 — is_bot/is_proxy/cf_ray/request_id/arrival_ts come straight
+        # off the (worker-populated) request.
+        req = ClickRequest(
+            click_id="c1", is_bot=True, is_proxy=True,
+            cf_ray="8abc-FRA", request_id="11111111-2222-3333-4444-555555555555",
+            arrival_ts="2026-06-01T10:00:00.100Z",
+        )
+        f = _phase3_attribution_fields({"attribution": {}}, req, {}, _RDT)
+        assert f["is_bot"] is True
+        assert f["is_proxy"] is True
+        assert f["cf_ray"] == "8abc-FRA"
+        assert f["request_id"] == "11111111-2222-3333-4444-555555555555"
+        assert f["arrival_ts"] == "2026-06-01T10:00:00.100Z"
+
+    def test_edge_signals_default_when_absent(self):
+        # S2 fail-open: an old worker (no edge signals) → safe defaults,
+        # never crashes. arrival_ts None → collector NULL (not now()).
+        f = _phase3_attribution_fields(
+            {"attribution": {}}, ClickRequest(click_id="c1"), {}, _RDT)
+        assert f["is_bot"] is False
+        assert f["is_proxy"] is False
+        assert f["is_unique"] is True        # absent cookie → new visitor
+        assert f["cf_ray"] == ""
+        assert f["request_id"] == ""
+        assert f["arrival_ts"] is None
 
     def test_utc_now_ms_iso_format(self):
         # FIX-1 — millisecond precision (3 digits), trailing Z, NOT the

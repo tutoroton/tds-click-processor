@@ -706,11 +706,13 @@ _RESERVED_SLOT_COLUMNS: tuple[str, ...] = (
 #   v2 — Phase 3 (org-chain + routing metadata + reserved slots + infra).
 #   v3 — Phase 4 S1: `flow_version_id` (the flow's current published
 #        version, now joined by the sync builder).
+#   v4 — Phase 4 S2: quality + correlation columns (is_unique / is_bot /
+#        is_proxy / cf_ray / request_id / arrival_ts).
 # The collector's §4b skew detector tolerates an OLD producer (lower
 # version / absent) against a NEW consumer during a rolling deploy —
 # absent columns simply land as CH defaults. Keep in lockstep with
 # collector `writer.KNOWN_CLICK_SCHEMA_VERSION`.
-_CLICK_SCHEMA_VERSION = 3
+_CLICK_SCHEMA_VERSION = 4
 
 
 def _utc_now_ms_iso() -> str:
@@ -761,15 +763,28 @@ def _phase3_attribution_fields(
         # routing_result is already on `timing`; promote to a column so
         # it is queryable without unpacking the timing JSON.
         "routing_result": timing.get("result", ""),
-        # Worker-auto infra/audit columns cleanly available on the
-        # request today. (cf_ray / request_id / arrival_ts need worker
-        # header propagation — DEFERRED, see 03 §5 + the Phase-3 report.)
+        # Worker-auto infra/audit columns cleanly available on the request.
         "worker_colo": req.colo or "",
         "tls_version": req.tls_version or "",
         "http_protocol": req.http_protocol or "",
         "hostname": req.hostname or "",
         "path": req.path or "",
         "language": parse_accept_language(req.accept_language) or "",
+        # Stage 3 / Phase 4 S2 — quality + correlation columns.
+        # is_unique is a CLICK-PROCESSOR derivation (user decision): a
+        # NEW visitor (no `_tds_vid` cookie → is_returning False) is a
+        # unique click. This is visitor-cookie-level, not server-side
+        # dedup. is_bot / is_proxy come from the EDGE (CF Bot Management,
+        # fail-open False). cf_ray / request_id are worker-propagated
+        # correlation ids. (All were DEFERRED in Phase 3.)
+        "is_unique": not req.is_returning,
+        "is_bot": req.is_bot,
+        "is_proxy": req.is_proxy,
+        "cf_ray": req.cf_ray or "",
+        "request_id": req.request_id or "",
+        # Worker edge-arrival instant — Nullable; absent (old worker) →
+        # collector _parse_dt_or_none → CH NULL (NOT now()).
+        "arrival_ts": req.arrival_ts,
         # routing decision instant (this node finished routing). ms-ISO
         # passed in by the caller → collector parses to the
         # Nullable(DateTime64(3)) column.

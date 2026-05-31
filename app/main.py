@@ -711,16 +711,27 @@ _RESERVED_SLOT_COLUMNS: tuple[str, ...] = (
 _CLICK_SCHEMA_VERSION = 2
 
 
+def _utc_now_ms_iso() -> str:
+    """Current UTC instant as `YYYY-MM-DDTHH:MM:SS.mmmZ` (millisecond
+    precision, 3 digits) — matches the DateTime64(3) `routing_decision_ts`
+    column and the `_resolve_click_timestamp` format, NOT `.isoformat()`'s
+    6-digit microseconds. The single impure (clock-reading) seam so the
+    record-build helper below can stay pure + deterministically testable."""
+    dt = datetime.now(timezone.utc)
+    return f"{dt.strftime('%Y-%m-%dT%H:%M:%S')}.{dt.microsecond // 1000:03d}Z"
+
+
 def _phase3_attribution_fields(
-    result: dict, req: ClickRequest, timing: dict,
+    result: dict, req: ClickRequest, timing: dict, routing_decision_ts: str,
 ) -> dict:
     """Build the Phase-3 column additions for one click record.
 
-    Pure + side-effect-free so it is unit-testable in isolation. Reads
-    the `attribution` dict threaded up by `router._route_via_campaign`
-    (org chain + routing ids + resolved `slots`) plus worker-auto
-    request fields. Returns a flat dict the caller merges into
-    `click_record`.
+    Pure + side-effect-free (the clock read is hoisted to the caller and
+    passed in as `routing_decision_ts`) so it is unit-testable in
+    isolation. Reads the `attribution` dict threaded up by
+    `router._route_via_campaign` (org chain + routing ids + resolved
+    `slots`) plus worker-auto request fields. Returns a flat dict the
+    caller merges into `click_record`.
 
     Guardrail (rule `multi-tenant-isolation`): `company_id` is taken
     from the attribution chain, which the router pins to the CAMPAIGN
@@ -754,9 +765,10 @@ def _phase3_attribution_fields(
         "hostname": req.hostname or "",
         "path": req.path or "",
         "language": parse_accept_language(req.accept_language) or "",
-        # routing decision instant (this node finished routing). ISO —
-        # collector parses to the Nullable(DateTime64(3)) column.
-        "routing_decision_ts": datetime.now(timezone.utc).isoformat(),
+        # routing decision instant (this node finished routing). ms-ISO
+        # passed in by the caller → collector parses to the
+        # Nullable(DateTime64(3)) column.
+        "routing_decision_ts": routing_decision_ts,
         # cost: advertiser-supplied per-click value (same source build_url
         # uses; campaign-hardcoded fallback still DEFERRED — no schema col).
         "cost": (req.query_params or {}).get("cost") or 0,
@@ -1083,7 +1095,9 @@ async def decide(
     # source_id / flow_id / sub9..20 / cost — PG now gets them populated
     # too). sub1..8 + extra_params are intentionally NOT touched.
     click_record["click_schema_version"] = _CLICK_SCHEMA_VERSION
-    click_record.update(_phase3_attribution_fields(result, req, timing))
+    click_record.update(
+        _phase3_attribution_fields(result, req, timing, _utc_now_ms_iso())
+    )
 
     # H1 fix (2026-05-11): idempotency gate BEFORE XADD.
     #

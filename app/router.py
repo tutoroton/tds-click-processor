@@ -306,7 +306,7 @@ async def _route_via_campaign(
     # `slots` is pure-Python over the source∪campaign param_mappings
     # (the source HASH was already fetched in `_fetch_resolution_context`)
     # — no extra Redis op (03 §5 open-Q #3 / 03 §4 hot-path guardrail).
-    slots, _slot_extras = resolve_slots(
+    slots, slot_extras = resolve_slots(
         query_params=req.query_params or {},
         source_mappings=source_mappings,
         campaign_mappings=campaign_mappings,
@@ -316,6 +316,13 @@ async def _route_via_campaign(
     # `company_id` ALWAYS from the campaign anchor (never buyer) — the
     # chain already enforces this (router.py:536-539). Reserved slots +
     # source_id ride along; the cascade fills in flow/target ids below.
+    #
+    # `extras` — the canonical resolver's authoritative "unmapped keys"
+    # set: every incoming query param NOT bound to a reserved or sub slot
+    # (by canonical name or source/campaign alias). Threaded up so the
+    # click record's `extra_params` is sourced from it (C-1, 2026-06-02)
+    # instead of a hand-rolled legacy-key filter — a param that landed in
+    # a dedicated column is therefore NEVER duplicated into extras.
     attribution: dict[str, Any] = {
         "buyer_id": buyer_chain["buyer_id"],
         "team_id": buyer_chain["team_id"],
@@ -324,6 +331,7 @@ async def _route_via_campaign(
         "company_id": buyer_chain["company_id"],
         "source_id": source_id,
         "slots": slots,
+        "extras": slot_extras,
     }
 
     # Stage 6.5 — flow cascade.

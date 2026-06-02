@@ -19,6 +19,7 @@ from app.enrichment import EMPTY_ENRICHMENT, enrich_buyer
 from app.main import (
     _CLICK_SCHEMA_VERSION,
     _RESERVED_SLOT_COLUMNS,
+    _build_extra_params,
     _phase3_attribution_fields,
     _utc_now_ms_iso,
 )
@@ -130,17 +131,29 @@ class TestPhase3AttributionFields:
     def test_buyer_id_is_not_a_reserved_string_column(self):
         assert "buyer_id" not in _RESERVED_SLOT_COLUMNS
 
-    def test_all_subs_9_to_20_from_slots_sub1_8_untouched(self):
-        # FIX-6 — loop the FULL sub9..20 range (catches off-by-one), not
-        # just sub9/sub20.
-        slots = {f"sub{i}": f"s{i}" for i in range(9, 21)}
+    def test_all_subs_1_to_20_from_slots(self):
+        # C-1 (2026-06-02): sub1..20 are ALL free per-Source containers,
+        # populated canonically from `?subN=` (+ alias) via resolve_slots.
+        # The legacy sub1..8 hardcode (sub1=?source, sub2=?creative, …) is
+        # GONE — every sub column now comes from the resolved slots dict.
+        slots = {f"sub{i}": f"s{i}" for i in range(1, 21)}
         f = _phase3_attribution_fields(
             {"attribution": {"slots": slots}}, ClickRequest(click_id="c1"),
             {}, _RDT)
-        for i in range(9, 21):
+        for i in range(1, 21):
             assert f[f"sub{i}"] == f"s{i}", i
-        for i in range(1, 9):
-            assert f"sub{i}" not in f  # legacy hardcoded mapping owns 1..8
+
+    def test_sub1_8_no_longer_read_legacy_get_keys(self):
+        # Regression pin for the user's pain ("only sub1 filled"): a click
+        # carrying the OLD Keitaro keys (?creative/?buyer/?adgroup) must NOT
+        # leak them into sub2/sub3/sub5 — those columns are now driven ONLY
+        # by the canonical ?sub2/?sub3/?sub5 (here absent → None/CH '').
+        slots = {"source": "fb"}   # ?source bound its reserved slot, not sub1
+        f = _phase3_attribution_fields(
+            {"attribution": {"slots": slots}}, ClickRequest(click_id="c1"),
+            {}, _RDT)
+        for i in range(1, 21):
+            assert f[f"sub{i}"] is None, i   # no legacy hijack
 
     def test_infra_and_cost_from_request(self):
         req = ClickRequest(
@@ -221,6 +234,51 @@ class TestPhase3AttributionFields:
         assert ts.endswith("Z")
         ms = ts.split(".")[1][:-1]
         assert len(ms) == 3 and ms.isdigit()
+
+
+# ============================================================
+# C-1 — _build_extra_params (no column duplication; no-match capture)
+# ============================================================
+
+
+class TestBuildExtraParams:
+    def test_matched_uses_resolver_extras_no_column_duplication(self):
+        # Matched click: the resolver already excluded every key that bound
+        # to a reserved/sub column, so extra_params == its `extras` set —
+        # a column-bound value (pixel_id) is NOT duplicated here.
+        attribution = {
+            "slots": {"pixel_id": "PIX", "sub3": "S3"},
+            "extras": {"fbclid": "abc", "step": "1"},
+        }
+        qp = {"pixel_id": "PIX", "sub3": "S3", "fbclid": "abc", "step": "1"}
+        extra = _build_extra_params(attribution, qp)
+        assert extra == {"fbclid": "abc", "step": "1"}
+        assert "pixel_id" not in extra   # lives in its column, not extras
+        assert "sub3" not in extra
+
+    def test_debug_flag_dropped_from_matched(self):
+        attribution = {"slots": {}, "extras": {"debug": "1", "x": "y"}}
+        extra = _build_extra_params(attribution, {"debug": "1", "x": "y"})
+        assert extra == {"x": "y"}
+
+    def test_no_match_captures_every_param(self):
+        # No attribution (pre-campaign / no-match path never ran the
+        # resolver) → capture all advertiser params so nothing is lost,
+        # str-coerced, minus the internal debug flag.
+        qp = {"source": "fb", "sub2": "B", "cost": 5, "debug": "1"}
+        extra = _build_extra_params(None, qp)
+        assert extra == {"source": "fb", "sub2": "B", "cost": "5"}
+        assert "debug" not in extra
+
+    def test_no_match_empty_attribution_dict_falls_back(self):
+        # An attribution dict WITHOUT an `extras` key (defensive) also
+        # falls back to full-qp capture rather than silently dropping.
+        qp = {"a": "1", "b": "2"}
+        assert _build_extra_params({"slots": {}}, qp) == {"a": "1", "b": "2"}
+
+    def test_empty_inputs(self):
+        assert _build_extra_params(None, {}) == {}
+        assert _build_extra_params({"extras": {}}, {"x": "1"}) == {}
 
 
 # ============================================================

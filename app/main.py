@@ -800,16 +800,45 @@ def _phase3_attribution_fields(
     for col in _RESERVED_SLOT_COLUMNS:
         fields[col] = slots.get(col)
 
-    # sub9..20 from the canonical resolution (sub1..8 keep their legacy
-    # hardcoded GET mapping for live-PG continuity — redefining them is a
-    # field-semantics change that needs a 1-cycle consumer overlap, 03
-    # §4 additive guardrail). sub9..20 were previously empty, so this is
-    # purely additive.
-    for i in range(9, 21):
+    # sub1..20 ALL resolve from the canonical mapping chain (C-1,
+    # 2026-06-02). Design contract `docs/design/PARAMETER-SYSTEM.md`
+    # §"Configurable SUB_SLOTS": every sub slot is a FREE per-Source
+    # container — its column value comes from the canonical key `?subN=`
+    # plus any source/campaign alias, NEVER from a hardcoded legacy GET
+    # name. This replaced the Keitaro-era sub1..8 hardcode in the record
+    # builder (which read `?source/?creative/?buyer/...` and silently
+    # dropped real `?sub1..?sub8` into extras).
+    for i in range(1, 21):
         key = f"sub{i}"
         fields[key] = slots.get(key)
 
     return fields
+
+
+def _build_extra_params(attribution: dict | None, query_params: dict) -> dict:
+    """The click's `extra_params` JSONB — query params that did NOT bind
+    to a dedicated reserved/sub column.
+
+    Matched clicks: the canonical resolver (`resolution.resolve_slots`)
+    already computed the authoritative unmapped-key set and threaded it
+    up as `attribution["extras"]` (every canonical slot name + every
+    source/campaign alias excluded). So a value that landed in a reserved
+    or sub column is NEVER duplicated into extras (C-1, 2026-06-02 — this
+    replaced a hand-rolled legacy-key filter that duplicated all canonical
+    values and misrouted real `?sub1..?sub8`).
+
+    No-match / pre-campaign clicks never ran the resolver (no attribution
+    extras): no slot column was populated for them, so capture every
+    advertiser param so nothing is lost. The internal `debug` flag is
+    dropped from both paths (diagnostic-only, never analytics).
+    """
+    extras = (attribution or {}).get("extras")
+    if extras is None:
+        extras = {k: str(v) for k, v in (query_params or {}).items()}
+    else:
+        extras = dict(extras)
+    extras.pop("debug", None)
+    return extras
 
 
 @app.post("/decide")
@@ -1080,17 +1109,12 @@ async def decide(
         "visitor_id": req.visitor_id or "",
         "is_returning": req.is_returning,
         "referer": req.referer,
-        "sub1": qp.get("source", ""),
-        "sub2": qp.get("creative", ""),
-        "sub3": qp.get("buyer", ""),
-        "sub4": qp.get("campaign_ext", qp.get("utm_campaign", "")),
-        "sub5": qp.get("adgroup", ""),
-        "sub6": qp.get("adset", ""),
-        "sub7": qp.get("app", ""),
-        "sub8": qp.get("team", ""),
-        "extra_params": {k: v for k, v in qp.items()
-                        if k not in ("source", "creative", "buyer", "campaign_ext",
-                                     "utm_campaign", "adgroup", "adset", "app", "team", "debug")},
+        # sub1..20 are populated canonically by
+        # `_phase3_attribution_fields` (merged in below) — NO legacy
+        # hardcode here. `extra_params` is the canonical resolver's
+        # "unmapped keys" set, so a value that landed in a reserved/sub
+        # column is never duplicated here (C-1, 2026-06-02).
+        "extra_params": _build_extra_params(result.get("attribution"), qp),
     }
     # F-1: tag fallback (no_match / blocked) clicks so they are queryable
     # (extra_params->>'routing_status'). Only set on the fallback path — a
@@ -1109,11 +1133,11 @@ async def decide(
     click_record["timing"] = timing
 
     # Stage 3 / Phase 3 — populate the org-chain, routing-decision,
-    # reserved-slot + infra columns now that routing + timing are final.
-    # Additive: every key here is either NEW (CH-only columns the PG
-    # writer never reads) or a previously-empty field (company_id /
-    # source_id / flow_id / sub9..20 / cost — PG now gets them populated
-    # too). sub1..8 + extra_params are intentionally NOT touched.
+    # reserved-slot + sub1..20 + infra columns now that routing + timing
+    # are final. sub1..20 ALL come from the canonical resolution here
+    # (C-1, 2026-06-02 — the legacy sub1..8 hardcode that lived in the
+    # record literal above is gone); `extra_params` was already sourced
+    # from the resolver's unmapped-key set in the literal.
     click_record["click_schema_version"] = _CLICK_SCHEMA_VERSION
     click_record.update(
         _phase3_attribution_fields(result, req, timing, _utc_now_ms_iso())

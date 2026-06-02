@@ -2,11 +2,23 @@
 
 Pure helpers — NO I/O. Used by click-processor's `/decide` to:
   1. Build the merged effective key map from source + campaign
-     `param_mappings` (campaign-wins-per-slot for aliases).
+     `param_mappings` (source-wins-per-slot for aliases — SOURCE
+     specializes/overrides the campaign on conflict).
   2. Run the per-slot value resolution chain
-     (request URL > campaign hardcoded > source hardcoded > NULL).
+     (request URL > effective_source hardcoded > campaign hardcoded > NULL).
   3. Capture unmapped query params into `extras` for the eventual
      `clicks.extras` JSONB column (Stage 3 storage target).
+
+SOURCE-WINS (`docs/development/param-source-campaign-overrides-2026-06-02.md`,
+DESIGN LOCKED 2026-06-02): the `source_mappings` argument is the
+EFFECTIVE source layer — the per-link `campaign_sources.params_override`
+when set, else the source's global `param_mappings` (the router resolves
+which one via `_effective_source_mappings`). The source SPECIALIZES the
+campaign, so on a per-slot conflict the source's alias and the source's
+hardcoded default both beat the campaign's. The campaign provides the
+fallback for any slot the source did not specialize (non-conflict ⇒
+campaign remains). This inverts the pre-2026-06-02 CAMPAIGN-WINS
+tiebreak.
 
 Design pin: PARAMETER-SYSTEM.md §"Key resolution".
 
@@ -174,10 +186,13 @@ def resolve_slots(
     Args:
         query_params: Incoming GET params from the request URL.
             Values are the raw string form (or `None`).
-        source_mappings: Source's `param_mappings` (already
-            JSON-parsed via `parse_param_mappings`). May be `None`
-            when no source matches the click — fall back to
-            campaign-only resolution.
+        source_mappings: The EFFECTIVE source layer (per-link
+            `params_override` when set, else the source global
+            `param_mappings`), already JSON-parsed via
+            `parse_param_mappings`. May be `None` when no source
+            matches the click — fall back to campaign-only resolution.
+            On a per-slot conflict the source WINS (specializes the
+            campaign) — both for the alias and the hardcoded default.
         campaign_mappings: Campaign's `default_param_mappings`
             (same shape).
 
@@ -196,19 +211,21 @@ def resolve_slots(
             slot name. Becomes the `clicks.extras` JSONB row in
             Stage 3.
 
-    Resolution chain per PARAMETER-SYSTEM.md (F.X canonical-binding):
+    Resolution chain per the SOURCE-WINS contract
+    (`param-source-campaign-overrides-2026-06-02.md`, F.X canonical-binding):
       For each slot in `CANONICAL_SLOTS ∪ src_by_slot ∪ cmp_by_slot`:
 
         1. Request URL — try the canonical slot name first, then the
            explicit `alias` (when defined and different). First
            non-empty value wins. Canonical-first guarantees that a
            same-named GET key beats an alias collision per the
-           design decision matrix.
-        2. Campaign hardcoded `default_value` (only when campaign
-           defines the slot).
-        3. Source hardcoded `default_value` (only when source defines
-           the slot — applies even when campaign overrode the alias
-           but left `default_value` empty).
+           design decision matrix. URL ALWAYS wins.
+        2. effective_source hardcoded `default_value` (only when the
+           source defines the slot — the source specializes the
+           campaign, so its default is checked BEFORE the campaign's).
+        3. Campaign hardcoded `default_value` (fallback for any slot the
+           source did not specialize, and when the source defined the
+           slot's alias but left `default_value` empty).
         4. NULL.
 
     Examined-key bookkeeping: every candidate GET key (canonical
@@ -261,12 +278,13 @@ def resolve_slots(
         src_entry = src_by_slot.get(slot)
         is_explicitly_mapped = (cmp_entry is not None) or (src_entry is not None)
 
-        # Effective alias = campaign's wins per slot (per design
-        # doc §"Key resolution"). When campaign doesn't define the
-        # slot, source's alias is the only option. When neither
-        # defines the slot (canonical-only auto-iteration), there
-        # is no alias — only the canonical name itself.
-        primary_entry = cmp_entry if cmp_entry is not None else src_entry
+        # Effective alias = SOURCE wins per slot (SOURCE-WINS contract,
+        # 2026-06-02 — the source specializes the campaign). When the
+        # source doesn't define the slot, the campaign's alias is the
+        # only option. When neither defines the slot (canonical-only
+        # auto-iteration), there is no alias — only the canonical name
+        # itself.
+        primary_entry = src_entry if src_entry is not None else cmp_entry
 
         # F.X — candidate GET keys in priority order. Canonical
         # slot name FIRST, then the explicit alias (when defined
@@ -300,19 +318,21 @@ def resolve_slots(
             slots[slot] = request_value
             continue
 
-        # Step 2 — campaign hardcoded (only when campaign defines).
-        if cmp_entry is not None:
-            cmp_default = _entry_default(cmp_entry)
-            if cmp_default is not None:
-                slots[slot] = cmp_default
-                continue
-
-        # Step 3 — source hardcoded (independent fallback even when
-        # campaign overrode the alias but left default_value empty).
+        # Step 2 — effective_source hardcoded (SOURCE-WINS: the source
+        # specializes the campaign, so its default is checked FIRST).
         if src_entry is not None:
             src_default = _entry_default(src_entry)
             if src_default is not None:
                 slots[slot] = src_default
+                continue
+
+        # Step 3 — campaign hardcoded (fallback for any slot the source
+        # did not specialize, and when the source defined the alias but
+        # left default_value empty).
+        if cmp_entry is not None:
+            cmp_default = _entry_default(cmp_entry)
+            if cmp_default is not None:
+                slots[slot] = cmp_default
                 continue
 
         # Step 4 — NULL. Only emit the slot into the result dict

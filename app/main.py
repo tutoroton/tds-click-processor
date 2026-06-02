@@ -1028,12 +1028,33 @@ async def decide(
     # "All backends failed" → fallback). The matched path is byte-identical
     # (it never enters this branch). `result is None` is checked first so
     # `result.get("blocked")` is only evaluated on a dict.
-    if result is None or result.get("blocked"):
-        reason = "no_match" if result is None else "blocked"
+    #
+    # G2 (2026-06-02): the `non_routed` sentinel (capped / no-flow /
+    # all-capped — a campaign DID match) joins blocked here. Crucially we
+    # now PRESERVE `result["attribution"]` from the sentinel instead of
+    # discarding it — that is exactly the campaign(+effective_source)
+    # hardcoded-defaults bundle `_phase3_attribution_fields` reads to fill
+    # the slot columns. Pre-G2 this branch rebuilt `result` WITHOUT
+    # attribution, so every slot column landed NULL even when the campaign
+    # declared hardcoded defaults. `result is None` (no campaign matched
+    # at all) carries no attribution — there are no defaults to persist.
+    if result is None or result.get("blocked") or result.get("non_routed"):
+        if result is None:
+            reason = "no_match"
+        elif result.get("blocked"):
+            reason = "blocked"
+        else:
+            # Honour the router's specific routing_status when present
+            # (campaign_capped / all_capped / no_offer); fall back to a
+            # generic tag otherwise.
+            reason = result.get("routing_status") or "non_routed"
         # Copy the timing dict — `setdefault` below would otherwise mutate
         # the object `route()` returned (benign today, fragile on reuse).
         fb_timing = {} if result is None else dict(result.get("timing") or {})
         fb_timing.setdefault("result", reason)
+        # Preserve the router-resolved attribution (blocked + non_routed
+        # sentinels carry it); no-campaign no_match has none.
+        attribution = None if result is None else result.get("attribution")
         result = {
             "url": f"{_resolve_fallback_url()}?reason={reason}"
                    f"&click_id={quote(req.click_id, safe='')}",
@@ -1042,6 +1063,9 @@ async def decide(
             "binding_id": 0 if result is None else result.get("binding_id", 0),
             "binding_alias": None if result is None else result.get("binding_alias"),
             "timing": fb_timing,
+            # G2 — campaign(+effective_source) hardcoded defaults ride
+            # through so the slot columns persist on the fallback record.
+            "attribution": attribution,
             # Surfaced into click_record.extra_params below so the fallback
             # click is queryable (extra_params->>'routing_status').
             "routing_status": reason,

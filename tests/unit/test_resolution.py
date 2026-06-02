@@ -5,15 +5,20 @@ Coverage targets:
     Redis sync can produce (JSON string, parsed list, malformed,
     None, dict).
   - `resolve_slots` correctness across all 4 priority levels of the
-    PARAMETER-SYSTEM.md resolution chain.
-  - Campaign-overrides-source-per-slot semantics for the alias map.
-  - Source hardcoded fallback when campaign overrides alias but
-    leaves `default_value` empty (subtle but spec-mandated case).
+    SOURCE-WINS resolution chain.
+  - SOURCE-overrides-campaign-per-slot semantics for the alias map
+    (SOURCE specializes the campaign on conflict, 2026-06-02).
+  - Campaign hardcoded fallback when the source defines the slot's
+    alias but leaves `default_value` empty (subtle but spec-mandated
+    case — campaign is now the FALLBACK layer).
   - `extras` JSONB-equivalent capture of unmapped query params.
   - Edge cases: malformed entries, non-string slots, None mappings.
 
-Pinned by `docs/design/PARAMETER-SYSTEM.md` §"Resolution chain"
-and `docs/roadmap/stage-1-vector-1-2-implementation-plan.md` Phase 5.
+Pinned by the SOURCE-WINS contract
+`docs/development/param-source-campaign-overrides-2026-06-02.md`
+(DESIGN LOCKED 2026-06-02) — `source_mappings` is the EFFECTIVE source
+layer (per-link override or source global). Priority:
+`URL > effective_source > campaign > NULL`.
 """
 
 import pytest
@@ -106,16 +111,18 @@ class TestPriority1RequestURL:
         )
         assert slots == {"source_click_id": "live_click"}
 
-    def test_campaign_alias_wins_for_lookup(self):
-        # Campaign aliases `gclid` → `source_click_id`. Source aliased same slot
-        # via `gbraid`. The campaign-defined alias is what we look up.
+    def test_source_alias_wins_for_lookup(self):
+        # SOURCE-WINS (2026-06-02): source aliases `gbraid` →
+        # `source_click_id`; campaign aliases the same slot via `gclid`.
+        # The SOURCE-defined alias is what we look up (source specializes
+        # the campaign).
         slots, _ = resolve_slots(
             query_params={"gclid": "g123", "gbraid": "gb456"},
             source_mappings=[{"slot": "source_click_id", "alias": "gbraid"}],
             campaign_mappings=[{"slot": "source_click_id", "alias": "gclid"}],
         )
-        # Campaign alias wins → use `gclid` value.
-        assert slots == {"source_click_id": "g123"}
+        # Source alias wins → use `gbraid` value.
+        assert slots == {"source_click_id": "gb456"}
 
 
 # ============================================================
@@ -132,13 +139,15 @@ class TestPriority2CampaignHardcoded:
         )
         assert slots == {"funnel_type": "tripwire"}
 
-    def test_campaign_hardcoded_beats_source_hardcoded(self):
+    def test_source_hardcoded_beats_campaign_hardcoded(self):
+        # SOURCE-WINS (2026-06-02): source hardcoded default beats the
+        # campaign hardcoded default — the source specializes the campaign.
         slots, _ = resolve_slots(
             query_params={},
             source_mappings=[{"slot": "pixel_id", "default_value": "src_pixel"}],
             campaign_mappings=[{"slot": "pixel_id", "default_value": "campaign_pixel"}],
         )
-        assert slots == {"pixel_id": "campaign_pixel"}
+        assert slots == {"pixel_id": "src_pixel"}
 
     def test_empty_query_value_falls_through_to_campaign_hardcoded(self):
         # Advertiser sent ?source_click_id= (empty). Treat as no value.
@@ -164,18 +173,19 @@ class TestPriority3SourceHardcoded:
         )
         assert slots == {"pixel_id": "fb_pixel_42"}
 
-    def test_source_hardcoded_falls_through_when_campaign_alias_only(self):
-        # Subtle case from PARAMETER-SYSTEM.md spec:
-        # Campaign overrides slot's ALIAS but leaves `default_value`
-        # null. Source still has its hardcoded value. Per spec line
-        # 105-107 — source's hardcoded must apply as final fallback.
+    def test_campaign_hardcoded_falls_through_when_source_alias_only(self):
+        # Subtle SOURCE-WINS case (2026-06-02): the SOURCE defines the
+        # slot's ALIAS but leaves `default_value` null. The CAMPAIGN still
+        # has its hardcoded value. Since the source layer is checked first
+        # but contributes no default, the campaign hardcoded applies as the
+        # final fallback (campaign is now the FALLBACK layer).
         slots, _ = resolve_slots(
             query_params={},  # no request value
-            source_mappings=[{"slot": "pixel_id", "alias": "px", "default_value": "src_fallback"}],
-            campaign_mappings=[{"slot": "pixel_id", "alias": "campaign_px", "default_value": None}],
+            source_mappings=[{"slot": "pixel_id", "alias": "px", "default_value": None}],
+            campaign_mappings=[{"slot": "pixel_id", "alias": "campaign_px", "default_value": "cmp_fallback"}],
         )
-        # Campaign defined slot but no hardcoded; falls through to source's.
-        assert slots == {"pixel_id": "src_fallback"}
+        # Source defined slot but no hardcoded; falls through to campaign's.
+        assert slots == {"pixel_id": "cmp_fallback"}
 
 
 # ============================================================
@@ -230,7 +240,7 @@ class TestPriority4Null:
 
 
 # ============================================================
-# Merged map semantics — campaign overrides source per slot
+# Merged map semantics — source overrides campaign per slot (SOURCE-WINS)
 # ============================================================
 
 
@@ -244,16 +254,17 @@ class TestMergedMap:
         )
         assert slots == {"sub1": "c1", "sub2": "k1"}
 
-    def test_campaign_alias_replaces_source_alias_for_lookup(self):
-        # Source maps sub1 → "src_key"; campaign maps sub1 → "cmp_key".
-        # Only "cmp_key" should be the lookup key.
+    def test_source_alias_replaces_campaign_alias_for_lookup(self):
+        # SOURCE-WINS (2026-06-02): source maps sub1 → "src_key";
+        # campaign maps sub1 → "cmp_key". The SOURCE alias is the lookup
+        # key (source specializes the campaign).
         slots, _ = resolve_slots(
             query_params={"src_key": "from_src", "cmp_key": "from_cmp"},
             source_mappings=[{"slot": "sub1", "alias": "src_key", "default_value": "x"}],
             campaign_mappings=[{"slot": "sub1", "alias": "cmp_key"}],
         )
-        # Campaign alias wins → lookup `cmp_key`.
-        assert slots == {"sub1": "from_cmp"}
+        # Source alias wins → lookup `src_key`.
+        assert slots == {"sub1": "from_src"}
 
     def test_only_source_layer(self):
         slots, _ = resolve_slots(
@@ -445,20 +456,21 @@ class TestEdgeCases:
 
 
 class TestSpecScenario:
-    def test_facebook_source_with_campaign_pixel_override(self):
-        """End-to-end: Facebook Source + Campaign that overrides pixel_id.
+    def test_facebook_source_pixel_wins_over_campaign(self):
+        """End-to-end SOURCE-WINS (2026-06-02): Facebook Source + Campaign
+        that ALSO declares a pixel_id default.
 
         Source maps:
           - sub1 ← creative
           - source_click_id ← fbclid
           - pixel_id default = "fb_default_pixel"
-        Campaign overrides pixel_id with hardcoded "promo_pixel_42".
+        Campaign also hardcodes pixel_id = "promo_pixel_42".
         Click arrives with ?creative=ad42&fbclid=fb_xxx&utm=remix.
 
-        Expected:
+        Expected (SOURCE specializes the campaign on the pixel_id slot):
           - sub1 = "ad42" (request)
           - source_click_id = "fb_xxx" (request)
-          - pixel_id = "promo_pixel_42" (campaign hardcoded)
+          - pixel_id = "fb_default_pixel" (SOURCE hardcoded wins)
           - extras = {"utm": "remix"}
         """
         source_mappings = [
@@ -482,7 +494,7 @@ class TestSpecScenario:
         assert slots == {
             "sub1": "ad42",
             "source_click_id": "fb_xxx",
-            "pixel_id": "promo_pixel_42",
+            "pixel_id": "fb_default_pixel",
         }
         assert extras == {"utm": "remix"}
 
@@ -549,6 +561,88 @@ class TestSpecScenario:
         )
         assert slots == {"source": "fb", "sub1": "v"}
         assert extras == {}
+
+
+# ============================================================
+# SOURCE-WINS contract (2026-06-02) — source specializes campaign
+# ============================================================
+#
+# Pins the inverted tiebreak from
+# `docs/development/param-source-campaign-overrides-2026-06-02.md`.
+# Priority: URL > effective_source > campaign > NULL. The source layer
+# passed to `resolve_slots` is the EFFECTIVE source (per-link override OR
+# source global) — the router picks which one; from `resolve_slots`'s POV
+# it is simply "whatever source mappings were handed in".
+
+
+class TestSourceWins:
+    def test_source_alias_wins_over_campaign_alias(self):
+        # (a) Both layers alias the SAME slot to DIFFERENT URL keys, both
+        # present in the URL. Source alias wins the lookup.
+        slots, _ = resolve_slots(
+            query_params={"s_key": "from_src", "c_key": "from_cmp"},
+            source_mappings=[{"slot": "keyword", "alias": "s_key"}],
+            campaign_mappings=[{"slot": "keyword", "alias": "c_key"}],
+        )
+        assert slots == {"keyword": "from_src"}
+
+    def test_source_default_wins_over_campaign_default(self):
+        # (b) Both layers hardcode the SAME slot, no URL value. Source
+        # hardcoded default wins.
+        slots, _ = resolve_slots(
+            query_params={},
+            source_mappings=[{"slot": "funnel_type", "default_value": "src_funnel"}],
+            campaign_mappings=[{"slot": "funnel_type", "default_value": "cmp_funnel"}],
+        )
+        assert slots == {"funnel_type": "src_funnel"}
+
+    def test_url_still_beats_source_default(self):
+        # URL ALWAYS wins — even over the source default (full chain order).
+        slots, _ = resolve_slots(
+            query_params={"funnel_type": "url_funnel"},
+            source_mappings=[{"slot": "funnel_type", "default_value": "src_funnel"}],
+            campaign_mappings=[{"slot": "funnel_type", "default_value": "cmp_funnel"}],
+        )
+        assert slots == {"funnel_type": "url_funnel"}
+
+    def test_campaign_fills_slot_source_did_not_specialize(self):
+        # Non-conflict: source specializes slot X, campaign owns slot Y.
+        # Both resolve — campaign is the fallback layer, not suppressed.
+        slots, _ = resolve_slots(
+            query_params={},
+            source_mappings=[{"slot": "pixel_id", "default_value": "src_pixel"}],
+            campaign_mappings=[{"slot": "funnel_type", "default_value": "cmp_funnel"}],
+        )
+        assert slots == {"pixel_id": "src_pixel", "funnel_type": "cmp_funnel"}
+
+    def test_effective_source_override_replaces_global(self):
+        # (c) The EFFECTIVE source layer is the per-link override when set.
+        # `resolve_slots` receives whichever the router chose — so passing
+        # the override list (NOT the source global) yields override-driven
+        # resolution. Here the override hardcodes pixel_id = "override_px";
+        # were the GLOBAL ["fb_default_pixel"] passed instead, the result
+        # would differ — proving the override list fully REPLACES the
+        # global (it is not merged).
+        per_link_override = [{"slot": "pixel_id", "default_value": "override_px"}]
+        source_global = [{"slot": "pixel_id", "default_value": "fb_default_pixel"}]
+        campaign_mappings = [{"slot": "pixel_id", "default_value": "cmp_px"}]
+
+        slots_override, _ = resolve_slots(
+            query_params={},
+            source_mappings=per_link_override,
+            campaign_mappings=campaign_mappings,
+        )
+        assert slots_override == {"pixel_id": "override_px"}
+
+        # Contrast: the global would have produced the global's value —
+        # confirming the two source layers are mutually exclusive (replace,
+        # not merge).
+        slots_global, _ = resolve_slots(
+            query_params={},
+            source_mappings=source_global,
+            campaign_mappings=campaign_mappings,
+        )
+        assert slots_global == {"pixel_id": "fb_default_pixel"}
 
 
 # ============================================================

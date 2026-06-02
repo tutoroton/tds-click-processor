@@ -60,6 +60,11 @@ class FakeRedis:
     async def get(self, key):
         return self.strings.get(key)
 
+    async def hget(self, key, field):
+        # Single-field HASH read — used by `_effective_source_mappings`
+        # to read `campaign:{cid}:source_overrides` (per-link override).
+        return self.hashes.get(key, {}).get(field)
+
     async def incr(self, key):
         cur = int(self.strings.get(key, 0))
         self.strings[key] = str(cur + 1)
@@ -563,8 +568,13 @@ class TestFailureModes:
         result = _route_with(redis, _click())
         assert result is None
 
-    def test_no_offer_no_flow_returns_none(self):
-        """Campaign exists but has no flow AND no legacy offer → None."""
+    def test_no_offer_no_flow_returns_non_routed_sentinel(self):
+        """Geo-branch campaign matched but has no flow AND no legacy offer.
+
+        G2 (2026-06-02): this is now the TERMINAL geo branch, so instead
+        of bare `None` it returns the non-routed sentinel carrying the
+        matched campaign + its attribution (so hardcoded defaults persist).
+        """
         campaign_id = "10"
         redis = FakeRedis(
             sets={
@@ -579,7 +589,52 @@ class TestFailureModes:
             lists={f"campaign:{campaign_id}:flows": []},
         )
         result = _route_with(redis, _click())
-        assert result is None
+        assert result is not None
+        assert result["non_routed"] is True
+        assert result["url"] is None
+        assert result["campaign_id"] == campaign_id
+        assert result["routing_status"] == "no_offer"
+        # Attribution present → fallback record persists slot columns.
+        assert "attribution" in result
+
+    def test_g2_campaign_hardcoded_default_persists_on_non_routed(self):
+        """G2 — a non-routed (no-flow/no-offer) click whose campaign
+        declares a hardcoded `funnel_type` default carries that value in
+        the threaded attribution, so the fallback record persists it to
+        the column (instead of NULL).
+        """
+        campaign_id = "10"
+        redis = FakeRedis(
+            sets={
+                "geo:US": {campaign_id},
+                "device:mobile": {campaign_id},
+                "os:ios": {campaign_id},
+                "campaigns:active": {campaign_id},
+            },
+            hashes={
+                f"campaign:{campaign_id}": {
+                    "company_id": "1",
+                    "priority": "0",
+                    # Campaign hardcodes funnel_type — must survive even
+                    # though the click never routes.
+                    "default_param_mappings": json.dumps([
+                        {"slot": "funnel_type", "default_value": "tripwire"},
+                    ]),
+                },
+            },
+            lists={f"campaign:{campaign_id}:flows": []},
+        )
+        result = _route_with(redis, _click())
+        assert result["non_routed"] is True
+        slots = result["attribution"]["slots"]
+        assert slots.get("funnel_type") == "tripwire"
+        # And it stamps onto the click record column via the phase-3 helper.
+        from app.main import _phase3_attribution_fields
+        fields = _phase3_attribution_fields(
+            result, _click(), result["timing"],
+            "2026-06-02T00:00:00.000Z",
+        )
+        assert fields["funnel_type"] == "tripwire"
 
 
 class TestCapPreCheck:
@@ -973,3 +1028,144 @@ class TestBindingMetadataInResult:
         assert "lp.example" in result["url"]
         assert result["binding_id"] == 0
         assert result["binding_alias"] is None
+
+
+# ============================================================
+# P-DEAD — _effective_source_mappings end-to-end Redis-read selection
+# ============================================================
+#
+# The headline 2026-06-02 fix: the per-link override HASH
+# `campaign:{cid}:source_overrides` was DEAD at click time. These tests
+# drive the REAL read path through `route()` → `_fetch_resolution_context`
+# → `_effective_source_mappings` (not the pure `resolve_slots` level — that
+# is covered in test_resolution.py). Each asserts on
+# `result["attribution"]["slots"]`, the resolved slot bundle the click
+# record persists, so the FULL selection matrix is pinned:
+#   - per-link override (non-null list)        → override WINS
+#   - null / absent override                   → inherit source global
+#   - explicit []                              → "no source mappings"
+#                                                (campaign fallback)
+#   - malformed JSON / non-dict                → defensive source global
+# Contract: param-source-campaign-overrides-2026-06-02.md (P-DEAD).
+
+
+class TestEffectiveSourceOverrideReadPath:
+    CID = "5"
+    SID = "42"
+
+    def _redis(self, *, source_overrides_field: str | None) -> FakeRedis:
+        """Routable redirect-flow campaign + linked source `fbsrc`.
+
+        - source global hardcodes pixel_id = "global_px"
+        - campaign hardcodes pixel_id = "cmp_px"
+        With SOURCE-WINS, the source layer (global OR per-link override)
+        wins per slot unless it contributes nothing for that slot.
+
+        `source_overrides_field`: the raw value stored in the
+        `campaign:{cid}:source_overrides` HASH under field `str(SID)`
+        (mirrors the admin-api sync builder's `json.dumps({...})`). When
+        `None`, the HASH field is ABSENT entirely (no override row).
+        """
+        cid, sid = self.CID, self.SID
+        overrides_hash = {} if source_overrides_field is None else {sid: source_overrides_field}
+        return FakeRedis(
+            sets={
+                "geo:US": {cid},
+                "device:mobile": {cid},
+                "os:ios": {cid},
+                "campaigns:active": {cid},
+                f"campaign:{cid}:sources": {sid},
+            },
+            hashes={
+                f"campaign:{cid}": {
+                    "company_id": "1",
+                    "priority": "0",
+                    "weight": "100",
+                    "default_param_mappings": json.dumps([
+                        {"slot": "pixel_id", "default_value": "cmp_px"},
+                    ]),
+                },
+                f"source:{sid}": {
+                    "slug": "fbsrc",
+                    "param_mappings": json.dumps([
+                        {"slot": "pixel_id", "default_value": "global_px"},
+                    ]),
+                },
+                f"campaign:{cid}:source_overrides": overrides_hash,
+                f"flow:300": {
+                    "campaign_id": cid,
+                    "scope_type": "company",
+                    "scope_id": "1",
+                    "seq_id": "1",
+                    "is_default": "0",
+                    "criteria": "[]",
+                    "action_type": "redirect",
+                    "action_config": json.dumps({
+                        "url": "https://lp.example.com/?px={pixel_id}",
+                    }),
+                },
+            },
+            lists={f"campaign:{cid}:flows": ["300"]},
+        )
+
+    def _slots(self, redis: FakeRedis, query=None):
+        qp = {"source": "fbsrc"}
+        if query:
+            qp.update(query)
+        result = _route_with(redis, _click(qp))
+        assert result is not None
+        assert result["attribution"]["source_id"] == int(self.SID)
+        return result
+
+    def test_override_default_wins_over_source_global(self):
+        # Non-null params_override hardcoding pixel_id → override WINS over
+        # both the source global AND the campaign.
+        ov = json.dumps({"params_override": [
+            {"slot": "pixel_id", "default_value": "override_px"},
+        ]})
+        result = self._slots(self._redis(source_overrides_field=ov))
+        assert result["attribution"]["slots"]["pixel_id"] == "override_px"
+        assert "px=override_px" in result["url"]
+
+    def test_override_alias_wins_and_reads_url(self):
+        # Override aliases pixel_id ← "ovpx"; URL carries ?ovpx=fromurl.
+        # The override's alias is what gets looked up (URL > override).
+        ov = json.dumps({"params_override": [
+            {"slot": "pixel_id", "alias": "ovpx"},
+        ]})
+        result = self._slots(
+            self._redis(source_overrides_field=ov), query={"ovpx": "fromurl"},
+        )
+        assert result["attribution"]["slots"]["pixel_id"] == "fromurl"
+
+    def test_absent_override_inherits_source_global(self):
+        # No override row at all → effective source = source global.
+        result = self._slots(self._redis(source_overrides_field=None))
+        assert result["attribution"]["slots"]["pixel_id"] == "global_px"
+
+    def test_null_params_override_inherits_source_global(self):
+        # Override row exists but params_override is JSON null → inherit
+        # the source global (the per-link toggle is OFF for params).
+        ov = json.dumps({"params_override": None, "postbacks_override": []})
+        result = self._slots(self._redis(source_overrides_field=ov))
+        assert result["attribution"]["slots"]["pixel_id"] == "global_px"
+
+    def test_empty_list_override_means_no_source_mappings(self):
+        # Explicit [] → admin wiped all per-link mappings. Honoured as
+        # "the source contributes NOTHING" (NOT a silent global fallback),
+        # so the campaign hardcoded default is the fallback that applies.
+        ov = json.dumps({"params_override": []})
+        result = self._slots(self._redis(source_overrides_field=ov))
+        assert result["attribution"]["slots"]["pixel_id"] == "cmp_px"
+
+    def test_malformed_json_override_falls_back_to_source_global(self):
+        # Drift / corruption in the HASH field → never blank params,
+        # defensively inherit the source global.
+        result = self._slots(self._redis(source_overrides_field="{not valid json"))
+        assert result["attribution"]["slots"]["pixel_id"] == "global_px"
+
+    def test_non_dict_json_override_falls_back_to_source_global(self):
+        # Valid JSON but not the expected dict shape (e.g. a bare list) →
+        # defensive source-global fallback.
+        result = self._slots(self._redis(source_overrides_field=json.dumps([1, 2])))
+        assert result["attribution"]["slots"]["pixel_id"] == "global_px"

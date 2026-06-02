@@ -60,15 +60,23 @@ def _ms_since(start: float) -> float:
 async def route(req: ClickRequest) -> dict | None:
     """Find matching campaign + offer for this click.
 
-    Returns one of three shapes:
+    Returns one of four shapes:
       - Happy path: `{"url": str, "campaign_id": str, "offer_id": str,
         "timing": dict}` — caller emits 302 to `url`.
       - Block sentinel: `{"url": None, "campaign_id": str, "offer_id":
         None, "timing": dict, "blocked": True}` — caller emits 404
         (or worker may serve a block page). Distinguished by
         `result.get("blocked") is True` OR `result.get("url") is None`.
-      - `None` — no campaign matched; caller emits the worker's
-        default fallback (typically 404 with a generic page).
+      - Non-routed sentinel (G2, 2026-06-02): `{"url": None,
+        "campaign_id": str, "non_routed": True, "attribution": dict,
+        "routing_status": str, ...}` — a campaign matched but the click
+        could not be routed (capped / no flow + no legacy offer). Caller
+        records it to the admin-configured fallback URL WITH the resolved
+        attribution so campaign(+effective_source) hardcoded defaults
+        persist (instead of every slot column being NULL).
+      - `None` — no campaign matched at all; caller emits the worker's
+        default fallback (typically 404 with a generic page). No
+        attribution exists because no campaign anchored the click.
 
     Timing dict contains ms-precision breakdown of every routing stage,
     plus a `route_via` tag (`flow_cascade`, `flow_cascade_block`, or
@@ -125,6 +133,10 @@ async def route(req: ClickRequest) -> dict | None:
                 result_label="domain_matched",
                 binding_id=resolution.binding_id,
                 binding_alias=resolution.binding_alias,
+                # Domain match is NOT terminal — a no-route outcome here
+                # falls through to geo targeting (return None), not a
+                # non-routed fallback.
+                fall_through_on_no_route=True,
             )
             if routed is not None:
                 return routed
@@ -216,16 +228,28 @@ async def route(req: ClickRequest) -> dict | None:
     timing["eligible_count"] = len(eligible)
 
     if not eligible:
-        timing["route_total_ms"] = _ms_since(t_start)
+        # G2 (2026-06-02): every candidate campaign was capped. A
+        # campaign DID match this click's targeting, so its hardcoded
+        # defaults must persist. Pick the same winner Stage 6 would have
+        # (top-priority, weighted) among the capped candidates, resolve
+        # its attribution, and emit the non-routed sentinel. `campaigns`
+        # holds the Stage-4 HASHes (each non-None one got `_id` set in
+        # the cap loop above).
         timing["result"] = "all_capped"
-        return None
+        capped = [c for c in campaigns if c]
+        winner = _select_winner(capped)
+        if winner is None:
+            timing["route_total_ms"] = _ms_since(t_start)
+            return None
+        _src_m, _cmp_m, attribution = await _build_campaign_attribution(
+            r, winner, winner["_id"], req,
+        )
+        timing["route_total_ms"] = _ms_since(t_start)
+        return _non_routed_result(winner["_id"], attribution, timing)
 
     # Stage 6: Campaign selection (priority + weight)
     t0 = time.perf_counter()
-    eligible.sort(key=lambda c: safe_int(c.get("priority"), 0), reverse=True)
-    top_priority = safe_int(eligible[0].get("priority"), 0)
-    top_campaigns = [c for c in eligible if safe_int(c.get("priority"), 0) == top_priority]
-    winner = weighted_select(top_campaigns)
+    winner = _select_winner(eligible)
     timing["selection_ms"] = _ms_since(t0)
 
     # Stages 6.5-9: flow cascade → action execution → counter increment.
@@ -235,10 +259,141 @@ async def route(req: ClickRequest) -> dict | None:
     if routed is not None:
         return routed
 
-    # No routing path found (no flow + legacy fallback exhausted).
+    # No routing path found — defensive only. `_route_via_campaign` with
+    # `fall_through_on_no_route=False` (the default, geo-branch context)
+    # now ALWAYS returns a routed result or the G2 non-routed sentinel,
+    # never bare None, so this line is unreachable in practice.
     timing["route_total_ms"] = _ms_since(t_start)
     timing["result"] = "no_offer"
     return None
+
+
+def _select_winner(campaigns: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Pick the routing winner from a list of campaign HASHes.
+
+    Top-priority bucket, then weighted-random within it (Stage 6
+    selection). Returns `None` for an empty list. Extracted so the
+    happy path AND the G2 all-capped fallback share ONE selection rule —
+    the capped click attributes to the same campaign that would have
+    routed it.
+    """
+    if not campaigns:
+        return None
+    top_priority = max(safe_int(c.get("priority"), 0) for c in campaigns)
+    top = [c for c in campaigns if safe_int(c.get("priority"), 0) == top_priority]
+    return weighted_select(top)
+
+
+def _attribution_buyer_chain(attribution: dict[str, Any]) -> dict[str, int | None]:
+    """Re-project the org-hierarchy chain out of a built `attribution`.
+
+    `_build_campaign_attribution` already resolved the buyer chain and
+    folded it into `attribution`; the cascade needs it back as the
+    `{buyer_id, team_id, ...}` shape `cascade.resolve_flow` expects. Pure
+    dict re-projection — no Redis.
+    """
+    return {
+        "buyer_id": attribution["buyer_id"],
+        "team_id": attribution["team_id"],
+        "department_id": attribution["department_id"],
+        "custom_group_id": attribution["custom_group_id"],
+        "company_id": attribution["company_id"],
+    }
+
+
+async def _build_campaign_attribution(
+    r,
+    campaign: dict[str, Any],
+    campaign_id: str,
+    req: ClickRequest,
+) -> tuple[list[dict[str, Any]] | None, list[dict[str, Any]] | None, dict[str, Any]]:
+    """Resolve the click's full attribution for one matched campaign.
+
+    Returns `(source_mappings, campaign_mappings, attribution)` where:
+      - `source_mappings` is the EFFECTIVE source layer (per-link
+        override or source global) and `campaign_mappings` the campaign
+        layer — both threaded into `build_url` / the cascade.
+      - `attribution` is the by-reference dict the click record reads
+        (org chain + source_id + resolved `slots` + `extras`). The
+        cascade later mutates it with flow / target ids.
+
+    Cost: one `_fetch_resolution_context` (source HASH + effective-source
+    HGET) + one `_resolve_buyer_chain` HGETALL — the same reads the
+    matched path always performed. Extracted (G2, 2026-06-02) so the
+    non-routed paths (capped / no-flow / all-capped) can persist the
+    campaign(+effective_source) hardcoded defaults instead of dropping
+    every slot column to NULL.
+    """
+    source_mappings, campaign_mappings, source_id = await _fetch_resolution_context(
+        r, campaign_id, campaign, req.query_params or {},
+    )
+
+    # `slots` is pure-Python over the source∪campaign param_mappings
+    # (the source HASH was already fetched in `_fetch_resolution_context`)
+    # — no extra Redis op (03 §5 open-Q #3 / 03 §4 hot-path guardrail).
+    slots, slot_extras = resolve_slots(
+        query_params=req.query_params or {},
+        source_mappings=source_mappings,
+        campaign_mappings=campaign_mappings,
+    )
+    buyer_chain = await _resolve_buyer_chain(r, slots, campaign)
+
+    # `company_id` ALWAYS from the campaign anchor (never buyer) — the
+    # chain already enforces this. Reserved slots + source_id ride along;
+    # the cascade fills in flow/target ids on the routed path.
+    #
+    # `extras` — the canonical resolver's authoritative "unmapped keys"
+    # set: every incoming query param NOT bound to a reserved or sub slot
+    # (by canonical name or source/campaign alias). Threaded up so the
+    # click record's `extra_params` is sourced from it (C-1, 2026-06-02)
+    # instead of a hand-rolled legacy-key filter — a param that landed in
+    # a dedicated column is therefore NEVER duplicated into extras.
+    attribution: dict[str, Any] = {
+        "buyer_id": buyer_chain["buyer_id"],
+        "team_id": buyer_chain["team_id"],
+        "department_id": buyer_chain["department_id"],
+        "custom_group_id": buyer_chain["custom_group_id"],
+        "company_id": buyer_chain["company_id"],
+        "source_id": source_id,
+        "slots": slots,
+        "extras": slot_extras,
+    }
+    return source_mappings, campaign_mappings, attribution
+
+
+def _non_routed_result(
+    campaign_id: str,
+    attribution: dict[str, Any],
+    timing: dict[str, Any],
+    *,
+    binding_id: int = 0,
+    binding_alias: str | None = None,
+) -> dict[str, Any]:
+    """Build the G2 non-routed sentinel for a matched-but-unrouted click.
+
+    A campaign matched (targeting + tenant resolved) but the click could
+    not be routed (capped / no flow + no legacy offer). The sentinel
+    carries `campaign_id` + the resolved `attribution` so the click
+    record persists the campaign(+effective_source) hardcoded defaults —
+    instead of the pre-G2 behaviour where `route()` returned bare `None`
+    and main.py wrote every slot column NULL.
+
+    `non_routed=True` is the marker main.py keys on (alongside the legacy
+    `result is None` / `blocked` cases) to drive the SAME
+    record-build → dedup → XADD → 302-to-fallback path. `url=None` →
+    main.py substitutes the admin-configured fallback URL.
+    """
+    return {
+        "url": None,
+        "campaign_id": campaign_id,
+        "offer_id": None,
+        "binding_id": binding_id,
+        "binding_alias": binding_alias,
+        "timing": timing,
+        "attribution": attribution,
+        "non_routed": True,
+        "routing_status": timing.get("result", "non_routed"),
+    }
 
 
 async def _route_via_campaign(
@@ -251,8 +406,17 @@ async def _route_via_campaign(
     result_label: str,
     binding_id: int = 0,
     binding_alias: str | None = None,
+    fall_through_on_no_route: bool = False,
 ) -> dict[str, Any] | None:
     """Drive the routing tail end for one resolved campaign.
+
+    `fall_through_on_no_route`: when True (the domain-resolved branch),
+    a campaign that matched the domain binding but has no usable routing
+    path returns `None` so the caller falls through to geo targeting —
+    geo still gets a chance to route the click, so emitting a non-routed
+    fallback here would be premature. When False (the geo branch, the
+    terminal branch), a campaign-capped / no-flow / no-offer outcome is
+    FINAL → return the G2 non-routed sentinel carrying attribution.
 
     Encapsulates Stages 6.5-9 so both the domain-resolved branch and the
     geo-targeting branch share one implementation. Stages:
@@ -271,8 +435,15 @@ async def _route_via_campaign(
       9   — Cap + frequency counter increment (non-blocking).
 
     Returns a routing result dict (`{url, campaign_id, offer_id, timing}`)
-    when a path is found; None when the click should fall through to the
-    next branch (e.g. domain match but no flow + no legacy split).
+    when a path is found; a NON-ROUTED sentinel
+    (`{"non_routed": True, "campaign_id", "attribution", ...}`) when a
+    campaign matched but the click could not be routed (capped / no flow
+    + no legacy split) — G2 (2026-06-02): the sentinel carries the
+    resolved `attribution` so the click record persists the campaign(+
+    effective_source) hardcoded defaults instead of dropping every slot
+    column to NULL. Returns `None` only when this branch should fall
+    through to the next routing branch (domain match but no usable path —
+    geo targeting still gets a chance).
     """
     t_branch = time.perf_counter()
 
@@ -282,16 +453,27 @@ async def _route_via_campaign(
     # symmetry. For the domain branch this is the FIRST cap check —
     # without it a domain-bound campaign with daily_cap=N could route
     # unlimited clicks until the next click read a stale counter.
+    #
+    # Kept BEFORE attribution resolution so the latency profile is
+    # unchanged on the cap-hit path. G2 (2026-06-02): when this is the
+    # TERMINAL branch (geo; `fall_through_on_no_route=False`), a capped
+    # click must still persist the campaign(+effective_source) hardcoded
+    # defaults — so we resolve attribution lazily HERE (only on the
+    # cap-hit + terminal path) and emit the non-routed sentinel. The
+    # domain branch (`fall_through_on_no_route=True`) returns None to fall
+    # through to geo, paying NO resolution cost — byte-identical to before.
     if await _campaign_caps_exceeded(r, campaign_id, campaign, req.visitor_id):
         timing["route_total_ms"] = _ms_since(t_branch)
         timing["result"] = "campaign_capped"
-        return None
-
-    # Resolve param-mapping context once — used by both cascade action
-    # execution and legacy fallback for URL substitution.
-    source_mappings, campaign_mappings, source_id = await _fetch_resolution_context(
-        r, campaign_id, campaign, req.query_params or {},
-    )
+        if fall_through_on_no_route:
+            return None
+        _src_m, _cmp_m, attribution = await _build_campaign_attribution(
+            r, campaign, campaign_id, req,
+        )
+        return _non_routed_result(
+            campaign_id, attribution, timing,
+            binding_id=binding_id, binding_alias=binding_alias,
+        )
 
     # Stage 3 / Phase 3 — attribution population. Resolve the canonical
     # slots + org-hierarchy chain ONCE here and thread them (plus the
@@ -302,37 +484,10 @@ async def _route_via_campaign(
     # `_try_flow_cascade` on EVERY routed click (before the no-flow
     # check), so lifting it here adds no new round-trip — it just stops
     # the already-computed result from being discarded.
-    #
-    # `slots` is pure-Python over the source∪campaign param_mappings
-    # (the source HASH was already fetched in `_fetch_resolution_context`)
-    # — no extra Redis op (03 §5 open-Q #3 / 03 §4 hot-path guardrail).
-    slots, slot_extras = resolve_slots(
-        query_params=req.query_params or {},
-        source_mappings=source_mappings,
-        campaign_mappings=campaign_mappings,
+    source_mappings, campaign_mappings, attribution = (
+        await _build_campaign_attribution(r, campaign, campaign_id, req)
     )
-    buyer_chain = await _resolve_buyer_chain(r, slots, campaign)
-
-    # `company_id` ALWAYS from the campaign anchor (never buyer) — the
-    # chain already enforces this (router.py:536-539). Reserved slots +
-    # source_id ride along; the cascade fills in flow/target ids below.
-    #
-    # `extras` — the canonical resolver's authoritative "unmapped keys"
-    # set: every incoming query param NOT bound to a reserved or sub slot
-    # (by canonical name or source/campaign alias). Threaded up so the
-    # click record's `extra_params` is sourced from it (C-1, 2026-06-02)
-    # instead of a hand-rolled legacy-key filter — a param that landed in
-    # a dedicated column is therefore NEVER duplicated into extras.
-    attribution: dict[str, Any] = {
-        "buyer_id": buyer_chain["buyer_id"],
-        "team_id": buyer_chain["team_id"],
-        "department_id": buyer_chain["department_id"],
-        "custom_group_id": buyer_chain["custom_group_id"],
-        "company_id": buyer_chain["company_id"],
-        "source_id": source_id,
-        "slots": slots,
-        "extras": slot_extras,
-    }
+    buyer_chain = _attribution_buyer_chain(attribution)
 
     # Stage 6.5 — flow cascade.
     t0 = time.perf_counter()
@@ -394,7 +549,17 @@ async def _route_via_campaign(
     offer = await select_offer(r, campaign_id)
     timing["offer_ms"] = _ms_since(t0)
     if not offer:
-        return None
+        if fall_through_on_no_route:
+            # Domain matched but no flow + no legacy offer — let geo
+            # targeting try. The geo branch (if it also lands here) will
+            # emit the G2 non-routed sentinel.
+            return None
+        timing["route_total_ms"] = _ms_since(t_branch)
+        timing["result"] = "no_offer"
+        return _non_routed_result(
+            campaign_id, attribution, timing,
+            binding_id=binding_id, binding_alias=binding_alias,
+        )
 
     # Stage 8 — legacy URL build via offer.url / target resolution.
     t0 = time.perf_counter()
@@ -1127,6 +1292,70 @@ async def _resolve_source_for_click(
     return {}
 
 
+async def _effective_source_mappings(
+    r,
+    campaign_id: str,
+    source_id: int | None,
+    source_global: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Resolve the EFFECTIVE source param mappings for this (campaign, source).
+
+    Per the SOURCE↔CAMPAIGN override contract
+    (`docs/development/param-source-campaign-overrides-2026-06-02.md`):
+
+      `effective_source = campaign_sources(C,S).params_override
+                          IF that override is a non-null list
+                          ELSE S.param_mappings (the source global)`
+
+    The admin-api sync builder writes the per-link override into the
+    Redis HASH `campaign:{cid}:source_overrides` (key built by
+    `keys.campaign_source_overrides_hash`), field = `str(source_id)`,
+    value = `json.dumps({"params_override": [...], "postbacks_override":
+    [...]})`. A `null`/absent `params_override` means "inherit the
+    source global" (the toggle is per-link). This read was previously
+    DEAD — the click-processor ignored the HASH entirely (defect P-DEAD,
+    audit 2026-06-02), so per-link overrides never took effect at click
+    time.
+
+    Defensive throughout: a malformed HASH field, malformed JSON, or a
+    non-list `params_override` all fall back to the source global so a
+    bad override never blanks a click's params.
+    """
+    if source_id is None:
+        return source_global
+
+    # Mirror the admin-api key contract — field is the stringified PK.
+    raw = await r.hget(f"campaign:{campaign_id}:source_overrides", str(source_id))
+    if not raw:
+        return source_global
+
+    try:
+        override_obj = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        # Drift / corruption — never blank params, inherit the global.
+        logger.warning(
+            "Malformed source_overrides for campaign:%s source:%s; "
+            "inheriting source global",
+            campaign_id, source_id,
+        )
+        return source_global
+
+    if not isinstance(override_obj, dict):
+        return source_global
+
+    params_override = override_obj.get("params_override")
+    # `null` override ⇒ inherit global; a non-null list ⇒ override.
+    # Re-use the same defensive parser the global path uses so the
+    # entry-shape guarantees are identical.
+    if params_override is None:
+        return source_global
+    parsed = parse_param_mappings(params_override)
+    # `parse_param_mappings([])` returns `[]` — an explicit empty
+    # override (admin wiped all per-link mappings) is honoured as
+    # "no source mappings", NOT a silent fallback to the global.
+    return parsed if isinstance(params_override, list) else source_global
+
+
 async def _fetch_resolution_context(
     r,
     campaign_id: str,
@@ -1142,11 +1371,21 @@ async def _fetch_resolution_context(
     `None` when no `?source=` matched — surfaced so the click record can
     attribute the click to its source without a second lookup (the HASH
     was already fetched here).
+
+    `source_mappings` is the EFFECTIVE source layer: the per-link
+    `campaign_sources.params_override` when set (non-null list), else the
+    source's global `param_mappings`. See `_effective_source_mappings`.
     """
     src = await _resolve_source_for_click(r, campaign_id, query_params)
-    source_mappings = parse_param_mappings(src.get("param_mappings")) if src else None
-    campaign_mappings = parse_param_mappings(campaign.get("default_param_mappings"))
     source_id = _to_int(src.get("_id")) if src else None
+    if not src:
+        return None, parse_param_mappings(campaign.get("default_param_mappings")), None
+
+    source_global = parse_param_mappings(src.get("param_mappings"))
+    source_mappings = await _effective_source_mappings(
+        r, campaign_id, source_id, source_global,
+    )
+    campaign_mappings = parse_param_mappings(campaign.get("default_param_mappings"))
     return source_mappings, campaign_mappings, source_id
 
 
@@ -1168,10 +1407,12 @@ def build_url(
     `macros.safe_substitute` for safe URL output (path-segment
     collapse, empty-query-param drop, always-encode).
 
-    Resolution order per `docs/design/PARAMETER-SYSTEM.md`:
-      1. Request URL via merged map (campaign alias wins per slot).
-      2. Campaign hardcoded `default_value`.
-      3. Source hardcoded `default_value`.
+    Resolution order per the SOURCE-WINS contract
+    (`docs/development/param-source-campaign-overrides-2026-06-02.md`):
+      1. Request URL via merged map (SOURCE alias wins per slot).
+      2. effective_source hardcoded `default_value` (source specializes
+         the campaign).
+      3. Campaign hardcoded `default_value`.
       4. NULL — substituter handles by collapsing the macro position.
 
     Worker-auto fields (`country`, `city`, `ip`, …), substituted-auto
@@ -1196,8 +1437,10 @@ def build_url(
         req: ClickRequest (worker fields, UA, accept_language).
         campaign_id: Stringified campaign PK for `{campaign_id}`.
         offer_id: Stringified offer PK for `{offer_id}` ('' if N/A).
-        source_mappings: Source's `param_mappings` (resolution chain).
-        campaign_mappings: Campaign's overrides (wins per slot).
+        source_mappings: Effective source layer — per-link override or
+            source global `param_mappings` (wins per slot, SOURCE-WINS).
+        campaign_mappings: Campaign's `default_param_mappings` (fallback
+            for any slot the source did not specialize).
         target_id: Offer-target PK (`{offer_target_id}`). NULL for
             `redirect` actions which have no target.
         flow_id: Winning flow PK (`{flow_id}`). NULL when caller

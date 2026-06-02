@@ -318,17 +318,18 @@ class TestBuildUrl:
         # Empty query param was cleaned up.
         assert "s=" not in url
 
-    def test_campaign_overrides_source_alias(self):
-        """Campaign mapping wins per-slot for the URL-key lookup."""
+    def test_source_overrides_campaign_alias(self):
+        """SOURCE-WINS (2026-06-02): source mapping wins per-slot for the
+        URL-key lookup — the source specializes the campaign."""
         req = self._make_request(query_params={"gclid": "g123", "fbclid": "fb456"})
         url = build_url(
             "https://example.com/?clk={source_click_id}", req, "1", "101",
             source_mappings=[{"slot": "source_click_id", "alias": "fbclid"}],
             campaign_mappings=[{"slot": "source_click_id", "alias": "gclid"}],
         )
-        # Campaign alias wins → `gclid` value lands in the slot.
-        assert "clk=g123" in url
-        assert "fb456" not in url
+        # Source alias wins → `fbclid` value lands in the slot.
+        assert "clk=fb456" in url
+        assert "g123" not in url
 
 
 # ============================================================

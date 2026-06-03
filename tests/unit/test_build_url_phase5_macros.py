@@ -162,37 +162,26 @@ class TestCostMacro:
         assert "c=" not in url
         assert "keep=1" in url
 
-    def test_cost_special_chars_url_encoded(self):
-        """Even if cost is a malformed string with special chars,
-        it must be URL-encoded — never break the URL syntactically.
-        Defense vs misbehaving traffic source.
-
-        Audit fix 2026-05-09 (Agent 4 minor): the prior assertion
-        used `or "%3D" in url` which made it pass on any URL
-        containing `%3D` anywhere — even if the cost segment
-        itself was un-encoded. Replaced with two unconditional
-        per-segment checks.
+    def test_cost_malformed_string_is_dropped(self):
+        """A2 (audit 2026-06-03): a non-numeric / malformed cost is now
+        REJECTED by `coerce_cost` → the `{cost}` macro resolves to None
+        and is dropped by safe_substitute. This SUPERSEDES the prior
+        behaviour (URL-encode-and-keep): a value like `a&b=evil` is never
+        numeric cost, so it must never reach the redirect at all — strictly
+        safer than encoding-and-keeping. The dedicated cost CH column is
+        likewise stored as 0 (see test_phase3_attribution).
         """
         url = build_url(
-            "https://x.example/?c={cost}",
+            "https://x.example/?c={cost}&keep=1",
             _req(query_params={"cost": "a&b=evil"}),
             "1", "101",
         )
-        # & and = should be percent-encoded; payload becomes
-        # `c=a%26b%3Devil`. Slice the cost segment and verify
-        # the dangerous shape is GONE from THAT segment, not
-        # from any random part of the URL.
-        cost_segment = url.split("c=")[1].split("&")[0]
-        assert "%3D" in cost_segment, (
-            f"`=` in cost value MUST be URL-encoded as %3D in the "
-            f"cost segment specifically; got {cost_segment!r}"
-        )
-        assert "%26" in cost_segment, (
-            f"`&` in cost value MUST be URL-encoded as %26 in the "
-            f"cost segment specifically; got {cost_segment!r}"
-        )
-        # The full encoded value as a positive sanity check.
-        assert "c=a%26b%3Devil" in url
+        # Malformed cost dropped entirely — neither the raw nor an encoded
+        # form reaches the URL.
+        assert "c=" not in url
+        assert "evil" not in url
+        assert "%26b" not in url
+        assert "keep=1" in url
 
 
 # ---------------------------------------------------------------------------

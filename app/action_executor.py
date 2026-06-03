@@ -41,6 +41,11 @@ import random
 from typing import Any
 
 from app.models import ClickRequest
+from app.telemetry import (
+    OP_OFFER_RESOLVE,
+    OP_SPLIT_FALLBACK,
+    capture_op_msg_throttled,
+)
 
 logger = logging.getLogger("tds.action")
 
@@ -212,6 +217,19 @@ async def _execute_split(
 
     if not valid or sum(weights) <= 0:
         logger.warning("split action has no usable offers — falling back")
+        # B3 (audit 2026-06-03) — a split flow whose every branch is
+        # invalid/zero-weight silently falls back to legacy selection on
+        # EVERY click. Surface it (throttled per flow id) — an operator
+        # likely has a misconfigured split (e.g. all weights truncated,
+        # all offers archived).
+        capture_op_msg_throttled(
+            OP_SPLIT_FALLBACK, flow_id,
+            f"split flow {flow_id} has no usable offers "
+            f"({len(entries)} entries) — falling back to legacy selection",
+            level="warning",
+            flow_id=flow_id,
+            entry_count=len(entries),
+        )
         return None
 
     chosen = random.choices(valid, weights=weights, k=1)[0]
@@ -262,6 +280,16 @@ async def _resolve_offer_url(
             logger.warning(
                 "offer:%s not found in Redis — sync drift?", offer_id,
             )
+            # D3 (audit 2026-06-03) — the flow points at an offer that
+            # isn't in Redis (sync drift / archived). Silent fallback on
+            # every click → surface it (throttled per offer id).
+            capture_op_msg_throttled(
+                OP_OFFER_RESOLVE, offer_id,
+                f"offer {offer_id} not found in Redis (sync drift?) — "
+                "action falling back to legacy selection",
+                level="warning",
+                offer_id=offer_id,
+            )
             return None
         pinned_template, pinned_target_id = await _offer_default_template(
             r, offer_id, offer,
@@ -269,6 +297,15 @@ async def _resolve_offer_url(
         if not pinned_template:
             logger.warning(
                 "offer:%s has no usable URL — falling back", offer_id,
+            )
+            # D3 — offer exists but has no default target + no bare url
+            # (the B4 shape). Falls back silently → surface it.
+            capture_op_msg_throttled(
+                OP_OFFER_RESOLVE, offer_id,
+                f"offer {offer_id} has no usable URL (no is_default target, "
+                "no bare url) — falling back to legacy selection",
+                level="warning",
+                offer_id=offer_id,
             )
             return None
 

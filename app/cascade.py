@@ -47,6 +47,12 @@ import json
 import logging
 from typing import Any, Final
 
+from app.telemetry import (
+    OP_CRITERIA_SKIP,
+    OP_FLOW_LOAD,
+    capture_op_msg_throttled,
+)
+
 logger = logging.getLogger("tds.cascade")
 
 
@@ -165,6 +171,20 @@ async def resolve_flow(
 
     flows = await _load_flow_records(r, deduped)
     if not flows:
+        # D4 (audit 2026-06-03) — the scope cascade found candidate flow
+        # IDs but EVERY flow HASH was empty/missing (sync drift between the
+        # scope list and the flow hashes). The click silently falls back to
+        # legacy split selection with no signal. Surface it (throttled per
+        # campaign) so an operator sees the drift instead of a quiet misroute.
+        capture_op_msg_throttled(
+            OP_FLOW_LOAD, campaign_id,
+            f"cascade: campaign {campaign_id} had {len(deduped)} candidate "
+            "flow id(s) but zero loaded as flow HASHes (sync drift) — "
+            "falling back to legacy split selection",
+            level="warning",
+            campaign_id=campaign_id,
+            candidate_count=len(deduped),
+        )
         return None
 
     survivors = _filter_by_criteria(flows, click_attrs)
@@ -281,9 +301,21 @@ def _filter_by_criteria(
                 else criteria_raw
             )
         except (json.JSONDecodeError, TypeError):
+            fid = flow.get("_id")
             logger.warning(
                 "cascade: malformed criteria for flow %s — skipping",
-                flow.get("_id"),
+                fid,
+            )
+            # B12 (audit 2026-06-03) — a flow with corrupt criteria JSON is
+            # silently dropped from candidacy on EVERY click → the click
+            # may route elsewhere with no signal. Surface it (throttled per
+            # flow id so one bad flow doesn't flood Sentry).
+            capture_op_msg_throttled(
+                OP_CRITERIA_SKIP, fid,
+                f"cascade: flow {fid} skipped — malformed criteria JSON "
+                "(routing decision excludes it until the flow is re-saved)",
+                level="warning",
+                flow_id=fid,
             )
             continue
 

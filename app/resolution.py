@@ -52,6 +52,7 @@ import logging
 from typing import Any
 
 from app.parameters import CANONICAL_SLOTS
+from app.telemetry import OP_PARAM_PARSE, capture_op_msg_throttled
 
 logger = logging.getLogger("tds.resolution")
 
@@ -111,6 +112,20 @@ def parse_param_mappings(raw: Any) -> list[dict[str, Any]]:
             logger.warning(
                 "Malformed param_mappings JSON: len=%d err_pos=%d msg=%s",
                 len(raw), exc.pos, exc.msg,
+            )
+            # D10 (audit 2026-06-03) — malformed param_mappings means
+            # EVERY click for that source/campaign resolves params as if
+            # unmapped (raw GET keys → extras, reserved/sub columns empty)
+            # with only a log line. Surface it (throttled; key by error
+            # position so distinct corruptions are each visible without
+            # leaking the admin-authored content). No PII — pos + len only.
+            capture_op_msg_throttled(
+                OP_PARAM_PARSE, f"pos{exc.pos}:len{len(raw)}",
+                f"param_mappings JSON unparseable (len={len(raw)} "
+                f"err_pos={exc.pos}) — params resolve as unmapped until fixed",
+                level="warning",
+                raw_len=len(raw),
+                err_pos=exc.pos,
             )
             return []
         if isinstance(parsed, list):

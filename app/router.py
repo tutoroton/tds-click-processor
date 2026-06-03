@@ -38,9 +38,48 @@ from app.macros import safe_substitute
 from app.models import ClickRequest
 from app.redis_client import get_redis
 from app.resolution import parse_param_mappings, resolve_slots
+from app.telemetry import OP_CAP_COUNTER, capture_op_msg
 from app.ua_parser import parse_ua
 
 logger = logging.getLogger("tds.router")
+
+
+# D1/D2 (audit 2026-06-03) — caps/counters fail-OPEN is deliberate (a
+# click must NEVER fail because Redis cap state is unavailable; closes
+# 2026-04-28 CRIT-001). Pre-fix the only signal on a Redis cap/counter
+# fault was logger.warning, so a SUSTAINED outage (caps silently NOT
+# enforced) was Sentry-invisible. Count consecutive failures across the
+# cap-read AND the counter-bump; fire ONE capture at the threshold and
+# every Nth thereafter (bounded paging, NOT per-click spam). Reset on the
+# next successful bump (which runs on every routed click → reliable
+# "Redis healthy again" signal). Mirrors the writer's F-C1a counter.
+_CAP_FAILURE_ALERT_AFTER = 5
+_cap_failures_consecutive = 0
+
+
+def _record_cap_failure(where: str, exc: Exception) -> None:
+    """Increment the consecutive cap/counter-failure counter; page at
+    the threshold + every Nth after (sustained outage, not a blip)."""
+    global _cap_failures_consecutive
+    _cap_failures_consecutive += 1
+    n = _cap_failures_consecutive
+    if n >= _CAP_FAILURE_ALERT_AFTER and n % _CAP_FAILURE_ALERT_AFTER == 0:
+        capture_op_msg(
+            OP_CAP_COUNTER,
+            f"cap/counter Redis op failing for {n} consecutive clicks "
+            f"(at {where}) — daily/frequency caps are NOT being enforced "
+            "(failing open). Investigate Redis health.",
+            level="warning",
+            consecutive_failures=n,
+            where=where,
+            last_error=repr(exc)[:300],
+        )
+
+
+def _record_cap_success() -> None:
+    """A healthy counter bump resets the consecutive-failure window."""
+    global _cap_failures_consecutive
+    _cap_failures_consecutive = 0
 
 
 def coerce_cost(raw: Any) -> float | None:
@@ -857,6 +896,7 @@ async def _campaign_caps_exceeded(
             "cap check failed for campaign:%s — failing open: %s",
             campaign_id, e,
         )
+        _record_cap_failure("cap_check", e)
     return False
 
 
@@ -884,8 +924,10 @@ async def _bump_counters(
             pipe.incr(freq_key)
             pipe.expire(freq_key, freq_period if freq_period > 0 else 86400)
         await pipe.execute()
+        _record_cap_success()
     except Exception as e:
         logger.warning("Counter update failed: %s", e)
+        _record_cap_failure("counter_bump", e)
     timing["counter_ms"] = _ms_since(t0)
 
 

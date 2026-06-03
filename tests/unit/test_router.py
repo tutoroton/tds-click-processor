@@ -596,13 +596,14 @@ class TestResolveTargetLegacy:
         assert await resolve_target(r, offer, _ot_click(country="US")) is None
 
     @pytest.mark.asyncio
-    async def test_b9_priority_then_lexicographic_id_tiebreak(self):
-        # B9: two equal-priority match-all targets with ids "2" and "10".
-        # Input order is `sorted(target_ids)` = lexicographic = ["10","2"];
-        # the stable priority-DESC sort preserves it, so the FIRST
-        # match-all target iterated ("10") wins. This pins the
-        # lexicographic (NOT numeric) tie-break: a future change to
-        # numeric ordering (which would pick "2") fails this test.
+    async def test_b9_priority_then_numeric_id_tiebreak(self):
+        # B9 (audit 2026-06-03, post-fix): two equal-priority match-all
+        # targets with ids "2" and "10". resolve_target now sorts ids
+        # NUMERICALLY (via _safe_id_sort_key), matching the Stage-2
+        # action_executor path, so the FIRST match-all target iterated
+        # is "2" (numeric 2 < 10) — NOT lexicographic "10". This pins the
+        # cross-path-aligned numeric tie-break: a regression back to a
+        # plain lexicographic sorted() (which would pick "10") fails here.
         offer = {"_id": "5", "has_targets": "1"}
         r = _ot_redis(
             {"offer:5:targets": {"2", "10"}},
@@ -613,4 +614,4 @@ class TestResolveTargetLegacy:
                                     "is_default": "0", "criteria": "[]"},
             },
         )
-        assert await resolve_target(r, offer, _ot_click()) == "https://id-10"
+        assert await resolve_target(r, offer, _ot_click()) == "https://id-2"

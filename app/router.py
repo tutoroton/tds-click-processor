@@ -907,9 +907,12 @@ def _safe_id_sort_key(rid: Any) -> tuple[int, int, str]:
       - bucket=1 + 0 + raw string when parse fails (sorts after numeric;
         original string used as tiebreaker for determinism)
 
-    Mirrors `action_executor._safe_target_sort_key`. Promote to a shared
-    helper if a third caller needs this — left inline for now per
-    `reusability-discipline` "extract at 2nd use".
+    Mirrors `action_executor._safe_target_sort_key`. Used by source
+    enumeration AND (B9, audit 2026-06-03) `resolve_target`'s offer-target
+    ordering so the legacy path's priority-tie fallthrough matches the
+    Stage-2 cascade path numerically. If a cross-service shared module
+    ever lands, fold this + `action_executor._safe_target_sort_key` into
+    one home (tracked, low priority — both are identical 3 lines).
     """
     try:
         return (0, int(rid), str(rid))
@@ -1168,15 +1171,23 @@ async def resolve_target(r, offer: dict, req: ClickRequest) -> str | None:
     if not target_ids:
         return None
 
-    # Load all targets in one pipeline
+    # Load all targets in one pipeline. B9 (audit 2026-06-03): sort
+    # target_ids NUMERICALLY (via `_safe_id_sort_key`) so the
+    # priority-tie fallthrough order matches the Stage-2 path
+    # (`action_executor._safe_target_sort_key`). Pre-fix this used a
+    # plain `sorted()` = LEXICOGRAPHIC ("10" before "2"), so the same
+    # offer could pick a different target on the legacy vs cascade path
+    # at equal priority. Both iterations must use the SAME key so the
+    # zip below stays aligned.
     pipe = r.pipeline()
-    for tid in sorted(target_ids):
+    sorted_target_ids = sorted(target_ids, key=_safe_id_sort_key)
+    for tid in sorted_target_ids:
         pipe.hgetall(f"offer_target:{tid}")
     targets = await pipe.execute()
 
     # Sort by priority DESC
     target_list = []
-    for tid, t in zip(sorted(target_ids), targets):
+    for tid, t in zip(sorted_target_ids, targets):
         if t:
             t["_id"] = tid
             t["_priority"] = safe_int(t.get("priority"), 0)

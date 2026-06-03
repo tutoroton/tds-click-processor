@@ -278,23 +278,33 @@ def resolve_slots(
         src_entry = src_by_slot.get(slot)
         is_explicitly_mapped = (cmp_entry is not None) or (src_entry is not None)
 
-        # Effective alias = SOURCE wins per slot (SOURCE-WINS contract,
-        # 2026-06-02 — the source specializes the campaign). When the
-        # source doesn't define the slot, the campaign's alias is the
-        # only option. When neither defines the slot (canonical-only
-        # auto-iteration), there is no alias — only the canonical name
-        # itself.
-        primary_entry = src_entry if src_entry is not None else cmp_entry
-
-        # F.X — candidate GET keys in priority order. Canonical
-        # slot name FIRST, then the explicit alias (when defined
-        # and different). The plan's canonical-first decision means
-        # `?<slot_name>=` always trumps `?<alias>=` on collision.
+        # Candidate GET keys in the locked value-chain order
+        # `URL(canonical > eff_source.alias > campaign.alias)`.
+        # Canonical slot name FIRST (so `?<slot_name>=` always trumps
+        # `?<alias>=` on collision), then the SOURCE alias (SOURCE-WINS:
+        # the source specializes the campaign), then the CAMPAIGN alias
+        # as the final URL fallback.
+        #
+        # Finding #4 (2026-06-03): consult BOTH layers' aliases, not
+        # just the source's. When a slot is aliased by eff_source AND
+        # campaign with DIFFERENT keys this is load-bearing twice over:
+        #   (1) the campaign alias is a real resolution fallback — with
+        #       only the source alias in get_keys, a click carrying just
+        #       the campaign-alias key resolved the slot EMPTY, breaking
+        #       the `> campaign.alias` rung of the contract.
+        #   (2) every present alias key is marked consumed by the loop
+        #       below, so the losing alias key no longer bleeds into
+        #       `extras` (measured leak: campaign-alias `ckw` for an
+        #       eff_source-won keyword slot).
+        # The value loop (first non-empty in get_keys order) then yields
+        # canonical > src_alias > cmp_alias automatically.
         get_keys: list[str] = [slot]
-        if primary_entry is not None:
-            alias = _entry_alias(primary_entry)
-            if alias and alias != slot:
-                get_keys.append(alias)
+        src_alias = _entry_alias(src_entry) if src_entry is not None else None
+        cmp_alias = _entry_alias(cmp_entry) if cmp_entry is not None else None
+        if src_alias and src_alias != slot:
+            get_keys.append(src_alias)
+        if cmp_alias and cmp_alias != slot and cmp_alias != src_alias:
+            get_keys.append(cmp_alias)
 
         # Mark every candidate GET key that exists in the query as
         # examined BEFORE picking a winner. This ensures the

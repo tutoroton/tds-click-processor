@@ -293,6 +293,77 @@ class TestMergedMap:
 
 
 # ============================================================
+# Finding #4 — dual-aliased slot (eff_source AND campaign)
+# ============================================================
+
+
+class TestFinding4DualAliasFallback:
+    """Finding #4 (2026-06-03): when a slot is aliased by BOTH the
+    effective-source layer AND the campaign with *different* alias
+    keys, the campaign alias must (a) act as a real URL fallback after
+    the source alias — `URL(canonical > eff_source.alias >
+    campaign.alias)` — and (b) be consumed so the losing alias key
+    never bleeds into `extras`. Pre-fix `get_keys` only ever held the
+    source alias, so a campaign-alias-only click resolved NULL and the
+    campaign-alias key leaked into extras (measured: `ckw=CMPALIAS`).
+    """
+
+    def test_dual_alias_source_wins_and_no_bleed(self):
+        # Both alias keys present: source alias `ekw` and campaign
+        # alias `ckw` both map `keyword`. Source value wins (SOURCE-
+        # WINS) AND the losing campaign-alias key must NOT leak into
+        # extras — this is the bleed we measured live.
+        slots, extras = resolve_slots(
+            query_params={"ekw": "SRCALIAS", "ckw": "CMPALIAS"},
+            source_mappings=[{"slot": "keyword", "alias": "ekw"}],
+            campaign_mappings=[{"slot": "keyword", "alias": "ckw"}],
+        )
+        assert slots["keyword"] == "SRCALIAS"
+        assert "ckw" not in extras
+        assert "ekw" not in extras
+        assert extras == {}
+
+    def test_dual_alias_campaign_alias_only_resolves_via_campaign(self):
+        # Latent value bug: with ONLY the campaign-alias key present
+        # (no canonical, no source-alias key), the slot must resolve
+        # from the campaign alias — not empty. Pre-fix `get_keys` held
+        # only the source alias, so this resolved NULL.
+        slots, extras = resolve_slots(
+            query_params={"ckw": "CMPALIAS"},
+            source_mappings=[{"slot": "keyword", "alias": "ekw"}],
+            campaign_mappings=[{"slot": "keyword", "alias": "ckw"}],
+        )
+        assert slots["keyword"] == "CMPALIAS"
+        assert "ckw" not in extras
+        assert extras == {}
+
+    def test_dual_alias_canonical_beats_both(self):
+        # Canonical slot name still trumps BOTH aliases on collision,
+        # and neither alias key bleeds.
+        slots, extras = resolve_slots(
+            query_params={
+                "keyword": "CANON", "ekw": "SRCALIAS", "ckw": "CMPALIAS",
+            },
+            source_mappings=[{"slot": "keyword", "alias": "ekw"}],
+            campaign_mappings=[{"slot": "keyword", "alias": "ckw"}],
+        )
+        assert slots["keyword"] == "CANON"
+        assert extras == {}
+
+    def test_regression_single_layer_alias_and_unknown_extras(self):
+        # Regression: the dual-alias change must not disturb the
+        # single-layer path — source-only alias resolves, an unknown
+        # param still lands in extras.
+        slots, extras = resolve_slots(
+            query_params={"creative": "v42", "mk": "nonce"},
+            source_mappings=[{"slot": "sub1", "alias": "creative"}],
+            campaign_mappings=None,
+        )
+        assert slots["sub1"] == "v42"
+        assert extras == {"mk": "nonce"}
+
+
+# ============================================================
 # Extras — unmapped keys
 # ============================================================
 

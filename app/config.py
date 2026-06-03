@@ -286,6 +286,22 @@ class Settings(BaseSettings):
     # retry forever.
     shipper_retry_ttl_seconds: int = 86400  # 24 hours
 
+    # C3 (audit 2026-06-03) — edge-shipper orphaned-PEL reclaim. Mirror of
+    # the central writer's reclaim knobs (writer_reclaim_*). CONSUMER_NAME
+    # embeds os.getpid(), so a shipper crash/restart orphans the dead
+    # consumer's PEL entries (XREADGROUP-read but never XACKed because the
+    # process died between read and ship+ack). The main loop reads only
+    # `>` (new), never the dead consumer's PEL → silent click loss. The
+    # central writer already guards this (writer._reclaim_pending); these
+    # knobs drive the mirrored edge-shipper reclaim loop.
+    #   * interval_sec — how often the loop runs reclaim between drains.
+    #   * min_idle_ms  — only claim entries idle PAST this (never race the
+    #                    live consumer; > a normal ship+ack round-trip).
+    #   * max_per_cycle — bound the reclaim hot loop per tick.
+    shipper_reclaim_interval_sec: float = 30.0
+    shipper_reclaim_min_idle_ms: int = 60_000
+    shipper_reclaim_max_per_cycle: int = 5_000
+
     # ------------------------------------------------------------------
     # Diagnostic mode toggles. All three default `False` — production
     # safety-first. Operator flips per-environment via `.env`:

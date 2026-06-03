@@ -13,6 +13,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 
 import httpx
 import sentry_sdk
@@ -674,6 +675,24 @@ async def _drain_batch_from_stream(
         return [], []
 
     _stream_name, messages = results[0]
+    # C3 (audit 2026-06-03) — parse loop extracted to a helper so the
+    # orphaned-PEL reclaim path (`_reclaim_shipper_pending`) parses
+    # XAUTOCLAIM'd messages with the identical poison-handling semantics.
+    return await _parse_messages_into_clicks(redis_pool, messages)
+
+
+async def _parse_messages_into_clicks(
+    redis_pool, messages,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Parse a list of ``(msg_id, data)`` stream entries into clicks.
+
+    Shared by :func:`_drain_batch_from_stream` (XREADGROUP `>`) and
+    :func:`_reclaim_shipper_pending` (XAUTOCLAIM orphaned PEL). Returns
+    ``(clicks, msg_ids)`` 1:1 by index for SUCCESSFULLY-parsed entries.
+    A poison (undecodable-JSON) entry is XACKed in place — it can never
+    succeed, so leaving it pending would wedge the reclaim cursor — and
+    excluded from the returned lists (caller must not re-ACK it).
+    """
     clicks: list[dict[str, Any]] = []
     msg_ids: list[str] = []
 
@@ -719,6 +738,147 @@ async def _drain_batch_from_stream(
         msg_ids.append(msg_id)
 
     return clicks, msg_ids
+
+
+async def _reclaim_shipper_pending(redis_pool, http_client) -> dict[str, int]:
+    """C3 (audit 2026-06-03) — reclaim orphaned PEL entries and re-ship them.
+
+    The mirror of the central writer's ``_reclaim_pending``
+    (``services/collector/app/writer.py``) for the edge shipper. The
+    shipper ``CONSUMER_NAME`` embeds ``os.getpid()``; when the process
+    crashes/restarts between ``XREADGROUP`` and ship+``XACK``, those read
+    messages stay in the DEAD consumer's PEL. The main loop reads only
+    ``>`` (new entries), so the orphaned PEL is never re-driven →
+    **silent click loss** (audit-2026-06-02 C3 / EDGE-XCLAIM).
+
+    This periodic reclaim ``XAUTOCLAIM``s entries idle past
+    ``shipper_reclaim_min_idle_ms`` (so it never races the live consumer)
+    and re-drives each batch through the SAME post→verdict→ack path as
+    the main loop, so accepted clicks get ACKed (leave the PEL) and
+    rejected ones re-queue/deadletter exactly as in steady state.
+
+    Durability contract:
+      * On a ship FAILURE (non-2xx, contract-violation 207, or central
+        unreachable) the claimed entries are LEFT un-ACKed — they are now
+        in THIS live consumer's PEL and get re-driven on a later reclaim
+        tick once idle again. Nothing is lost; nothing is dead-lettered
+        for a transient outage.
+      * Only structurally-poison (undecodable-JSON) entries are ACKed in
+        place (a retry cannot help) — via the shared parse helper.
+
+    Never raises — a reclaim fault must not break the main ship loop;
+    NOGROUP is self-healed in place (mirrors the drain path).
+
+    Returns a small counts dict (``claimed`` / ``shipped_batches``) for
+    observability + tests.
+    """
+    counts = {"claimed": 0, "shipped_batches": 0}
+    try:
+        await _ensure_local_consumer_group(redis_pool)
+
+        cursor = "0-0"
+        while counts["claimed"] < settings.shipper_reclaim_max_per_cycle:
+            # redis-py XAUTOCLAIM → [next_cursor, messages, deleted_ids]
+            # (older servers omit deleted_ids — unpack defensively).
+            result = await redis_pool.xautoclaim(
+                STREAM_KEY,
+                GROUP_NAME,
+                CONSUMER_NAME,
+                min_idle_time=settings.shipper_reclaim_min_idle_ms,
+                start_id=cursor,
+                count=BATCH_SIZE,
+            )
+            cursor = result[0]
+            messages = result[1] if len(result) > 1 else []
+            if not messages:
+                break
+
+            clicks, msg_ids = await _parse_messages_into_clicks(
+                redis_pool, messages,
+            )
+            if clicks:
+                counts["claimed"] += len(clicks)
+                shipped = await _reship_reclaimed_batch(
+                    redis_pool, http_client, clicks, msg_ids,
+                )
+                if not shipped:
+                    # Ship failed — claimed entries stay un-ACKed in OUR
+                    # PEL and are retried on a later reclaim tick. Stop the
+                    # cycle so we don't hammer a down central.
+                    logger.warning(
+                        "Shipper reclaim: re-ship failed for %d clicks — "
+                        "left in PEL for next reclaim cycle (op=%s).",
+                        len(clicks), OP_BATCH_POST,
+                    )
+                    break
+                counts["shipped_batches"] += 1
+
+            # XAUTOCLAIM returns "0-0" when the PEL scan is complete.
+            if cursor in ("0-0", b"0-0"):
+                break
+
+        if counts["claimed"]:
+            logger.info(
+                "Shipper reclaim cycle: claimed=%d shipped_batches=%d (op=%s)",
+                counts["claimed"], counts["shipped_batches"], OP_BATCH_POST,
+            )
+        return counts
+    except RedisResponseError as exc:
+        if _is_nogroup_error(exc):
+            await _ensure_local_consumer_group(redis_pool)
+        else:
+            logger.warning("Shipper reclaim ResponseError: %s", exc)
+            _capture_op_exc(OP_LOOP_ITERATION, exc, context="reclaim")
+        return counts
+    except Exception as exc:  # noqa: BLE001 — never break the main loop
+        logger.warning("Shipper reclaim cycle failed: %s", exc)
+        _capture_op_exc(OP_LOOP_ITERATION, exc, context="reclaim")
+        return counts
+
+
+async def _reship_reclaimed_batch(
+    redis_pool, http_client, clicks, msg_ids,
+) -> bool:
+    """Re-drive one reclaimed batch through the post→verdict→ack path.
+
+    Returns True when the batch reached central (per-click verdict or
+    legacy ACK-all path ran → accepted clicks ACKed). Returns False on a
+    delivery failure (non-2xx, contract-violation 207, or unreachable) so
+    the caller leaves the entries pending for the next reclaim tick.
+
+    NB: this intentionally does NOT call ``_process_collector_error`` —
+    that helper sleeps + advances the main-loop backoff, which would be
+    wrong for the periodic reclaim. A reclaim failure is silent here and
+    simply retried next tick.
+    """
+    try:
+        response = await _post_batch_to_central(http_client, clicks)
+    except httpx.RequestError as exc:
+        logger.warning("Shipper reclaim: central unreachable: %s", exc)
+        return False
+
+    if response.status_code not in (200, 202, 207):
+        return False
+
+    shape, body = _parse_collector_response(response.text)
+    if shape == "new":
+        await _process_new_shape_batch(
+            redis_pool, http_client, response, body, clicks, msg_ids,
+        )
+        return True
+    if shape == "legacy" and response.status_code in (200, 202):
+        await _process_legacy_shape_batch(
+            redis_pool, response, shape, clicks, msg_ids,
+        )
+        return True
+    # unknown shape on any 2xx, or legacy/unknown on 207 → contract
+    # violation. Do NOT ACK-all (the D9/TD-17 invariant) — leave pending.
+    logger.error(
+        "Shipper reclaim: collector returned status=%d shape=%s — "
+        "leaving %d clicks in PEL for retry (op=%s).",
+        response.status_code, shape, len(clicks), OP_BATCH_POST,
+    )
+    return False
 
 
 async def _post_batch_to_central(
@@ -1261,6 +1421,12 @@ async def run_shipper(redis_pool):
     # silent-disable pathology that G5 was built to surface.
     try:
         retry_delay = 1
+        # C3 (audit 2026-06-03) — periodic orphaned-PEL reclaim cadence.
+        # Mirrors the central writer's `last_reclaim` heartbeat. The
+        # XREADGROUP block timeout (BATCH_TIMEOUT_MS) is the natural loop
+        # heartbeat, so this check fires roughly every
+        # `shipper_reclaim_interval_sec` even on an idle node.
+        last_reclaim = time.monotonic()
         async with httpx.AsyncClient(timeout=15.0) as client:
             while True:
                 # Local-iteration default so the httpx.RequestError /
@@ -1271,6 +1437,17 @@ async def run_shipper(redis_pool):
                 # ``_handle_shipper_loop_error`` (no batch_size arg).
                 clicks: list[dict[str, Any]] = []
                 try:
+                    # C3 — reclaim orphaned PEL entries (from a dead
+                    # consumer after a crash/restart) BEFORE draining new
+                    # ones. Runs every reclaim_interval_sec regardless of
+                    # whether the drain below finds new clicks, so an idle
+                    # node still recovers its orphans. Self-contained +
+                    # never-raises (see `_reclaim_shipper_pending`).
+                    now = time.monotonic()
+                    if now - last_reclaim >= settings.shipper_reclaim_interval_sec:
+                        await _reclaim_shipper_pending(redis_pool, client)
+                        last_reclaim = now
+
                     clicks, msg_ids = await _drain_batch_from_stream(redis_pool)
                     if not clicks:
                         continue

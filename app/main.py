@@ -39,7 +39,7 @@ from app.diag import (
 )
 from app.models import ClickRequest, ClickResponse, HealthResponse
 from app.redis_client import get_redis, close_redis
-from app.router import route, get_full_ua_info, parse_accept_language
+from app.router import route, get_full_ua_info, parse_accept_language, coerce_cost
 from app.ua_parser import warmup as warmup_ua_parser
 from app.shipper import assert_shipper_ready, run_shipper
 from app.shipper_metrics import metrics as shipper_metrics
@@ -791,7 +791,10 @@ def _phase3_attribution_fields(
         "routing_decision_ts": routing_decision_ts,
         # cost: advertiser-supplied per-click value (same source build_url
         # uses; campaign-hardcoded fallback still DEFERRED — no schema col).
-        "cost": (req.query_params or {}).get("cost") or 0,
+        # A2 (audit 2026-06-03) — strict numeric gate: non-numeric/negative
+        # ?cost= → 0, never arbitrary text into the numeric CH column
+        # (which would risk a collector insert failure, the C1 class).
+        "cost": coerce_cost((req.query_params or {}).get("cost")) or 0,
     }
 
     # Reserved slots → dedicated columns (canonical param_mappings

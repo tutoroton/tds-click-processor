@@ -12,6 +12,7 @@ from app.router import (
     parse_os,
     parse_browser,
     build_url,
+    coerce_cost,
     resolve_target,
     weighted_select,
     weighted_select_from_dict,
@@ -426,6 +427,49 @@ class TestEdgeCases:
         req = ClickRequest(click_id="test", query_params=params)
         url = build_url("https://example.com/", req, "1", "101")
         assert "example.com" in url
+
+
+# ============================================================
+# Audit 2026-06-03 — A2 cost numeric gate (coerce_cost)
+# ============================================================
+
+
+class TestCoerceCost:
+    def test_valid_float(self):
+        assert coerce_cost("0.5") == 0.5
+        assert coerce_cost("12") == 12.0
+        assert coerce_cost(3) == 3.0
+        assert coerce_cost("0") == 0.0
+
+    def test_non_numeric_returns_none(self):
+        assert coerce_cost("abc'inj<script>") is None
+        assert coerce_cost("1; DROP TABLE") is None
+        assert coerce_cost("$5") is None
+
+    def test_absent_returns_none(self):
+        assert coerce_cost(None) is None
+        assert coerce_cost("") is None
+
+    def test_negative_returns_none(self):
+        assert coerce_cost("-5") is None
+        assert coerce_cost(-0.01) is None
+
+    def test_nonfinite_returns_none(self):
+        assert coerce_cost("nan") is None
+        assert coerce_cost("inf") is None
+        assert coerce_cost("1e9999") is None  # overflows to inf
+
+    def test_build_url_drops_non_numeric_cost_macro(self):
+        # {cost} macro must collapse (not reflect text) on bad input.
+        req = ClickRequest(click_id="c1", query_params={"cost": "abc'inj"})
+        url = build_url("https://lp.test/?c={cost}", req, "1", "10")
+        assert "abc" not in url
+        assert "{cost}" not in url
+
+    def test_build_url_keeps_valid_cost_macro(self):
+        req = ClickRequest(click_id="c1", query_params={"cost": "1.5"})
+        url = build_url("https://lp.test/?c={cost}", req, "1", "10")
+        assert "c=1.5" in url
 
 
 # ============================================================

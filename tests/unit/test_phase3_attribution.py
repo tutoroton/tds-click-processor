@@ -168,9 +168,29 @@ class TestPhase3AttributionFields:
         assert f["hostname"] == "lp.x.test"
         assert f["path"] == "/go"
         assert f["language"] == parse_accept_language("en-US")
-        assert f["cost"] == "0.5"
+        # A2 (audit 2026-06-03) — cost is now strict-coerced to a float
+        # (was the raw string "0.5" pre-fix).
+        assert f["cost"] == 0.5
         # FIX-1 — exact passed value (helper is pure; no internal now()).
         assert f["routing_decision_ts"] == _RDT
+
+    def test_cost_non_numeric_injection_stored_as_zero(self):
+        # A2: an attacker-controllable non-numeric ?cost= must NOT land
+        # verbatim in the numeric cost column (would risk a collector
+        # insert failure — the C1 poison-pill class) and must never be
+        # reflected. Strict gate → stored 0.
+        req = ClickRequest(
+            click_id="c1", query_params={"cost": "abc'inj<script>"},
+        )
+        f = _phase3_attribution_fields({"attribution": {}}, req, {}, _RDT)
+        assert f["cost"] == 0
+        assert f["cost"] != "abc'inj<script>"
+
+    def test_cost_negative_stored_as_zero(self):
+        # Negative per-click cost is nonsensical → dropped to 0.
+        req = ClickRequest(click_id="c1", query_params={"cost": "-5"})
+        f = _phase3_attribution_fields({"attribution": {}}, req, {}, _RDT)
+        assert f["cost"] == 0
 
     def test_fallback_path_empty_attribution_no_crash(self):
         # route() returned None → handler builds a synthetic result with

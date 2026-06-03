@@ -26,6 +26,7 @@ migration safe for campaigns whose flows haven't yet been authored.
 
 import json
 import logging
+import math
 import random
 import time
 from typing import Any, NamedTuple
@@ -40,6 +41,37 @@ from app.resolution import parse_param_mappings, resolve_slots
 from app.ua_parser import parse_ua
 
 logger = logging.getLogger("tds.router")
+
+
+def coerce_cost(raw: Any) -> float | None:
+    """Strict numeric coercion for the advertiser-supplied ``?cost=`` param.
+
+    Returns a non-negative, finite float, or ``None`` when the value is
+    absent / non-numeric / negative / NaN / ±inf.
+
+    A2 (audit 2026-06-03): ``?cost=`` is attacker-controllable raw GET
+    input. Pre-fix, both the stored ``cost`` column (``main._phase3_
+    attribution_fields``) and the ``{cost}`` macro (``build_url`` below)
+    read it verbatim via ``get("cost") or 0``, so ``?cost=abc'inj`` put
+    arbitrary text into the click record (a numeric CH column — risking
+    a collector insert failure, the C1 poison-pill class) and could be
+    reflected into the redirect. This gate mirrors the ``isdigit()``
+    discipline ``enrichment.py`` applies to ``buyer_id``: validate first,
+    drop on fail — never propagate unvalidated text.
+
+    Callers pick the fallback: the stored column uses ``coerce_cost(raw)
+    or 0`` (numeric 0 on miss); the macro uses the ``None`` directly so
+    ``safe_substitute`` collapses the ``{cost}`` placeholder.
+    """
+    if raw is None or raw == "":
+        return None
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(val) or val < 0:
+        return None
+    return val
 
 
 def safe_int(value, default=0):
@@ -1531,8 +1563,10 @@ def build_url(
     # (existing semantics preserved; no new behaviour change).
     parsed_lang = parse_accept_language(req.accept_language)
     values["language"] = parsed_lang or None
+    # A2 (audit 2026-06-03) — strict numeric gate; non-numeric ?cost=
+    # drops to None so the {cost} macro collapses (never reflects text).
     qp_cost = (req.query_params or {}).get("cost") if req.query_params else None
-    values["cost"] = qp_cost if qp_cost else None
+    values["cost"] = coerce_cost(qp_cost)
 
     # Technical layer (always wins for system-reserved names).
     # T2.5 added offer_target_id + flow_id — caller now threads

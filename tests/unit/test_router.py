@@ -5,11 +5,14 @@ parameter mapping, edge cases, and malicious inputs.
 """
 
 import pytest
+from unittest.mock import MagicMock
+
 from app.router import (
     parse_device_type,
     parse_os,
     parse_browser,
     build_url,
+    resolve_target,
     weighted_select,
     weighted_select_from_dict,
 )
@@ -423,3 +426,147 @@ class TestEdgeCases:
         req = ClickRequest(click_id="test", query_params=params)
         url = build_url("https://example.com/", req, "1", "101")
         assert "example.com" in url
+
+
+# ============================================================
+# Audit 2026-06-03 regression fence — legacy resolve_target
+# ============================================================
+#
+# `resolve_target` is the offer-target picker on the cascade-MISS
+# (legacy) path: when `cascade.resolve_flow` returns None, route()
+# falls to `select_offer` → `resolve_target`. It was entirely
+# unit-untested before this fence. Pins: no-targets passthrough,
+# empty-criteria match-all, criteria selection, is_default fallback,
+# the B4 "no match + no default → None" gap, and the B9 priority
+# tie-break (priority DESC, then LEXICOGRAPHIC offer_target id —
+# NOT numeric, unlike `action_executor._safe_target_sort_key`; the
+# two paths intentionally diverge here, documented in P2-results.md).
+# Mutation-checked — see P2-results.md.
+
+
+def _ot_redis(target_sets: dict[str, set], target_hashes: dict[str, dict]) -> MagicMock:
+    """Mock Redis for `resolve_target`: smembers + pipeline.hgetall."""
+
+    class FakePipeline:
+        def __init__(self):
+            self._keys: list[str] = []
+
+        def hgetall(self, key):
+            self._keys.append(key)
+
+        async def execute(self):
+            return [dict(target_hashes.get(k, {})) for k in self._keys]
+
+    async def _smembers(key):
+        return set(target_sets.get(key, set()))
+
+    redis = MagicMock()
+    redis.smembers = _smembers
+    redis.pipeline = lambda: FakePipeline()
+    return redis
+
+
+def _ot_click(country="US", region="", city="", ua="Mozilla/5.0 (iPhone)", al="en-US"):
+    return ClickRequest(
+        click_id="t-1", country=country, region=region, city=city,
+        user_agent=ua, accept_language=al, query_params={},
+    )
+
+
+class TestResolveTargetLegacy:
+    @pytest.mark.asyncio
+    async def test_offer_without_targets_returns_none(self):
+        offer = {"_id": "5", "has_targets": "0"}
+        url = await resolve_target(_ot_redis({}, {}), offer, _ot_click())
+        assert url is None
+
+    @pytest.mark.asyncio
+    async def test_empty_targets_set_returns_none(self):
+        offer = {"_id": "5", "has_targets": "1"}
+        r = _ot_redis({"offer:5:targets": set()}, {})
+        assert await resolve_target(r, offer, _ot_click()) is None
+
+    @pytest.mark.asyncio
+    async def test_empty_criteria_matches_all(self):
+        offer = {"_id": "5", "has_targets": "1"}
+        r = _ot_redis(
+            {"offer:5:targets": {"7"}},
+            {"offer_target:7": {"url": "https://match-all", "criteria": "[]",
+                                "priority": "0", "is_default": "0"}},
+        )
+        assert await resolve_target(r, offer, _ot_click()) == "https://match-all"
+
+    @pytest.mark.asyncio
+    async def test_criteria_selects_matching_target(self):
+        offer = {"_id": "5", "has_targets": "1"}
+        r = _ot_redis(
+            {"offer:5:targets": {"7", "8"}},
+            {
+                "offer_target:7": {
+                    "url": "https://us", "priority": "10", "is_default": "0",
+                    "criteria": '[{"type":"geo","op":"in","values":["US"]}]',
+                },
+                "offer_target:8": {
+                    "url": "https://ru", "priority": "5", "is_default": "0",
+                    "criteria": '[{"type":"geo","op":"in","values":["RU"]}]',
+                },
+            },
+        )
+        # US click → target 7 matches (and is higher priority anyway).
+        assert await resolve_target(r, offer, _ot_click(country="US")) == "https://us"
+
+    @pytest.mark.asyncio
+    async def test_no_criteria_match_uses_is_default(self):
+        offer = {"_id": "5", "has_targets": "1"}
+        r = _ot_redis(
+            {"offer:5:targets": {"7", "9"}},
+            {
+                "offer_target:7": {
+                    "url": "https://ru-only", "priority": "10", "is_default": "0",
+                    "criteria": '[{"type":"geo","op":"in","values":["RU"]}]',
+                },
+                "offer_target:9": {
+                    "url": "https://default", "priority": "1", "is_default": "1",
+                    "criteria": '[{"type":"geo","op":"in","values":["DE"]}]',
+                },
+            },
+        )
+        # US click matches neither geo criterion → fall to is_default target.
+        assert await resolve_target(r, offer, _ot_click(country="US")) == "https://default"
+
+    @pytest.mark.asyncio
+    async def test_b4_no_match_no_default_returns_none(self):
+        # B4 (legacy path): targets exist, none match the click, and NONE
+        # is is_default → resolve_target returns None. route() then falls
+        # back to `offer.get("url")`; if that's empty too the click has no
+        # target. Pins that a non-matching, non-default target is never
+        # returned as a silent fallback.
+        offer = {"_id": "5", "has_targets": "1"}
+        r = _ot_redis(
+            {"offer:5:targets": {"7"}},
+            {"offer_target:7": {
+                "url": "https://ru-only", "priority": "10", "is_default": "0",
+                "criteria": '[{"type":"geo","op":"in","values":["RU"]}]',
+            }},
+        )
+        assert await resolve_target(r, offer, _ot_click(country="US")) is None
+
+    @pytest.mark.asyncio
+    async def test_b9_priority_then_lexicographic_id_tiebreak(self):
+        # B9: two equal-priority match-all targets with ids "2" and "10".
+        # Input order is `sorted(target_ids)` = lexicographic = ["10","2"];
+        # the stable priority-DESC sort preserves it, so the FIRST
+        # match-all target iterated ("10") wins. This pins the
+        # lexicographic (NOT numeric) tie-break: a future change to
+        # numeric ordering (which would pick "2") fails this test.
+        offer = {"_id": "5", "has_targets": "1"}
+        r = _ot_redis(
+            {"offer:5:targets": {"2", "10"}},
+            {
+                "offer_target:2": {"url": "https://id-2", "priority": "5",
+                                   "is_default": "0", "criteria": "[]"},
+                "offer_target:10": {"url": "https://id-10", "priority": "5",
+                                    "is_default": "0", "criteria": "[]"},
+            },
+        )
+        assert await resolve_target(r, offer, _ot_click()) == "https://id-10"

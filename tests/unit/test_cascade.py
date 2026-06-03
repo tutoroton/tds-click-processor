@@ -646,3 +646,102 @@ class TestPureHelpers:
         assert SCOPE_PRIORITY == (
             "buyer", "custom_group", "team", "department", "company",
         )
+
+
+# ============================================================
+# Audit 2026-06-03 regression fence — criteria + multi-scope gaps
+# ============================================================
+#
+# Pins decision-engine behaviours flagged as under-covered by the
+# routing-reliability audit (Agent-C GAP3/4/5/6). Mutation-checked —
+# see P2-results.md.
+
+
+class TestAuditCriteriaGaps:
+    """Agent-C GAP3/5/6 — per-dim criteria coverage that was thin."""
+
+    def test_device_tablet_not_in_excludes(self):
+        # GAP5: device_type=tablet against not_in[mobile, tablet] →
+        # tablet IS in the list → criterion fails (flow excluded).
+        assert _criteria_match(
+            [{"type": "device_type", "op": "not_in", "values": ["mobile", "tablet"]}],
+            {"device_type": "tablet"},
+        ) is False
+
+    def test_device_desktop_passes_not_in_mobile_tablet(self):
+        # Complement: desktop is NOT excluded.
+        assert _criteria_match(
+            [{"type": "device_type", "op": "not_in", "values": ["mobile", "tablet"]}],
+            {"device_type": "desktop"},
+        ) is True
+
+    def test_browser_not_in_with_empty_click_value_passes(self):
+        # GAP3: device_detector couldn't parse a browser (empty) →
+        # not_in is permissive (empty is in nothing) → passes. Same
+        # fail-open-on-missing semantics as the region case, pinned
+        # explicitly for the browser dimension.
+        assert _criteria_match(
+            [{"type": "browser", "op": "not_in", "values": ["Chrome", "Firefox"]}],
+            {"browser": ""},
+        ) is True
+
+    def test_browser_not_in_excludes_listed(self):
+        assert _criteria_match(
+            [{"type": "browser", "op": "not_in", "values": ["Chrome"]}],
+            {"browser": "Chrome"},
+        ) is False
+
+    def test_region_and_city_compound_and_match(self):
+        # GAP6: a compound region AND city criterion. Both must hold.
+        crit = [
+            {"type": "region", "op": "in", "values": ["California"]},
+            {"type": "city", "op": "in", "values": ["Los Angeles"]},
+        ]
+        # city is NOT case-preserving — matcher lowercases both sides,
+        # router lowercases click city upstream.
+        assert _criteria_match(crit, {"region": "California", "city": "los angeles"}) is True
+
+    def test_region_and_city_compound_and_city_miss(self):
+        crit = [
+            {"type": "region", "op": "in", "values": ["California"]},
+            {"type": "city", "op": "in", "values": ["Los Angeles"]},
+        ]
+        # Right region, wrong city → the AND fails.
+        assert _criteria_match(crit, {"region": "California", "city": "san diego"}) is False
+
+
+class TestAuditMultiScopeFallback:
+    """Agent-C GAP4 — every scope level has a flow but ALL fail criteria.
+
+    The single-scope no-match case is covered by
+    `TestFallbackChain.test_no_match_anywhere_returns_none`. This pins
+    the harder case: flows exist at buyer AND team AND company, the
+    cascade walks every level, none survives criteria → `None` (the
+    legacy split fallback contract), not a stale/last-considered flow.
+    """
+
+    @pytest.mark.asyncio
+    async def test_all_scopes_present_but_all_fail_criteria_returns_none(self):
+        ru_only = [{"type": "geo", "op": "in", "values": ["RU"]}]
+        flows = {
+            "flow:10": _make_flow(fid="10", scope_type="buyer", scope_id=5,
+                                  seq_id=1, criteria=ru_only),
+            "flow:20": _make_flow(fid="20", scope_type="team", scope_id=3,
+                                  seq_id=1, criteria=ru_only),
+            "flow:30": _make_flow(fid="30", scope_type="company", scope_id=1,
+                                  seq_id=1, criteria=ru_only),
+        }
+        lists = {
+            "campaign:1:flows": [],
+            "flows:scope:1:buyer:5": ["10"],
+            "flows:scope:1:team:3": ["20"],
+            "flows:scope:1:company:1": ["30"],
+        }
+        r = _redis_with_lists_and_hashes(lists, flows)
+        winner = await resolve_flow(
+            r, campaign_id="1", company_id=1, buyer_id=5,
+            team_id=3, department_id=None, custom_group_id=None,
+            click_attrs={"geo": "US", "os": "ios", "device_type": "mobile"},
+        )
+        # Click is US — every scope's RU-only flow is filtered out.
+        assert winner is None

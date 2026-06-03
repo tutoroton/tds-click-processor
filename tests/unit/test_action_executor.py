@@ -393,3 +393,138 @@ class TestHelpers:
         # JSON-parsed `{"offer_id": true}` must NEVER be treated as id=1.
         assert _is_positive_int(True) is False
         assert _is_positive_int(False) is False
+
+
+# ============================================================
+# Audit 2026-06-03 regression fence — decision-engine gaps
+# ============================================================
+#
+# Pins behaviours surfaced by the routing-reliability audit
+# (`docs/development/audit-2026-06-03-routing-reliability.md`). Each
+# test is mutation-checked: reintroducing the underlying defect makes
+# the test fail (see P2-results.md mutation-check log).
+
+
+class TestOfferDefaultTargetGap:
+    """B4 / Agent-C GAP1 — offer with targets but no usable default.
+
+    The KNOWN Stage-1 gap "offers required-default-target validation"
+    (admin-api does NOT enforce that an offer with `has_targets=1`
+    carries an `is_default=1` target). At click time the executor's
+    offer-fallback (`_offer_default_template`) ONLY promotes an
+    `is_default=1` target — a non-default target is NEVER auto-selected
+    as the offer fallback. With no default and no bare `offer.url`, the
+    action yields `None` and the click silently routes to the legacy
+    split fallback. These tests pin that contract so a future change
+    that starts auto-selecting an arbitrary target (or that drops the
+    is_default gate) fails loudly.
+    """
+
+    @pytest.mark.asyncio
+    async def test_has_targets_but_no_default_and_no_bare_url_returns_none(self):
+        # offer:5 has targets, but target 7 is NOT is_default and the
+        # offer carries no bare url → no usable destination → None.
+        flow = _flow("offer", {"offer_id": 5})
+        r = _redis_with_hashes(
+            {
+                "offer:5": {"has_targets": "1"},  # no `url`
+                "offer_target:7": {"url": "https://non-default", "is_default": "0"},
+            },
+            sets={"offer:5:targets": {"7"}},
+        )
+        result = await execute_action(
+            r, flow, _click(), "1",
+            source_mappings=None, campaign_mappings=None,
+            build_url_fn=_stub_build_url(),
+        )
+        # A non-default target must NOT be promoted as the offer fallback.
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_has_targets_empty_set_and_no_bare_url_returns_none(self):
+        # has_targets=1 but the targets SET is empty (sync drift) and no
+        # bare url → None (cannot fabricate a destination).
+        flow = _flow("offer", {"offer_id": 5})
+        r = _redis_with_hashes(
+            {"offer:5": {"has_targets": "1"}},
+            sets={"offer:5:targets": set()},
+        )
+        result = await execute_action(
+            r, flow, _click(), "1",
+            source_mappings=None, campaign_mappings=None,
+            build_url_fn=_stub_build_url(),
+        )
+        assert result is None
+
+
+class TestSplitFloatWeightTruncation:
+    """B2 / Agent-C GAP2 — float weights are int()-truncated.
+
+    admin-api `flows/validation.py:344` accepts `weight` as
+    `(int, float)` and only requires the sum to be positive, so a split
+    configured with fractional weights (e.g. 0.5 / 0.5, or someone
+    typing percentages as 0.3 / 0.7) PASSES write-time validation. But
+    `_execute_split` (action_executor.py:211) AND the sync builder
+    (`admin-api/app/sync/builders/splits.py:86,135`) both do
+    `int(weight)`, so every fractional weight < 1 truncates to 0.
+
+    CHARACTERIZATION tests — they pin the CURRENT (buggy) truncation so
+    the remediation phase (which will round/scale or reject floats at
+    validation) flips them with an explicit cascade update. Mutation
+    check: replacing `int(weight)` with `weight` makes both tests fail.
+    """
+
+    @pytest.mark.asyncio
+    async def test_fractional_weights_below_one_truncate_to_zero_falls_back(self):
+        # 0.5 + 0.5 sum to 1.0 (passes admin-api validation) but
+        # int(0.5)=0 for both → sum of int weights == 0 → no usable
+        # offers → None → legacy fallback. The split silently never runs.
+        flow = _flow("split", {
+            "offers": [
+                {"offer_id": 5, "target_id": 7, "weight": 0.5},
+                {"offer_id": 6, "target_id": 8, "weight": 0.5},
+            ],
+        })
+        # Populate the targets so offer-URL resolution WOULD succeed if a
+        # branch were ever picked — this isolates the truncation: the
+        # None result is caused by int()-truncated weights summing to 0,
+        # NOT by a missing offer/target row.
+        r = _redis_with_hashes({
+            "offer_target:7": {"url": "https://t-7", "is_default": "0"},
+            "offer_target:8": {"url": "https://t-8", "is_default": "0"},
+        })
+        result = await execute_action(
+            r, flow, _click(), "1",
+            source_mappings=None, campaign_mappings=None,
+            build_url_fn=_stub_build_url(),
+        )
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_sub_unit_weight_branch_never_selected_after_truncation(self):
+        # Mixed: 2.9 → int 2, 0.9 → int 0. The 0.9 branch (offer 6)
+        # becomes weight 0 and is therefore UNREACHABLE — random.choices
+        # never selects a zero-weight element when others are positive.
+        # So 100/100 picks land on offer 5, distorting the operator's
+        # intended ~2.9 : 0.9 (≈76/24) split into 100/0.
+        flow = _flow("split", {
+            "offers": [
+                {"offer_id": 5, "target_id": 7, "weight": 2.9},
+                {"offer_id": 6, "target_id": 8, "weight": 0.9},
+            ],
+        })
+        r = _redis_with_hashes({
+            "offer_target:7": {"url": "https://t-7", "is_default": "0"},
+            "offer_target:8": {"url": "https://t-8", "is_default": "0"},
+        })
+        chosen = set()
+        for _ in range(100):
+            result = await execute_action(
+                r, flow, _click(), "1",
+                source_mappings=None, campaign_mappings=None,
+                build_url_fn=_stub_build_url(),
+            )
+            assert result is not None
+            chosen.add(result["offer_id"])
+        # offer 6's 0.9 weight truncated to 0 → never chosen.
+        assert chosen == {"5"}

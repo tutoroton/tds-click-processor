@@ -235,8 +235,17 @@ def _parse_collector_response(
           ``queued`` keys but no ``accepted``). Used during rolling
           deploy when shipper has been updated but collector hasn't.
         * ``("unknown", None)`` — body unparseable as JSON OR has
-          no recognised keys. Caller falls back to status-code-only
-          decision (legacy ACK-all on 2xx).
+          no recognised keys.
+
+    Caller routing (run_shipper dispatcher, since Sprint 3.7.1 TD-17 —
+    docstring corrected here per D9, audit 2026-06-03):
+      * ``new`` on any 2xx → per-click verdict handling.
+      * ``legacy`` on 200/202 → ACK-all backwards-compat shim.
+      * everything else (``unknown`` on any 2xx, ``legacy``/``unknown``
+        on 207) → ``_process_collector_error`` → RETRY, never ACK-all.
+        The pre-3.7.1 "fall back to status-code-only ACK-all on 2xx for
+        unknown" path was REMOVED — a mangled body must not silently
+        drop the batch.
     """
     if not response_text:
         return ("unknown", None)
@@ -1084,16 +1093,25 @@ async def _process_collector_error(
         # never returns 207 (only 200); 207 + legacy/unknown shape means
         # a Sprint 2.1+ collector returned 207 with corrupt JSON OR a
         # malicious proxy injected the status. Retry conservatively.
-        logger.warning(
+        #
+        # D9 (audit 2026-06-03): escalate this branch from WARN to ERROR.
+        # A garbled 207 means a per-click verdict the shipper cannot read
+        # — the batch is retried (no silent ACK-all; that loss path was
+        # closed in Sprint 3.7.1 TD-17), but a PERSISTENT garbled-207
+        # (collector bug / proxy mangling the body) keeps the batch
+        # bouncing and must page an operator, not whisper at WARN. The
+        # plain non-2xx path below stays WARN (ordinary transient 5xx).
+        logger.error(
             "Shipper got status=207 with non-new body shape=%s "
             "(contract violation, op=%s). Treating as collector_error — "
-            "retrying. Body: %s",
+            "retrying (NOT ACK-all). Body: %s",
             shape, OP_BATCH_POST, response.text[:200],
         )
         _capture_op_msg(
             OP_BATCH_POST,
-            f"Contract violation: status 207 with shape={shape}",
-            level="warning",
+            f"Contract violation: status 207 with shape={shape} — "
+            "unreadable per-click verdict, batch retried not ACK-all",
+            level="error",
             collector_status=response.status_code,
             response_body=response.text[:500],
             batch_size=batch_size,

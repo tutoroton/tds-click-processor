@@ -306,17 +306,63 @@ async def test_process_collector_error_records_metrics():
 async def test_process_collector_error_207_contract_violation_branch():
     """When ``shape`` is passed (caller hit 207 + non-new shape), the
     helper takes the contract-violation logging branch. Behaviour is
-    otherwise identical — same backoff, same metrics."""
+    otherwise identical — same backoff, same metrics.
+
+    D9 (audit 2026-06-03): the contract-violation branch now captures to
+    Sentry at ERROR level (was WARN) — a garbled 207 the shipper cannot
+    parse-verdict means the batch keeps bouncing on retry and must page,
+    not whisper.
+    """
     response = _make_response(207, '{"received": 5}')  # legacy shape
     clicks = [{"click_id": "c1"}]
 
-    with patch.object(shipper.asyncio, "sleep", new=AsyncMock()):
+    with patch.object(shipper.asyncio, "sleep", new=AsyncMock()), \
+         patch.object(shipper, "_capture_op_msg") as cap:
         new_delay = await _process_collector_error(
             response, clicks, retry_delay=2, shape="legacy",
         )
 
     assert new_delay == 4
     assert smm.metrics.last_ship_status == "collector_error"
+    # Captured at ERROR (D9), not warning.
+    cap.assert_called_once()
+    assert cap.call_args.kwargs.get("level") == "error"
+
+
+@pytest.mark.asyncio
+async def test_garbled_207_unknown_shape_retries_not_ackall(monkeypatch):
+    """D9 regression fence — a 207 with an UNPARSEABLE body (shape
+    ``unknown``) must route to ``_process_collector_error`` (retry, no
+    ACK-all), NOT the legacy ACK-all shim. Pins the Sprint 3.7.1 TD-17
+    tightening so a future loosening of the dispatcher (re-adding
+    'unknown on 2xx → ACK-all') is caught.
+
+    We assert the routing INVARIANT at the parse+decision seam: the
+    garbled body parses to ``unknown`` and the contract-violation helper
+    (a) does NOT XACK anything and (b) records ``collector_error`` +
+    captures at ERROR.
+    """
+    # Garbled 207 body — not valid JSON → unknown shape.
+    shape, body = shipper._parse_collector_response("{garbled<not-json>")
+    assert shape == "unknown"
+    assert body is None
+
+    response = _make_response(207, "{garbled<not-json>")
+    clicks = [{"click_id": "c1"}, {"click_id": "c2"}]
+    redis = MagicMock()
+    redis.xack = AsyncMock()
+
+    with patch.object(shipper.asyncio, "sleep", new=AsyncMock()), \
+         patch.object(shipper, "_capture_op_msg") as cap:
+        await _process_collector_error(
+            response, clicks, retry_delay=1, shape=shape,
+        )
+
+    # No ACK-all: the contract-violation path never touches the stream
+    # (the batch stays in the PEL / is re-driven on the next loop).
+    redis.xack.assert_not_called()
+    assert smm.metrics.last_ship_status == "collector_error"
+    assert cap.call_args.kwargs.get("level") == "error"
 
 
 # ===========================================================================

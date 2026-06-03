@@ -1,0 +1,14 @@
+# Click-processor test-only dependencies (NOT installed in the edge
+# runtime image). The click-processor is the public edge mirror
+# (tutoroton/tds-click-processor, deployed via `git subtree push`) and
+# must stay lean — pytest/fakeredis would bloat every edge node — so
+# the test stack lives here, separate from requirements.txt. Mirrors
+# the collector's requirements-dev.txt convention.
+#
+# Install for local/CI test runs:
+#   pip install -r requirements.txt -r requirements-dev.txt
+-r requirements.txt
+
+pytest==9.0.3
+pytest-asyncio==1.3.0    # @pytest.mark.asyncio in the unit suite
+fakeredis==2.35.1        # in-memory Redis for dedup / cache paths (test-only)

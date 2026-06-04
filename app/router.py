@@ -448,12 +448,20 @@ async def _build_campaign_attribution(
     # resolver never raises out of here, never 5xx, never loses a click.
     if settings.returning_resolver_enabled and _company_returning_enabled(campaign):
         try:
+            # Read previous-visit history (for prev_* matching) only when
+            # segmented routing is ALSO live for this company (env AND
+            # per-company) — otherwise RT#2 stays a single SISMEMBER.
+            with_history = (
+                settings.returning_routing_enabled
+                and _company_routing_enabled(campaign)
+            )
             ident = await identity.resolve_and_stamp(
                 company_id=buyer_chain["company_id"],
                 funnel_user_id=slots.get("funnel_user_id"),
                 visitor_id=req.visitor_id,
                 funnel_id=slots.get("funnel_id"),
                 source_trusted=source_trusted,
+                with_history=with_history,
             )
             attribution["uid"] = ident.uid
             attribution["is_unique"] = ident.is_unique
@@ -479,6 +487,16 @@ def _company_returning_enabled(campaign: dict[str, Any]) -> bool:
     already-fetched campaign HASH (default closed). Admin sync populates
     `returning_resolver` in P4; until then it is absent → False → dark."""
     return str(campaign.get("returning_resolver", "")).strip().lower() in (
+        "1", "true", "yes",
+    )
+
+
+def _company_routing_enabled(campaign: dict[str, Any]) -> bool:
+    """Per-company opt-in for SEGMENTED ROUTING (the 2-pass cascade), read FREE
+    from the already-fetched campaign HASH (default closed). Admin sync emits
+    `returning_routing` from the company setting (P5); absent → False → dark.
+    Combined with the `TDS_RETURNING_ROUTING` env toggle (env AND per-company)."""
+    return str(campaign.get("returning_routing", "")).strip().lower() in (
         "1", "true", "yes",
     )
 
@@ -765,7 +783,9 @@ async def _try_flow_cascade(
     # conflating them silently drops segment C, R4 G1). Only meaningful when the
     # P2 resolver produced a uid; absent → False → first pool only (zero-regress
     # when the resolver / routing is OFF).
-    audience_routing = settings.returning_routing_enabled
+    audience_routing = settings.returning_routing_enabled and _company_routing_enabled(
+        campaign
+    )
     seen_before = bool(attribution.get("uid")) and (
         attribution.get("is_unique") is False
     )
@@ -1517,12 +1537,12 @@ async def _effective_source_mappings(
 
 def _source_trusted(src: dict[str, Any]) -> bool:
     """Whether the matched source is flagged trusted for returning-user
-    identity (P2, default-closed). A funnel_user_id is only treated as an
-    identity signal from a trusted source (anti-poisoning, R4 G6). The admin
-    plumbing that sets this flag lands in P4 — until then the synced source
-    HASH never carries it, so this is always False (the L2 tier stays dark).
-    """
-    return str(src.get("trusted", "")).strip().lower() in ("1", "true", "yes")
+    identity (default-closed). A funnel_user_id is only treated as an identity
+    signal from a trusted source (anti-poisoning, R4 G6). The admin sync emits
+    `source_trusted` ("1"/"0") from `sources.funnel_user_id_trusted` (P5); a
+    legacy source HASH without the field → False, so the L2 tier stays dark
+    until a source is explicitly marked trusted."""
+    return str(src.get("source_trusted", "")).strip().lower() in ("1", "true", "yes")
 
 
 async def _fetch_resolution_context(

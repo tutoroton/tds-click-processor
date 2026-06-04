@@ -398,3 +398,51 @@ class TestRouterGate:
         assert attr["uid"] == "UID-OK"
         assert attr["is_unique"] is False
         assert attr["is_returning"] is True
+
+
+# ============================================================
+# P5 — per-company gates + cutover marker + trusted field (2026-06-05)
+# ============================================================
+
+from app.router import (
+    _company_returning_enabled,
+    _company_routing_enabled,
+    _source_trusted,
+)
+
+
+class TestP5Gates:
+    def test_company_returning_enabled(self):
+        assert _company_returning_enabled({"returning_resolver": "1"}) is True
+        assert _company_returning_enabled({"returning_resolver": "0"}) is False
+        assert _company_returning_enabled({}) is False  # legacy HASH → dark
+
+    def test_company_routing_enabled(self):
+        assert _company_routing_enabled({"returning_routing": "1"}) is True
+        assert _company_routing_enabled({"returning_routing": "0"}) is False
+        assert _company_routing_enabled({}) is False  # legacy HASH → dark
+
+    def test_source_trusted_reads_source_trusted_field(self):
+        assert _source_trusted({"source_trusted": "1"}) is True
+        assert _source_trusted({"source_trusted": "0"}) is False
+        assert _source_trusted({}) is False  # legacy source HASH → not trusted
+
+
+class TestP5FlagsSemanticsVersion:
+    @staticmethod
+    def _result(extra_attr=None):
+        attr = {"slots": {}, "company_id": 1}
+        if extra_attr:
+            attr.update(extra_attr)
+        return {"attribution": attr, "offer_id": None}
+
+    async def test_version_0_when_resolver_off(self):
+        # No resolver output in attr → legacy semantics → marker 0.
+        fields = _phase3_attribution_fields(self._result(), _req(), {}, "ts")
+        assert fields["flags_semantics_version"] == 0
+
+    async def test_version_1_when_resolver_on(self):
+        # Resolver stamped is_unique → canonical semantics → marker 1.
+        result = self._result({"uid": "U", "is_unique": True, "is_returning": False})
+        fields = _phase3_attribution_fields(result, _req(), {}, "ts")
+        assert fields["flags_semantics_version"] == 1

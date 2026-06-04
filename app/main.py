@@ -798,6 +798,14 @@ def _phase3_attribution_fields(
         # company enables the resolver. Written to every click so the Redis
         # identity map is rebuildable from ClickHouse (Redis disposable).
         "uid": attr.get("uid", ""),
+        # flags_semantics_version (P5) — analytics cutover marker. 0 = LEGACY
+        # cookie-presence semantics (is_unique = "no _tds_vid"); 1 = CANONICAL
+        # resolver semantics (is_unique = first uid appearance; is_returning =
+        # same-funnel return). The resolver stamps `is_unique` into `attr` only
+        # when it ran, so its presence is the discriminator. Lets dashboards
+        # branch pre/post cutover (the two columns are non-complementary across
+        # the boundary).
+        "flags_semantics_version": 1 if "is_unique" in attr else 0,
         "is_bot": req.is_bot,
         "is_proxy": req.is_proxy,
         "cf_ray": req.cf_ray or "",

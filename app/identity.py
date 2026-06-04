@@ -263,10 +263,14 @@ async def resolve_and_stamp(
     visitor_id: str | None,
     funnel_id: str | None,
     source_trusted: bool,
+    with_history: bool = False,
 ) -> IdentityResult:
     """Router entrypoint: resolve on the identity Redis, then SCHEDULE the
     deferred writes (fire-and-forget). Returns the result to stamp onto the
     click attribution. The CALLER wraps this in fail-open (gate V1).
+
+    `with_history` (P5) — the caller passes the two-layer routing gate (env
+    AND per-company); only then are the prev_* history sets read (in RT#2).
     """
     r = await get_identity_redis()
     ttl = settings.returning_uid_ttl_seconds
@@ -278,9 +282,7 @@ async def resolve_and_stamp(
         funnel_id=funnel_id,
         source_trusted=source_trusted,
         ttl=ttl,
-        # Read previous-visit history (for prev_* matching) only when segmented
-        # routing is enabled — otherwise RT#2 stays a single SISMEMBER.
-        with_history=settings.returning_routing_enabled,
+        with_history=with_history,
     )
     # Deferred writes off the critical path. create_task so the response is not
     # blocked; the task body is fully error-swallowing.

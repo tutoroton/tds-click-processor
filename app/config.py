@@ -347,6 +347,35 @@ class Settings(BaseSettings):
     # the probe.
     diag_obs_stream_ttl_seconds: int = 3600
 
+    # ------------------------------------------------------------------
+    # Returning-user identity resolver (P2, 2026-06-05). DARK by default.
+    #
+    # `returning_resolver_enabled` is the GLOBAL master kill-switch and the
+    # gate-#1 toggle (R4 audit): the router checks this cached bool FIRST,
+    # before ANY identity Redis I/O — OFF ⇒ instant skip, zero new
+    # round-trips, click_attrs / is_unique / is_returning computed exactly
+    # as today (byte-identical). A finer per-company gate rides on the
+    # synced campaign HASH (`returning_resolver` field, default closed,
+    # wired by admin sync in P4) so a tenant opts in individually.
+    #
+    # `identity_redis_url` (gate #2, R4): identity keys SHOULD live on a
+    # dedicated, `noeviction` Redis instance — an LRU eviction of an
+    # identity key silently degrades a returning user back to "new" AND
+    # competes with the routing cache for memory. Empty ⇒ reuse the
+    # routing Redis (`redis_url`); a startup assertion then WARNs that the
+    # shared instance MUST be `maxmemory-policy noeviction`. Point this at
+    # a separate instance/DB before enabling the resolver for a tenant at
+    # scale. (The edge routing Redis is already `noeviction` per the
+    # stream-MAXLEN note above, so sharing is safe at small scale.)
+    #
+    # `returning_uid_ttl_seconds` — sliding TTL (refreshed on every visit)
+    # so memory tracks the ACTIVE returning audience, not all-time uids.
+    # 180 days (R3 §6 recommendation; 1-year ceiling is a per-tenant
+    # opt-in handled in admin config later, not here).
+    returning_resolver_enabled: bool = False
+    identity_redis_url: str = ""
+    returning_uid_ttl_seconds: int = 15_552_000  # 180 days
+
     model_config = {"env_prefix": "TDS_"}
 
     @model_validator(mode="after")

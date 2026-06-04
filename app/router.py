@@ -32,13 +32,14 @@ import time
 from typing import Any, NamedTuple
 
 import sentry_sdk
-from app import action_executor, cascade
+from app import action_executor, cascade, identity
+from app.config import settings
 from app.enrichment import enrich_buyer
 from app.macros import safe_substitute
 from app.models import ClickRequest
 from app.redis_client import get_redis
 from app.resolution import parse_param_mappings, resolve_slots
-from app.telemetry import OP_CAP_COUNTER, capture_op_msg
+from app.telemetry import OP_CAP_COUNTER, OP_IDENTITY, capture_op_msg, capture_op_msg_throttled
 from app.ua_parser import parse_ua
 
 logger = logging.getLogger("tds.router")
@@ -395,8 +396,10 @@ async def _build_campaign_attribution(
     campaign(+effective_source) hardcoded defaults instead of dropping
     every slot column to NULL.
     """
-    source_mappings, campaign_mappings, source_id = await _fetch_resolution_context(
-        r, campaign_id, campaign, req.query_params or {},
+    source_mappings, campaign_mappings, source_id, source_trusted = (
+        await _fetch_resolution_context(
+            r, campaign_id, campaign, req.query_params or {},
+        )
     )
 
     # `slots` is pure-Python over the source∪campaign param_mappings
@@ -429,7 +432,50 @@ async def _build_campaign_attribution(
         "slots": slots,
         "extras": slot_extras,
     }
+
+    # Returning-user identity (P2, 2026-06-05) — DARK + fail-open.
+    #
+    # Gate #1 (no-IO-when-OFF): the cached `settings.returning_resolver_enabled`
+    # bool is checked FIRST — OFF ⇒ instant skip, zero identity Redis I/O,
+    # `attribution` carries no uid/flag keys, so `_phase3_attribution_fields`
+    # falls back to the legacy is_unique/is_returning computation → the click
+    # record is byte-identical to pre-P2. The per-company flag rides on the
+    # already-in-hand campaign HASH (free; admin sync wires it in P4) so a
+    # tenant opts in individually (default closed).
+    #
+    # Gate V1 (fail-open): the WHOLE resolver call is wrapped — ANY exception
+    # degrades to legacy (no keys stamped) and the click still routes. The
+    # resolver never raises out of here, never 5xx, never loses a click.
+    if settings.returning_resolver_enabled and _company_returning_enabled(campaign):
+        try:
+            ident = await identity.resolve_and_stamp(
+                company_id=buyer_chain["company_id"],
+                funnel_user_id=slots.get("funnel_user_id"),
+                visitor_id=req.visitor_id,
+                funnel_id=slots.get("funnel_id"),
+                source_trusted=source_trusted,
+            )
+            attribution["uid"] = ident.uid
+            attribution["is_unique"] = ident.is_unique
+            attribution["is_returning"] = ident.is_returning
+        except Exception as e:  # fail-open — never fail the click
+            capture_op_msg_throttled(
+                OP_IDENTITY, buyer_chain["company_id"],
+                f"returning-user resolver failed; degraded to legacy flags: {e}",
+                level="warning",
+            )
+            logger.warning("identity resolver failed — fail-open to legacy: %s", e)
+
     return source_mappings, campaign_mappings, attribution
+
+
+def _company_returning_enabled(campaign: dict[str, Any]) -> bool:
+    """Per-company opt-in for the returning-user resolver, read FREE from the
+    already-fetched campaign HASH (default closed). Admin sync populates
+    `returning_resolver` in P4; until then it is absent → False → dark."""
+    return str(campaign.get("returning_resolver", "")).strip().lower() in (
+        "1", "true", "yes",
+    )
 
 
 def _non_routed_result(
@@ -1441,21 +1487,33 @@ async def _effective_source_mappings(
     return parsed if isinstance(params_override, list) else source_global
 
 
+def _source_trusted(src: dict[str, Any]) -> bool:
+    """Whether the matched source is flagged trusted for returning-user
+    identity (P2, default-closed). A funnel_user_id is only treated as an
+    identity signal from a trusted source (anti-poisoning, R4 G6). The admin
+    plumbing that sets this flag lands in P4 — until then the synced source
+    HASH never carries it, so this is always False (the L2 tier stays dark).
+    """
+    return str(src.get("trusted", "")).strip().lower() in ("1", "true", "yes")
+
+
 async def _fetch_resolution_context(
     r,
     campaign_id: str,
     campaign: dict[str, Any],
     query_params: dict[str, Any],
-) -> tuple[list[dict[str, Any]] | None, list[dict[str, Any]] | None, int | None]:
+) -> tuple[list[dict[str, Any]] | None, list[dict[str, Any]] | None, int | None, bool]:
     """Resolve which source matched + parse both mapping layers.
 
-    Returns `(source_mappings, campaign_mappings, source_id)` ready to
-    pass to `build_url(...)`. `None` for source_mappings indicates "no
-    source matched" — `resolve_slots` then drives the campaign-only
+    Returns `(source_mappings, campaign_mappings, source_id, source_trusted)`
+    ready to pass to `build_url(...)`. `None` for source_mappings indicates
+    "no source matched" — `resolve_slots` then drives the campaign-only
     chain. `source_id` (Stage 3 / Phase 3) is the matched source's PK —
     `None` when no `?source=` matched — surfaced so the click record can
     attribute the click to its source without a second lookup (the HASH
-    was already fetched here).
+    was already fetched here). `source_trusted` (P2) rides along from the
+    SAME already-fetched HASH (no extra read) for the returning-user
+    identity gate; False when no source matched.
 
     `source_mappings` is the EFFECTIVE source layer: the per-link
     `campaign_sources.params_override` when set (non-null list), else the
@@ -1464,14 +1522,14 @@ async def _fetch_resolution_context(
     src = await _resolve_source_for_click(r, campaign_id, query_params)
     source_id = _to_int(src.get("_id")) if src else None
     if not src:
-        return None, parse_param_mappings(campaign.get("default_param_mappings")), None
+        return None, parse_param_mappings(campaign.get("default_param_mappings")), None, False
 
     source_global = parse_param_mappings(src.get("param_mappings"))
     source_mappings = await _effective_source_mappings(
         r, campaign_id, source_id, source_global,
     )
     campaign_mappings = parse_param_mappings(campaign.get("default_param_mappings"))
-    return source_mappings, campaign_mappings, source_id
+    return source_mappings, campaign_mappings, source_id, _source_trusted(src)
 
 
 def build_url(

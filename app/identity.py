@@ -1,0 +1,317 @@
+"""Returning-user identity resolver (P2, 2026-06-05). DARK by default.
+
+Derives a canonical company-scoped ``uid`` from a click's identity signals and
+the *redefined* ``is_unique`` / ``is_returning`` flags. The router calls this
+ONLY when the gate-#1 master toggle (``settings.returning_resolver_enabled``)
+AND a per-company flag are both set; otherwise the click is byte-identical to
+pre-P2 behaviour.
+
+Design   : docs/development/returning-users-identity-design-2026-06-04.md §1,§4,§5
+Plan     : docs/development/returning-users-implementation-plan-2026-06-04.md §P2
+Audit    : returning-users-regression-safety-2026-06-04.md (gates V1/#2/#6/#7/#8)
+
+Signals, highest precedence first:
+  1. ``funnel_user_id``  (L2) — the funnel's own user id. Used as identity ONLY
+     when the matched source is ``trusted`` (anti-poisoning, G6). DARK in P2:
+     no source carries the flag yet (admin plumbing is P4), so this tier is
+     effectively dormant and identity rides the cookie vid.
+  2. ``visitor_id``      (L1) — the ``_tds_vid`` cookie. Same-domain only.
+  3. ``fp``              (L3) — fingerprint, future; the signal-tier list makes
+     it a one-line addition at the lowest precedence (R2 §5).
+
+Flag semantics (R3 refinement 4 — REUSE is_unique/is_returning, no new dims):
+  * ``is_unique``    = this click MINTED the uid (genuinely first appearance).
+    Under the NX mint only the winner of a concurrent race reports True (G7).
+  * ``is_returning`` = uid seen before AND the click's ``funnel_id`` is in the
+    uid's funnels-seen set (return via the SAME funnel).
+  * new-funnel return ⇒ both False (segment C). New user ⇒ unique·True (A).
+    Same-funnel return ⇒ returning·True (B).
+
+Hot path: ≤2 pipelined Redis round-trips on the critical path
+(signal-map reads → mint-NX OR funnels SISMEMBER). The profile/attach/TTL
+writes are deferred (fire-and-forget, error-swallowing — gate #8, mirroring
+``router._bump_counters``). Company-scoped keys (gate #7, hard multi-tenant
+boundary). uid is written to every click → the Redis map is rebuildable from
+ClickHouse (architecture: Redis is a disposable cache).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import logging
+import secrets
+import time
+from dataclasses import dataclass
+
+from app.config import settings
+from app.redis_client import get_identity_redis
+
+logger = logging.getLogger(__name__)
+
+# Signal tiers in precedence order (high → low). Adding L3 later = append
+# ("fp", ...) here + an extractor branch in `_present_signals` — no change to
+# the resolution algorithm (R2 §5 pluggability).
+_TIER_FUID = "fuid"   # funnel_user_id (L2)
+_TIER_VID = "vid"     # cookie visitor id (L1)
+
+# Bound the funnels-seen set so a pathological funnel-id sprayer can't grow one
+# uid's profile without limit (cardinality guard). Realistic users touch a
+# handful of funnels; 64 is generous headroom.
+_MAX_FUNNELS_PER_UID = 64
+
+
+@dataclass(frozen=True)
+class IdentityResult:
+    """Resolver output stamped onto the click's attribution.
+
+    `uid` is "" when the click carried NO usable identity signal (a brand-new,
+    cookie-less visitor) — there is no persistent identity to track, so the
+    click is treated as unique·new (segment A) and nothing is written.
+    """
+
+    uid: str
+    is_unique: bool
+    is_returning: bool
+
+
+def _hash(value: str) -> str:
+    """Stable short hash — bounds key length + minimises PII-at-rest for the
+    advertiser-supplied funnel_user_id (a raw email/UUID never becomes a key)."""
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:32]
+
+
+def _present_signals(
+    funnel_user_id: str | None,
+    visitor_id: str | None,
+    source_trusted: bool,
+) -> list[tuple[str, str]]:
+    """The signals this click carries, in precedence order → ``[(tier, key_value)]``.
+
+    ``funnel_user_id`` is included ONLY when the source is trusted (G6). In P2
+    no source is trusted yet, so this returns at most the vid tier.
+    """
+    out: list[tuple[str, str]] = []
+    if source_trusted and funnel_user_id:
+        out.append((_TIER_FUID, _hash(funnel_user_id)))
+    if visitor_id:
+        out.append((_TIER_VID, visitor_id))
+    return out
+
+
+def _funnel_bucket(funnel_id: str | None) -> str:
+    """The funnels-seen-set member for this click. Absent funnel → the "" bucket
+    (direct-to-tracker), so two direct returns count as the SAME funnel."""
+    return funnel_id or ""
+
+
+def _sig_key(company_id: int, tier: str, value: str) -> str:
+    return f"id:{company_id}:{tier}:{value}"
+
+
+def _funnels_key(company_id: int, uid: str) -> str:
+    return f"id:{company_id}:uid:{uid}:funnels"
+
+
+def _profile_key(company_id: int, uid: str) -> str:
+    return f"id:{company_id}:uid:{uid}"
+
+
+async def resolve_identity(
+    r,
+    *,
+    company_id: int,
+    funnel_user_id: str | None,
+    visitor_id: str | None,
+    funnel_id: str | None,
+    source_trusted: bool,
+    ttl: int,
+) -> IdentityResult:
+    """Critical-path resolution: signals → canonical uid + redefined flags.
+
+    Concurrency-safe (gate G7): a NEW user mints via ``SET NX``; the winner
+    reports ``is_unique=True``, a racing first-click reads back the winner's
+    uid and reports ``is_unique=False`` — two simultaneous first clicks
+    converge on ONE uid. Reuses the same atomic primitive as the click-dedup
+    gate (``main.py`` ``SET … NX EX``).
+
+    Round-trips: RT#1 = pipelined GET of each present signal map; RT#2 =
+    mint-NX (new user) OR funnels SISMEMBER (returning). ≤2 either way.
+    """
+    signals = _present_signals(funnel_user_id, visitor_id, source_trusted)
+
+    # Case A (R2 §1.3): no usable signal — a cookie-less, untrusted-funnel
+    # visitor. No persistent identity; unique·new (segment A). No writes.
+    if not signals:
+        return IdentityResult(uid="", is_unique=True, is_returning=False)
+
+    # RT#1 — read every present signal's map in one pipeline.
+    pipe = r.pipeline()
+    for tier, value in signals:
+        pipe.get(_sig_key(company_id, tier, value))
+    hits = await pipe.execute()
+
+    # Highest-precedence non-null hit wins (signals already precedence-ordered).
+    resolved_uid: str | None = next((h for h in hits if h), None)
+
+    if resolved_uid is None:
+        # NEW USER — mint on the highest-precedence present signal, in-band NX.
+        new_uid = secrets.token_hex(16)
+        top_tier, top_value = signals[0]
+        top_key = _sig_key(company_id, top_tier, top_value)
+        won = await r.set(top_key, new_uid, nx=True, ex=ttl)  # RT#2
+        if won:
+            return IdentityResult(uid=new_uid, is_unique=True, is_returning=False)
+        # Race lost — adopt the winner's uid; NOT unique (G7).
+        adopted = await r.get(top_key)
+        return IdentityResult(
+            uid=adopted or new_uid, is_unique=False, is_returning=False,
+        )
+
+    # RETURNING — is_returning iff this click's funnel was seen before.
+    bucket = _funnel_bucket(funnel_id)
+    same_funnel = bool(
+        await r.sismember(_funnels_key(company_id, resolved_uid), bucket)  # RT#2
+    )
+    return IdentityResult(
+        uid=resolved_uid, is_unique=False, is_returning=same_funnel,
+    )
+
+
+async def persist_identity(
+    r,
+    *,
+    company_id: int,
+    uid: str,
+    funnel_user_id: str | None,
+    visitor_id: str | None,
+    funnel_id: str | None,
+    source_trusted: bool,
+    ttl: int,
+) -> None:
+    """Deferred, non-blocking writes (gate #8). Off the critical path:
+    attach any present signal maps to the uid (alias-stitching, SET NX so a
+    conflict never overwrites), record the click's funnel, stamp first_seen,
+    and slide every key's TTL forward. Any failure is swallowed — identity
+    drift is acceptable; a failed write must NEVER fail the click.
+    """
+    if not uid:
+        return  # case A — nothing persistent to write
+    try:
+        signals = _present_signals(funnel_user_id, visitor_id, source_trusted)
+        bucket = _funnel_bucket(funnel_id)
+        fkey = _funnels_key(company_id, uid)
+        pkey = _profile_key(company_id, uid)
+
+        pipe = r.pipeline()
+        # Attach/refresh each signal → uid. SET NX preserves the canonical
+        # mapping on a conflict (log-not-merge, R2 §1.3 case E) while still
+        # sliding the TTL via the trailing EXPIRE.
+        for tier, value in signals:
+            skey = _sig_key(company_id, tier, value)
+            pipe.set(skey, uid, nx=True)
+            pipe.expire(skey, ttl)
+        # Funnels-seen set (membership = "any previous visit on this funnel").
+        pipe.sadd(fkey, bucket)
+        pipe.expire(fkey, ttl)
+        # Profile — first_seen stamped once; sliding TTL.
+        pipe.hsetnx(pkey, "first_seen", str(int(time.time())))
+        pipe.expire(pkey, ttl)
+        await pipe.execute()
+
+        # Cardinality guard — trim runaway funnel sets (rare; outside the
+        # pipeline so SCARD's result is available).
+        if await r.scard(fkey) > _MAX_FUNNELS_PER_UID:
+            logger.warning(
+                "identity: funnels set for company=%s uid=%s exceeds cap %d",
+                company_id, uid, _MAX_FUNNELS_PER_UID,
+            )
+    except Exception as e:  # pragma: no cover — best-effort, never fail a click
+        logger.warning("identity persist failed (swallowed): %s", e)
+
+
+async def resolve_and_stamp(
+    *,
+    company_id: int,
+    funnel_user_id: str | None,
+    visitor_id: str | None,
+    funnel_id: str | None,
+    source_trusted: bool,
+) -> IdentityResult:
+    """Router entrypoint: resolve on the identity Redis, then SCHEDULE the
+    deferred writes (fire-and-forget). Returns the result to stamp onto the
+    click attribution. The CALLER wraps this in fail-open (gate V1).
+    """
+    r = await get_identity_redis()
+    ttl = settings.returning_uid_ttl_seconds
+    result = await resolve_identity(
+        r,
+        company_id=company_id,
+        funnel_user_id=funnel_user_id,
+        visitor_id=visitor_id,
+        funnel_id=funnel_id,
+        source_trusted=source_trusted,
+        ttl=ttl,
+    )
+    # Deferred writes off the critical path. create_task so the response is not
+    # blocked; the task body is fully error-swallowing.
+    if result.uid:
+        asyncio.create_task(
+            persist_identity(
+                r,
+                company_id=company_id,
+                uid=result.uid,
+                funnel_user_id=funnel_user_id,
+                visitor_id=visitor_id,
+                funnel_id=funnel_id,
+                source_trusted=source_trusted,
+                ttl=ttl,
+            )
+        )
+    return result
+
+
+async def assert_identity_namespace_safe() -> None:
+    """Gate #2 (R4 audit) — make the no-eviction requirement EXPLICIT at boot.
+
+    Code cannot enforce a Redis maxmemory policy, so we surface it loudly:
+    when the resolver is enabled and the identity keyspace SHARES the routing
+    instance, probe ``maxmemory-policy``; if it is an eviction policy, log a
+    CRITICAL warning (an evicted identity key silently degrades a returner to
+    "new"). If the dedicated URL is set, or CONFIG is restricted, we log the
+    documented requirement instead. Never raises — boot must not fail on this.
+    """
+    if not settings.returning_resolver_enabled:
+        return
+    if settings.identity_redis_url:
+        logger.info(
+            "identity: resolver ENABLED on dedicated identity Redis (%s) — "
+            "ensure that instance is configured `maxmemory-policy noeviction`.",
+            settings.identity_redis_url,
+        )
+        return
+    # Shared with the routing instance — probe the policy.
+    try:
+        r = await get_identity_redis()
+        cfg = await r.config_get("maxmemory-policy")
+        policy = (cfg or {}).get("maxmemory-policy", "")
+        if policy and policy != "noeviction":
+            logger.critical(
+                "identity: resolver ENABLED but the SHARED routing Redis uses "
+                "maxmemory-policy=%r (eviction). An evicted identity key "
+                "silently degrades a returning user to 'new'. Set "
+                "`maxmemory-policy noeviction`, or point TDS_IDENTITY_REDIS_URL "
+                "at a dedicated no-eviction instance.",
+                policy,
+            )
+        else:
+            logger.info(
+                "identity: resolver ENABLED on shared routing Redis "
+                "(maxmemory-policy=%r) — OK.", policy or "unknown",
+            )
+    except Exception as e:  # pragma: no cover — CONFIG may be restricted
+        logger.warning(
+            "identity: could not verify maxmemory-policy (%s). OPERATOR MUST "
+            "ensure the identity Redis is `noeviction` before enabling the "
+            "resolver for production tenants.", e,
+        )

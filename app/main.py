@@ -37,8 +37,9 @@ from app.diag import (
     set_test_id,
     traces_sampler as diag_traces_sampler,
 )
+from app import identity
 from app.models import ClickRequest, ClickResponse, HealthResponse
-from app.redis_client import get_redis, close_redis
+from app.redis_client import get_redis, close_redis, close_identity_redis
 from app.router import route, get_full_ua_info, parse_accept_language, coerce_cost
 from app.ua_parser import warmup as warmup_ua_parser
 from app.shipper import assert_shipper_ready, run_shipper
@@ -199,6 +200,11 @@ async def lifespan(app: FastAPI):
     # prod and staging.
     diag_drain_task = asyncio.create_task(run_obs_drain(r))
 
+    # Returning-user identity (P2) — gate-#2 explicit no-eviction check.
+    # No-op when the resolver is OFF (default); when ON, makes the dedicated
+    # / no-eviction Redis requirement loud at boot. Never raises (fail-open).
+    await identity.assert_identity_namespace_safe()
+
     yield
 
     # Shutdown — cancel all background tasks and await each so
@@ -231,6 +237,7 @@ async def lifespan(app: FastAPI):
     except asyncio.CancelledError:
         pass
     await close_redis()
+    await close_identity_redis()
 
 
 app = FastAPI(
@@ -777,7 +784,20 @@ def _phase3_attribution_fields(
         # dedup. is_bot / is_proxy come from the EDGE (CF Bot Management,
         # fail-open False). cf_ray / request_id are worker-propagated
         # correlation ids. (All were DEFERRED in Phase 3.)
-        "is_unique": not req.is_returning,
+        # is_unique / is_returning — REDEFINED by the P2 returning-user
+        # resolver (R3 refinement 4). When the resolver ran (per-company ON)
+        # `attr` carries canonical values; otherwise these fall back to the
+        # legacy semantics (is_unique = "no _tds_vid cookie"; is_returning =
+        # the worker's cookie-presence flag). Set in these phase-3 fields,
+        # which are merged LAST into click_record (main flow), so the
+        # is_returning value here overrides the legacy literal below — and is
+        # byte-identical to it whenever the resolver is OFF (no keys in attr).
+        "is_unique": attr.get("is_unique", not req.is_returning),
+        "is_returning": attr.get("is_returning", req.is_returning),
+        # uid (P2) — canonical company-scoped returning-user id; "" until a
+        # company enables the resolver. Written to every click so the Redis
+        # identity map is rebuildable from ClickHouse (Redis disposable).
+        "uid": attr.get("uid", ""),
         "is_bot": req.is_bot,
         "is_proxy": req.is_proxy,
         "cf_ray": req.cf_ray or "",

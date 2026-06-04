@@ -63,6 +63,10 @@ OP_LOOP_ITERATION = "loop_iteration"
 # Hot-path /decide failure modes (Sprint 1.5+)
 OP_DISK_PRESSURE = "disk_pressure"
 
+# Returning-user identity resolver fail-open (P2, 2026-06-05). Emitted (throttled
+# per company) when the resolver raises and the click degrades to legacy flags.
+OP_IDENTITY = "identity_resolve"
+
 # Per-click verdict outcomes (Sprint 2.2+)
 OP_DEADLETTER = "deadletter"   # click hit max-attempts after rejections
 OP_PARTIAL_ACK = "partial_ack"  # batch had mixed accepted+rejected

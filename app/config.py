@@ -376,6 +376,17 @@ class Settings(BaseSettings):
     identity_redis_url: str = ""
     returning_uid_ttl_seconds: int = 15_552_000  # 180 days
 
+    # P4 (2026-06-05) — returning-user SEGMENTED ROUTING. Separate gate from the
+    # resolver so identity can be computed/observed (P2/P3) WITHOUT changing
+    # routing selection. DARK by default: OFF ⇒ the cascade is single-pass,
+    # byte-identical to today (no audience partition, seen_before ignored).
+    # ON ⇒ a returning visitor (seen_before) evaluates audience='returning'
+    # flows first, falling through to 'first' flows on no match; new visitors
+    # see 'first' flows only. Requires returning_resolver_enabled to be ON too
+    # (seen_before / prev_* come from the resolver); if routing is ON but the
+    # resolver is OFF, seen_before is never true → first-pool only (fail-safe).
+    returning_routing_enabled: bool = False
+
     model_config = {"env_prefix": "TDS_"}
 
     @model_validator(mode="after")

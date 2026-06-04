@@ -42,9 +42,10 @@ import hashlib
 import logging
 import secrets
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from app.config import settings
+from app.history import _offers_key, _subs_key, _targets_key
 from app.redis_client import get_identity_redis
 
 logger = logging.getLogger(__name__)
@@ -68,11 +69,19 @@ class IdentityResult:
     `uid` is "" when the click carried NO usable identity signal (a brand-new,
     cookie-less visitor) — there is no persistent identity to track, so the
     click is treated as unique·new (segment A) and nothing is written.
+
+    `prev_offers` / `prev_targets` / `prev_subs` are the uid's previous-visit
+    history sets (P3-written), read in RT#2 ONLY for a returning visitor when
+    `with_history` is requested (routing enabled). Empty for new users / when
+    routing is OFF. The cascade reads these to match the P4 `prev_*` criteria.
     """
 
     uid: str
     is_unique: bool
     is_returning: bool
+    prev_offers: frozenset = field(default_factory=frozenset)
+    prev_targets: frozenset = field(default_factory=frozenset)
+    prev_subs: frozenset = field(default_factory=frozenset)
 
 
 def _hash(value: str) -> str:
@@ -126,6 +135,7 @@ async def resolve_identity(
     funnel_id: str | None,
     source_trusted: bool,
     ttl: int,
+    with_history: bool = False,
 ) -> IdentityResult:
     """Critical-path resolution: signals → canonical uid + redefined flags.
 
@@ -168,11 +178,27 @@ async def resolve_identity(
             uid=adopted or new_uid, is_unique=False, is_returning=False,
         )
 
-    # RETURNING — is_returning iff this click's funnel was seen before.
+    # RETURNING — is_returning iff this click's funnel was seen before. When
+    # routing is enabled (`with_history`), the previous-visit history sets are
+    # read in the SAME pipeline so prev_* costs ZERO extra round-trips (R4
+    # RT-budget: RT#2 = funnels SISMEMBER (+ history SMEMBERS) in one round).
     bucket = _funnel_bucket(funnel_id)
-    same_funnel = bool(
-        await r.sismember(_funnels_key(company_id, resolved_uid), bucket)  # RT#2
-    )
+    pipe = r.pipeline()
+    pipe.sismember(_funnels_key(company_id, resolved_uid), bucket)
+    if with_history:
+        pipe.smembers(_offers_key(company_id, resolved_uid))
+        pipe.smembers(_targets_key(company_id, resolved_uid))
+        pipe.smembers(_subs_key(company_id, resolved_uid))
+    rt2 = await pipe.execute()  # RT#2
+
+    same_funnel = bool(rt2[0])
+    if with_history:
+        return IdentityResult(
+            uid=resolved_uid, is_unique=False, is_returning=same_funnel,
+            prev_offers=frozenset(rt2[1] or ()),
+            prev_targets=frozenset(rt2[2] or ()),
+            prev_subs=frozenset(rt2[3] or ()),
+        )
     return IdentityResult(
         uid=resolved_uid, is_unique=False, is_returning=same_funnel,
     )
@@ -252,6 +278,9 @@ async def resolve_and_stamp(
         funnel_id=funnel_id,
         source_trusted=source_trusted,
         ttl=ttl,
+        # Read previous-visit history (for prev_* matching) only when segmented
+        # routing is enabled — otherwise RT#2 stays a single SISMEMBER.
+        with_history=settings.returning_routing_enabled,
     )
     # Deferred writes off the critical path. create_task so the response is not
     # blocked; the task body is fully error-swallowing.

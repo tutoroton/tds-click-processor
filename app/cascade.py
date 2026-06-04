@@ -95,9 +95,21 @@ async def resolve_flow(
     team_id: int | None,
     department_id: int | None,
     custom_group_id: int | None,
-    click_attrs: dict[str, str],
+    click_attrs: dict[str, Any],
+    seen_before: bool = False,
+    audience_routing: bool = False,
 ) -> dict[str, Any] | None:
     """Resolve the winning flow for a click via scope cascade.
+
+    P4 returning-user segmented routing (DARK unless `audience_routing`):
+      * `audience_routing=False` (default) → single pass over ALL flows,
+        byte-identical to pre-P4 (no audience partition, `seen_before` ignored).
+      * `audience_routing=True` → partition the loaded flows by `flow.audience`
+        (default 'first'). A `seen_before` visitor (B∪C — NOT the is_returning
+        flag) evaluates the 'returning' pool FIRST and, on no match, FALLS
+        THROUGH to the 'first' pool. A new visitor sees the 'first' pool only.
+        `_pick_winner` is pure over its survivor list, so the two passes are
+        independent — the fallthrough cannot perturb first-pool selection.
 
     Args:
         r: Redis async client.
@@ -187,20 +199,55 @@ async def resolve_flow(
         )
         return None
 
-    survivors = _filter_by_criteria(flows, click_attrs)
+    click_levels = {
+        "buyer": buyer_id,
+        "custom_group": custom_group_id,
+        "team": team_id,
+        "department": department_id,
+        "company": company_id,
+    }
+
+    # DARK / zero-regress path: segmented routing OFF → one pass over ALL flows,
+    # exactly as pre-P4. No partition, no audience read, `seen_before` ignored.
+    if not audience_routing:
+        survivors = _filter_by_criteria(flows, click_attrs)
+        if not survivors:
+            return None
+        return _pick_winner(survivors, click_levels)
+
+    # Segmented routing ON. Partition by audience (default 'first').
+    returning_flows, first_flows = _partition_audience(flows)
+
+    # A seen_before visitor (B∪C) evaluates the 'returning' pool first.
+    if seen_before:
+        winner = _pick_winner(
+            _filter_by_criteria(returning_flows, click_attrs), click_levels,
+        )
+        if winner is not None:
+            return winner
+        # No returning-flow matched → FALL THROUGH to the first pool below.
+
+    # New visitor, OR returning visitor with no returning-flow match.
+    survivors = _filter_by_criteria(first_flows, click_attrs)
     if not survivors:
         return None
+    return _pick_winner(survivors, click_levels)
 
-    return _pick_winner(
-        survivors,
-        click_levels={
-            "buyer": buyer_id,
-            "custom_group": custom_group_id,
-            "team": team_id,
-            "department": department_id,
-            "company": company_id,
-        },
-    )
+
+def _partition_audience(
+    flows: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Split loaded flows into (returning, first) by `flow.audience`. A missing
+    or unknown audience defaults to 'first' — so every legacy flow (and any
+    flow synced before P4) is a first-flow, guaranteeing zero-regress."""
+    returning: list[dict[str, Any]] = []
+    first: list[dict[str, Any]] = []
+    for f in flows:
+        if (f.get("audience") or "first") == "returning":
+            returning.append(f)
+        else:
+            first.append(f)
+    return returning, first
 
 
 async def _collect_candidate_ids(
@@ -371,6 +418,30 @@ def _criteria_match(
         op = c.get("op", "in")
         raw_values = c.get("values", []) or []
         click_val = click_attrs.get(dim, "")
+
+        # P4 — set-valued dims (prev_offer / prev_offer_target / prev_sub): the
+        # click "value" is the user's HISTORY set, so membership becomes
+        # intersection. `in` = history hit ANY criterion value; `not_in` = none.
+        # ONLY a set click_val takes this branch, so every base (str) dim — and
+        # the offer_target inline matcher, which never carries set values — is
+        # byte-identical to pre-P4.
+        if isinstance(click_val, (set, frozenset)):
+            cvals = frozenset(
+                v.lower() if isinstance(v, str) else v for v in raw_values
+            )
+            hist = frozenset(
+                x.lower() if isinstance(x, str) else x for x in click_val
+            )
+            hit = bool(hist & cvals)
+            if op == "in":
+                if not hit:
+                    return False
+            elif op == "not_in":
+                if hit:
+                    return False
+            else:
+                return False
+            continue
 
         if dim in _CASE_PRESERVE:
             values = frozenset(v for v in raw_values if isinstance(v, str))

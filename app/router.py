@@ -458,6 +458,11 @@ async def _build_campaign_attribution(
             attribution["uid"] = ident.uid
             attribution["is_unique"] = ident.is_unique
             attribution["is_returning"] = ident.is_returning
+            # P4 — previous-visit history sets for prev_* criteria matching
+            # (empty unless segmented routing is ON and the user is returning).
+            attribution["prev_offers"] = ident.prev_offers
+            attribution["prev_targets"] = ident.prev_targets
+            attribution["prev_subs"] = ident.prev_subs
         except Exception as e:  # fail-open — never fail the click
             capture_op_msg_throttled(
                 OP_IDENTITY, buyer_chain["company_id"],
@@ -740,6 +745,42 @@ async def _try_flow_cascade(
     # (slot resolve + buyer enrich) happen there now; this function owns
     # steps c (cascade) + d (action) and records the routing-decision ids
     # it discovers into the shared `attribution` dict (Phase 3).
+    # F.17 (2026-05-03): 7-dim click_attrs. Each value's casing matches what
+    # admin-api validates — see `cascade._CASE_PRESERVE` for which dims preserve
+    # case (geo / region / browser / language) vs lowercase (os / device_type /
+    # city). Values that CF or the parser couldn't resolve fall through as `""`
+    # — `op=in` fails closed (no match), `op=not_in` passes everyone.
+    click_attrs: dict[str, Any] = {
+        "geo": (req.country or "").upper(),
+        "os": parse_os(req.user_agent).lower(),
+        "device_type": parse_device_type(req.user_agent).lower(),
+        "browser": parse_browser(req.user_agent),  # Title Case verbatim
+        "region": req.region or "",                # CF human name verbatim
+        "city": (req.city or "").lower(),          # case-insensitive match
+        "language": parse_accept_language(req.accept_language),
+    }
+
+    # P4 — returning-user segmented routing. `seen_before` = the uid existed
+    # BEFORE this click (= B∪C; NOT the is_returning flag, which is B-only —
+    # conflating them silently drops segment C, R4 G1). Only meaningful when the
+    # P2 resolver produced a uid; absent → False → first pool only (zero-regress
+    # when the resolver / routing is OFF).
+    audience_routing = settings.returning_routing_enabled
+    seen_before = bool(attribution.get("uid")) and (
+        attribution.get("is_unique") is False
+    )
+    # Returning-flow criterion palette (flow-level only, v1). Injected ONLY for
+    # a seen_before user under segmented routing — first-pool flows never carry
+    # these dims (palette-guard), and the offer_target inline matcher (which
+    # uses its own base-dim click_attrs) never sees them.
+    if audience_routing and seen_before:
+        click_attrs["is_returning"] = (
+            "true" if attribution.get("is_returning") else "false"
+        )
+        click_attrs["prev_offer"] = attribution.get("prev_offers") or frozenset()
+        click_attrs["prev_offer_target"] = attribution.get("prev_targets") or frozenset()
+        click_attrs["prev_sub"] = attribution.get("prev_subs") or frozenset()
+
     flow = await cascade.resolve_flow(
         r,
         campaign_id=campaign_id,
@@ -748,22 +789,9 @@ async def _try_flow_cascade(
         team_id=buyer_chain["team_id"],
         department_id=buyer_chain["department_id"],
         custom_group_id=buyer_chain["custom_group_id"],
-        # F.17 (2026-05-03): 7-dim click_attrs. Each value's casing
-        # matches what admin-api validates — see `cascade._CASE_PRESERVE`
-        # for which dims preserve case (geo / region / browser /
-        # language) vs lowercase (os / device_type / city). Values
-        # that CF or the parser couldn't resolve fall through as `""`
-        # — `op=in` fails closed (no match), `op=not_in` passes
-        # everyone (no-op for that criterion).
-        click_attrs={
-            "geo": (req.country or "").upper(),
-            "os": parse_os(req.user_agent).lower(),
-            "device_type": parse_device_type(req.user_agent).lower(),
-            "browser": parse_browser(req.user_agent),  # Title Case verbatim
-            "region": req.region or "",                # CF human name verbatim
-            "city": (req.city or "").lower(),          # case-insensitive match
-            "language": parse_accept_language(req.accept_language),
-        },
+        click_attrs=click_attrs,
+        seen_before=seen_before if audience_routing else False,
+        audience_routing=audience_routing,
     )
     if flow is None:
         return None

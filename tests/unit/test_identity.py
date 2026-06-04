@@ -236,6 +236,38 @@ class TestLatency:
         await _resolve(rt, vid=None, fuid=None)
         assert rt.rt == 0
 
+    async def test_returning_with_history_still_two_round_trips(self):
+        # P4 RT-budget: reading the prev_* history sets folds into RT#2 (the
+        # funnels SISMEMBER pipeline) → still ≤2 round-trips for a returning user.
+        r = _fr()
+        v1 = await _resolve(r, vid="V", funnel="F")
+        await persist_identity(
+            r, company_id=1, uid=v1.uid, funnel_user_id=None,
+            visitor_id="V", funnel_id="F", source_trusted=False, ttl=TTL,
+        )
+        rt = _RT(r)
+        res = await resolve_identity(
+            rt, company_id=1, funnel_user_id=None, visitor_id="V",
+            funnel_id="F", source_trusted=False, ttl=TTL, with_history=True,
+        )
+        assert rt.rt <= 2, f"returning+history critical path took {rt.rt} RT"
+        assert res.is_returning is True  # same funnel
+
+    async def test_with_history_returns_prev_sets(self):
+        # The history sets written by the P3 capture surface on the result.
+        r = _fr()
+        v1 = await _resolve(r, vid="V", funnel="F")  # mints + sets the vid map
+        await r.sadd(f"id:1:uid:{v1.uid}:offers", "5", "9")
+        await r.sadd(f"id:1:uid:{v1.uid}:targets", "3")
+        await r.sadd(f"id:1:uid:{v1.uid}:subs", "aff")
+        res = await resolve_identity(
+            r, company_id=1, funnel_user_id=None, visitor_id="V",
+            funnel_id="F", source_trusted=False, ttl=TTL, with_history=True,
+        )
+        assert res.prev_offers == frozenset({"5", "9"})
+        assert res.prev_targets == frozenset({"3"})
+        assert res.prev_subs == frozenset({"aff"})
+
 
 # ============================================================
 # Deferred persist (#8 non-blocking)

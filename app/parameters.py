@@ -62,6 +62,7 @@ RESERVED_SLOTS: frozenset[str] = frozenset({
     "funnel_id",       # opaque funnel identifier
     "funnel_type",     # funnel category
     "funnel_click_id", # click id local to the funnel
+    "funnel_user_id",  # funnel's own stable user identifier (L2 returning-user identity anchor — P1 2026-06-05, dark until P2)
     "subscribe_id",    # subscription / opt-in id
     "landing_id",      # landing page id
     # Group E — Org / buyer attribution

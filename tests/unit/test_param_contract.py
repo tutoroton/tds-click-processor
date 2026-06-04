@@ -94,6 +94,13 @@ CONTRACT: list[Case] = [
         note="sub slot auto-binds its own name",
     ),
     Case(
+        name="canonical_self_binding_funnel_user_id",
+        url={"funnel_user_id": "FU-123"},
+        expected_slots={"funnel_user_id": "FU-123"},
+        expected_extras={},
+        note="P1: funnel_user_id reserved slot auto-binds (L2 identity anchor, dark)",
+    ),
+    Case(
         name="c1_free_subs_not_legacy_routed",
         url={"sub1": "FREE1", "sub3": "FREE3", "sub8": "FREE8"},
         expected_slots={"sub1": "FREE1", "sub3": "FREE3", "sub8": "FREE8"},

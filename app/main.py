@@ -698,7 +698,7 @@ _RESERVED_SLOT_COLUMNS: tuple[str, ...] = (
     "source", "host", "placement",
     "ad_campaign_id", "adset_id", "ad_id", "creative_id", "keyword",
     "source_click_id", "pixel_id",
-    "funnel_id", "funnel_type", "funnel_click_id", "subscribe_id", "landing_id",
+    "funnel_id", "funnel_type", "funnel_click_id", "funnel_user_id", "subscribe_id", "landing_id",
     "user_id", "external_id", "app_id",
 )
 

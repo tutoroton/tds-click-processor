@@ -37,7 +37,7 @@ from app.diag import (
     set_test_id,
     traces_sampler as diag_traces_sampler,
 )
-from app import identity
+from app import history, identity
 from app.models import ClickRequest, ClickResponse, HealthResponse
 from app.redis_client import get_redis, close_redis, close_identity_redis
 from app.router import route, get_full_ua_info, parse_accept_language, coerce_cost
@@ -1245,6 +1245,14 @@ async def decide(
         return response
     # dedup_ok is True (first-seen) or None (Redis dedup unavailable
     # — fail-open, proceed with XADD as before).
+
+    # P3 (2026-06-05) — returning-user previous-visit history capture.
+    # Fire-and-forget, OFF the redirect path, gated on a non-empty uid
+    # (resolver ON only). DARK: nothing reads these sets in routing yet (P4).
+    # No-op + zero I/O when the resolver is OFF (uid==""). Placed AFTER the
+    # dedup gate so a worker-retry duplicate (already returned above) does not
+    # re-capture, and AFTER the winner is finalized in `click_record`.
+    history.schedule_capture(click_record)
 
     # Write to local stream.
     # T2.1 / G-22: inline `MAXLEN ~ N` enforces a hard ceiling on

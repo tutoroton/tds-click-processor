@@ -32,7 +32,7 @@ import time
 from typing import Any, NamedTuple
 
 import sentry_sdk
-from app import action_executor, cascade, identity
+from app import action_executor, cascade, identity, sticky
 from app.config import settings
 from app.enrichment import enrich_buyer
 from app.macros import safe_substitute
@@ -657,6 +657,85 @@ async def _route_via_campaign(
     }
 
 
+async def _resolve_action_with_sticky(
+    r,
+    flow: dict[str, Any],
+    req: ClickRequest,
+    campaign_id: str,
+    *,
+    source_mappings,
+    campaign_mappings,
+    sticky_active: bool,
+    uid: str,
+    company_id: int | None,
+    seen_before: bool,
+    returning_visitor: bool,
+    flow_id: str | None,
+) -> tuple[dict[str, Any] | None, str]:
+    """v2 Phase S — resolve the destination, applying the sticky pin when active.
+
+    Returns `(result, sticky_status)`. When `sticky_active` is False this is a
+    pure pass-through to `execute_action` (status "na" → byte-identical). When
+    active (offer/split flow under a live sticky-mode campaign with a uid):
+
+      * returning visitor + pin AVAILABLE for the class (active|draining) →
+        serve the pin, `hit`. (`closed` never serves — the Phase-A availability
+        floor still wins → no dead-end.)
+      * returning visitor + pin closed/missing → re-pick the flow's target,
+        `repin` (overwrite), `invalid_closed`.
+      * returning visitor + no pin → re-pick + mint (NX), `miss`.
+      * first visit → re-pick + mint (NX), `minted` (next visit honours it).
+
+    FAIL-OPEN: every sticky Redis op swallows errors (a fault degrades to normal
+    selection); the click always routes + is XADD'd.
+    """
+    async def _normal() -> dict[str, Any] | None:
+        return await action_executor.execute_action(
+            r, flow, req, campaign_id,
+            source_mappings=source_mappings,
+            campaign_mappings=campaign_mappings,
+            build_url_fn=build_url,
+        )
+
+    if not sticky_active:
+        return await _normal(), "na"
+
+    ttl = settings.returning_uid_ttl_seconds
+    allowed = {"active", "draining"} if returning_visitor else {"active"}
+
+    if seen_before:
+        pinned_tid = await sticky.get_sticky(company_id, uid, campaign_id, ttl)
+        if pinned_tid:
+            target = await r.hgetall(f"offer_target:{pinned_tid}")
+            avail = (target.get("availability") if target else None) or "active"
+            if target and target.get("url") and avail in allowed:
+                pinned = action_executor.pinned_target_result(
+                    target, pinned_tid, req, campaign_id, build_url,
+                    source_mappings, campaign_mappings, flow_id,
+                )
+                if pinned is not None:
+                    return pinned, "hit"
+            # Pin closed / missing / no url → re-pick the flow's target, repin.
+            result = await _normal()
+            tid = result.get("target_id") if result else None
+            if tid:
+                await sticky.repin(company_id, uid, campaign_id, tid, ttl)
+            return result, "invalid_closed"
+        # Returning visitor, no pin (e.g. minted before sticky was enabled).
+        result = await _normal()
+        tid = result.get("target_id") if result else None
+        if tid:
+            await sticky.set_sticky_nx(company_id, uid, campaign_id, tid, ttl)
+        return result, "miss"
+
+    # First visit under sticky mode → pick + mint so the NEXT visit honours it.
+    result = await _normal()
+    tid = result.get("target_id") if result else None
+    if tid:
+        await sticky.set_sticky_nx(company_id, uid, campaign_id, tid, ttl)
+    return result, "minted"
+
+
 async def _try_flow_cascade(
     r,
     campaign: dict[str, Any],
@@ -795,32 +874,48 @@ async def _try_flow_cascade(
     # visitor (mode is a returning-visitor concept). The PARTITION already used
     # `campaign_mode` (pre-selection); the flow override refines only what is
     # RECORDED + (Phase S) the sticky pin.
-    if returning_live and seen_before:
-        attribution["returning_mode"] = (
-            (flow.get("returning_mode") or "").strip().lower() or campaign_mode
-        )
+    effective_mode = (flow.get("returning_mode") or "").strip().lower() or campaign_mode
+    # The PARTITION already used `campaign_mode` (pre-selection); the flow
+    # override refines only the RECORDED mode + the Phase-S sticky pin.
+    if returning_live and (seen_before or effective_mode == "sticky"):
+        attribution["returning_mode"] = effective_mode
     else:
         attribution["returning_mode"] = "na"
-    # TODO(Phase S): when the effective returning_mode is 'sticky', read/write
-    # the (uid, campaign_id) → offer_target pin here (SET NX, 180d) around the
-    # action call below — see plan §6 Phase S + §3 IDENTITY store. Phase M
-    # routes 'sticky' EXACTLY like 'override' (returning partition on) WITHOUT
-    # any pin; `sticky_status` is a Phase-S provenance column, not added here.
 
-    result = await action_executor.execute_action(
+    # v2 Phase S — sticky binding. Activates ONLY for an offer/split flow under
+    # a live `sticky`-mode campaign with a uid (block/redirect have no offer
+    # pick to pin; no uid ⇒ nothing to key on). Replaces the action's offer
+    # pick with the validated (uid,campaign)→target pin. FAIL-OPEN end-to-end.
+    uid = attribution.get("uid") or ""
+    sticky_active = (
+        returning_live
+        and effective_mode == "sticky"
+        and bool(uid)
+        and (flow.get("action_type") or "") in ("offer", "split")
+    )
+    company_id = buyer_chain["company_id"]
+    flow_id_str = str(flow.get("_id")) if flow.get("_id") else None
+
+    result, sticky_status = await _resolve_action_with_sticky(
         r, flow, req, campaign_id,
         source_mappings=source_mappings,
         campaign_mappings=campaign_mappings,
-        build_url_fn=build_url,
+        sticky_active=sticky_active,
+        uid=uid,
+        company_id=company_id,
+        seen_before=seen_before,
+        returning_visitor=seen_before,
+        flow_id=flow_id_str,
     )
+    attribution["sticky_status"] = sticky_status
+
     # `offer_target_id` = the destination target the action resolved to.
     # Read from a COPY-safe `.get` — never mutate `result` (it may be the
     # shared module-level `BLOCK_RESULT` singleton on a block action).
     if result is not None:
         attribution["offer_target_id"] = _to_int(result.get("target_id"))
         # v2 Phase A2 — how the destination target was resolved
-        # (pinned/offer_default/bare_url/split_weighted). Block actions carry
-        # none → "".
+        # (pinned/offer_default/bare_url/split_weighted/sticky). Block → "".
         attribution["target_selection_path"] = result.get("target_selection_path") or ""
     return result
 

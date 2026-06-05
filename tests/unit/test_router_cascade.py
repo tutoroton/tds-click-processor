@@ -60,6 +60,14 @@ class FakeRedis:
     async def get(self, key):
         return self.strings.get(key)
 
+    async def set(self, key, value, nx=False, ex=None):
+        # v2 Phase S — sticky pin writes (SET NX EX / SET EX). ex is a no-op in
+        # the fake (expire() is a no-op too).
+        if nx and key in self.strings:
+            return None
+        self.strings[key] = value
+        return True
+
     async def hget(self, key, field):
         # Single-field HASH read — used by `_effective_source_mappings`
         # to read `campaign:{cid}:source_overrides` (per-link override).
@@ -1307,3 +1315,190 @@ class TestReturningModePhaseM:
             r = _route_with(redis, _click())
         assert "RET" in r["url"]
         assert r["attribution"]["returning_mode"] == "sticky"  # flow ?? campaign
+
+
+# ============================================================
+# v2 Phase S — sticky binding (uid, campaign) → offer_target pin
+# ============================================================
+
+
+class TestStickyPhaseS:
+    """Mint on first / honor on return / re-pin on closed / draining serves /
+    cross-company isolation / mode≠sticky byte-identical / fail-open. Sticky
+    pins live in the (here shared) identity Redis; offer_target availability is
+    read from the routing Redis — both backed by ONE FakeRedis in the test."""
+
+    def _redis(self, *, returning_mode="sticky", flow_target="7", offer_targets=None,
+               pins=None):
+        campaign_id = "10"
+        camp = {
+            "company_id": "1", "priority": "0",
+            "returning_resolver": "1", "returning_routing": "1",
+            "returning_mode": returning_mode,
+        }
+        flow = {
+            "campaign_id": campaign_id, "scope_type": "company", "scope_id": "1",
+            "seq_id": "1", "is_default": "0", "audience": "first", "criteria": "[]",
+            "action_type": "offer",
+            "action_config": json.dumps({"offer_id": 1, "target_id": int(flow_target)}),
+        }
+        hashes = {f"campaign:{campaign_id}": camp, "flow:1": flow}
+        for tid, h in (offer_targets or {}).items():
+            hashes[f"offer_target:{tid}"] = h
+        return FakeRedis(
+            sets={"geo:US": {campaign_id}, "device:mobile": {campaign_id},
+                  "os:ios": {campaign_id}, "campaigns:active": {campaign_id}},
+            hashes=hashes,
+            lists={f"campaign:{campaign_id}:flows": ["1"]},
+            strings={**(pins or {})},
+        )
+
+    def _run(self, redis, *, is_unique, uid="U", resolver=True, routing=True,
+             identity_redis=None):
+        from app import identity as identity_mod, sticky as sticky_mod
+        from app.identity import IdentityResult
+        from app.config import settings
+        import asyncio
+
+        async def _stamp(**kw):
+            return IdentityResult(uid=uid, is_unique=is_unique, is_returning=not is_unique)
+
+        async def _async_redis():
+            return redis
+
+        async def _gir():
+            return identity_redis if identity_redis is not None else redis
+
+        async def _runner():
+            with patch.object(router, "get_redis", _async_redis), \
+                 patch.object(settings, "returning_resolver_enabled", resolver), \
+                 patch.object(settings, "returning_routing_enabled", routing), \
+                 patch.object(identity_mod, "resolve_and_stamp", _stamp), \
+                 patch.object(sticky_mod, "get_identity_redis", _gir):
+                return await router.route(_click())
+
+        return asyncio.run(_runner())
+
+    def test_mint_on_first_visit(self):
+        redis = self._redis(offer_targets={
+            "7": {"url": "https://T7/{click_id}", "availability": "active", "offer_id": "1"},
+        })
+        result = self._run(redis, is_unique=True)
+        assert "T7" in result["url"]
+        assert result["attribution"]["sticky_status"] == "minted"
+        # pin written for next visit.
+        assert redis.strings.get("sticky:1:U:10") == "7"
+        assert result["attribution"]["target_selection_path"] == "pinned"
+
+    def test_honor_pin_on_return(self):
+        redis = self._redis(
+            flow_target="7",
+            offer_targets={
+                "7": {"url": "https://T7/{click_id}", "availability": "active", "offer_id": "1"},
+                "9": {"url": "https://T9/{click_id}", "availability": "active", "offer_id": "1"},
+            },
+            pins={"sticky:1:U:10": "9"},  # prior pin → target 9 (not the flow's 7)
+        )
+        result = self._run(redis, is_unique=False)
+        assert "T9" in result["url"]  # pin overrides the flow's offer pick
+        assert result["attribution"]["sticky_status"] == "hit"
+        assert result["attribution"]["target_selection_path"] == "sticky"
+        assert result["attribution"]["offer_target_id"] == 9
+
+    def test_draining_pin_serves_returning(self):
+        redis = self._redis(
+            offer_targets={
+                "7": {"url": "https://T7/{click_id}", "availability": "active", "offer_id": "1"},
+                "9": {"url": "https://T9/{click_id}", "availability": "draining", "offer_id": "1"},
+            },
+            pins={"sticky:1:U:10": "9"},
+        )
+        result = self._run(redis, is_unique=False)
+        assert "T9" in result["url"]  # draining still serves a returning visitor
+        assert result["attribution"]["sticky_status"] == "hit"
+
+    def test_closed_pin_repins_to_new_target(self):
+        redis = self._redis(
+            flow_target="7",
+            offer_targets={
+                "7": {"url": "https://T7/{click_id}", "availability": "active", "offer_id": "1"},
+                "9": {"url": "https://T9/{click_id}", "availability": "closed", "offer_id": "1"},
+            },
+            pins={"sticky:1:U:10": "9"},  # pinned target is CLOSED
+        )
+        result = self._run(redis, is_unique=False)
+        assert "T7" in result["url"]  # re-picked the flow's (available) target
+        assert result["attribution"]["sticky_status"] == "invalid_closed"
+        assert redis.strings.get("sticky:1:U:10") == "7"  # re-pinned (overwrite)
+
+    def test_missing_pin_target_repins(self):
+        redis = self._redis(
+            flow_target="7",
+            offer_targets={
+                "7": {"url": "https://T7/{click_id}", "availability": "active", "offer_id": "1"},
+            },
+            pins={"sticky:1:U:10": "404"},  # pinned target does not exist
+        )
+        result = self._run(redis, is_unique=False)
+        assert "T7" in result["url"]
+        assert result["attribution"]["sticky_status"] == "invalid_closed"
+        assert redis.strings.get("sticky:1:U:10") == "7"
+
+    def test_returning_no_pin_mints_miss(self):
+        redis = self._redis(offer_targets={
+            "7": {"url": "https://T7/{click_id}", "availability": "active", "offer_id": "1"},
+        })
+        result = self._run(redis, is_unique=False)  # seen_before, no pin
+        assert "T7" in result["url"]
+        assert result["attribution"]["sticky_status"] == "miss"
+        assert redis.strings.get("sticky:1:U:10") == "7"  # minted now
+
+    def test_cross_company_isolation(self):
+        # A pin for company 1 is invisible to company 2's keyspace. The flow's
+        # campaign is company 1; a pin keyed under company 2 must NOT be honored.
+        redis = self._redis(
+            offer_targets={
+                "7": {"url": "https://T7/{click_id}", "availability": "active", "offer_id": "1"},
+                "9": {"url": "https://T9/{click_id}", "availability": "active", "offer_id": "1"},
+            },
+            pins={"sticky:2:U:10": "9"},  # company 2 pin — wrong tenant
+        )
+        result = self._run(redis, is_unique=False)
+        assert "T7" in result["url"]  # company-1 click ignores company-2 pin
+        assert result["attribution"]["sticky_status"] == "miss"  # no company-1 pin
+
+    def test_mode_override_no_sticky_logic(self):
+        # mode=override (not sticky) → no pin logic; byte-identical offer pick.
+        redis = self._redis(returning_mode="override", offer_targets={
+            "7": {"url": "https://T7/{click_id}", "availability": "active", "offer_id": "1"},
+        })
+        result = self._run(redis, is_unique=False)
+        assert "T7" in result["url"]
+        assert result["attribution"]["sticky_status"] == "na"
+        assert redis.strings.get("sticky:1:U:10") is None  # nothing pinned
+
+    def test_routing_off_byte_identical(self):
+        redis = self._redis(offer_targets={
+            "7": {"url": "https://T7/{click_id}", "availability": "active", "offer_id": "1"},
+        })
+        result = self._run(redis, is_unique=False, routing=False)
+        assert "T7" in result["url"]
+        assert result["attribution"]["sticky_status"] == "na"
+        assert redis.strings.get("sticky:1:U:10") is None
+
+    def test_fail_open_on_sticky_redis_error(self):
+        # Identity/sticky Redis errors ⇒ click still routes (lose no click).
+        class _Boom:
+            async def get(self, *a, **k):
+                raise RuntimeError("identity redis down")
+            async def set(self, *a, **k):
+                raise RuntimeError("identity redis down")
+            async def expire(self, *a, **k):
+                raise RuntimeError("identity redis down")
+        redis = self._redis(offer_targets={
+            "7": {"url": "https://T7/{click_id}", "availability": "active", "offer_id": "1"},
+        })
+        result = self._run(redis, is_unique=False, identity_redis=_Boom())
+        assert result is not None and "T7" in result["url"]  # routed despite error
+        # status reflects the lookup miss (get failed → None → miss); no crash.
+        assert result["attribution"]["sticky_status"] == "miss"

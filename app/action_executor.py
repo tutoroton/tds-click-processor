@@ -50,7 +50,45 @@ from app.telemetry import (
 logger = logging.getLogger("tds.action")
 
 
-__all__ = ["execute_action", "BLOCK_RESULT"]
+__all__ = ["execute_action", "pinned_target_result", "BLOCK_RESULT"]
+
+
+def pinned_target_result(
+    target: dict[str, Any],
+    target_id,
+    req: ClickRequest,
+    campaign_id: str,
+    build_url_fn,
+    source_mappings,
+    campaign_mappings,
+    flow_id: str | None,
+) -> dict[str, Any] | None:
+    """v2 Phase S — build the redirect result for a STICKY-pinned offer_target.
+
+    Takes the ALREADY-LOADED `offer_target:{tid}` HASH (the caller HGETALLs it
+    once to validate availability, then reuses it here — no double read). The
+    pin is a (uid,campaign)→target decision, independent of the winning flow's
+    own offer pick; we read the target's `offer_id` for the `{offer_id}` macro
+    and build the URL. Returns the standard result dict with
+    `target_selection_path='sticky'`, or None when the target has no url (caller
+    falls back to normal selection + re-pin).
+    """
+    if not target or not target.get("url"):
+        return None
+    offer_id = target.get("offer_id") or ""
+    url = build_url_fn(
+        target["url"], req, campaign_id, offer_id,
+        source_mappings=source_mappings,
+        campaign_mappings=campaign_mappings,
+        target_id=str(target_id),
+        flow_id=flow_id,
+    )
+    return {
+        "url": url,
+        "offer_id": offer_id or None,
+        "target_id": str(target_id),
+        "target_selection_path": "sticky",
+    }
 
 
 # Sentinel for `action_type='block'`. Caller tells worker to return 404

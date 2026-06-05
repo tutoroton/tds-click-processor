@@ -157,7 +157,9 @@ def _execute_redirect(
         target_id=None,
         flow_id=flow_id,
     )
-    return {"url": url, "offer_id": None, "target_id": None}
+    # v2 Phase A2 — provenance: a redirect action is a bare URL template.
+    return {"url": url, "offer_id": None, "target_id": None,
+            "target_selection_path": "bare_url"}
 
 
 async def _execute_offer(
@@ -233,12 +235,17 @@ async def _execute_split(
         return None
 
     chosen = random.choices(valid, weights=weights, k=1)[0]
-    return await _resolve_offer_url(
+    result = await _resolve_offer_url(
         r, str(chosen["offer_id"]), chosen.get("target_id"),
         req, campaign_id, build_url_fn,
         source_mappings, campaign_mappings,
         flow_id,
     )
+    # v2 Phase A2 — the SELECTION mechanism for a split is the weighted pick,
+    # regardless of how the chosen entry's URL resolved underneath.
+    if result is not None:
+        result["target_selection_path"] = "split_weighted"
+    return result
 
 
 async def _resolve_offer_url(
@@ -265,6 +272,9 @@ async def _resolve_offer_url(
     """
     pinned_template: str | None = None
     pinned_target_id: str | None = None
+    # v2 Phase A2 — target_selection_path provenance: how the destination
+    # was resolved (pinned target / offer's default target / offer bare url).
+    selection_path = "pinned"
     if _is_positive_int(target_id):
         target = await r.hgetall(f"offer_target:{target_id}")
         if target and target.get("url"):
@@ -294,6 +304,9 @@ async def _resolve_offer_url(
         pinned_template, pinned_target_id = await _offer_default_template(
             r, offer_id, offer,
         )
+        # default-target resolution → 'offer_default'; bare offer.url (no
+        # default target) → 'bare_url'.
+        selection_path = "offer_default" if pinned_target_id else "bare_url"
         if not pinned_template:
             logger.warning(
                 "offer:%s has no usable URL — falling back", offer_id,
@@ -326,6 +339,7 @@ async def _resolve_offer_url(
         "url": url,
         "offer_id": offer_id,
         "target_id": pinned_target_id,
+        "target_selection_path": selection_path,
     }
 
 

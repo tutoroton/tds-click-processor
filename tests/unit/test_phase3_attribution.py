@@ -418,3 +418,81 @@ class TestHigh001TenantScopedKey:
         result = await enrich_buyer(redis, "42", company_id=0)
         assert result["company_id"] == "0"
         redis.hgetall.assert_any_await("user:0:42")
+
+
+# ============================================================
+# v2 Phase A2 — base routing provenance + decision_reason
+# ============================================================
+
+
+from app.main import _decision_reason  # noqa: E402
+
+
+class TestDecisionReason:
+    def test_matched_flow(self):
+        assert _decision_reason({}, {"route_via": "flow_cascade"}, {}) == "matched_flow"
+
+    def test_matched_legacy_split(self):
+        assert _decision_reason({}, {"route_via": "legacy_split"}, {}) == "matched_legacy_split"
+
+    def test_blocked_by_flow(self):
+        assert _decision_reason({}, {"route_via": "flow_cascade_block"}, {}) == "blocked_by_flow"
+        assert _decision_reason({"routing_status": "blocked"}, {}, {}) == "blocked_by_flow"
+
+    def test_no_campaign_match(self):
+        assert _decision_reason({"routing_status": "no_match"}, {}, {}) == "no_campaign_match"
+
+    def test_no_flow_no_offer(self):
+        r = _decision_reason({"routing_status": "no_offer"}, {}, {"routing_trace": {}})
+        assert r == "no_flow_no_offer"
+
+    def test_terminal_fallback_on_availability_exclusion(self):
+        r = _decision_reason(
+            {"routing_status": "no_offer"}, {},
+            {"routing_trace": {"availability_excluded": 2}},
+        )
+        assert r == "terminal_fallback"
+
+    def test_always_set_defensive_default(self):
+        assert _decision_reason({}, {}, {}) == "no_campaign_match"
+
+
+class TestA2ProvenanceFields:
+    def _result(self, attr_extra=None):
+        attr = {"company_id": 1, "slots": {}}
+        if attr_extra:
+            attr.update(attr_extra)
+        return {"attribution": attr}
+
+    def test_provenance_emitted_from_attribution(self):
+        import json
+        result = self._result({
+            "action_type": "offer", "winning_scope_type": "buyer",
+            "winning_scope_id": 5, "audience_pool": "returning",
+            "target_selection_path": "pinned",
+            "routing_trace": {"candidates": 3, "availability_excluded": 1},
+        })
+        f = _phase3_attribution_fields(
+            result, ClickRequest(click_id="c1"), {"route_via": "flow_cascade"}, _RDT,
+        )
+        assert f["decision_reason"] == "matched_flow"
+        assert f["winning_scope_type"] == "buyer"
+        assert f["winning_scope_id"] == 5
+        assert f["audience_pool"] == "returning"
+        assert f["action_type"] == "offer"
+        assert f["target_selection_path"] == "pinned"
+        trace = json.loads(f["routing_trace"])
+        assert trace["candidates"] == 3
+        assert trace["decision_reason"] == "matched_flow"  # folded into trace
+
+    def test_defaults_when_absent(self):
+        f = _phase3_attribution_fields(
+            self._result(), ClickRequest(click_id="c1"), {}, _RDT,
+        )
+        assert f["decision_reason"] == "no_campaign_match"
+        assert f["winning_scope_type"] == ""
+        assert f["audience_pool"] == "none"
+        assert f["action_type"] == ""
+        assert f["target_selection_path"] == ""
+        # routing_result is KEPT alongside decision_reason (both present).
+        assert "routing_result" in f

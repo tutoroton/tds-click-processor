@@ -528,3 +528,70 @@ class TestSplitFloatWeightTruncation:
             chosen.add(result["offer_id"])
         # offer 6's 0.9 weight truncated to 0 → never chosen.
         assert chosen == {"5"}
+
+
+# ============================================================
+# v2 Phase A2 — target_selection_path provenance
+# ============================================================
+
+
+class TestTargetSelectionPath:
+    @pytest.mark.asyncio
+    async def test_redirect_is_bare_url(self):
+        flow = _flow("redirect", {"url": "https://lp.example/{click_id}"})
+        result = await execute_action(
+            _redis_with_hashes({}), flow, _click(), "1",
+            source_mappings=None, campaign_mappings=None, build_url_fn=_stub_build_url(),
+        )
+        assert result["target_selection_path"] == "bare_url"
+
+    @pytest.mark.asyncio
+    async def test_offer_pinned_is_pinned(self):
+        flow = _flow("offer", {"offer_id": 5, "target_id": 7})
+        r = _redis_with_hashes({"offer_target:7": {"url": "https://t.example", "is_default": "0"}})
+        result = await execute_action(
+            r, flow, _click(), "1",
+            source_mappings=None, campaign_mappings=None, build_url_fn=_stub_build_url(),
+        )
+        assert result["target_selection_path"] == "pinned"
+
+    @pytest.mark.asyncio
+    async def test_offer_default_fallback_is_offer_default(self):
+        # No pinned target → resolves the offer's is_default target.
+        flow = _flow("offer", {"offer_id": 5})
+        r = _redis_with_hashes(
+            {
+                "offer:5": {"has_targets": "1"},
+                "offer_target:9": {"url": "https://d.example", "is_default": "1"},
+            },
+            sets={"offer:5:targets": {"9"}},
+        )
+        result = await execute_action(
+            r, flow, _click(), "1",
+            source_mappings=None, campaign_mappings=None, build_url_fn=_stub_build_url(),
+        )
+        assert result is not None
+        assert result["target_selection_path"] == "offer_default"
+
+    @pytest.mark.asyncio
+    async def test_offer_bare_url_is_bare_url(self):
+        # Offer with a bare url, no targets → bare_url path.
+        flow = _flow("offer", {"offer_id": 5})
+        r = _redis_with_hashes({"offer:5": {"url": "https://bare.example"}})
+        result = await execute_action(
+            r, flow, _click(), "1",
+            source_mappings=None, campaign_mappings=None, build_url_fn=_stub_build_url(),
+        )
+        assert result is not None
+        assert result["target_selection_path"] == "bare_url"
+
+    @pytest.mark.asyncio
+    async def test_split_is_split_weighted(self):
+        flow = _flow("split", {"offers": [{"offer_id": 5, "target_id": 7, "weight": 100}]})
+        r = _redis_with_hashes({"offer_target:7": {"url": "https://t.example", "is_default": "0"}})
+        result = await execute_action(
+            r, flow, _click(), "1",
+            source_mappings=None, campaign_mappings=None, build_url_fn=_stub_build_url(),
+        )
+        assert result is not None
+        assert result["target_selection_path"] == "split_weighted"

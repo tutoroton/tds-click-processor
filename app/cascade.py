@@ -100,6 +100,7 @@ async def resolve_flow(
     seen_before: bool = False,
     audience_routing: bool = False,
     returning_visitor: bool = False,
+    trace: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Resolve the winning flow for a click via scope cascade.
 
@@ -218,35 +219,42 @@ async def resolve_flow(
     # the criteria + availability filters keeps `_pick_winner` pure over its
     # survivor list (purity preserved — the two cascade passes stay independent).
     avail_map = await _load_target_availability(r, flows)
+    if trace is not None:
+        trace["candidates"] = len(deduped)
+        trace["loaded"] = len(flows)
+        trace["availability_excluded"] = 0
+        trace["scope_walk"] = [
+            st for st in SCOPE_PRIORITY if click_levels.get(st) is not None
+        ]
 
     def _eligible(pool: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        return _filter_by_availability(
-            _filter_by_criteria(pool, click_attrs), avail_map, returning_visitor,
-        )
+        crit = _filter_by_criteria(pool, click_attrs)
+        avail = _filter_by_availability(crit, avail_map, returning_visitor)
+        if trace is not None:
+            trace["availability_excluded"] += len(crit) - len(avail)
+        return avail
 
-    # DARK / zero-regress path: segmented routing OFF → one pass over ALL flows,
-    # exactly as pre-P4. No partition, no audience read, `seen_before` ignored.
+    # `_pick_winner([])` returns None, so each branch collapses to a single
+    # winner expression — the audience partition + first-pool fallthrough is
+    # preserved (returning pool first for a seen_before visitor, else first
+    # pool). DARK path (audience OFF) = one pass over ALL flows, as pre-P4.
+    winner: dict[str, Any] | None
     if not audience_routing:
-        survivors = _eligible(flows)
-        if not survivors:
-            return None
-        return _pick_winner(survivors, click_levels)
+        winner = _pick_winner(_eligible(flows), click_levels)
+    else:
+        returning_flows, first_flows = _partition_audience(flows)
+        winner = None
+        if seen_before:
+            winner = _pick_winner(_eligible(returning_flows), click_levels)
+        if winner is None:
+            winner = _pick_winner(_eligible(first_flows), click_levels)
 
-    # Segmented routing ON. Partition by audience (default 'first').
-    returning_flows, first_flows = _partition_audience(flows)
-
-    # A seen_before visitor (B∪C) evaluates the 'returning' pool first.
-    if seen_before:
-        winner = _pick_winner(_eligible(returning_flows), click_levels)
-        if winner is not None:
-            return winner
-        # No returning-flow matched → FALL THROUGH to the first pool below.
-
-    # New visitor, OR returning visitor with no returning-flow match.
-    survivors = _eligible(first_flows)
-    if not survivors:
-        return None
-    return _pick_winner(survivors, click_levels)
+    if trace is not None and winner is not None:
+        trace["winning_flow_id"] = winner.get("_id")
+        trace["winning_scope_type"] = winner.get("scope_type")
+        trace["winning_scope_id"] = _safe_int(winner.get("scope_id"))
+        trace["audience_pool"] = winner.get("audience") or "first"
+    return winner
 
 
 def _partition_audience(

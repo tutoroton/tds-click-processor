@@ -640,6 +640,12 @@ async def _route_via_campaign(
     timing["route_total_ms"] = _ms_since(t_branch)
     timing["result"] = result_label
 
+    # v2 Phase A2 — legacy-split-bridge provenance (no flow/scope/audience).
+    attribution["action_type"] = "split"
+    attribution["winning_scope_type"] = "legacy"
+    attribution["audience_pool"] = "none"
+    attribution["target_selection_path"] = "split_weighted"
+
     return {
         "url": url,
         "campaign_id": campaign_id,
@@ -728,6 +734,13 @@ async def _try_flow_cascade(
         click_attrs["prev_offer_target"] = attribution.get("prev_targets") or frozenset()
         click_attrs["prev_sub"] = attribution.get("prev_subs") or frozenset()
 
+    # v2 Phase A2 — routing_trace (compact, always). The cascade populates it
+    # by-reference with scope_walk + candidate/loaded/availability-excluded
+    # counts + winning scope, EVEN on a miss — so a non-routed click still
+    # records WHY no flow won. Stamped onto attribution unconditionally below.
+    cascade_trace: dict[str, Any] = {
+        "buyer_enrichment": "ok" if buyer_chain.get("buyer_id") else "absent",
+    }
     flow = await cascade.resolve_flow(
         r,
         campaign_id=campaign_id,
@@ -744,7 +757,9 @@ async def _try_flow_cascade(
         # even when segmented routing is off. Resolver-OFF ⇒ seen_before False
         # ⇒ everyone is "new" class ⇒ all-active default ⇒ byte-identical.
         returning_visitor=seen_before,
+        trace=cascade_trace,
     )
+    attribution["routing_trace"] = cascade_trace
     if flow is None:
         return None
 
@@ -757,6 +772,11 @@ async def _try_flow_cascade(
     attribution["flow_id"] = _to_int(flow.get("_id"))
     attribution["traffic_target_id"] = _to_int(flow.get("traffic_target_id"))
     attribution["flow_version_id"] = _to_int(flow.get("current_version_id"))
+    # v2 Phase A2 — base provenance from the winning flow.
+    attribution["action_type"] = flow.get("action_type") or ""
+    attribution["winning_scope_type"] = flow.get("scope_type") or ""
+    attribution["winning_scope_id"] = _to_int(flow.get("scope_id"))
+    attribution["audience_pool"] = flow.get("audience") or "first"
 
     result = await action_executor.execute_action(
         r, flow, req, campaign_id,
@@ -769,6 +789,10 @@ async def _try_flow_cascade(
     # shared module-level `BLOCK_RESULT` singleton on a block action).
     if result is not None:
         attribution["offer_target_id"] = _to_int(result.get("target_id"))
+        # v2 Phase A2 — how the destination target was resolved
+        # (pinned/offer_default/bare_url/split_weighted). Block actions carry
+        # none → "".
+        attribution["target_selection_path"] = result.get("target_selection_path") or ""
     return result
 
 

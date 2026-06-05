@@ -734,6 +734,32 @@ def _utc_now_ms_iso() -> str:
     return f"{dt.strftime('%Y-%m-%dT%H:%M:%S')}.{dt.microsecond // 1000:03d}Z"
 
 
+def _decision_reason(result: dict, timing: dict, attr: dict) -> str:
+    """v2 Phase A2 — map the routing outcome to the closed `decision_reason`
+    vocab (06-EXECUTABLE-PLAN.md §7). ALWAYS returns a value — every click,
+    including blocked / fallback / no-match, gets a reason.
+
+    `routing_result` (`timing['result']`) is KEPT alongside this as the raw
+    label; decision_reason is the analytics-stable enum.
+    """
+    rv = timing.get("route_via")
+    rs = result.get("routing_status")
+    if rv == "flow_cascade_block" or rs == "blocked" or result.get("blocked"):
+        return "blocked_by_flow"
+    if rs == "no_match":
+        return "no_campaign_match"
+    if rs:  # no_offer / no_candidates → a campaign matched but nothing routed
+        trace = attr.get("routing_trace") or {}
+        # All-unavailable (availability floor excluded the flow[s]) → terminal
+        # fallback; otherwise a plain no-flow + no-legacy-offer dead-end.
+        return "terminal_fallback" if trace.get("availability_excluded") else "no_flow_no_offer"
+    if rv == "legacy_split":
+        return "matched_legacy_split"
+    if rv == "flow_cascade":
+        return "matched_flow"
+    return "no_campaign_match"
+
+
 def _phase3_attribution_fields(
     result: dict, req: ClickRequest, timing: dict, routing_decision_ts: str,
 ) -> dict:
@@ -772,6 +798,23 @@ def _phase3_attribution_fields(
         # routing_result is already on `timing`; promote to a column so
         # it is queryable without unpacking the timing JSON.
         "routing_result": timing.get("result", ""),
+        # v2 Phase A2 — base routing provenance (KEEPS routing_result; both).
+        # decision_reason is the closed-enum, ALWAYS-set analytics key.
+        "decision_reason": _decision_reason(result, timing, attr),
+        "winning_scope_type": attr.get("winning_scope_type", ""),
+        "winning_scope_id": attr.get("winning_scope_id"),
+        "audience_pool": attr.get("audience_pool") or "none",
+        "action_type": attr.get("action_type", ""),
+        "target_selection_path": attr.get("target_selection_path", ""),
+        # routing_trace — COMPACT JSON (scope_walk, candidate/loaded/excluded
+        # counts, winning scope, buyer_enrichment) + decision_reason. Bounded
+        # so a pathological flood can't bloat the click row. Heavy per-candidate
+        # / rejected-criteria detail (X-Test-Id gated) is a deferred extension.
+        "routing_trace": json.dumps(
+            {**(attr.get("routing_trace") or {}),
+             "decision_reason": _decision_reason(result, timing, attr)},
+            separators=(",", ":"),
+        )[:4000],
         # Worker-auto infra/audit columns cleanly available on the request.
         "worker_colo": req.colo or "",
         "tls_version": req.tls_version or "",

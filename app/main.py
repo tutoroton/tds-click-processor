@@ -810,6 +810,10 @@ def _phase3_attribution_fields(
         "audience_pool": attr.get("audience_pool") or "none",
         "action_type": attr.get("action_type", ""),
         "target_selection_path": attr.get("target_selection_path", ""),
+        # v2 Phase M — effective returning_mode actually used (fresh/override/
+        # sticky), or "na" when routing not live / not a returning visitor.
+        # Default-safe "na" when the router didn't stamp it (resolver OFF).
+        "returning_mode": attr.get("returning_mode") or "na",
         # routing_trace — COMPACT JSON (scope_walk, candidate/loaded/excluded
         # counts, winning scope, buyer_enrichment) + decision_reason. Bounded
         # so a pathological flood can't bloat the click row. Heavy per-candidate

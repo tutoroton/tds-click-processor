@@ -1165,6 +1165,9 @@ class TestAvailabilityClassGating:
         camp = {"company_id": "1", "priority": "0", "returning_resolver": "1"}
         if company_routing:
             camp["returning_routing"] = "1"
+            # v2 Phase M — the partition (and thus the returning availability
+            # class) now also requires a non-fresh campaign returning_mode.
+            camp["returning_mode"] = "override"
         redis = FakeRedis(
             sets={
                 "geo:US": {campaign_id}, "device:mobile": {campaign_id},
@@ -1193,3 +1196,114 @@ class TestAvailabilityClassGating:
         cap = self._capture_returning_visitor(routing_enabled=True, company_routing=True)
         assert cap["audience_routing"] is True
         assert cap["returning_visitor"] is True
+
+
+# ============================================================
+# v2 Phase M — returning_mode (campaign default + flow override)
+# ============================================================
+
+
+class TestReturningModePhaseM:
+    """fresh (default) routes a returning visitor AS NEW (partition off);
+    override = v1 partition; sticky = like override (no pin, Phase S); routing
+    OFF ⇒ mode inert (byte-identical). A 'returning'-audience flow keyed on
+    is_returning is the discriminator: it only matches when the partition
+    injects the is_returning dim (audience_routing ON)."""
+
+    def _route(self, *, campaign_returning_mode, routing_enabled):
+        from app import identity as identity_mod
+        from app.identity import IdentityResult
+        from app.config import settings
+
+        campaign_id = "10"
+        camp = {
+            "company_id": "1", "priority": "0",
+            "returning_resolver": "1", "returning_routing": "1",
+            "returning_mode": campaign_returning_mode,
+        }
+        ret_flow = {
+            "campaign_id": campaign_id, "scope_type": "company", "scope_id": "1",
+            "seq_id": "1", "is_default": "0", "audience": "returning",
+            "criteria": json.dumps([{"type": "is_returning", "op": "in", "values": ["true"]}]),
+            "action_type": "redirect",
+            "action_config": json.dumps({"url": "https://RET/{click_id}"}),
+        }
+        first_flow = {
+            "campaign_id": campaign_id, "scope_type": "company", "scope_id": "1",
+            "seq_id": "2", "is_default": "0", "audience": "first", "criteria": "[]",
+            "action_type": "redirect",
+            "action_config": json.dumps({"url": "https://FIRST/{click_id}"}),
+        }
+        redis = FakeRedis(
+            sets={
+                "geo:US": {campaign_id}, "device:mobile": {campaign_id},
+                "os:ios": {campaign_id}, "campaigns:active": {campaign_id},
+            },
+            hashes={f"campaign:{campaign_id}": camp, "flow:1": ret_flow, "flow:2": first_flow},
+            lists={f"campaign:{campaign_id}:flows": ["1", "2"]},
+        )
+
+        async def _stamp(**kw):
+            return IdentityResult(uid="U", is_unique=False, is_returning=True)
+
+        with patch.object(settings, "returning_resolver_enabled", True), \
+             patch.object(settings, "returning_routing_enabled", routing_enabled), \
+             patch.object(identity_mod, "resolve_and_stamp", _stamp):
+            return _route_with(redis, _click())
+
+    def test_override_routes_via_returning_pool(self):
+        r = self._route(campaign_returning_mode="override", routing_enabled=True)
+        assert "RET" in r["url"]  # returning partition applied → returning flow
+        assert r["attribution"]["returning_mode"] == "override"
+
+    def test_fresh_routes_returning_as_new(self):
+        r = self._route(campaign_returning_mode="fresh", routing_enabled=True)
+        assert "FIRST" in r["url"]  # partition DISABLED → routed as new
+        assert r["attribution"]["returning_mode"] == "fresh"
+
+    def test_sticky_routes_like_override_no_pin(self):
+        r = self._route(campaign_returning_mode="sticky", routing_enabled=True)
+        assert "RET" in r["url"]  # sticky = override partition (pin is Phase S)
+        assert r["attribution"]["returning_mode"] == "sticky"
+
+    def test_routing_off_mode_inert_byte_identical(self):
+        # routing OFF ⇒ partition off regardless of mode ⇒ routed as new; the
+        # recorded mode is "na" (returning routing not live).
+        r = self._route(campaign_returning_mode="override", routing_enabled=False)
+        assert "FIRST" in r["url"]
+        assert r["attribution"]["returning_mode"] == "na"
+
+    def test_flow_override_beats_campaign_in_recorded_mode(self):
+        # campaign override but the WINNING returning flow declares sticky →
+        # effective recorded mode = flow override (flow ?? campaign).
+        from app import identity as identity_mod
+        from app.identity import IdentityResult
+        from app.config import settings
+
+        campaign_id = "10"
+        camp = {"company_id": "1", "priority": "0", "returning_resolver": "1",
+                "returning_routing": "1", "returning_mode": "override"}
+        ret_flow = {
+            "campaign_id": campaign_id, "scope_type": "company", "scope_id": "1",
+            "seq_id": "1", "is_default": "0", "audience": "returning",
+            "returning_mode": "sticky",  # flow override
+            "criteria": json.dumps([{"type": "is_returning", "op": "in", "values": ["true"]}]),
+            "action_type": "redirect",
+            "action_config": json.dumps({"url": "https://RET/{click_id}"}),
+        }
+        redis = FakeRedis(
+            sets={"geo:US": {campaign_id}, "device:mobile": {campaign_id},
+                  "os:ios": {campaign_id}, "campaigns:active": {campaign_id}},
+            hashes={f"campaign:{campaign_id}": camp, "flow:1": ret_flow},
+            lists={f"campaign:{campaign_id}:flows": ["1"]},
+        )
+
+        async def _stamp(**kw):
+            return IdentityResult(uid="U", is_unique=False, is_returning=True)
+
+        with patch.object(settings, "returning_resolver_enabled", True), \
+             patch.object(settings, "returning_routing_enabled", True), \
+             patch.object(identity_mod, "resolve_and_stamp", _stamp):
+            r = _route_with(redis, _click())
+        assert "RET" in r["url"]
+        assert r["attribution"]["returning_mode"] == "sticky"  # flow ?? campaign

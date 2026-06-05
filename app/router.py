@@ -710,9 +710,18 @@ async def _try_flow_cascade(
     # conflating them silently drops segment C, R4 G1). Only meaningful when the
     # P2 resolver produced a uid; absent → False → first pool only (zero-regress
     # when the resolver / routing is OFF).
-    audience_routing = settings.returning_routing_enabled and _company_routing_enabled(
+    # v2 Phase M — the returning-audience PARTITION is gated by the CAMPAIGN
+    # returning_mode (the only mode known pre-flow-selection). 'fresh' (the
+    # default) DISABLES the partition ⇒ a returning visitor is routed AS NEW;
+    # 'override' / 'sticky' ENABLE the v1 2-pass. `returning_live` (env AND
+    # per-company, mode-INDEPENDENT) gates whether returning_mode is meaningful
+    # for THIS click — used to record the effective mode after selection.
+    # routing OFF OR mode 'fresh' ⇒ no partition ⇒ byte-identical.
+    returning_live = settings.returning_routing_enabled and _company_routing_enabled(
         campaign
     )
+    campaign_mode = (campaign.get("returning_mode") or "fresh").strip().lower()
+    audience_routing = returning_live and campaign_mode != "fresh"
     seen_before = bool(attribution.get("uid")) and (
         attribution.get("is_unique") is False
     )
@@ -779,6 +788,24 @@ async def _try_flow_cascade(
     attribution["winning_scope_type"] = flow.get("scope_type") or ""
     attribution["winning_scope_id"] = _to_int(flow.get("scope_id"))
     attribution["audience_pool"] = flow.get("audience") or "first"
+
+    # v2 Phase M — record the EFFECTIVE returning_mode actually in force for a
+    # returning visitor under live returning routing: flow override ?? campaign
+    # ?? 'fresh'. "na" when routing is not live OR this is not a returning
+    # visitor (mode is a returning-visitor concept). The PARTITION already used
+    # `campaign_mode` (pre-selection); the flow override refines only what is
+    # RECORDED + (Phase S) the sticky pin.
+    if returning_live and seen_before:
+        attribution["returning_mode"] = (
+            (flow.get("returning_mode") or "").strip().lower() or campaign_mode
+        )
+    else:
+        attribution["returning_mode"] = "na"
+    # TODO(Phase S): when the effective returning_mode is 'sticky', read/write
+    # the (uid, campaign_id) → offer_target pin here (SET NX, 180d) around the
+    # action call below — see plan §6 Phase S + §3 IDENTITY store. Phase M
+    # routes 'sticky' EXACTLY like 'override' (returning partition on) WITHOUT
+    # any pin; `sticky_status` is a Phase-S provenance column, not added here.
 
     result = await action_executor.execute_action(
         r, flow, req, campaign_id,

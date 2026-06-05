@@ -44,7 +44,7 @@ import secrets
 import time
 from dataclasses import dataclass, field
 
-from app.config import settings
+from app.config import _LOCAL_ENVIRONMENTS, settings
 from app.history import _offers_key, _subs_key, _targets_key
 from app.redis_client import get_identity_redis
 
@@ -303,46 +303,111 @@ async def resolve_and_stamp(
 
 
 async def assert_identity_namespace_safe() -> None:
-    """Gate #2 (R4 audit) — make the no-eviction requirement EXPLICIT at boot.
+    """Gate #2 (R4 + v2 P0.3) — enforce the no-eviction requirement at boot.
 
-    Code cannot enforce a Redis maxmemory policy, so we surface it loudly:
-    when the resolver is enabled and the identity keyspace SHARES the routing
-    instance, probe ``maxmemory-policy``; if it is an eviction policy, log a
-    CRITICAL warning (an evicted identity key silently degrades a returner to
-    "new"). If the dedicated URL is set, or CONFIG is restricted, we log the
-    documented requirement instead. Never raises — boot must not fail on this.
+    The identity store MUST NOT evict: an evicted ``id:*`` key silently
+    degrades a returning visitor back to "new" AND drops their sticky pins.
+    Code cannot set a Redis maxmemory policy, so we VERIFY it at boot and —
+    in a non-local environment — REFUSE TO START when the identity Redis is
+    absent or misconfigured, turning a silent data-quality bug into a loud
+    deploy failure.
+
+    Fires ONLY when the resolver is enabled (``returning_resolver_enabled``).
+    With the resolver OFF (the dark default) this is a zero-cost no-op, so
+    every existing node boots byte-identically — the gate activates only when
+    an operator opts a node into identity resolution.
+
+    Policy by environment (resolver ON):
+
+    * **non-local** — a dedicated ``TDS_IDENTITY_REDIS_URL`` is REQUIRED.
+      Empty ⇒ refuse (we will NOT silently reuse the evictable routing
+      Redis). Set ⇒ the instance must be reachable AND report
+      ``maxmemory-policy noeviction``; an unreachable instance or a
+      confirmed eviction policy ⇒ refuse. If the policy cannot be READ
+      (managed Redis may restrict ``CONFIG GET``) we log CRITICAL and allow
+      boot — the operator owns that residual risk.
+    * **local** — warn only, never refuse. Reusing the routing Redis is
+      acceptable for dev; we probe + log the policy so the requirement stays
+      visible.
+
+    Raises ``RuntimeError`` to abort startup in the non-local refuse cases.
     """
     if not settings.returning_resolver_enabled:
         return
-    if settings.identity_redis_url:
-        logger.info(
-            "identity: resolver ENABLED on dedicated identity Redis (%s) — "
-            "ensure that instance is configured `maxmemory-policy noeviction`.",
-            settings.identity_redis_url,
-        )
+
+    is_local = settings.environment in _LOCAL_ENVIRONMENTS
+
+    if not settings.identity_redis_url:
+        if not is_local:
+            raise RuntimeError(
+                "TDS_IDENTITY_REDIS_URL must be set when the returning-user "
+                "resolver is ENABLED in a non-local environment "
+                f"(TDS_ENVIRONMENT={settings.environment!r}). The identity "
+                "keyspace requires a dedicated `maxmemory-policy noeviction` "
+                "Redis — an evicted identity key silently degrades a returning "
+                "visitor to 'new' and loses sticky pins. Refusing to silently "
+                "reuse the evictable routing Redis; point TDS_IDENTITY_REDIS_URL "
+                "at a dedicated no-eviction instance."
+            )
+        # Local dev — reuse the routing Redis, probe + warn only.
+        await _probe_identity_policy(required=False)
         return
-    # Shared with the routing instance — probe the policy.
+
+    # A dedicated identity URL is configured — verify reachability + policy.
+    await _probe_identity_policy(required=not is_local)
+
+
+async def _probe_identity_policy(*, required: bool) -> None:
+    """Probe the identity Redis: reachable + ``maxmemory-policy``.
+
+    ``required=True`` (non-local) ⇒ raise ``RuntimeError`` on an unreachable
+    instance or a CONFIRMED eviction policy. ``required=False`` (local) ⇒ log
+    only. An UNREADABLE policy (CONFIG GET restricted) is CRITICAL-logged and
+    tolerated in both modes — we cannot prove misconfiguration, so we surface
+    it loudly rather than block boot.
+    """
     try:
         r = await get_identity_redis()
+        await r.ping()
+    except Exception as e:
+        msg = (
+            "identity: resolver ENABLED but the identity Redis is unreachable "
+            f"({e!r})."
+        )
+        if required:
+            raise RuntimeError(
+                msg + " Refusing to start in a non-local environment."
+            ) from e
+        logger.warning("%s Reusing routing Redis in local dev.", msg)
+        return
+
+    try:
         cfg = await r.config_get("maxmemory-policy")
         policy = (cfg or {}).get("maxmemory-policy", "")
-        if policy and policy != "noeviction":
-            logger.critical(
-                "identity: resolver ENABLED but the SHARED routing Redis uses "
-                "maxmemory-policy=%r (eviction). An evicted identity key "
-                "silently degrades a returning user to 'new'. Set "
-                "`maxmemory-policy noeviction`, or point TDS_IDENTITY_REDIS_URL "
-                "at a dedicated no-eviction instance.",
-                policy,
-            )
-        else:
-            logger.info(
-                "identity: resolver ENABLED on shared routing Redis "
-                "(maxmemory-policy=%r) — OK.", policy or "unknown",
-            )
-    except Exception as e:  # pragma: no cover — CONFIG may be restricted
-        logger.warning(
-            "identity: could not verify maxmemory-policy (%s). OPERATOR MUST "
-            "ensure the identity Redis is `noeviction` before enabling the "
-            "resolver for production tenants.", e,
+    except Exception as e:  # CONFIG GET may be restricted on managed Redis
+        logger.critical(
+            "identity: resolver ENABLED but maxmemory-policy could NOT be "
+            "verified (%r). Ensure the identity Redis is `noeviction` — an "
+            "evicted identity key silently degrades returning visitors.", e,
         )
+        return
+
+    if policy and policy != "noeviction":
+        msg = (
+            "identity: resolver ENABLED but the identity Redis uses "
+            f"maxmemory-policy={policy!r} (eviction). An evicted identity key "
+            "silently degrades a returning visitor to 'new' and loses sticky "
+            "pins. Set `maxmemory-policy noeviction`."
+        )
+        if required:
+            raise RuntimeError(
+                msg + " Refusing to start in a non-local environment."
+            )
+        logger.critical(msg)
+        return
+
+    logger.info(
+        "identity: resolver ENABLED on %s Redis (maxmemory-policy=%r) — OK.",
+        "dedicated" if settings.identity_redis_url else "shared routing",
+        policy or "unknown",
+    )

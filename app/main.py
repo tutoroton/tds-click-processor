@@ -200,9 +200,11 @@ async def lifespan(app: FastAPI):
     # prod and staging.
     diag_drain_task = asyncio.create_task(run_obs_drain(r))
 
-    # Returning-user identity (P2) — gate-#2 explicit no-eviction check.
-    # No-op when the resolver is OFF (default); when ON, makes the dedicated
-    # / no-eviction Redis requirement loud at boot. Never raises (fail-open).
+    # Returning-user identity (P2 / v2 P0.3) — gate-#2 no-eviction check.
+    # No-op when the resolver is OFF (default). When ON in a non-local env it
+    # REFUSES TO START (raises) if the dedicated identity Redis is absent or
+    # misconfigured (evicting) — an evicted identity key silently degrades a
+    # returning visitor to 'new'. Local dev warns only.
     await identity.assert_identity_namespace_safe()
 
     yield

@@ -446,3 +446,100 @@ class TestP5FlagsSemanticsVersion:
         result = self._result({"uid": "U", "is_unique": True, "is_returning": False})
         fields = _phase3_attribution_fields(result, _req(), {}, "ts")
         assert fields["flags_semantics_version"] == 1
+
+
+# ============================================================
+# v2 P0.3 — identity Redis no-eviction boot gate
+# ============================================================
+
+
+class _FakeIdentityRedis:
+    """Minimal stand-in for the identity Redis client used by the boot gate.
+
+    Drives the three observable outcomes the gate branches on: reachability
+    (``ping``), and the ``maxmemory-policy`` value / readability
+    (``config_get``).
+    """
+
+    def __init__(self, *, policy="noeviction", reachable=True, policy_readable=True):
+        self._policy = policy
+        self._reachable = reachable
+        self._policy_readable = policy_readable
+
+    async def ping(self):
+        if not self._reachable:
+            raise ConnectionError("identity redis down")
+        return True
+
+    async def config_get(self, key):
+        if not self._policy_readable:
+            raise RuntimeError("CONFIG GET restricted")
+        return {"maxmemory-policy": self._policy}
+
+
+def _patch_identity_redis(monkeypatch, fake):
+    async def _gir():
+        return fake
+
+    monkeypatch.setattr(identity, "get_identity_redis", _gir)
+
+
+class TestIdentityNamespaceGate:
+    """The boot gate: refuse-to-start in non-local when the identity Redis is
+    absent or evicting; warn-only in local; pure no-op when the resolver is
+    OFF (dark default → every existing node boots byte-identically)."""
+
+    async def test_resolver_off_is_noop_even_nonlocal_empty(self, monkeypatch):
+        # The dark default: OFF ⇒ never raises, even in a non-local env with
+        # no identity URL (this is exactly today's live state on every node).
+        monkeypatch.setattr(settings, "returning_resolver_enabled", False)
+        monkeypatch.setattr(settings, "environment", "staging")
+        monkeypatch.setattr(settings, "identity_redis_url", "")
+        await identity.assert_identity_namespace_safe()  # must not raise
+
+    async def test_local_empty_url_warns_not_raises(self, monkeypatch):
+        monkeypatch.setattr(settings, "returning_resolver_enabled", True)
+        monkeypatch.setattr(settings, "environment", "local")
+        monkeypatch.setattr(settings, "identity_redis_url", "")
+        # Even an evicting shared Redis is tolerated in local dev.
+        _patch_identity_redis(monkeypatch, _FakeIdentityRedis(policy="allkeys-lru"))
+        await identity.assert_identity_namespace_safe()  # must not raise
+
+    async def test_nonlocal_empty_url_refuses(self, monkeypatch):
+        monkeypatch.setattr(settings, "returning_resolver_enabled", True)
+        monkeypatch.setattr(settings, "environment", "staging")
+        monkeypatch.setattr(settings, "identity_redis_url", "")
+        with pytest.raises(RuntimeError, match="TDS_IDENTITY_REDIS_URL"):
+            await identity.assert_identity_namespace_safe()
+
+    async def test_nonlocal_noeviction_ok(self, monkeypatch):
+        monkeypatch.setattr(settings, "returning_resolver_enabled", True)
+        monkeypatch.setattr(settings, "environment", "staging")
+        monkeypatch.setattr(settings, "identity_redis_url", "redis://id:6379/0")
+        _patch_identity_redis(monkeypatch, _FakeIdentityRedis(policy="noeviction"))
+        await identity.assert_identity_namespace_safe()  # must not raise
+
+    async def test_nonlocal_eviction_policy_refuses(self, monkeypatch):
+        monkeypatch.setattr(settings, "returning_resolver_enabled", True)
+        monkeypatch.setattr(settings, "environment", "production")
+        monkeypatch.setattr(settings, "identity_redis_url", "redis://id:6379/0")
+        _patch_identity_redis(monkeypatch, _FakeIdentityRedis(policy="allkeys-lru"))
+        with pytest.raises(RuntimeError, match="eviction"):
+            await identity.assert_identity_namespace_safe()
+
+    async def test_nonlocal_unreachable_refuses(self, monkeypatch):
+        monkeypatch.setattr(settings, "returning_resolver_enabled", True)
+        monkeypatch.setattr(settings, "environment", "staging")
+        monkeypatch.setattr(settings, "identity_redis_url", "redis://id:6379/0")
+        _patch_identity_redis(monkeypatch, _FakeIdentityRedis(reachable=False))
+        with pytest.raises(RuntimeError, match="unreachable"):
+            await identity.assert_identity_namespace_safe()
+
+    async def test_nonlocal_unreadable_policy_tolerated(self, monkeypatch):
+        # Managed Redis may restrict CONFIG GET — we cannot prove a misconfig,
+        # so the gate CRITICAL-logs and allows boot rather than blocking.
+        monkeypatch.setattr(settings, "returning_resolver_enabled", True)
+        monkeypatch.setattr(settings, "environment", "staging")
+        monkeypatch.setattr(settings, "identity_redis_url", "redis://id:6379/0")
+        _patch_identity_redis(monkeypatch, _FakeIdentityRedis(policy_readable=False))
+        await identity.assert_identity_namespace_safe()  # must not raise

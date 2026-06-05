@@ -358,15 +358,19 @@ class Settings(BaseSettings):
     # synced campaign HASH (`returning_resolver` field, default closed,
     # wired by admin sync in P4) so a tenant opts in individually.
     #
-    # `identity_redis_url` (gate #2, R4): identity keys SHOULD live on a
-    # dedicated, `noeviction` Redis instance — an LRU eviction of an
-    # identity key silently degrades a returning user back to "new" AND
-    # competes with the routing cache for memory. Empty ⇒ reuse the
-    # routing Redis (`redis_url`); a startup assertion then WARNs that the
-    # shared instance MUST be `maxmemory-policy noeviction`. Point this at
-    # a separate instance/DB before enabling the resolver for a tenant at
-    # scale. (The edge routing Redis is already `noeviction` per the
-    # stream-MAXLEN note above, so sharing is safe at small scale.)
+    # `identity_redis_url` (gate #2, R4 + v2 P0.3): identity keys MUST live on
+    # a dedicated, `noeviction` Redis instance — an LRU eviction of an
+    # identity key silently degrades a returning user back to "new", drops
+    # sticky pins, AND competes with the routing cache for memory. The boot
+    # gate (`identity.assert_identity_namespace_safe`, run when the resolver
+    # is enabled) enforces this:
+    #   * non-local + empty ⇒ REFUSE TO START (we will NOT silently reuse the
+    #     evictable routing Redis);
+    #   * non-local + set ⇒ must be reachable AND `maxmemory-policy
+    #     noeviction`, else refuse;
+    #   * local ⇒ warn only, reuse of the routing Redis is acceptable for dev.
+    # Point this at a separate instance/DB before enabling the resolver for a
+    # tenant in any non-local environment.
     #
     # `returning_uid_ttl_seconds` — sliding TTL (refreshed on every visit)
     # so memory tracks the ACTIVE returning audience, not all-time uids.

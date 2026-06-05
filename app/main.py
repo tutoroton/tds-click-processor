@@ -778,6 +778,9 @@ def _phase3_attribution_fields(
     """
     attr = result.get("attribution") or {}
     slots = attr.get("slots") or {}
+    # v2 Phase A2 — compute the closed-enum decision_reason ONCE (hot path);
+    # reused for the column AND folded into routing_trace below.
+    decision_reason = _decision_reason(result, timing, attr)
 
     fields: dict = {
         # Org-attribution chain (resolved at click time; company_id =
@@ -799,8 +802,9 @@ def _phase3_attribution_fields(
         # it is queryable without unpacking the timing JSON.
         "routing_result": timing.get("result", ""),
         # v2 Phase A2 — base routing provenance (KEEPS routing_result; both).
-        # decision_reason is the closed-enum, ALWAYS-set analytics key.
-        "decision_reason": _decision_reason(result, timing, attr),
+        # decision_reason is the closed-enum, ALWAYS-set analytics key (computed
+        # once above).
+        "decision_reason": decision_reason,
         "winning_scope_type": attr.get("winning_scope_type", ""),
         "winning_scope_id": attr.get("winning_scope_id"),
         "audience_pool": attr.get("audience_pool") or "none",
@@ -811,8 +815,7 @@ def _phase3_attribution_fields(
         # so a pathological flood can't bloat the click row. Heavy per-candidate
         # / rejected-criteria detail (X-Test-Id gated) is a deferred extension.
         "routing_trace": json.dumps(
-            {**(attr.get("routing_trace") or {}),
-             "decision_reason": _decision_reason(result, timing, attr)},
+            {**(attr.get("routing_trace") or {}), "decision_reason": decision_reason},
             separators=(",", ":"),
         )[:4000],
         # Worker-auto infra/audit columns cleanly available on the request.

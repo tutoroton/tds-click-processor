@@ -1134,3 +1134,62 @@ class TestEffectiveSourceOverrideReadPath:
         # defensive source-global fallback.
         result = self._slots(self._redis(source_overrides_field=json.dumps([1, 2])))
         assert result["attribution"]["slots"]["pixel_id"] == "global_px"
+
+
+# ============================================================
+# v2 Phase A FIXUP — availability returning-class is GATED on returning_routing
+# ============================================================
+
+
+class TestAvailabilityClassGating:
+    """The availability returning-class (draining serves returning) activates
+    TOGETHER with returning routing. routing OFF ⇒ a seen_before visitor is the
+    NEW class for availability (draining blocks all) → TOTAL byte-identical."""
+
+    def _capture_returning_visitor(self, *, routing_enabled, company_routing):
+        from app import cascade as cascade_mod, identity as identity_mod
+        from app.identity import IdentityResult
+        from app.config import settings
+
+        captured: dict = {}
+
+        async def _fake_resolve_flow(r, **kw):  # noqa: ANN001
+            captured["returning_visitor"] = kw.get("returning_visitor")
+            captured["audience_routing"] = kw.get("audience_routing")
+            return None  # force non-route — we only assert the passed kwargs
+
+        async def _fake_stamp(**kw):  # seen_before visitor (uid set, not unique)
+            return IdentityResult(uid="U", is_unique=False, is_returning=True)
+
+        campaign_id = "10"
+        camp = {"company_id": "1", "priority": "0", "returning_resolver": "1"}
+        if company_routing:
+            camp["returning_routing"] = "1"
+        redis = FakeRedis(
+            sets={
+                "geo:US": {campaign_id}, "device:mobile": {campaign_id},
+                "os:ios": {campaign_id}, "campaigns:active": {campaign_id},
+            },
+            hashes={f"campaign:{campaign_id}": camp},
+            lists={f"campaign:{campaign_id}:flows": []},
+        )
+        with patch.object(settings, "returning_resolver_enabled", True), \
+             patch.object(settings, "returning_routing_enabled", routing_enabled), \
+             patch.object(identity_mod, "resolve_and_stamp", _fake_stamp), \
+             patch.object(cascade_mod, "resolve_flow", _fake_resolve_flow):
+            _route_with(redis, _click())
+        return captured
+
+    def test_routing_off_seen_before_treated_as_new_for_availability(self):
+        # resolver ON, routing OFF, seen_before visitor → availability class is
+        # NEW (returning_visitor False) → a draining target would block it.
+        cap = self._capture_returning_visitor(routing_enabled=False, company_routing=False)
+        assert cap["audience_routing"] is False
+        assert cap["returning_visitor"] is False
+
+    def test_routing_on_seen_before_is_returning_for_availability(self):
+        # resolver ON, routing ON (env + company) → returning_visitor True →
+        # a draining target serves the returning visitor.
+        cap = self._capture_returning_visitor(routing_enabled=True, company_routing=True)
+        assert cap["audience_routing"] is True
+        assert cap["returning_visitor"] is True

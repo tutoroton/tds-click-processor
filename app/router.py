@@ -752,11 +752,13 @@ async def _try_flow_cascade(
         click_attrs=click_attrs,
         seen_before=seen_before if audience_routing else False,
         audience_routing=audience_routing,
-        # v2 Phase A — availability class is the TRUE seen_before (un-gated by
-        # audience_routing): a returning visitor may use a 'draining' target
-        # even when segmented routing is off. Resolver-OFF ⇒ seen_before False
-        # ⇒ everyone is "new" class ⇒ all-active default ⇒ byte-identical.
-        returning_visitor=seen_before,
+        # v2 Phase A — availability returning-class is gated on
+        # returning_routing_enabled, the SAME as the audience partition above
+        # (reuse the already-gated value). routing OFF ⇒ everyone is "new" class
+        # ⇒ a 'draining' target blocks ALL ⇒ TOTAL byte-identical invariant with
+        # no exceptions (the "draining keeps returning" semantic activates
+        # together with returning routing — one clean switch, no dual meaning).
+        returning_visitor=seen_before if audience_routing else False,
         trace=cascade_trace,
     )
     attribution["routing_trace"] = cascade_trace

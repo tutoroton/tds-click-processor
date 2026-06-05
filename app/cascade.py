@@ -346,6 +346,13 @@ def _filter_by_availability(
     fail-open read) → no exclusion → byte-identical when nothing is
     drained/closed.
 
+    Split semantics: a multi-target (split) flow is KEPT if ANY of its legs has
+    an available target for the class — this is a coarse PRE-selection gate
+    ("can this flow serve the click at all?"). Per-leg availability (e.g. one
+    drained leg among several) is enforced at EXECUTION time by the action
+    executor's weighted pick, not here; this floor only excludes a flow whose
+    EVERY pinned leg is unavailable.
+
     Excluding a dead-target flow shrinks the survivor set, so `_pick_winner`
     falls through to the next scope level — the NO-DEAD-END behaviour, with no
     new control flow in the winner picker (purity preserved).

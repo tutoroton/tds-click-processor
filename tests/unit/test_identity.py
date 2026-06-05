@@ -21,7 +21,7 @@ from app import identity
 from app.config import settings
 from app.identity import (
     IdentityResult,
-    _funnels_key,
+    _campaigns_key,
     _hash,
     _profile_key,
     _sig_key,
@@ -46,13 +46,13 @@ def _req(**kw):
     return ClickRequest(click_id="0" * 24, **kw)
 
 
-async def _resolve(r, *, company_id=1, fuid=None, vid=None, funnel=None, trusted=False):
+async def _resolve(r, *, company_id=1, fuid=None, vid=None, campaign=None, trusted=False):
     return await resolve_identity(
         r,
         company_id=company_id,
         funnel_user_id=fuid,
         visitor_id=vid,
-        funnel_id=funnel,
+        campaign_id=campaign,
         source_trusted=trusted,
         ttl=TTL,
     )
@@ -107,57 +107,63 @@ class TestResolveCore:
         # cookie-less, untrusted funnel → no persistent identity (segment A).
         res = await _resolve(_fr(), vid=None, fuid="U", trusted=False)
         assert res == IdentityResult(uid="", is_unique=True, is_returning=False)
+        assert res.is_roaming is False and res.signal_tier == "none"
 
     async def test_new_vid_user_mints_unique(self):
         r = _fr()
-        res = await _resolve(r, vid="VID1", funnel="F")
+        res = await _resolve(r, vid="VID1", campaign="10")
         assert res.is_unique is True and res.is_returning is False and res.uid
+        assert res.is_roaming is False
+        assert res.signal_tier == "vid"
         assert await r.get(_sig_key(1, "vid", "VID1")) == res.uid  # minted map
 
-    async def test_returning_same_funnel_is_segment_B(self):
+    async def test_returning_same_campaign_is_segment_B(self):
         r = _fr()
-        v1 = await _resolve(r, vid="V", funnel="F")
+        v1 = await _resolve(r, vid="V", campaign="10")
         await persist_identity(
             r, company_id=1, uid=v1.uid, funnel_user_id=None,
-            visitor_id="V", funnel_id="F", source_trusted=False, ttl=TTL,
+            visitor_id="V", campaign_id="10", source_trusted=False, ttl=TTL,
         )
-        v2 = await _resolve(r, vid="V", funnel="F")
+        v2 = await _resolve(r, vid="V", campaign="10")
         assert v2.uid == v1.uid
-        assert (v2.is_unique, v2.is_returning) == (False, True)  # B
+        assert (v2.is_unique, v2.is_returning, v2.is_roaming) == (False, True, False)  # B
 
-    async def test_returning_new_funnel_is_segment_C(self):
+    async def test_roaming_different_campaign_is_segment_C(self):
         r = _fr()
-        v1 = await _resolve(r, vid="V", funnel="F")
+        v1 = await _resolve(r, vid="V", campaign="10")
         await persist_identity(
             r, company_id=1, uid=v1.uid, funnel_user_id=None,
-            visitor_id="V", funnel_id="F", source_trusted=False, ttl=TTL,
+            visitor_id="V", campaign_id="10", source_trusted=False, ttl=TTL,
         )
-        v2 = await _resolve(r, vid="V", funnel="G")  # different funnel
+        v2 = await _resolve(r, vid="V", campaign="20")  # different campaign
         assert v2.uid == v1.uid
-        assert (v2.is_unique, v2.is_returning) == (False, False)  # C
+        assert (v2.is_unique, v2.is_returning, v2.is_roaming) == (False, False, True)  # C
 
     @pytest.mark.parametrize(
-        "first_funnel,second_funnel,exp_unique,exp_returning,segment",
+        "first_campaign,second_campaign,exp_unique,exp_returning,exp_roaming,segment",
         [
-            (None, None, True, False, "A (new)"),          # first visit
-            ("F", "F", False, True, "B (same funnel)"),
-            ("F", "G", False, False, "C (new funnel)"),
+            (None, None, True, False, False, "A (new)"),          # first visit
+            ("10", "10", False, True, False, "B (same campaign)"),
+            ("10", "20", False, False, True, "C (roaming)"),
         ],
     )
     async def test_flag_semantics_table(
-        self, first_funnel, second_funnel, exp_unique, exp_returning, segment,
+        self, first_campaign, second_campaign, exp_unique, exp_returning,
+        exp_roaming, segment,
     ):
         r = _fr()
-        v1 = await _resolve(r, vid="V", funnel=first_funnel)
+        v1 = await _resolve(r, vid="V", campaign=first_campaign)
         if segment.startswith("A"):
-            assert (v1.is_unique, v1.is_returning) == (exp_unique, exp_returning), segment
+            assert (v1.is_unique, v1.is_returning, v1.is_roaming) == (
+                exp_unique, exp_returning, exp_roaming), segment
             return
         await persist_identity(
             r, company_id=1, uid=v1.uid, funnel_user_id=None,
-            visitor_id="V", funnel_id=first_funnel, source_trusted=False, ttl=TTL,
+            visitor_id="V", campaign_id=first_campaign, source_trusted=False, ttl=TTL,
         )
-        v2 = await _resolve(r, vid="V", funnel=second_funnel)
-        assert (v2.is_unique, v2.is_returning) == (exp_unique, exp_returning), segment
+        v2 = await _resolve(r, vid="V", campaign=second_campaign)
+        assert (v2.is_unique, v2.is_returning, v2.is_roaming) == (
+            exp_unique, exp_returning, exp_roaming), segment
 
 
 # ============================================================
@@ -168,7 +174,7 @@ class TestConcurrencyAndTenancy:
     async def test_nx_mint_race_converges_to_one_uid(self):
         r = _fr()
         results = await asyncio.gather(
-            *[_resolve(r, vid="RACE", funnel="F") for _ in range(2)]
+            *[_resolve(r, vid="RACE", campaign="10") for _ in range(2)]
         )
         uids = {x.uid for x in results}
         assert len(uids) == 1, "two concurrent first-clicks must share ONE uid"
@@ -177,8 +183,8 @@ class TestConcurrencyAndTenancy:
 
     async def test_cross_tenant_same_signal_isolated_uids(self):
         r = _fr()
-        a = await _resolve(r, company_id=1, vid="SAME", funnel="F")
-        b = await _resolve(r, company_id=2, vid="SAME", funnel="F")
+        a = await _resolve(r, company_id=1, vid="SAME", campaign="10")
+        b = await _resolve(r, company_id=2, vid="SAME", campaign="10")
         assert a.uid != b.uid
         assert a.is_unique and b.is_unique  # each is new within its OWN tenant
         assert await r.get(_sig_key(1, "vid", "SAME")) == a.uid
@@ -186,7 +192,7 @@ class TestConcurrencyAndTenancy:
 
 
 # ============================================================
-# Signal precedence + trusted-source gate (G6)
+# Signal precedence + trusted-source gate (G6) + provenance (v2 R)
 # ============================================================
 
 class TestSignalGating:
@@ -199,15 +205,36 @@ class TestSignalGating:
         r = _fr()
         res = await _resolve(r, fuid="U", vid=None, trusted=True)
         assert res.uid and res.is_unique
+        assert res.signal_tier == "fuid"
         assert await r.get(_sig_key(1, "fuid", _hash("U"))) == res.uid
 
     async def test_funnel_user_id_outranks_vid_on_conflict(self):
         r = _fr()
         await r.set(_sig_key(1, "fuid", _hash("U")), "uidA")
         await r.set(_sig_key(1, "vid", "V"), "uidB")
-        res = await _resolve(r, fuid="U", vid="V", funnel="F", trusted=True)
+        res = await _resolve(r, fuid="U", vid="V", campaign="10", trusted=True)
         assert res.uid == "uidA"  # highest-precedence (funnel_user_id) wins
         assert res.is_unique is False
+        assert res.signal_tier == "fuid"
+        # vid↔fuid resolve to DIFFERENT uids → conflict flagged (log-not-merge),
+        # but NOT merged (uid stays the highest-precedence one).
+        assert res.identity_conflict is True
+
+    async def test_no_conflict_when_signals_agree(self):
+        r = _fr()
+        await r.set(_sig_key(1, "fuid", _hash("U")), "uidA")
+        await r.set(_sig_key(1, "vid", "V"), "uidA")  # SAME uid
+        res = await _resolve(r, fuid="U", vid="V", campaign="10", trusted=True)
+        assert res.uid == "uidA"
+        assert res.identity_conflict is False
+        assert res.signal_tier == "fuid"
+
+    async def test_signal_tier_vid_when_only_vid_resolves(self):
+        r = _fr()
+        await r.set(_sig_key(1, "vid", "V"), "uidB")
+        res = await _resolve(r, vid="V", campaign="10")
+        assert res.uid == "uidB" and res.signal_tier == "vid"
+        assert res.identity_conflict is False
 
 
 # ============================================================
@@ -217,18 +244,18 @@ class TestSignalGating:
 class TestLatency:
     async def test_new_user_at_most_two_round_trips(self):
         rt = _RT(_fr())
-        await _resolve(rt, vid="V", funnel="F")
+        await _resolve(rt, vid="V", campaign="10")
         assert rt.rt <= 2, f"new-user critical path took {rt.rt} RT"
 
     async def test_returning_user_at_most_two_round_trips(self):
         r = _fr()
-        v1 = await _resolve(r, vid="V", funnel="F")
+        v1 = await _resolve(r, vid="V", campaign="10")
         await persist_identity(
             r, company_id=1, uid=v1.uid, funnel_user_id=None,
-            visitor_id="V", funnel_id="F", source_trusted=False, ttl=TTL,
+            visitor_id="V", campaign_id="10", source_trusted=False, ttl=TTL,
         )
         rt = _RT(r)
-        await _resolve(rt, vid="V", funnel="F")
+        await _resolve(rt, vid="V", campaign="10")
         assert rt.rt <= 2, f"returning critical path took {rt.rt} RT"
 
     async def test_no_signal_zero_round_trips(self):
@@ -238,31 +265,31 @@ class TestLatency:
 
     async def test_returning_with_history_still_two_round_trips(self):
         # P4 RT-budget: reading the prev_* history sets folds into RT#2 (the
-        # funnels SISMEMBER pipeline) → still ≤2 round-trips for a returning user.
+        # campaigns SISMEMBER pipeline) → still ≤2 round-trips for a returning user.
         r = _fr()
-        v1 = await _resolve(r, vid="V", funnel="F")
+        v1 = await _resolve(r, vid="V", campaign="10")
         await persist_identity(
             r, company_id=1, uid=v1.uid, funnel_user_id=None,
-            visitor_id="V", funnel_id="F", source_trusted=False, ttl=TTL,
+            visitor_id="V", campaign_id="10", source_trusted=False, ttl=TTL,
         )
         rt = _RT(r)
         res = await resolve_identity(
             rt, company_id=1, funnel_user_id=None, visitor_id="V",
-            funnel_id="F", source_trusted=False, ttl=TTL, with_history=True,
+            campaign_id="10", source_trusted=False, ttl=TTL, with_history=True,
         )
         assert rt.rt <= 2, f"returning+history critical path took {rt.rt} RT"
-        assert res.is_returning is True  # same funnel
+        assert res.is_returning is True  # same campaign
 
     async def test_with_history_returns_prev_sets(self):
         # The history sets written by the P3 capture surface on the result.
         r = _fr()
-        v1 = await _resolve(r, vid="V", funnel="F")  # mints + sets the vid map
+        v1 = await _resolve(r, vid="V", campaign="10")  # mints + sets the vid map
         await r.sadd(f"id:1:uid:{v1.uid}:offers", "5", "9")
         await r.sadd(f"id:1:uid:{v1.uid}:targets", "3")
         await r.sadd(f"id:1:uid:{v1.uid}:subs", "aff")
         res = await resolve_identity(
             r, company_id=1, funnel_user_id=None, visitor_id="V",
-            funnel_id="F", source_trusted=False, ttl=TTL, with_history=True,
+            campaign_id="10", source_trusted=False, ttl=TTL, with_history=True,
         )
         assert res.prev_offers == frozenset({"5", "9"})
         assert res.prev_targets == frozenset({"3"})
@@ -274,13 +301,13 @@ class TestLatency:
 # ============================================================
 
 class TestPersist:
-    async def test_persist_records_funnel_profile_and_attaches_maps(self):
+    async def test_persist_records_campaign_profile_and_attaches_maps(self):
         r = _fr()
         await persist_identity(
             r, company_id=1, uid="U1", funnel_user_id=None,
-            visitor_id="V", funnel_id="F", source_trusted=False, ttl=TTL,
+            visitor_id="V", campaign_id="10", source_trusted=False, ttl=TTL,
         )
-        assert await r.sismember(_funnels_key(1, "U1"), "F")
+        assert await r.sismember(_campaigns_key(1, "U1"), "10")
         assert await r.get(_sig_key(1, "vid", "V")) == "U1"
         assert await r.hget(_profile_key(1, "U1"), "first_seen")
 
@@ -292,14 +319,14 @@ class TestPersist:
         # MUST NOT raise — a failed identity write never fails a click.
         await persist_identity(
             _Boom(), company_id=1, uid="U", funnel_user_id=None,
-            visitor_id="V", funnel_id="F", source_trusted=False, ttl=TTL,
+            visitor_id="V", campaign_id="10", source_trusted=False, ttl=TTL,
         )
 
     async def test_persist_noop_on_empty_uid(self):
         r = _fr()
         await persist_identity(
             r, company_id=1, uid="", funnel_user_id=None,
-            visitor_id="V", funnel_id="F", source_trusted=False, ttl=TTL,
+            visitor_id="V", campaign_id="10", source_trusted=False, ttl=TTL,
         )
         assert await r.get(_sig_key(1, "vid", "V")) is None  # nothing written
 
@@ -446,6 +473,38 @@ class TestP5FlagsSemanticsVersion:
         result = self._result({"uid": "U", "is_unique": True, "is_returning": False})
         fields = _phase3_attribution_fields(result, _req(), {}, "ts")
         assert fields["flags_semantics_version"] == 1
+
+
+# ============================================================
+# v2 R — is_roaming + signal_tier + identity_conflict in the click record
+# ============================================================
+
+
+class TestRProvenanceFields:
+    @staticmethod
+    def _result(extra_attr=None):
+        attr = {"slots": {}, "company_id": 1}
+        if extra_attr:
+            attr.update(extra_attr)
+        return {"attribution": attr, "offer_id": None}
+
+    async def test_defaults_when_resolver_off(self):
+        # Resolver OFF (no keys in attr) → default-safe values (additive,
+        # no behaviour change on the legacy path).
+        fields = _phase3_attribution_fields(self._result(), _req(), {}, "ts")
+        assert fields["is_roaming"] is False
+        assert fields["signal_tier"] == ""
+        assert fields["identity_conflict"] is False
+
+    async def test_populated_from_attribution(self):
+        result = self._result({
+            "uid": "U", "is_unique": False, "is_returning": False,
+            "is_roaming": True, "signal_tier": "fuid", "identity_conflict": True,
+        })
+        fields = _phase3_attribution_fields(result, _req(), {}, "ts")
+        assert fields["is_roaming"] is True
+        assert fields["signal_tier"] == "fuid"
+        assert fields["identity_conflict"] is True
 
 
 # ============================================================

@@ -796,10 +796,19 @@ def _phase3_attribution_fields(
         # byte-identical to it whenever the resolver is OFF (no keys in attr).
         "is_unique": attr.get("is_unique", not req.is_returning),
         "is_returning": attr.get("is_returning", req.is_returning),
+        # is_roaming (v2 R) — seen-before uid on a DIFFERENT campaign (segment
+        # C; mutually exclusive with is_returning). Default-safe False when the
+        # resolver is OFF (legacy semantics had no roaming concept) → additive.
+        "is_roaming": attr.get("is_roaming", False),
         # uid (P2) — canonical company-scoped returning-user id; "" until a
         # company enables the resolver. Written to every click so the Redis
         # identity map is rebuildable from ClickHouse (Redis disposable).
         "uid": attr.get("uid", ""),
+        # Identity provenance (v2 R). signal_tier = which signal won precedence
+        # (fuid|vid|none); identity_conflict = two signals → different uids
+        # (log-not-merge). "" / False when the resolver is OFF (additive).
+        "signal_tier": attr.get("signal_tier", ""),
+        "identity_conflict": attr.get("identity_conflict", False),
         # flags_semantics_version (P5) — analytics cutover marker. 0 = LEGACY
         # cookie-presence semantics (is_unique = "no _tds_vid"); 1 = CANONICAL
         # resolver semantics (is_unique = first uid appearance; is_returning =

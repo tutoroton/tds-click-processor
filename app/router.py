@@ -401,13 +401,20 @@ async def _build_campaign_attribution(
                 company_id=buyer_chain["company_id"],
                 funnel_user_id=slots.get("funnel_user_id"),
                 visitor_id=req.visitor_id,
-                funnel_id=slots.get("funnel_id"),
+                campaign_id=campaign_id,
                 source_trusted=source_trusted,
                 with_history=with_history,
             )
             attribution["uid"] = ident.uid
             attribution["is_unique"] = ident.is_unique
+            # v2 R — is_returning is now CAMPAIGN-relative; is_roaming = seen
+            # before but a DIFFERENT campaign (mutually exclusive).
             attribution["is_returning"] = ident.is_returning
+            attribution["is_roaming"] = ident.is_roaming
+            # Identity provenance (v2 R) — which signal resolved the uid, and
+            # whether two signals disagreed (log-not-merge).
+            attribution["signal_tier"] = ident.signal_tier
+            attribution["identity_conflict"] = ident.identity_conflict
             # P4 — previous-visit history sets for prev_* criteria matching
             # (empty unless segmented routing is ON and the user is returning).
             attribution["prev_offers"] = ident.prev_offers

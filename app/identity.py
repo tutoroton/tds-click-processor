@@ -19,13 +19,22 @@ Signals, highest precedence first:
   3. ``fp``              (L3) — fingerprint, future; the signal-tier list makes
      it a one-line addition at the lowest precedence (R2 §5).
 
-Flag semantics (R3 refinement 4 — REUSE is_unique/is_returning, no new dims):
+Flag semantics (v2 R re-key — is_returning keyed on CAMPAIGN, add is_roaming):
   * ``is_unique``    = this click MINTED the uid (genuinely first appearance).
     Under the NX mint only the winner of a concurrent race reports True (G7).
-  * ``is_returning`` = uid seen before AND the click's ``funnel_id`` is in the
-    uid's funnels-seen set (return via the SAME funnel).
-  * new-funnel return ⇒ both False (segment C). New user ⇒ unique·True (A).
-    Same-funnel return ⇒ returning·True (B).
+  * ``is_returning`` = uid seen before AND ``campaign_id`` is in the uid's
+    campaigns-seen set (return to the SAME campaign — segment B).
+  * ``is_roaming``   = uid seen before but ``campaign_id`` is NOT in the set
+    (a different campaign within the same company — segment C). Mutually
+    exclusive with ``is_returning``.
+  * New user ⇒ unique·True, returning/roaming False (segment A). Same-campaign
+    return ⇒ returning·True (B). Different-campaign return ⇒ roaming·True (C).
+
+Provenance (v2 R, log-not-merge):
+  * ``signal_tier``      = which signal won precedence (``fuid`` | ``vid`` |
+    ``none``) — observability of WHICH identity anchor resolved the uid.
+  * ``identity_conflict`` = two present signals resolved to DIFFERENT existing
+    uids. We do NOT live-merge — flag it, adopt the highest-precedence uid.
 
 Hot path: ≤2 pipelined Redis round-trips on the critical path
 (signal-map reads → mint-NX OR funnels SISMEMBER). The profile/attach/TTL
@@ -55,11 +64,12 @@ logger = logging.getLogger(__name__)
 # the resolution algorithm (R2 §5 pluggability).
 _TIER_FUID = "fuid"   # funnel_user_id (L2)
 _TIER_VID = "vid"     # cookie visitor id (L1)
+_TIER_NONE = "none"   # no usable identity signal on this click (case A)
 
-# Bound the funnels-seen set so a pathological funnel-id sprayer can't grow one
-# uid's profile without limit (cardinality guard). Realistic users touch a
-# handful of funnels; 64 is generous headroom.
-_MAX_FUNNELS_PER_UID = 64
+# Bound the campaigns-seen set so a pathological caller can't grow one uid's
+# profile without limit (cardinality guard). A real uid touches a handful of
+# campaigns (fewer than funnels), so 64 is generous headroom.
+_MAX_CAMPAIGNS_PER_UID = 64
 
 
 @dataclass(frozen=True)
@@ -70,6 +80,11 @@ class IdentityResult:
     cookie-less visitor) — there is no persistent identity to track, so the
     click is treated as unique·new (segment A) and nothing is written.
 
+    `is_roaming` (v2 R) — uid seen before but on a DIFFERENT campaign
+    (segment C); mutually exclusive with `is_returning`. `signal_tier` /
+    `identity_conflict` are provenance (which signal won; whether two signals
+    disagreed — log-not-merge).
+
     `prev_offers` / `prev_targets` / `prev_subs` are the uid's previous-visit
     history sets (P3-written), read in RT#2 ONLY for a returning visitor when
     `with_history` is requested (routing enabled). Empty for new users / when
@@ -79,6 +94,9 @@ class IdentityResult:
     uid: str
     is_unique: bool
     is_returning: bool
+    is_roaming: bool = False
+    signal_tier: str = _TIER_NONE
+    identity_conflict: bool = False
     prev_offers: frozenset = field(default_factory=frozenset)
     prev_targets: frozenset = field(default_factory=frozenset)
     prev_subs: frozenset = field(default_factory=frozenset)
@@ -108,18 +126,19 @@ def _present_signals(
     return out
 
 
-def _funnel_bucket(funnel_id: str | None) -> str:
-    """The funnels-seen-set member for this click. Absent funnel → the "" bucket
-    (direct-to-tracker), so two direct returns count as the SAME funnel."""
-    return funnel_id or ""
+def _campaign_bucket(campaign_id) -> str:
+    """The campaigns-seen-set member for this click — the campaign the click
+    matched. Absent campaign → the "" bucket (defensive only; campaign_id is
+    always present at the router call site)."""
+    return str(campaign_id) if campaign_id else ""
 
 
 def _sig_key(company_id: int, tier: str, value: str) -> str:
     return f"id:{company_id}:{tier}:{value}"
 
 
-def _funnels_key(company_id: int, uid: str) -> str:
-    return f"id:{company_id}:uid:{uid}:funnels"
+def _campaigns_key(company_id: int, uid: str) -> str:
+    return f"id:{company_id}:uid:{uid}:campaigns"
 
 
 def _profile_key(company_id: int, uid: str) -> str:
@@ -132,7 +151,7 @@ async def resolve_identity(
     company_id: int,
     funnel_user_id: str | None,
     visitor_id: str | None,
-    funnel_id: str | None,
+    campaign_id,
     source_trusted: bool,
     ttl: int,
     with_history: bool = False,
@@ -145,15 +164,23 @@ async def resolve_identity(
     converge on ONE uid. Reuses the same atomic primitive as the click-dedup
     gate (``main.py`` ``SET … NX EX``).
 
+    v2 R: ``is_returning`` is now keyed on CAMPAIGN (was funnel); a seen-before
+    uid on a DIFFERENT campaign reports ``is_roaming=True`` instead. Also
+    captures ``signal_tier`` (winning signal) + ``identity_conflict`` (two
+    signals → two existing uids; log-not-merge, adopt highest precedence).
+
     Round-trips: RT#1 = pipelined GET of each present signal map; RT#2 =
-    mint-NX (new user) OR funnels SISMEMBER (returning). ≤2 either way.
+    mint-NX (new user) OR campaigns SISMEMBER (seen-before). ≤2 either way.
     """
     signals = _present_signals(funnel_user_id, visitor_id, source_trusted)
 
     # Case A (R2 §1.3): no usable signal — a cookie-less, untrusted-funnel
     # visitor. No persistent identity; unique·new (segment A). No writes.
     if not signals:
-        return IdentityResult(uid="", is_unique=True, is_returning=False)
+        return IdentityResult(
+            uid="", is_unique=True, is_returning=False, is_roaming=False,
+            signal_tier=_TIER_NONE, identity_conflict=False,
+        )
 
     # RT#1 — read every present signal's map in one pipeline.
     pipe = r.pipeline()
@@ -161,8 +188,18 @@ async def resolve_identity(
         pipe.get(_sig_key(company_id, tier, value))
     hits = await pipe.execute()
 
-    # Highest-precedence non-null hit wins (signals already precedence-ordered).
-    resolved_uid: str | None = next((h for h in hits if h), None)
+    # Highest-precedence non-null hit wins (signals are precedence-ordered);
+    # record WHICH tier won. identity_conflict (v2 R, log-not-merge): two
+    # present signals resolve to DIFFERENT existing uids — we flag it but do
+    # NOT live-merge, adopting the highest-precedence uid.
+    resolved_uid: str | None = None
+    winner_tier = signals[0][0]
+    for (tier, _value), hit in zip(signals, hits):
+        if hit:
+            resolved_uid = hit
+            winner_tier = tier
+            break
+    identity_conflict = len({h for h in hits if h}) > 1
 
     if resolved_uid is None:
         # NEW USER — mint on the highest-precedence present signal, in-band NX.
@@ -171,36 +208,50 @@ async def resolve_identity(
         top_key = _sig_key(company_id, top_tier, top_value)
         won = await r.set(top_key, new_uid, nx=True, ex=ttl)  # RT#2
         if won:
-            return IdentityResult(uid=new_uid, is_unique=True, is_returning=False)
-        # Race lost — adopt the winner's uid; NOT unique (G7).
+            return IdentityResult(
+                uid=new_uid, is_unique=True, is_returning=False,
+                is_roaming=False, signal_tier=top_tier,
+                identity_conflict=identity_conflict,
+            )
+        # Race lost — adopt the winner's uid; NOT unique (G7). The uid was
+        # minted microseconds ago → no campaigns seen yet → fresh (B/C False).
         adopted = await r.get(top_key)
         return IdentityResult(
             uid=adopted or new_uid, is_unique=False, is_returning=False,
+            is_roaming=False, signal_tier=top_tier,
+            identity_conflict=identity_conflict,
         )
 
-    # RETURNING — is_returning iff this click's funnel was seen before. When
-    # routing is enabled (`with_history`), the previous-visit history sets are
-    # read in the SAME pipeline so prev_* costs ZERO extra round-trips (R4
-    # RT-budget: RT#2 = funnels SISMEMBER (+ history SMEMBERS) in one round).
-    bucket = _funnel_bucket(funnel_id)
+    # SEEN BEFORE — is_returning iff THIS campaign is in the uid's
+    # campaigns-seen set (segment B); else is_roaming (segment C, different
+    # campaign same company). Mutually exclusive. When routing is enabled
+    # (`with_history`), the previous-visit history sets ride the SAME pipeline
+    # so prev_* costs ZERO extra round-trips (RT#2 = campaigns SISMEMBER
+    # (+ history SMEMBERS) in one round).
+    bucket = _campaign_bucket(campaign_id)
     pipe = r.pipeline()
-    pipe.sismember(_funnels_key(company_id, resolved_uid), bucket)
+    pipe.sismember(_campaigns_key(company_id, resolved_uid), bucket)
     if with_history:
         pipe.smembers(_offers_key(company_id, resolved_uid))
         pipe.smembers(_targets_key(company_id, resolved_uid))
         pipe.smembers(_subs_key(company_id, resolved_uid))
     rt2 = await pipe.execute()  # RT#2
 
-    same_funnel = bool(rt2[0])
+    is_returning = bool(rt2[0])
+    is_roaming = not is_returning  # seen-before AND not this campaign
     if with_history:
         return IdentityResult(
-            uid=resolved_uid, is_unique=False, is_returning=same_funnel,
+            uid=resolved_uid, is_unique=False, is_returning=is_returning,
+            is_roaming=is_roaming, signal_tier=winner_tier,
+            identity_conflict=identity_conflict,
             prev_offers=frozenset(rt2[1] or ()),
             prev_targets=frozenset(rt2[2] or ()),
             prev_subs=frozenset(rt2[3] or ()),
         )
     return IdentityResult(
-        uid=resolved_uid, is_unique=False, is_returning=same_funnel,
+        uid=resolved_uid, is_unique=False, is_returning=is_returning,
+        is_roaming=is_roaming, signal_tier=winner_tier,
+        identity_conflict=identity_conflict,
     )
 
 
@@ -211,13 +262,13 @@ async def persist_identity(
     uid: str,
     funnel_user_id: str | None,
     visitor_id: str | None,
-    funnel_id: str | None,
+    campaign_id,
     source_trusted: bool,
     ttl: int,
 ) -> None:
     """Deferred, non-blocking writes (gate #8). Off the critical path:
     attach any present signal maps to the uid (alias-stitching, SET NX so a
-    conflict never overwrites), record the click's funnel, stamp first_seen,
+    conflict never overwrites), record the click's CAMPAIGN, stamp first_seen,
     and slide every key's TTL forward. Any failure is swallowed — identity
     drift is acceptable; a failed write must NEVER fail the click.
     """
@@ -225,8 +276,8 @@ async def persist_identity(
         return  # case A — nothing persistent to write
     try:
         signals = _present_signals(funnel_user_id, visitor_id, source_trusted)
-        bucket = _funnel_bucket(funnel_id)
-        fkey = _funnels_key(company_id, uid)
+        bucket = _campaign_bucket(campaign_id)
+        ckey = _campaigns_key(company_id, uid)
         pkey = _profile_key(company_id, uid)
 
         pipe = r.pipeline()
@@ -237,20 +288,20 @@ async def persist_identity(
             skey = _sig_key(company_id, tier, value)
             pipe.set(skey, uid, nx=True)
             pipe.expire(skey, ttl)
-        # Funnels-seen set (membership = "any previous visit on this funnel").
-        pipe.sadd(fkey, bucket)
-        pipe.expire(fkey, ttl)
+        # Campaigns-seen set (membership = "uid has hit this campaign before").
+        pipe.sadd(ckey, bucket)
+        pipe.expire(ckey, ttl)
         # Profile — first_seen stamped once; sliding TTL.
         pipe.hsetnx(pkey, "first_seen", str(int(time.time())))
         pipe.expire(pkey, ttl)
         await pipe.execute()
 
-        # Cardinality guard — trim runaway funnel sets (rare; outside the
+        # Cardinality guard — trim runaway campaign sets (rare; outside the
         # pipeline so SCARD's result is available).
-        if await r.scard(fkey) > _MAX_FUNNELS_PER_UID:
+        if await r.scard(ckey) > _MAX_CAMPAIGNS_PER_UID:
             logger.warning(
-                "identity: funnels set for company=%s uid=%s exceeds cap %d",
-                company_id, uid, _MAX_FUNNELS_PER_UID,
+                "identity: campaigns set for company=%s uid=%s exceeds cap %d",
+                company_id, uid, _MAX_CAMPAIGNS_PER_UID,
             )
     except Exception as e:  # pragma: no cover — best-effort, never fail a click
         logger.warning("identity persist failed (swallowed): %s", e)
@@ -261,7 +312,7 @@ async def resolve_and_stamp(
     company_id: int,
     funnel_user_id: str | None,
     visitor_id: str | None,
-    funnel_id: str | None,
+    campaign_id,
     source_trusted: bool,
     with_history: bool = False,
 ) -> IdentityResult:
@@ -269,6 +320,8 @@ async def resolve_and_stamp(
     deferred writes (fire-and-forget). Returns the result to stamp onto the
     click attribution. The CALLER wraps this in fail-open (gate V1).
 
+    `campaign_id` (v2 R) keys the seen-before set — the router passes the
+    matched campaign so is_returning/is_roaming are campaign-relative.
     `with_history` (P5) — the caller passes the two-layer routing gate (env
     AND per-company); only then are the prev_* history sets read (in RT#2).
     """
@@ -279,7 +332,7 @@ async def resolve_and_stamp(
         company_id=company_id,
         funnel_user_id=funnel_user_id,
         visitor_id=visitor_id,
-        funnel_id=funnel_id,
+        campaign_id=campaign_id,
         source_trusted=source_trusted,
         ttl=ttl,
         with_history=with_history,
@@ -294,7 +347,7 @@ async def resolve_and_stamp(
                 uid=result.uid,
                 funnel_user_id=funnel_user_id,
                 visitor_id=visitor_id,
-                funnel_id=funnel_id,
+                campaign_id=campaign_id,
                 source_trusted=source_trusted,
                 ttl=ttl,
             )

@@ -39,48 +39,10 @@ from app.macros import safe_substitute
 from app.models import ClickRequest
 from app.redis_client import get_redis
 from app.resolution import parse_param_mappings, resolve_slots
-from app.telemetry import OP_CAP_COUNTER, OP_IDENTITY, capture_op_msg, capture_op_msg_throttled
+from app.telemetry import OP_IDENTITY, capture_op_msg_throttled
 from app.ua_parser import parse_ua
 
 logger = logging.getLogger("tds.router")
-
-
-# D1/D2 (audit 2026-06-03) — caps/counters fail-OPEN is deliberate (a
-# click must NEVER fail because Redis cap state is unavailable; closes
-# 2026-04-28 CRIT-001). Pre-fix the only signal on a Redis cap/counter
-# fault was logger.warning, so a SUSTAINED outage (caps silently NOT
-# enforced) was Sentry-invisible. Count consecutive failures across the
-# cap-read AND the counter-bump; fire ONE capture at the threshold and
-# every Nth thereafter (bounded paging, NOT per-click spam). Reset on the
-# next successful bump (which runs on every routed click → reliable
-# "Redis healthy again" signal). Mirrors the writer's F-C1a counter.
-_CAP_FAILURE_ALERT_AFTER = 5
-_cap_failures_consecutive = 0
-
-
-def _record_cap_failure(where: str, exc: Exception) -> None:
-    """Increment the consecutive cap/counter-failure counter; page at
-    the threshold + every Nth after (sustained outage, not a blip)."""
-    global _cap_failures_consecutive
-    _cap_failures_consecutive += 1
-    n = _cap_failures_consecutive
-    if n >= _CAP_FAILURE_ALERT_AFTER and n % _CAP_FAILURE_ALERT_AFTER == 0:
-        capture_op_msg(
-            OP_CAP_COUNTER,
-            f"cap/counter Redis op failing for {n} consecutive clicks "
-            f"(at {where}) — daily/frequency caps are NOT being enforced "
-            "(failing open). Investigate Redis health.",
-            level="warning",
-            consecutive_failures=n,
-            where=where,
-            last_error=repr(exc)[:300],
-        )
-
-
-def _record_cap_success() -> None:
-    """A healthy counter bump resets the consecutive-failure window."""
-    global _cap_failures_consecutive
-    _cap_failures_consecutive = 0
 
 
 def coerce_cost(raw: Any) -> float | None:
@@ -278,46 +240,29 @@ async def route(req: ClickRequest) -> dict | None:
     campaigns = await pipe.execute()
     timing["campaign_fetch_ms"] = _ms_since(t0)
 
-    # Stage 5: Cap/frequency filtering — delegates to the shared
-    # `_campaign_caps_exceeded` helper so both this branch and the
-    # domain-resolved branch (`_route_via_campaign`) honour the same
-    # eligibility contract. Per-candidate sequential awaits are
-    # acceptable inside the 10ms budget at realistic candidate
-    # cardinality (1-50). If the cardinality grows we'd batch via
-    # pipeline, but that's premature optimization until profiling
-    # shows it.
-    t0 = time.perf_counter()
+    # Stage 5: build the eligible set — every candidate campaign whose
+    # HASH loaded. The campaign-level click-cap / frequency filter was
+    # removed in returning-users v2 Phase 0: the cap columns never existed
+    # on the live DB (migration 002 is a no-op on the bootstrapped schema),
+    # so the engine always read None→0→disabled and the filter was dead
+    # code. Removing it is behaviour-preserving on staging/prod.
     eligible = []
     for i, campaign in enumerate(campaigns):
         if not campaign:
             continue
-        cid = candidates[i]
-        campaign["_id"] = cid
-        if await _campaign_caps_exceeded(r, cid, campaign, req.visitor_id):
-            continue
+        campaign["_id"] = candidates[i]
         eligible.append(campaign)
-    timing["filtering_ms"] = _ms_since(t0)
     timing["eligible_count"] = len(eligible)
 
     if not eligible:
-        # G2 (2026-06-02): every candidate campaign was capped. A
-        # campaign DID match this click's targeting, so its hardcoded
-        # defaults must persist. Pick the same winner Stage 6 would have
-        # (top-priority, weighted) among the capped candidates, resolve
-        # its attribution, and emit the non-routed sentinel. `campaigns`
-        # holds the Stage-4 HASHes (each non-None one got `_id` set in
-        # the cap loop above).
-        timing["result"] = "all_capped"
-        capped = [c for c in campaigns if c]
-        winner = _select_winner(capped)
-        if winner is None:
-            timing["route_total_ms"] = _ms_since(t_start)
-            return None
-        _src_m, _cmp_m, attribution = await _build_campaign_attribution(
-            r, winner, winner["_id"], req,
-        )
+        # No candidate campaign HASH loaded (index pointed at missing
+        # keys) — nothing to route. Matches the pre-v2 terminal: the old
+        # all-capped fallback resolved to `_select_winner([]) → None`
+        # here too, since with caps gone `eligible` == all non-None
+        # campaigns.
         timing["route_total_ms"] = _ms_since(t_start)
-        return _non_routed_result(winner["_id"], attribution, timing)
+        timing["result"] = "no_candidates"
+        return None
 
     # Stage 6: Campaign selection (priority + weight)
     t0 = time.perf_counter()
@@ -344,10 +289,7 @@ def _select_winner(campaigns: list[dict[str, Any]]) -> dict[str, Any] | None:
     """Pick the routing winner from a list of campaign HASHes.
 
     Top-priority bucket, then weighted-random within it (Stage 6
-    selection). Returns `None` for an empty list. Extracted so the
-    happy path AND the G2 all-capped fallback share ONE selection rule —
-    the capped click attributes to the same campaign that would have
-    routed it.
+    selection). Returns `None` for an empty list.
     """
     if not campaigns:
         return None
@@ -555,10 +497,10 @@ async def _route_via_campaign(
     path returns `None` so the caller falls through to geo targeting —
     geo still gets a chance to route the click, so emitting a non-routed
     fallback here would be premature. When False (the geo branch, the
-    terminal branch), a campaign-capped / no-flow / no-offer outcome is
-    FINAL → return the G2 non-routed sentinel carrying attribution.
+    terminal branch), a no-flow / no-offer outcome is FINAL → return the
+    G2 non-routed sentinel carrying attribution.
 
-    Encapsulates Stages 6.5-9 so both the domain-resolved branch and the
+    Encapsulates Stages 6.5-8 so both the domain-resolved branch and the
     geo-targeting branch share one implementation. Stages:
 
       6.5 — Flow cascade (Vectors 2.4 + 2.5): resolve a single flow per
@@ -572,48 +514,19 @@ async def _route_via_campaign(
             whose flows haven't been authored yet (Stage 2 → Stage 3
             transition).
       8   — `build_url` substitution.
-      9   — Cap + frequency counter increment (non-blocking).
 
     Returns a routing result dict (`{url, campaign_id, offer_id, timing}`)
     when a path is found; a NON-ROUTED sentinel
     (`{"non_routed": True, "campaign_id", "attribution", ...}`) when a
-    campaign matched but the click could not be routed (capped / no flow
-    + no legacy split) — G2 (2026-06-02): the sentinel carries the
-    resolved `attribution` so the click record persists the campaign(+
+    campaign matched but the click could not be routed (no flow + no
+    legacy split) — G2 (2026-06-02): the sentinel carries the resolved
+    `attribution` so the click record persists the campaign(+
     effective_source) hardcoded defaults instead of dropping every slot
     column to NULL. Returns `None` only when this branch should fall
     through to the next routing branch (domain match but no usable path —
     geo targeting still gets a chance).
     """
     t_branch = time.perf_counter()
-
-    # Cap pre-check (security audit 2026-04-28 CRITICAL-001 fix).
-    # Stage 5 already filtered geo-branch candidates by caps, so for
-    # that path this is a redundant ~0.5ms double-check kept for
-    # symmetry. For the domain branch this is the FIRST cap check —
-    # without it a domain-bound campaign with daily_cap=N could route
-    # unlimited clicks until the next click read a stale counter.
-    #
-    # Kept BEFORE attribution resolution so the latency profile is
-    # unchanged on the cap-hit path. G2 (2026-06-02): when this is the
-    # TERMINAL branch (geo; `fall_through_on_no_route=False`), a capped
-    # click must still persist the campaign(+effective_source) hardcoded
-    # defaults — so we resolve attribution lazily HERE (only on the
-    # cap-hit + terminal path) and emit the non-routed sentinel. The
-    # domain branch (`fall_through_on_no_route=True`) returns None to fall
-    # through to geo, paying NO resolution cost — byte-identical to before.
-    if await _campaign_caps_exceeded(r, campaign_id, campaign, req.visitor_id):
-        timing["route_total_ms"] = _ms_since(t_branch)
-        timing["result"] = "campaign_capped"
-        if fall_through_on_no_route:
-            return None
-        _src_m, _cmp_m, attribution = await _build_campaign_attribution(
-            r, campaign, campaign_id, req,
-        )
-        return _non_routed_result(
-            campaign_id, attribution, timing,
-            binding_id=binding_id, binding_alias=binding_alias,
-        )
 
     # Stage 3 / Phase 3 — attribution population. Resolve the canonical
     # slots + org-hierarchy chain ONCE here and thread them (plus the
@@ -641,14 +554,10 @@ async def _route_via_campaign(
     timing["cascade_ms"] = _ms_since(t0)
 
     if cascade_result is not None:
-        # `block` action: short-circuit with no redirect URL but DO
-        # bump counters — a blocked click still routed (to a 404), and
-        # cap/freq counters guard against retry-storm abuse where an
-        # attacker probes a known-block geo to bypass per-visitor rate
-        # limits (security audit 2026-04-28 HIGH-002). Stage 6 alert
-        # module consumes `action_config.alert` separately.
+        # `block` action: short-circuit with no redirect URL — a blocked
+        # click still routed (to a 404). Stage 6 alert module consumes
+        # `action_config.alert` separately.
         if cascade_result.get("action") == "block":
-            await _bump_counters(r, campaign_id, campaign, req, timing)
             timing["route_via"] = "flow_cascade_block"
             timing["route_total_ms"] = _ms_since(t_branch)
             timing["result"] = "blocked_by_flow"
@@ -671,7 +580,6 @@ async def _route_via_campaign(
         offer_id = cascade_result.get("offer_id")
         timing["url_build_ms"] = timing.get("cascade_ms", 0)
         timing["route_via"] = "flow_cascade"
-        await _bump_counters(r, campaign_id, campaign, req, timing)
         timing["route_total_ms"] = _ms_since(t_branch)
         timing["result"] = result_label
         return {
@@ -714,8 +622,6 @@ async def _route_via_campaign(
     timing["target_resolved"] = target_url is not None
     timing["route_via"] = "legacy_split"
 
-    # Stage 9 — counter increment.
-    await _bump_counters(r, campaign_id, campaign, req, timing)
     timing["route_total_ms"] = _ms_since(t_branch)
     timing["result"] = result_label
 
@@ -935,94 +841,6 @@ async def _resolve_buyer_chain(
         # cannot poison the keyspace anchor.
         "company_id": campaign_company_id,
     }
-
-
-async def _campaign_caps_exceeded(
-    r,
-    campaign_id: str,
-    campaign: dict[str, Any],
-    visitor_id: str | None,
-) -> bool:
-    """Stage-5-equivalent eligibility check for a single campaign.
-
-    Returns True when EITHER:
-      - daily_cap > 0 AND `cap:{campaign_id}:daily` ≥ daily_cap, OR
-      - frequency_cap > 0 AND visitor_id present AND
-        `freq:{campaign_id}:{visitor_id}` ≥ frequency_cap.
-
-    Used by both routing branches:
-      - Geo branch: Stage 5 calls this per-candidate to filter out
-        capped campaigns BEFORE selection (the original behaviour).
-      - Domain branch: `_route_via_campaign` calls this once at entry.
-        Pre-Vector 2.4+2.5 the domain branch went straight from
-        `resolve_domain_campaign` to `select_offer` and skipped the
-        eligibility check entirely — every domain-bound campaign
-        could over-deliver beyond `daily_cap` (security audit
-        2026-04-28 CRITICAL-001). Hoisting the check into the
-        shared orchestrator closes the asymmetry: both branches
-        now honour caps before any routing work runs.
-
-    Cost: 1-2 Redis GETs (daily counter + optional freq counter).
-    For the geo branch this is at most a redundant double-check
-    (Stage 5 already filtered) — kept defensively because the cost
-    is far below the 10ms hot-path budget and the symmetry guards
-    against future regressions where Stage 5 logic drifts.
-
-    Failure-mode: any Redis error here is treated as "not capped"
-    so a transient outage doesn't block routing. The fail-open
-    posture matches `_bump_counters` — caps are best-effort, never
-    fail the click.
-    """
-    try:
-        daily_cap = safe_int(campaign.get("daily_cap"))
-        if daily_cap > 0:
-            current = await r.get(f"cap:{campaign_id}:daily")
-            if current and safe_int(current) >= daily_cap:
-                return True
-
-        freq_cap = safe_int(campaign.get("frequency_cap"))
-        if visitor_id and freq_cap > 0:
-            visits = await r.get(f"freq:{campaign_id}:{visitor_id}")
-            if visits and safe_int(visits) >= freq_cap:
-                return True
-    except Exception as e:  # pragma: no cover — Redis transient
-        logger.warning(
-            "cap check failed for campaign:%s — failing open: %s",
-            campaign_id, e,
-        )
-        _record_cap_failure("cap_check", e)
-    return False
-
-
-async def _bump_counters(
-    r,
-    campaign_id: str,
-    campaign: dict[str, Any],
-    req: ClickRequest,
-    timing: dict[str, Any],
-) -> None:
-    """Stage 9 — daily cap + per-visitor frequency increment.
-
-    Non-blocking: failures are logged but never fail the click. Counters
-    drift in worst case; click still routes.
-    """
-    t0 = time.perf_counter()
-    try:
-        pipe = r.pipeline()
-        cap_key = f"cap:{campaign_id}:daily"
-        pipe.incr(cap_key)
-        pipe.expire(cap_key, 86400)
-        if req.visitor_id:
-            freq_period = safe_int(campaign.get("frequency_period"), 86400)
-            freq_key = f"freq:{campaign_id}:{req.visitor_id}"
-            pipe.incr(freq_key)
-            pipe.expire(freq_key, freq_period if freq_period > 0 else 86400)
-        await pipe.execute()
-        _record_cap_success()
-    except Exception as e:
-        logger.warning("Counter update failed: %s", e)
-        _record_cap_failure("counter_bump", e)
-    timing["counter_ms"] = _ms_since(t0)
 
 
 def _to_int(value: Any) -> int | None:

@@ -14,7 +14,7 @@ Membership = "any previous visit" (R3 §4): a SADD per dimension, idempotent,
 hard-capped at `_CAP` distinct values to bound cardinality (a runaway sub
 sprayer cannot grow one uid's profile without limit). Off the redirect-critical
 path — fire-and-forget, error-swallowing (gate #8, mirroring
-``identity.persist_identity`` / ``router._bump_counters``). Company-scoped keys
+``identity.persist_identity``). Company-scoped keys
 (gate #7). Implicitly gated by a non-empty uid: only the P2 resolver, when ON
 for the tenant, ever sets one, so this is a zero-I/O no-op when the resolver is
 OFF.

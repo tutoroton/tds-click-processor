@@ -2,10 +2,9 @@
 routing-decision skip/fallback paths (the user's #1 concern).
 
 Each previously-silent defensive skip now emits a THROTTLED Sentry
-capture (or, for caps, a consecutive-failure-counted capture) so an
-operator sees the misroute instead of clicks quietly going elsewhere.
-These tests pin that the capture fires on each path, and that the
-throttle / counter prevents per-click spam. All mutation-checked.
+capture so an operator sees the misroute instead of clicks quietly
+going elsewhere. These tests pin that the capture fires on each path,
+and that the throttle prevents per-click spam. All mutation-checked.
 """
 
 from __future__ import annotations
@@ -15,16 +14,14 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from app import action_executor, cascade, resolution, router, telemetry
+from app import action_executor, cascade, resolution, telemetry
 
 
 @pytest.fixture(autouse=True)
 def _reset_throttle():
     telemetry._reset_throttle_for_tests()
-    router._cap_failures_consecutive = 0
     yield
     telemetry._reset_throttle_for_tests()
-    router._cap_failures_consecutive = 0
 
 
 # ---------------------------------------------------------------------------
@@ -178,30 +175,3 @@ def test_d10_param_parse_failure_emits_signal():
     assert out == []  # behavior unchanged: treated as no mapping
     cap.assert_called_once()
     assert cap.call_args.args[0] == resolution.OP_PARAM_PARSE
-
-
-# ---------------------------------------------------------------------------
-# D1/D2 — caps/counters sustained-failure counter
-# ---------------------------------------------------------------------------
-
-
-class TestCapFailureCounter:
-    def test_fires_only_at_threshold(self):
-        exc = RuntimeError("redis down")
-        with patch.object(router, "capture_op_msg") as cap:
-            for _ in range(router._CAP_FAILURE_ALERT_AFTER - 1):
-                router._record_cap_failure("cap_check", exc)
-            cap.assert_not_called()  # below threshold — no per-click spam
-            router._record_cap_failure("cap_check", exc)  # Nth
-            cap.assert_called_once()
-            assert cap.call_args.args[0] == router.OP_CAP_COUNTER
-
-    def test_success_resets_the_window(self):
-        exc = RuntimeError("blip")
-        with patch.object(router, "capture_op_msg") as cap:
-            for _ in range(router._CAP_FAILURE_ALERT_AFTER - 1):
-                router._record_cap_failure("cap_check", exc)
-            router._record_cap_success()  # Redis recovered
-            # Counter reset → the next failure is #1, not the threshold.
-            router._record_cap_failure("cap_check", exc)
-            cap.assert_not_called()

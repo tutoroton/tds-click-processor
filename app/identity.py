@@ -29,8 +29,8 @@ Flag semantics (R3 refinement 4 — REUSE is_unique/is_returning, no new dims):
 
 Hot path: ≤2 pipelined Redis round-trips on the critical path
 (signal-map reads → mint-NX OR funnels SISMEMBER). The profile/attach/TTL
-writes are deferred (fire-and-forget, error-swallowing — gate #8, mirroring
-``router._bump_counters``). Company-scoped keys (gate #7, hard multi-tenant
+writes are deferred (fire-and-forget, error-swallowing — gate #8). Company-scoped
+keys (gate #7, hard multi-tenant
 boundary). uid is written to every click → the Redis map is rebuildable from
 ClickHouse (architecture: Redis is a disposable cache).
 """

@@ -637,111 +637,26 @@ class TestFailureModes:
         assert fields["funnel_type"] == "tripwire"
 
 
-class TestCapPreCheck:
-    """CRITICAL-001 fix (security audit 2026-04-28).
+class TestDomainBranchRouting:
+    """Domain-resolved branch routes through the flow cascade.
 
-    Pre-Vector 2.4+2.5 the domain-resolved branch skipped Stage 5
-    cap/freq filtering — every domain-bound campaign could over-deliver
-    beyond `daily_cap`. With the helper hoisted into `_route_via_campaign`,
-    both branches honour caps before any routing work.
+    Was `TestCapPreCheck`: the campaign-level click-cap / frequency engine
+    was removed in returning-users v2 Phase 0 (the cap columns never
+    existed on the live DB → the filter was dead code, removal is
+    behaviour-preserving). The two cap-blocking cases are gone; this
+    remaining case guards that a domain-bound campaign still routes
+    normally through the cascade.
     """
 
-    def test_domain_branch_blocks_when_daily_cap_exceeded(self):
-        """Domain-resolved campaign with daily counter ≥ daily_cap → None."""
+    def test_domain_branch_routes(self):
+        """Domain-bound campaign → cascade picks the flow and redirects."""
         campaign_id = "10"
         flow_id = "100"
         redis = FakeRedis(
-            strings={
-                f"cap:{campaign_id}:daily": "999",  # ≥ daily_cap
-            },
             hashes={
                 f"campaign:{campaign_id}": {
                     "company_id": "1",
                     "priority": "0",
-                    "daily_cap": "999",
-                },
-                f"flow:{flow_id}": {
-                    "campaign_id": campaign_id,
-                    "scope_type": "company",
-                    "scope_id": "1",
-                    "seq_id": "1",
-                    "is_default": "0",
-                    "criteria": "[]",
-                    "action_type": "redirect",
-                    "action_config": json.dumps({"url": "https://wont-fire"}),
-                },
-            },
-            lists={
-                f"campaign:{campaign_id}:flows": [flow_id],
-            },
-        )
-        # Domain resolution path — strings layer holds domain mapping.
-        redis.strings["domain:tds.adstudy.dev:root"] = campaign_id
-        click = ClickRequest(
-            click_id="test-cap",
-            country="US",
-            user_agent="Mozilla/5.0",
-            hostname="tds.adstudy.dev",
-            query_params={},
-        )
-        result = _route_with(redis, click)
-        # Domain matched but cap exceeded → fallthrough to geo path which
-        # has no eligible campaigns either → final result is None.
-        assert result is None
-
-    def test_domain_branch_blocks_when_frequency_cap_exceeded(self):
-        """Visitor at freq cap → no routing on domain branch."""
-        campaign_id = "10"
-        flow_id = "100"
-        visitor = "v-test-1"
-        redis = FakeRedis(
-            strings={
-                f"freq:{campaign_id}:{visitor}": "5",  # ≥ frequency_cap
-            },
-            hashes={
-                f"campaign:{campaign_id}": {
-                    "company_id": "1",
-                    "priority": "0",
-                    "frequency_cap": "5",
-                },
-                f"flow:{flow_id}": {
-                    "campaign_id": campaign_id,
-                    "scope_type": "company",
-                    "scope_id": "1",
-                    "seq_id": "1",
-                    "is_default": "0",
-                    "criteria": "[]",
-                    "action_type": "redirect",
-                    "action_config": json.dumps({"url": "https://wont-fire"}),
-                },
-            },
-            lists={f"campaign:{campaign_id}:flows": [flow_id]},
-        )
-        redis.strings["domain:tds.adstudy.dev:root"] = campaign_id
-        click = ClickRequest(
-            click_id="test-freq",
-            visitor_id=visitor,
-            country="US",
-            user_agent="Mozilla/5.0",
-            hostname="tds.adstudy.dev",
-            query_params={},
-        )
-        result = _route_with(redis, click)
-        assert result is None
-
-    def test_domain_branch_routes_when_under_cap(self):
-        """Counter under cap → normal routing happens."""
-        campaign_id = "10"
-        flow_id = "100"
-        redis = FakeRedis(
-            strings={
-                f"cap:{campaign_id}:daily": "100",  # < daily_cap
-            },
-            hashes={
-                f"campaign:{campaign_id}": {
-                    "company_id": "1",
-                    "priority": "0",
-                    "daily_cap": "999",
                 },
                 f"flow:{flow_id}": {
                     "campaign_id": campaign_id,

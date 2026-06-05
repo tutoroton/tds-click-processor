@@ -82,7 +82,6 @@ OP_FLOW_LOAD = "flow_load"              # D4  — flow HASH load empty/partial �
 OP_PARAM_PARSE = "param_parse"          # D10 — param_mappings JSON unparseable
 OP_OFFER_RESOLVE = "offer_resolve"      # D3  — offer/target row missing → fallback
 OP_SPLIT_FALLBACK = "split_fallback"    # B3  — split had no usable offers → fallback
-OP_CAP_COUNTER = "cap_counter"          # D1/D2 — cap/freq Redis op failing (sustained)
 
 
 # ---------------------------------------------------------------------------

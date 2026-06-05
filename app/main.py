@@ -1060,8 +1060,8 @@ async def decide(
     # (it never enters this branch). `result is None` is checked first so
     # `result.get("blocked")` is only evaluated on a dict.
     #
-    # G2 (2026-06-02): the `non_routed` sentinel (capped / no-flow /
-    # all-capped — a campaign DID match) joins blocked here. Crucially we
+    # G2 (2026-06-02): the `non_routed` sentinel (no-flow + no legacy
+    # split — a campaign DID match) joins blocked here. Crucially we
     # now PRESERVE `result["attribution"]` from the sentinel instead of
     # discarding it — that is exactly the campaign(+effective_source)
     # hardcoded-defaults bundle `_phase3_attribution_fields` reads to fill
@@ -1076,8 +1076,8 @@ async def decide(
             reason = "blocked"
         else:
             # Honour the router's specific routing_status when present
-            # (campaign_capped / all_capped / no_offer); fall back to a
-            # generic tag otherwise.
+            # (no_offer / no_candidates); fall back to a generic tag
+            # otherwise.
             reason = result.get("routing_status") or "non_routed"
         # Copy the timing dict — `setdefault` below would otherwise mutate
         # the object `route()` returned (benign today, fragile on reuse).
@@ -1791,7 +1791,7 @@ async def seed_data(x_tds_key: str = Header("", alias="X-TDS-Key")):
     # Campaign 1: US Mobile CPA
     pipe.hset("campaign:1", mapping={
         "name": "US Mobile CPA", "status": "active", "priority": "10",
-        "weight": "100", "daily_cap": "10000", "frequency_cap": "3", "frequency_period": "86400",
+        "weight": "100",
     })
     pipe.set("campaign:1:has_geo", "1")
     pipe.set("campaign:1:has_device", "1")
@@ -1805,7 +1805,7 @@ async def seed_data(x_tds_key: str = Header("", alias="X-TDS-Key")):
     # Campaign 2: EU Desktop
     pipe.hset("campaign:2", mapping={
         "name": "EU Desktop CPL", "status": "active", "priority": "5",
-        "weight": "100", "daily_cap": "5000",
+        "weight": "100",
     })
     pipe.set("campaign:2:has_geo", "1")
     pipe.set("campaign:2:has_os", "1")
@@ -1820,7 +1820,7 @@ async def seed_data(x_tds_key: str = Header("", alias="X-TDS-Key")):
     # Campaign 3: Global catch-all
     pipe.hset("campaign:3", mapping={
         "name": "Global Catch-all", "status": "active", "priority": "1",
-        "weight": "100", "daily_cap": "50000",
+        "weight": "100",
     })
     pipe.sadd("campaign:3:offers", "301")
     pipe.hset("offer:301", mapping={"url": "https://example.com/offer-global", "payout": "0.50", "weight": "100"})

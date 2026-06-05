@@ -85,6 +85,11 @@ class _FakePipeline:
     def hgetall(self, key):
         self.ops.append(("hgetall", key))
 
+    def hget(self, key, field):
+        # v2 Phase A — cascade availability pre-selection reads
+        # `offer_target:{tid}` `availability` via a pipelined HGET.
+        self.ops.append(("hget", key, field))
+
     def smembers(self, key):
         self.ops.append(("smembers", key))
 
@@ -110,6 +115,9 @@ class _FakePipeline:
             key = op[1]
             if kind == "hgetall":
                 out.append(dict(self.parent.hashes.get(key, {})))
+            elif kind == "hget":
+                field = op[2]
+                out.append(self.parent.hashes.get(key, {}).get(field))
             elif kind == "smembers":
                 out.append(set(self.parent.sets.get(key, set())))
             elif kind == "get":
@@ -635,6 +643,48 @@ class TestFailureModes:
             "2026-06-02T00:00:00.000Z",
         )
         assert fields["funnel_type"] == "tripwire"
+
+    def test_non_routed_threads_campaign_fallback_url(self):
+        """v2 Phase A — the non-routed sentinel carries the campaign's
+        `fallback_url` (synced HASH field) so main.py prefers it over the
+        node default for the terminal-fallback redirect."""
+        campaign_id = "10"
+        redis = FakeRedis(
+            sets={
+                "geo:US": {campaign_id},
+                "device:mobile": {campaign_id},
+                "os:ios": {campaign_id},
+                "campaigns:active": {campaign_id},
+            },
+            hashes={
+                f"campaign:{campaign_id}": {
+                    "company_id": "1", "priority": "0",
+                    "fallback_url": "https://camp-fallback.example/lp",
+                },
+            },
+            lists={f"campaign:{campaign_id}:flows": []},
+        )
+        result = _route_with(redis, _click())
+        assert result["non_routed"] is True
+        assert result["fallback_url"] == "https://camp-fallback.example/lp"
+
+    def test_non_routed_fallback_url_none_when_unset(self):
+        """No campaign fallback_url → sentinel carries None → main.py uses the
+        node default (byte-identical to pre-v2)."""
+        campaign_id = "10"
+        redis = FakeRedis(
+            sets={
+                "geo:US": {campaign_id},
+                "device:mobile": {campaign_id},
+                "os:ios": {campaign_id},
+                "campaigns:active": {campaign_id},
+            },
+            hashes={f"campaign:{campaign_id}": {"company_id": "1", "priority": "0"}},
+            lists={f"campaign:{campaign_id}:flows": []},
+        )
+        result = _route_with(redis, _click())
+        assert result["non_routed"] is True
+        assert result["fallback_url"] is None
 
 
 class TestDomainBranchRouting:

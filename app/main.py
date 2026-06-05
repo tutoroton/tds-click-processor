@@ -1090,6 +1090,12 @@ async def decide(
             # (no_offer / no_candidates); fall back to a generic tag
             # otherwise.
             reason = result.get("routing_status") or "non_routed"
+        # v2 Phase A — per-campaign terminal fallback. The non_routed sentinel
+        # carries `campaign.fallback_url` (synced); prefer it over the node
+        # default. NO-DEAD-END: a matched-but-unroutable click (all targets
+        # unavailable / no flow / no offer) still gets a recorded redirect.
+        # None ⇒ node default (byte-identical).
+        fb_base = (result.get("fallback_url") if result else None) or _resolve_fallback_url()
         # Copy the timing dict — `setdefault` below would otherwise mutate
         # the object `route()` returned (benign today, fragile on reuse).
         fb_timing = {} if result is None else dict(result.get("timing") or {})
@@ -1097,8 +1103,12 @@ async def decide(
         # Preserve the router-resolved attribution (blocked + non_routed
         # sentinels carry it); no-campaign no_match has none.
         attribution = None if result is None else result.get("attribution")
+        # Separator: node default ("https://adstudy.dev") has no query → "?"
+        # (byte-identical to pre-v2). A per-campaign fallback_url MAY carry its
+        # own query string → "&" so the appended reason/click_id stay valid.
+        fb_sep = "&" if "?" in fb_base else "?"
         result = {
-            "url": f"{_resolve_fallback_url()}?reason={reason}"
+            "url": f"{fb_base}{fb_sep}reason={reason}"
                    f"&click_id={quote(req.click_id, safe='')}",
             "campaign_id": None if result is None else result.get("campaign_id"),
             "offer_id": None,

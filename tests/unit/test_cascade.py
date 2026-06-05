@@ -28,8 +28,10 @@ import pytest
 from app.cascade import (
     SCOPE_PRIORITY,
     _criteria_match,
+    _filter_by_availability,
     _filter_by_criteria,
     _pick_winner,
+    _referenced_target_ids,
     _safe_int,
     _winner_sort_key,
     resolve_flow,
@@ -82,18 +84,25 @@ def _redis_with_lists_and_hashes(
             self._ops: list[tuple[str, str]] = []
 
         def lrange(self, key, _start, _end):
-            self._ops.append(("lrange", key))
+            self._ops.append(("lrange", key, None))
 
         def hgetall(self, key):
-            self._ops.append(("hgetall", key))
+            self._ops.append(("hgetall", key, None))
+
+        def hget(self, key, field):
+            # v2 Phase A — availability pre-selection HGETs
+            # `offer_target:{tid}` `availability`.
+            self._ops.append(("hget", key, field))
 
         async def execute(self):
             out = []
-            for op, key in self._ops:
+            for op, key, field in self._ops:
                 if op == "lrange":
                     out.append(list(lists.get(key, [])))
                 elif op == "hgetall":
                     out.append(dict(hashes.get(key, {})))
+                elif op == "hget":
+                    out.append(hashes.get(key, {}).get(field))
             return out
 
     redis = MagicMock()
@@ -744,4 +753,188 @@ class TestAuditMultiScopeFallback:
             click_attrs={"geo": "US", "os": "ios", "device_type": "mobile"},
         )
         # Click is US — every scope's RU-only flow is filtered out.
+        assert winner is None
+
+
+# ============================================================
+# v2 Phase A — availability pre-selection floor (NO-DEAD-END)
+# ============================================================
+
+
+def _offer_flow(*, fid, scope_type="company", scope_id=1, seq_id=1, target_id):
+    """An `offer`-action flow pinning a single offer_target."""
+    return {
+        "_id": fid,
+        "scope_type": scope_type,
+        "scope_id": str(scope_id),
+        "campaign_id": "0",
+        "seq_id": str(seq_id),
+        "is_default": "0",
+        "criteria": "[]",
+        "action_type": "offer",
+        "action_config": json.dumps({"offer_id": 1, "target_id": target_id}),
+        "name": f"flow-{fid}",
+    }
+
+
+class TestReferencedTargetIds:
+    def test_offer_pins_target(self):
+        f = _offer_flow(fid="1", target_id=7)
+        assert _referenced_target_ids(f) == ["7"]
+
+    def test_split_pins_all_targets(self):
+        f = {
+            "action_type": "split",
+            "action_config": json.dumps(
+                {"offers": [{"offer_id": 1, "target_id": 7, "weight": 50},
+                            {"offer_id": 2, "target_id": 9, "weight": 50}]}
+            ),
+        }
+        assert _referenced_target_ids(f) == ["7", "9"]
+
+    def test_redirect_has_no_pinned_target(self):
+        assert _referenced_target_ids(_make_flow(fid="1", action_type="redirect")) == []
+
+    def test_offer_without_pinned_target_is_empty(self):
+        f = {"action_type": "offer", "action_config": json.dumps({"offer_id": 1})}
+        assert _referenced_target_ids(f) == []
+
+
+class TestFilterByAvailabilityPure:
+    def test_empty_map_excludes_nothing(self):
+        flows = [_offer_flow(fid="1", target_id=7)]
+        assert _filter_by_availability(flows, {}, returning_visitor=False) == flows
+
+    def test_new_visitor_active_kept(self):
+        flows = [_offer_flow(fid="1", target_id=7)]
+        out = _filter_by_availability(flows, {"7": "active"}, returning_visitor=False)
+        assert [f["_id"] for f in out] == ["1"]
+
+    def test_new_visitor_draining_excluded(self):
+        flows = [_offer_flow(fid="1", target_id=7)]
+        out = _filter_by_availability(flows, {"7": "draining"}, returning_visitor=False)
+        assert out == []
+
+    def test_returning_visitor_draining_kept(self):
+        flows = [_offer_flow(fid="1", target_id=7)]
+        out = _filter_by_availability(flows, {"7": "draining"}, returning_visitor=True)
+        assert [f["_id"] for f in out] == ["1"]
+
+    def test_closed_excluded_for_all_classes(self):
+        flows = [_offer_flow(fid="1", target_id=7)]
+        assert _filter_by_availability(flows, {"7": "closed"}, returning_visitor=False) == []
+        assert _filter_by_availability(flows, {"7": "closed"}, returning_visitor=True) == []
+
+    def test_split_kept_if_any_target_available(self):
+        f = {
+            "_id": "1", "action_type": "split",
+            "action_config": json.dumps(
+                {"offers": [{"offer_id": 1, "target_id": 7, "weight": 50},
+                            {"offer_id": 2, "target_id": 9, "weight": 50}]}
+            ),
+        }
+        # 7 closed but 9 active → kept for a new visitor.
+        out = _filter_by_availability([f], {"7": "closed", "9": "active"},
+                                      returning_visitor=False)
+        assert [x["_id"] for x in out] == ["1"]
+
+    def test_redirect_never_floored(self):
+        flows = [_make_flow(fid="1", action_type="redirect")]
+        # Even with a non-empty map, a no-pinned-target flow is kept.
+        out = _filter_by_availability(flows, {"99": "closed"}, returning_visitor=False)
+        assert [f["_id"] for f in out] == ["1"]
+
+
+class TestAvailabilityCascade:
+    """End-to-end resolve_flow with the availability floor."""
+
+    @pytest.mark.asyncio
+    async def test_all_active_byte_identical_winner(self):
+        # Two offer flows: buyer (active) beats company (active) — same as
+        # without availability (byte-identical when nothing drained/closed).
+        flows = {
+            "flow:10": _offer_flow(fid="10", scope_type="buyer", scope_id=5, target_id=7),
+            "flow:20": _offer_flow(fid="20", scope_type="company", scope_id=1, target_id=9),
+        }
+        hashes = {
+            **flows,
+            "offer_target:7": {"availability": "active"},
+            "offer_target:9": {"availability": "active"},
+        }
+        lists = {
+            "campaign:1:flows": [],
+            "flows:scope:1:buyer:5": ["10"],
+            "flows:scope:1:company:1": ["20"],
+        }
+        r = _redis_with_lists_and_hashes(lists, hashes)
+        winner = await resolve_flow(
+            r, campaign_id="1", company_id=1, buyer_id=5, team_id=None,
+            department_id=None, custom_group_id=None,
+            click_attrs={"geo": "US", "os": "ios", "device_type": "mobile"},
+        )
+        assert winner["_id"] == "10"
+
+    @pytest.mark.asyncio
+    async def test_closed_buyer_flow_falls_through_to_company(self):
+        # Buyer flow's only target is CLOSED → excluded → cascade falls through
+        # to the company flow (NO-DEAD-END within the cascade).
+        flows = {
+            "flow:10": _offer_flow(fid="10", scope_type="buyer", scope_id=5, target_id=7),
+            "flow:20": _offer_flow(fid="20", scope_type="company", scope_id=1, target_id=9),
+        }
+        hashes = {
+            **flows,
+            "offer_target:7": {"availability": "closed"},
+            "offer_target:9": {"availability": "active"},
+        }
+        lists = {
+            "campaign:1:flows": [],
+            "flows:scope:1:buyer:5": ["10"],
+            "flows:scope:1:company:1": ["20"],
+        }
+        r = _redis_with_lists_and_hashes(lists, hashes)
+        winner = await resolve_flow(
+            r, campaign_id="1", company_id=1, buyer_id=5, team_id=None,
+            department_id=None, custom_group_id=None,
+            click_attrs={"geo": "US", "os": "ios", "device_type": "mobile"},
+        )
+        assert winner["_id"] == "20"
+
+    @pytest.mark.asyncio
+    async def test_draining_blocks_new_serves_returning(self):
+        flows = {"flow:10": _offer_flow(fid="10", scope_type="company", scope_id=1, target_id=7)}
+        hashes = {**flows, "offer_target:7": {"availability": "draining"}}
+        lists = {"campaign:1:flows": [], "flows:scope:1:company:1": ["10"]}
+        attrs = {"geo": "US", "os": "ios", "device_type": "mobile"}
+
+        # NEW visitor → draining target excluded → no flow → None.
+        r = _redis_with_lists_and_hashes(lists, hashes)
+        new_winner = await resolve_flow(
+            r, campaign_id="1", company_id=1, buyer_id=None, team_id=None,
+            department_id=None, custom_group_id=None, click_attrs=attrs,
+            returning_visitor=False,
+        )
+        assert new_winner is None
+
+        # RETURNING visitor → draining served.
+        r2 = _redis_with_lists_and_hashes(lists, hashes)
+        ret_winner = await resolve_flow(
+            r2, campaign_id="1", company_id=1, buyer_id=None, team_id=None,
+            department_id=None, custom_group_id=None, click_attrs=attrs,
+            returning_visitor=True,
+        )
+        assert ret_winner["_id"] == "10"
+
+    @pytest.mark.asyncio
+    async def test_all_unavailable_returns_none(self):
+        # Only flow's target closed → None → router emits terminal fallback.
+        flows = {"flow:10": _offer_flow(fid="10", scope_type="company", scope_id=1, target_id=7)}
+        hashes = {**flows, "offer_target:7": {"availability": "closed"}}
+        lists = {"campaign:1:flows": [], "flows:scope:1:company:1": ["10"]}
+        r = _redis_with_lists_and_hashes(lists, hashes)
+        winner = await resolve_flow(
+            r, campaign_id="1", company_id=1, buyer_id=None, team_id=None,
+            department_id=None, custom_group_id=None,
+            click_attrs={"geo": "US", "os": "ios", "device_type": "mobile"},
+        )
         assert winner is None

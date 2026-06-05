@@ -457,6 +457,7 @@ def _non_routed_result(
     *,
     binding_id: int = 0,
     binding_alias: str | None = None,
+    fallback_url: str | None = None,
 ) -> dict[str, Any]:
     """Build the G2 non-routed sentinel for a matched-but-unrouted click.
 
@@ -482,6 +483,11 @@ def _non_routed_result(
         "attribution": attribution,
         "non_routed": True,
         "routing_status": timing.get("result", "non_routed"),
+        # v2 Phase A — per-campaign terminal fallback URL (synced from
+        # `campaign.fallback_url`). main.py prefers this over the node default
+        # when building the no-dead-end fallback redirect. None ⇒ node default
+        # (byte-identical).
+        "fallback_url": fallback_url,
     }
 
 
@@ -614,6 +620,8 @@ async def _route_via_campaign(
         return _non_routed_result(
             campaign_id, attribution, timing,
             binding_id=binding_id, binding_alias=binding_alias,
+            # v2 Phase A — per-campaign terminal fallback (synced HASH field).
+            fallback_url=campaign.get("fallback_url") or None,
         )
 
     # Stage 8 — legacy URL build via offer.url / target resolution.
@@ -710,6 +718,12 @@ async def _try_flow_cascade(
         click_attrs["is_returning"] = (
             "true" if attribution.get("is_returning") else "false"
         )
+        # v2 Phase A — is_roaming joins the returning-flow criterion palette
+        # (Phase-R handoff: the dim is now computed + a valid criterion, and
+        # the cascade matches on it here). Same gate as is_returning.
+        click_attrs["is_roaming"] = (
+            "true" if attribution.get("is_roaming") else "false"
+        )
         click_attrs["prev_offer"] = attribution.get("prev_offers") or frozenset()
         click_attrs["prev_offer_target"] = attribution.get("prev_targets") or frozenset()
         click_attrs["prev_sub"] = attribution.get("prev_subs") or frozenset()
@@ -725,6 +739,11 @@ async def _try_flow_cascade(
         click_attrs=click_attrs,
         seen_before=seen_before if audience_routing else False,
         audience_routing=audience_routing,
+        # v2 Phase A — availability class is the TRUE seen_before (un-gated by
+        # audience_routing): a returning visitor may use a 'draining' target
+        # even when segmented routing is off. Resolver-OFF ⇒ seen_before False
+        # ⇒ everyone is "new" class ⇒ all-active default ⇒ byte-identical.
+        returning_visitor=seen_before,
     )
     if flow is None:
         return None

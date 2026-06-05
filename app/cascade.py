@@ -47,6 +47,7 @@ import json
 import logging
 from typing import Any, Final
 
+from app.action_executor import _is_positive_int, _parse_action_config
 from app.telemetry import (
     OP_CRITERIA_SKIP,
     OP_FLOW_LOAD,
@@ -98,6 +99,7 @@ async def resolve_flow(
     click_attrs: dict[str, Any],
     seen_before: bool = False,
     audience_routing: bool = False,
+    returning_visitor: bool = False,
 ) -> dict[str, Any] | None:
     """Resolve the winning flow for a click via scope cascade.
 
@@ -207,10 +209,25 @@ async def resolve_flow(
         "company": company_id,
     }
 
+    # v2 Phase A — availability pre-selection floor (NO-DEAD-END). Load the
+    # availability of every offer_target a candidate flow would route to (one
+    # pipelined read; absent / pre-076 → 'active' → no exclusion → byte-identical
+    # when nothing is drained/closed). A flow whose pinned targets are ALL
+    # unavailable for this click's class is dropped from survivors, so
+    # `_pick_winner` naturally falls through to the next scope level. Combining
+    # the criteria + availability filters keeps `_pick_winner` pure over its
+    # survivor list (purity preserved — the two cascade passes stay independent).
+    avail_map = await _load_target_availability(r, flows)
+
+    def _eligible(pool: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return _filter_by_availability(
+            _filter_by_criteria(pool, click_attrs), avail_map, returning_visitor,
+        )
+
     # DARK / zero-regress path: segmented routing OFF → one pass over ALL flows,
     # exactly as pre-P4. No partition, no audience read, `seen_before` ignored.
     if not audience_routing:
-        survivors = _filter_by_criteria(flows, click_attrs)
+        survivors = _eligible(flows)
         if not survivors:
             return None
         return _pick_winner(survivors, click_levels)
@@ -220,15 +237,13 @@ async def resolve_flow(
 
     # A seen_before visitor (B∪C) evaluates the 'returning' pool first.
     if seen_before:
-        winner = _pick_winner(
-            _filter_by_criteria(returning_flows, click_attrs), click_levels,
-        )
+        winner = _pick_winner(_eligible(returning_flows), click_levels)
         if winner is not None:
             return winner
         # No returning-flow matched → FALL THROUGH to the first pool below.
 
     # New visitor, OR returning visitor with no returning-flow match.
-    survivors = _filter_by_criteria(first_flows, click_attrs)
+    survivors = _eligible(first_flows)
     if not survivors:
         return None
     return _pick_winner(survivors, click_levels)
@@ -248,6 +263,98 @@ def _partition_audience(
         else:
             first.append(f)
     return returning, first
+
+
+def _referenced_target_ids(flow: dict[str, Any]) -> list[str]:
+    """The offer_target ids a flow's action would PIN-route to.
+
+    offer → `action_config.target_id` (when pinned); split → each entry's
+    `target_id`. redirect/block carry no target; an offer/split WITHOUT a
+    pinned target_id resolves to the offer's default target at action time —
+    not knowable cheaply here, so it returns [] and is NOT subject to the
+    pre-selection availability floor (the terminal fallback is its safety net).
+    Reuses action_executor's canonical config parser + positive-int guard so
+    the pre-selection view of a flow's targets cannot drift from execution.
+    """
+    action_type = flow.get("action_type", "")
+    if action_type not in ("offer", "split"):
+        return []
+    config = _parse_action_config(flow.get("action_config", "{}"))
+    out: list[str] = []
+    if action_type == "offer":
+        tid = config.get("target_id")
+        if _is_positive_int(tid):
+            out.append(str(tid))
+    else:  # split
+        for entry in config.get("offers") or []:
+            if isinstance(entry, dict) and _is_positive_int(entry.get("target_id")):
+                out.append(str(entry["target_id"]))
+    return out
+
+
+async def _load_target_availability(
+    r, flows: list[dict[str, Any]],
+) -> dict[str, str]:
+    """`{target_id: availability}` for every PINNED target across the flows.
+
+    ONE pipelined HGET per referenced target. Returns `{}` when no flow pins a
+    target (redirect/block-only campaign) → zero extra Redis cost. FAIL-OPEN:
+    any Redis error → `{}` → the availability filter excludes nothing (a click
+    is NEVER lost because availability state is unreadable). A target HASH
+    missing the `availability` field (synced before migration 076) defaults to
+    'active' in the filter.
+    """
+    tids: set[str] = set()
+    for f in flows:
+        tids.update(_referenced_target_ids(f))
+    if not tids:
+        return {}
+    ordered = list(tids)
+    pipe = r.pipeline()
+    for tid in ordered:
+        pipe.hget(f"offer_target:{tid}", "availability")
+    try:
+        vals = await pipe.execute()
+    except Exception as exc:  # pragma: no cover — fail-open to all-active
+        logger.warning(
+            "cascade: availability load failed (%s) — treating all targets "
+            "active (fail-open)", exc,
+        )
+        return {}
+    return {tid: (val or "active") for tid, val in zip(ordered, vals)}
+
+
+def _filter_by_availability(
+    flows: list[dict[str, Any]],
+    avail_map: dict[str, str],
+    returning_visitor: bool,
+) -> list[dict[str, Any]]:
+    """Pre-selection availability floor (v2 Phase A, plan §4 step 7).
+
+    A flow is kept only if it has ≥1 PINNED target available for the click's
+    class — NEW traffic needs an 'active' target; RETURNING traffic accepts
+    'active' OR 'draining'; 'closed' never counts. A flow with no pinned target
+    is kept (resolved at action time). Empty `avail_map` (nothing pinned, or a
+    fail-open read) → no exclusion → byte-identical when nothing is
+    drained/closed.
+
+    Excluding a dead-target flow shrinks the survivor set, so `_pick_winner`
+    falls through to the next scope level — the NO-DEAD-END behaviour, with no
+    new control flow in the winner picker (purity preserved).
+    """
+    if not avail_map:
+        return flows
+    allowed = {"active", "draining"} if returning_visitor else {"active"}
+    survivors: list[dict[str, Any]] = []
+    for f in flows:
+        tids = _referenced_target_ids(f)
+        if not tids:
+            survivors.append(f)  # no pinned target → not floored here
+            continue
+        if any(avail_map.get(t, "active") in allowed for t in tids):
+            survivors.append(f)
+        # else: every pinned target unavailable for the class → EXCLUDE
+    return survivors
 
 
 async def _collect_candidate_ids(

@@ -63,17 +63,31 @@ def _redis_with_hashes(hashes: dict[str, dict], sets: dict[str, set] | None = No
 
     class FakePipeline:
         def __init__(self):
-            self._ops: list[tuple[str, str]] = []
+            self._ops: list[tuple] = []
 
         def hgetall(self, key):
-            self._ops.append(("hgetall", key))
+            self._ops.append(("hgetall", key, None))
+
+        def hget(self, key, field):
+            # v2 C2 — split per-leg availability read. Absent field → None →
+            # action_executor._avail_ok treats it as 'active' (fail-open).
+            self._ops.append(("hget", key, field))
 
         async def execute(self):
-            return [dict(hashes.get(key, {})) for _, key in self._ops]
+            out = []
+            for op, key, field in self._ops:
+                if op == "hget":
+                    out.append(hashes.get(key, {}).get(field))
+                else:
+                    out.append(dict(hashes.get(key, {})))
+            return out
 
     redis = MagicMock()
     redis.pipeline = lambda: FakePipeline()
     redis.hgetall = AsyncMock(side_effect=lambda key: dict(hashes.get(key, {})))
+    redis.hget = AsyncMock(
+        side_effect=lambda key, field: dict(hashes.get(key, {})).get(field)
+    )
     redis.smembers = AsyncMock(side_effect=lambda key: set(sets.get(key, set())))
     return redis
 

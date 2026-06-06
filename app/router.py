@@ -491,6 +491,57 @@ def _non_routed_result(
     }
 
 
+def _allowed_availability(
+    campaign: dict[str, Any], attribution: dict[str, Any]
+) -> frozenset[str]:
+    """The availability classes a target may have to be SERVED for this click —
+    the single rule shared by the cascade pre-floor (`cascade._filter_by_
+    availability`) and EVERY delivery path (v2 C2). Computed ONCE per click in
+    `_route_via_campaign` and threaded (no recompute-drift).
+
+      returning visitor (seen_before, under live returning routing) → {active, draining}
+      everyone else (incl. routing OFF / mode fresh / new visitor)     → {active}
+
+    Gated identically to the audience partition: routing OFF ⇒ `returning_visitor`
+    is False ⇒ {active} ⇒ a 'draining' target blocks all ⇒ TOTAL byte-identical
+    invariant with production dark (all targets 'active' → every class passes)."""
+    returning_live = settings.returning_routing_enabled and _company_routing_enabled(
+        campaign
+    )
+    mode = (campaign.get("returning_mode") or "fresh").strip().lower()
+    audience_routing = returning_live and mode != "fresh"
+    seen_before = bool(attribution.get("uid")) and (
+        attribution.get("is_unique") is False
+    )
+    returning_visitor = seen_before if audience_routing else False
+    return (
+        frozenset({"active", "draining"})
+        if returning_visitor
+        else frozenset({"active"})
+    )
+
+
+def _resolve_fallback_template(
+    template: str | None,
+    req: ClickRequest,
+    campaign_id: str,
+    source_mappings,
+    campaign_mappings,
+) -> str | None:
+    """v2 F-MACRO-1 — macro-resolve a campaign `fallback_url` BEFORE it is served.
+    Reuses `build_url` (the single substitution chokepoint: `safe_substitute` +
+    the full values dict) so a terminal_fallback URL never leaks a literal
+    `{macro}`. `None` template → `None` (node-default path stays raw; it carries
+    no macros). Offer/target macros collapse cleanly (no offer on this path)."""
+    if not template:
+        return None
+    return build_url(
+        template, req, campaign_id, "",
+        source_mappings=source_mappings,
+        campaign_mappings=campaign_mappings,
+    )
+
+
 async def _route_via_campaign(
     r,
     campaign: dict[str, Any],
@@ -555,6 +606,12 @@ async def _route_via_campaign(
     )
     buyer_chain = _attribution_buyer_chain(attribution)
 
+    # v2 C2 — the availability classes a target may have to be served for THIS
+    # click, computed ONCE and threaded to every delivery path (cascade action +
+    # legacy Stage 7-8). Same rule + fail-open 'active' default as the cascade
+    # pre-floor → byte-identical when all targets active / routing OFF.
+    allowed_avail = _allowed_availability(campaign, attribution)
+
     # Stage 6.5 — flow cascade.
     t0 = time.perf_counter()
     cascade_result = await _try_flow_cascade(
@@ -563,6 +620,7 @@ async def _route_via_campaign(
         campaign_mappings=campaign_mappings,
         buyer_chain=buyer_chain,
         attribution=attribution,
+        allowed_avail=allowed_avail,
     )
     timing["cascade_ms"] = _ms_since(t0)
 
@@ -605,6 +663,29 @@ async def _route_via_campaign(
             "attribution": attribution,
         }
 
+    # v2 C2 — matched-but-unroutable → terminal_fallback (NOT legacy re-serve).
+    # The cascade pre-floor excluded candidate flow(s) on availability, OR a
+    # matched flow's delivery returned UNAVAILABLE (recorded into the trace by
+    # `_try_flow_cascade`). Either way the campaign HAD a routing intent that the
+    # availability floor blocked → serve THIS campaign's terminal_fallback
+    # (macro-resolved, F-MACRO-1) rather than re-serving the drained/closed
+    # target via Stage 7-8 (the C2 bug) or poaching another campaign via geo.
+    # availability_excluded == 0 ⇒ genuine no-flow ⇒ Stage 7-8 runs below
+    # (now self-filtering its own targets by availability). Byte-identical when
+    # nothing is drained/closed (the floor excludes nothing → counter stays 0).
+    _trace = attribution.get("routing_trace") or {}
+    if _trace.get("availability_excluded"):
+        timing["route_total_ms"] = _ms_since(t_branch)
+        timing["result"] = "no_offer"
+        return _non_routed_result(
+            campaign_id, attribution, timing,
+            binding_id=binding_id, binding_alias=binding_alias,
+            fallback_url=_resolve_fallback_template(
+                campaign.get("fallback_url"), req, campaign_id,
+                source_mappings, campaign_mappings,
+            ),
+        )
+
     # Stage 7 — legacy fallback (no flow matched).
     t0 = time.perf_counter()
     offer = await select_offer(r, campaign_id)
@@ -621,12 +702,20 @@ async def _route_via_campaign(
             campaign_id, attribution, timing,
             binding_id=binding_id, binding_alias=binding_alias,
             # v2 Phase A — per-campaign terminal fallback (synced HASH field).
-            fallback_url=campaign.get("fallback_url") or None,
+            # v2 F-MACRO-1 — macro-resolved before serve (no literal {macro} leak).
+            fallback_url=_resolve_fallback_template(
+                campaign.get("fallback_url"), req, campaign_id,
+                source_mappings, campaign_mappings,
+            ),
         )
 
     # Stage 8 — legacy URL build via offer.url / target resolution.
+    # v2 C2 — resolve_target now honours the availability floor so the legacy
+    # path never RE-SERVES a drained/closed target; an unavailable target is
+    # skipped → falls to the offer's available default / bare url (byte-identical
+    # when all targets active).
     t0 = time.perf_counter()
-    target_url = await resolve_target(r, offer, req)
+    target_url = await resolve_target(r, offer, req, allowed_avail)
     url_template = target_url if target_url else offer.get("url", "")
     url = build_url(
         url_template, req, campaign_id, offer.get("_id", ""),
@@ -671,6 +760,7 @@ async def _resolve_action_with_sticky(
     seen_before: bool,
     returning_visitor: bool,
     flow_id: str | None,
+    allowed_avail=frozenset({"active"}),
 ) -> tuple[dict[str, Any] | None, str]:
     """v2 Phase S — resolve the destination, applying the sticky pin when active.
 
@@ -695,13 +785,17 @@ async def _resolve_action_with_sticky(
             source_mappings=source_mappings,
             campaign_mappings=campaign_mappings,
             build_url_fn=build_url,
+            allowed_avail=allowed_avail,
         )
 
     if not sticky_active:
         return await _normal(), "na"
 
     ttl = settings.returning_uid_ttl_seconds
-    allowed = {"active", "draining"} if returning_visitor else {"active"}
+    # v2 C2 — use the threaded allowed_avail (computed ONCE in _route_via_campaign)
+    # instead of recomputing here; the sticky pin-HIT availability gate below and
+    # every delivery path then share ONE rule (no recompute-drift).
+    allowed = allowed_avail
 
     if seen_before:
         pinned_tid = await sticky.get_sticky(company_id, uid, campaign_id, ttl)
@@ -746,6 +840,7 @@ async def _try_flow_cascade(
     campaign_mappings,
     buyer_chain: dict[str, int | None],
     attribution: dict[str, Any],
+    allowed_avail=frozenset({"active"}),
 ) -> dict[str, Any] | None:
     """Run scope cascade + action execution. Returns None if no flow.
 
@@ -906,8 +1001,21 @@ async def _try_flow_cascade(
         seen_before=seen_before,
         returning_visitor=seen_before,
         flow_id=flow_id_str,
+        allowed_avail=allowed_avail,
     )
     attribution["sticky_status"] = sticky_status
+
+    # v2 C2 — a matched flow whose delivery returned UNAVAILABLE (its pinned
+    # target / every split leg / offer default excluded by the availability
+    # floor) must route to terminal_fallback, NOT legacy re-serve. Record it in
+    # the trace (shared object with attribution["routing_trace"]) so
+    # `_route_via_campaign`'s availability_excluded short-circuit fires, and
+    # return None. Byte-identical when all targets active (never produced).
+    if result is action_executor.UNAVAILABLE_RESULT:
+        cascade_trace["availability_excluded"] = (
+            cascade_trace.get("availability_excluded") or 0
+        ) + 1
+        return None
 
     # `offer_target_id` = the destination target the action resolved to.
     # Read from a COPY-safe `.get` — never mutate `result` (it may be the
@@ -1281,7 +1389,9 @@ async def select_offer(r, campaign_id: str) -> dict | None:
         return None
 
 
-async def resolve_target(r, offer: dict, req: ClickRequest) -> str | None:
+async def resolve_target(
+    r, offer: dict, req: ClickRequest, allowed_avail=frozenset({"active"}),
+) -> str | None:
     """Resolve the best matching offer target URL for the click's attributes.
 
     If offer has targets (has_targets=1):
@@ -1347,6 +1457,12 @@ async def resolve_target(r, offer: dict, req: ClickRequest) -> str | None:
     case_preserve_dims = {"geo", "region", "browser", "language"}
 
     for t in target_list:
+        # v2 C2 — availability floor: an unavailable target for the click's
+        # class is never served on the legacy path (skipped for BOTH criteria
+        # match AND the is_default fallback). Fail-open 'active' default →
+        # byte-identical when nothing drained/closed.
+        if (t.get("availability") or "active") not in allowed_avail:
+            continue
         # Check if this is the default fallback
         if t.get("is_default") == "1":
             default_url = t.get("url", "")

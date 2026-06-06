@@ -50,7 +50,25 @@ from app.telemetry import (
 logger = logging.getLogger("tds.action")
 
 
-__all__ = ["execute_action", "pinned_target_result", "BLOCK_RESULT"]
+__all__ = ["execute_action", "pinned_target_result", "BLOCK_RESULT", "UNAVAILABLE_RESULT"]
+
+
+# v2 C2 — sentinel returned when a delivery path had candidate target(s) but
+# EVERY one was excluded by the availability floor (closed, or draining for a
+# new visitor). Distinct from `None` (malformed config / missing offer/target
+# row → legacy fallback, pre-v2 behaviour preserved): the router routes an
+# UNAVAILABLE result to terminal_fallback (NO legacy re-serve), honouring the
+# NO-DEAD-END contract. Byte-identical when all targets are `active` (the floor
+# excludes nothing → this sentinel is never produced).
+UNAVAILABLE_RESULT: dict[str, Any] = {"unavailable": True, "url": None}
+
+
+def _avail_ok(availability: Any, allowed_avail) -> bool:
+    """Availability gate shared by every delivery path. Fail-open: a missing /
+    empty / pre-migration-076 `availability` field defaults to 'active' (mirrors
+    `cascade._load_target_availability`), so a target HASH without the field
+    passes → byte-identical when nothing is drained/closed."""
+    return ((availability or "active")) in allowed_avail
 
 
 def pinned_target_result(
@@ -107,6 +125,7 @@ async def execute_action(
     source_mappings: list | None,
     campaign_mappings: list | None,
     build_url_fn,
+    allowed_avail=frozenset({"active"}),
 ) -> dict[str, Any] | None:
     """Translate a winning flow into a concrete routing result.
 
@@ -145,10 +164,12 @@ async def execute_action(
                                  source_mappings, campaign_mappings, flow_id)
     if action_type == "offer":
         return await _execute_offer(r, config, req, campaign_id, build_url_fn,
-                                     source_mappings, campaign_mappings, flow_id)
+                                     source_mappings, campaign_mappings, flow_id,
+                                     allowed_avail)
     if action_type == "split":
         return await _execute_split(r, config, req, campaign_id, build_url_fn,
-                                     source_mappings, campaign_mappings, flow_id)
+                                     source_mappings, campaign_mappings, flow_id,
+                                     allowed_avail)
     if action_type == "block":
         return BLOCK_RESULT
 
@@ -209,6 +230,7 @@ async def _execute_offer(
     source_mappings,
     campaign_mappings,
     flow_id: str | None,
+    allowed_avail,
 ) -> dict[str, Any] | None:
     """`offer` — flow has pinned offer_id + target_id."""
     offer_id = config.get("offer_id")
@@ -221,7 +243,7 @@ async def _execute_offer(
         r, str(offer_id), target_id,
         req, campaign_id, build_url_fn,
         source_mappings, campaign_mappings,
-        flow_id,
+        flow_id, allowed_avail,
     )
 
 
@@ -234,6 +256,7 @@ async def _execute_split(
     source_mappings,
     campaign_mappings,
     flow_id: str | None,
+    allowed_avail,
 ) -> dict[str, Any] | None:
     """`split` — weighted random pick over `action_config.offers`."""
     entries = config.get("offers")
@@ -272,13 +295,61 @@ async def _execute_split(
         )
         return None
 
+    # v2 C2 — per-leg availability floor. The cascade pre-floor keeps a split
+    # flow if ANY leg is available ("can it serve at all?") and DOCUMENTS that
+    # per-leg exclusion is enforced here (cascade.py `_filter_by_availability`
+    # docstring) — this implements that contract. Load each leg's PINNED target
+    # availability in ONE pipelined batch; exclude legs unavailable for the
+    # click's class. Legs WITHOUT a pinned target_id resolve to the offer default
+    # at `_resolve_offer_url` (same floor applied there). Byte-identical when all
+    # targets active (nothing excluded). Fail-open: a Redis error → exclude
+    # nothing (a click is never lost on unreadable availability state).
+    pinned_tids = [
+        str(e["target_id"]) for e in valid if _is_positive_int(e.get("target_id"))
+    ]
+    avail_map: dict[str, str] = {}
+    if pinned_tids:
+        pipe = r.pipeline()
+        for tid in pinned_tids:
+            pipe.hget(f"offer_target:{tid}", "availability")
+        try:
+            vals = await pipe.execute()
+            avail_map = {tid: (v or "active") for tid, v in zip(pinned_tids, vals)}
+        except Exception as exc:  # pragma: no cover — fail-open to all-active
+            logger.warning("split availability load failed (%s) — all-active", exc)
+            avail_map = {}
+    kept_valid: list[dict[str, Any]] = []
+    kept_weights: list[int] = []
+    excluded_on_avail = False
+    for entry, w in zip(valid, weights):
+        tid = entry.get("target_id")
+        if _is_positive_int(tid) and not _avail_ok(
+            avail_map.get(str(tid), "active"), allowed_avail
+        ):
+            excluded_on_avail = True
+            continue
+        kept_valid.append(entry)
+        kept_weights.append(w)
+    if not kept_valid or sum(kept_weights) <= 0:
+        # Every usable leg excluded by the availability floor → terminal_fallback
+        # (NO legacy re-serve). Distinct from the malformed-offers None above.
+        if excluded_on_avail:
+            return UNAVAILABLE_RESULT
+        return None
+    valid, weights = kept_valid, kept_weights
+
     chosen = random.choices(valid, weights=weights, k=1)[0]
     result = await _resolve_offer_url(
         r, str(chosen["offer_id"]), chosen.get("target_id"),
         req, campaign_id, build_url_fn,
         source_mappings, campaign_mappings,
-        flow_id,
+        flow_id, allowed_avail,
     )
+    # The chosen leg's pinned target was already availability-checked above; an
+    # UNAVAILABLE here means its offer-default fallback was also unavailable →
+    # propagate (terminal_fallback, no re-serve).
+    if result is UNAVAILABLE_RESULT:
+        return UNAVAILABLE_RESULT
     # v2 Phase A2 — the SELECTION mechanism for a split is the weighted pick,
     # regardless of how the chosen entry's URL resolved underneath.
     if result is not None:
@@ -296,6 +367,7 @@ async def _resolve_offer_url(
     source_mappings,
     campaign_mappings,
     flow_id: str | None,
+    allowed_avail,
 ) -> dict[str, Any] | None:
     """Shared between offer + split actions — load target → URL.
 
@@ -313,11 +385,19 @@ async def _resolve_offer_url(
     # v2 Phase A2 — target_selection_path provenance: how the destination
     # was resolved (pinned target / offer's default target / offer bare url).
     selection_path = "pinned"
+    # v2 C2 — remember when a candidate existed but was availability-excluded,
+    # so an empty result becomes terminal_fallback (UNAVAILABLE), not legacy None.
+    avail_blocked = False
     if _is_positive_int(target_id):
         target = await r.hgetall(f"offer_target:{target_id}")
         if target and target.get("url"):
-            pinned_template = target["url"]
-            pinned_target_id = str(target_id)
+            # v2 C2 — serve the pinned target ONLY when available for the
+            # click's class; else fall through to the offer default (same floor).
+            if _avail_ok(target.get("availability"), allowed_avail):
+                pinned_template = target["url"]
+                pinned_target_id = str(target_id)
+            else:
+                avail_blocked = True
 
     if pinned_template is None:
         # Fall back to offer-level resolution: load offer, pick
@@ -338,10 +418,11 @@ async def _resolve_offer_url(
                 level="warning",
                 offer_id=offer_id,
             )
-            return None
-        pinned_template, pinned_target_id = await _offer_default_template(
-            r, offer_id, offer,
+            return UNAVAILABLE_RESULT if avail_blocked else None
+        pinned_template, pinned_target_id, def_avail_blocked = (
+            await _offer_default_template(r, offer_id, offer, allowed_avail)
         )
+        avail_blocked = avail_blocked or def_avail_blocked
         # default-target resolution → 'offer_default'; bare offer.url (no
         # default target) → 'bare_url'.
         selection_path = "offer_default" if pinned_target_id else "bare_url"
@@ -358,7 +439,10 @@ async def _resolve_offer_url(
                 level="warning",
                 offer_id=offer_id,
             )
-            return None
+            # v2 C2 — if the emptiness was caused by the availability floor
+            # (pinned and/or default target excluded), route to terminal_fallback
+            # (NO legacy re-serve). A genuinely URL-less offer → None (legacy).
+            return UNAVAILABLE_RESULT if avail_blocked else None
 
     # T2.5 — pinned_target_id resolves the {offer_target_id} macro;
     # flow_id (threaded from execute_action) resolves {flow_id}.
@@ -390,11 +474,14 @@ _MAX_TARGETS_PER_OFFER_AT_CLICK = 100
 
 
 async def _offer_default_template(
-    r, offer_id: str, offer: dict,
-) -> tuple[str | None, str | None]:
+    r, offer_id: str, offer: dict, allowed_avail,
+) -> tuple[str | None, str | None, bool]:
     """Read the offer's `is_default=1` target, or fall back to offer.url.
 
-    Returns `(template, target_id)`. Either may be `None`.
+    Returns `(template, target_id, avail_blocked)`. template/target_id may be
+    `None`. `avail_blocked` is True when an is_default target EXISTED but was
+    excluded by the availability floor (the caller turns an empty result into
+    terminal_fallback, not legacy re-serve). v2 C2.
 
     Sort key uses `int()` so the iteration is in numeric (not
     lexicographic) order — e.g. `["2", "10", "100"]` instead of
@@ -416,14 +503,23 @@ async def _offer_default_template(
             for tid in sorted_ids:
                 pipe.hgetall(f"offer_target:{tid}")
             rows = await pipe.execute()
+            avail_blocked = False
             for tid, row in zip(sorted_ids, rows):
                 if row and row.get("is_default") == "1" and row.get("url"):
-                    return row["url"], str(tid)
+                    # v2 C2 — only serve an available default target.
+                    if _avail_ok(row.get("availability"), allowed_avail):
+                        return row["url"], str(tid), False
+                    avail_blocked = True  # default exists but excluded
+            if avail_blocked:
+                # A default target exists but is unavailable for the class →
+                # do NOT silently fall to the bare offer.url (that would defeat
+                # the operator's drain/close). Signal terminal_fallback.
+                return None, None, True
 
     bare = offer.get("url")
     if bare:
-        return bare, None
-    return None, None
+        return bare, None, False
+    return None, None, False
 
 
 def _safe_target_sort_key(tid: Any) -> tuple[int, int, str]:

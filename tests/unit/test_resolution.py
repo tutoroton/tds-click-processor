@@ -23,7 +23,11 @@ layer (per-link override or source global). Priority:
 
 import pytest
 
-from app.resolution import parse_param_mappings, resolve_slots
+from app.resolution import (
+    BINDING_SELECTOR_KEY,
+    parse_param_mappings,
+    resolve_slots,
+)
 
 
 # ============================================================
@@ -900,3 +904,43 @@ class TestDefensiveCaps:
         )
         # Non-scalar defaults dropped rather than serialised as garbage.
         assert slots == {"sub1": None}
+
+
+class TestFParam2BindingSelectorNotLeaked:
+    """F-PARAM-2 — the binding-selector key (`c`, consumed by domain-resolution
+    upstream) must NOT leak into `extras` (→ clicks.extra_params). Legitimate
+    custom params are untouched."""
+
+    def test_binding_selector_excluded_from_extras(self):
+        _, extras = resolve_slots(
+            query_params={BINDING_SELECTOR_KEY: "promo-binding", "utm": "fb"},
+            source_mappings=None, campaign_mappings=None,
+        )
+        assert BINDING_SELECTOR_KEY not in extras   # consumed by domain-resolution
+        assert extras == {"utm": "fb"}              # custom param preserved
+
+    def test_no_binding_selector_byte_identical(self):
+        # A click WITHOUT `c` → extras unchanged (only legit customs).
+        _, extras = resolve_slots(
+            query_params={"utm": "fb", "kw": "shoes"},
+            source_mappings=None, campaign_mappings=None,
+        )
+        assert extras == {"utm": "fb", "kw": "shoes"}
+
+    def test_binding_selector_excluded_even_when_other_extras_present(self):
+        _, extras = resolve_slots(
+            query_params={BINDING_SELECTOR_KEY: "b1", "a": "1", "b": "2"},
+            source_mappings=None, campaign_mappings=None,
+        )
+        assert extras == {"a": "1", "b": "2"}
+
+    def test_binding_selector_still_usable_as_slot_alias(self):
+        # If an advertiser aliases a slot to `c`, the slot still resolves from
+        # `?c=` (the slot loop consumes it); it simply never DOUBLES into extras.
+        slots, extras = resolve_slots(
+            query_params={BINDING_SELECTOR_KEY: "kwval"},
+            source_mappings=[{"slot": "sub1", "alias": BINDING_SELECTOR_KEY}],
+            campaign_mappings=None,
+        )
+        assert slots.get("sub1") == "kwval"
+        assert BINDING_SELECTOR_KEY not in extras

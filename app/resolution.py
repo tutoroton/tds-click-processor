@@ -57,7 +57,19 @@ from app.telemetry import OP_PARAM_PARSE, capture_op_msg_throttled
 logger = logging.getLogger("tds.resolution")
 
 
+# F-PARAM-2 — the binding-selector query key. `resolve_domain_campaign`
+# (router.py) reads `?c=<alias>` at the param tier to pick a domain binding, so
+# `c` is a GLOBALLY-RESERVED routing-control key — never legitimate advertiser
+# data. resolve_slots is a pure function with no view of domain resolution, so
+# without this it had no way to know `c` was consumed and leaked it into
+# `extras` → clicks.extra_params (stream/PG/CH) on every click carrying it. The
+# router imports this constant for its `query_params.get(...)` so the key has a
+# single source of truth (no drift between consumer and exclusion).
+BINDING_SELECTOR_KEY = "c"
+
+
 __all__ = [
+    "BINDING_SELECTOR_KEY",
     "parse_param_mappings",
     "resolve_slots",
 ]
@@ -383,6 +395,14 @@ def resolve_slots(
         if k in examined_keys:
             continue
         if k in CANONICAL_SLOTS:
+            continue
+        # F-PARAM-2 — the binding-selector key is consumed by domain-resolution
+        # upstream (router.resolve_domain_campaign), which this pure function
+        # can't see. Drop it so it never leaks into extra_params as if it were
+        # an advertiser custom param. It's globally reserved → byte-identical for
+        # every NON-`c` key (only `c` is removed). Binding attribution still
+        # lives in the dedicated binding_id/binding_alias columns.
+        if k == BINDING_SELECTOR_KEY:
             continue
         if v is None:
             continue

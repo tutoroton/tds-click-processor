@@ -38,7 +38,7 @@ from app.enrichment import enrich_buyer
 from app.macros import safe_substitute
 from app.models import ClickRequest
 from app.redis_client import get_redis
-from app.resolution import parse_param_mappings, resolve_slots
+from app.resolution import BINDING_SELECTOR_KEY, parse_param_mappings, resolve_slots
 from app.telemetry import OP_IDENTITY, capture_op_msg_throttled
 from app.ua_parser import parse_ua
 
@@ -1272,7 +1272,9 @@ async def resolve_domain_campaign(r, req: ClickRequest) -> DomainResolution:
 
     path = (req.path or "").strip("/")
     first_segment = path.split("/")[0] if path else ""
-    param_c = (req.query_params or {}).get("c", "")
+    # F-PARAM-2 — single source of truth for the binding-selector key (shared
+    # with resolution.resolve_slots so it's excluded from extras, not leaked).
+    param_c = (req.query_params or {}).get(BINDING_SELECTOR_KEY, "")
 
     # Split off the first label as the candidate subdomain. A wildcard
     # subdomain needs ≥3 labels (`{label}.{base}` where the base itself

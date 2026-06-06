@@ -205,7 +205,9 @@ class TestSignalGating:
         r = _fr()
         res = await _resolve(r, fuid="U", vid=None, trusted=True)
         assert res.uid and res.is_unique
-        assert res.signal_tier == "fuid"
+        assert res.signal_tier == "funnel_user_id"  # DOC-1 canonical label
+        # DOC-1 decouple proof: the Redis KEY tier stays "fuid" (label≠key) so
+        # existing identity maps are NOT orphaned by the relabel.
         assert await r.get(_sig_key(1, "fuid", _hash("U"))) == res.uid
 
     async def test_funnel_user_id_outranks_vid_on_conflict(self):
@@ -215,7 +217,7 @@ class TestSignalGating:
         res = await _resolve(r, fuid="U", vid="V", campaign="10", trusted=True)
         assert res.uid == "uidA"  # highest-precedence (funnel_user_id) wins
         assert res.is_unique is False
-        assert res.signal_tier == "fuid"
+        assert res.signal_tier == "funnel_user_id"  # DOC-1 canonical label
         # vid↔fuid resolve to DIFFERENT uids → conflict flagged (log-not-merge),
         # but NOT merged (uid stays the highest-precedence one).
         assert res.identity_conflict is True
@@ -227,7 +229,7 @@ class TestSignalGating:
         res = await _resolve(r, fuid="U", vid="V", campaign="10", trusted=True)
         assert res.uid == "uidA"
         assert res.identity_conflict is False
-        assert res.signal_tier == "fuid"
+        assert res.signal_tier == "funnel_user_id"  # DOC-1 canonical label
 
     async def test_signal_tier_vid_when_only_vid_resolves(self):
         r = _fr()
@@ -499,11 +501,12 @@ class TestRProvenanceFields:
     async def test_populated_from_attribution(self):
         result = self._result({
             "uid": "U", "is_unique": False, "is_returning": False,
-            "is_roaming": True, "signal_tier": "fuid", "identity_conflict": True,
+            "is_roaming": True, "signal_tier": "funnel_user_id",
+            "identity_conflict": True,
         })
         fields = _phase3_attribution_fields(result, _req(), {}, "ts")
         assert fields["is_roaming"] is True
-        assert fields["signal_tier"] == "fuid"
+        assert fields["signal_tier"] == "funnel_user_id"
         assert fields["identity_conflict"] is True
 
 

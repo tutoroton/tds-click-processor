@@ -66,6 +66,20 @@ _TIER_FUID = "fuid"   # funnel_user_id (L2)
 _TIER_VID = "vid"     # cookie visitor id (L1)
 _TIER_NONE = "none"   # no usable identity signal on this click (case A)
 
+# DOC-1 — the `signal_tier` PROVENANCE label uses the canonical reserved-slot
+# token (`funnel_user_id`), not the internal key-tier abbreviation. CRITICAL:
+# the Redis KEY tier above stays "fuid"/"vid" — changing it would re-key every
+# existing `id:{co}:fuid:*` identity map, orphaning returning users (they'd
+# degrade to new). So we decouple: keys keep the abbreviation, the emitted
+# label canonicalizes. Only `fuid`→`funnel_user_id` per DOC-1; `vid`/`none`
+# unchanged (byte-identical for those).
+_SIGNAL_TIER_LABEL = {_TIER_FUID: "funnel_user_id"}
+
+
+def _tier_label(tier: str) -> str:
+    """Map an internal key-tier to its canonical signal_tier provenance label."""
+    return _SIGNAL_TIER_LABEL.get(tier, tier)
+
 # Bound the campaigns-seen set so a pathological caller can't grow one uid's
 # profile without limit (cardinality guard). A real uid touches a handful of
 # campaigns (fewer than funnels), so 64 is generous headroom.
@@ -179,7 +193,7 @@ async def resolve_identity(
     if not signals:
         return IdentityResult(
             uid="", is_unique=True, is_returning=False, is_roaming=False,
-            signal_tier=_TIER_NONE, identity_conflict=False,
+            signal_tier=_tier_label(_TIER_NONE), identity_conflict=False,
         )
 
     # RT#1 — read every present signal's map in one pipeline.
@@ -210,7 +224,7 @@ async def resolve_identity(
         if won:
             return IdentityResult(
                 uid=new_uid, is_unique=True, is_returning=False,
-                is_roaming=False, signal_tier=top_tier,
+                is_roaming=False, signal_tier=_tier_label(top_tier),
                 identity_conflict=identity_conflict,
             )
         # Race lost — adopt the winner's uid; NOT unique (G7). The uid was
@@ -218,7 +232,7 @@ async def resolve_identity(
         adopted = await r.get(top_key)
         return IdentityResult(
             uid=adopted or new_uid, is_unique=False, is_returning=False,
-            is_roaming=False, signal_tier=top_tier,
+            is_roaming=False, signal_tier=_tier_label(top_tier),
             identity_conflict=identity_conflict,
         )
 
@@ -242,7 +256,7 @@ async def resolve_identity(
     if with_history:
         return IdentityResult(
             uid=resolved_uid, is_unique=False, is_returning=is_returning,
-            is_roaming=is_roaming, signal_tier=winner_tier,
+            is_roaming=is_roaming, signal_tier=_tier_label(winner_tier),
             identity_conflict=identity_conflict,
             prev_offers=frozenset(rt2[1] or ()),
             prev_targets=frozenset(rt2[2] or ()),
@@ -250,7 +264,7 @@ async def resolve_identity(
         )
     return IdentityResult(
         uid=resolved_uid, is_unique=False, is_returning=is_returning,
-        is_roaming=is_roaming, signal_tier=winner_tier,
+        is_roaming=is_roaming, signal_tier=_tier_label(winner_tier),
         identity_conflict=identity_conflict,
     )
 

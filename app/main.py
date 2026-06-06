@@ -35,6 +35,7 @@ from app.diag import (
     emit_obs,
     run_obs_drain,
     set_test_id,
+    _is_valid_test_id,
     traces_sampler as diag_traces_sampler,
 )
 from app import history, identity
@@ -44,7 +45,12 @@ from app.router import route, get_full_ua_info, parse_accept_language, coerce_co
 from app.ua_parser import warmup as warmup_ua_parser
 from app.shipper import assert_shipper_ready, run_shipper
 from app.shipper_metrics import metrics as shipper_metrics
-from app.telemetry import OP_DISK_PRESSURE, capture_op_msg
+from app.telemetry import (
+    OP_DISK_PRESSURE,
+    OP_ROUTE_ERROR,
+    capture_op_exc,
+    capture_op_msg,
+)
 from app.disk_queue import (
     check_disk_pressure,
     enqueue_click as enqueue_click_to_disk,
@@ -1096,6 +1102,13 @@ async def decide(
     # can append to obs:test:<id> Redis stream without threading the
     # test_id through every signature. The context var is local to
     # this request — concurrent /decide calls each see their own.
+    # SEC-L1 — gate the Sentry tag + response echo behind the SAME whitelist the
+    # redis/obs path uses (`set_test_id` already validates internally). An
+    # unvalidated X-Test-Id was reflected RAW into the `test_id` Sentry tag AND
+    # the response `echoed_test_id` → tag pollution / reflected value. Collapse
+    # an invalid value to "" here so every downstream `if x_test_id:` (tag /
+    # echo / checkpoint) in this handler is gated at once.
+    x_test_id = x_test_id if _is_valid_test_id(x_test_id) else ""
     if x_test_id:
         sentry_sdk.set_tag("test_id", x_test_id)
         set_test_id(x_test_id)
@@ -1125,7 +1138,17 @@ async def decide(
         result = await route(req)
     except Exception as e:
         logger.error("route() failed: %s", e, extra={"click_id": req.click_id})
-        sentry_sdk.capture_exception(e)
+        # G-LOW-2 — tag the route() catch-all (was a bare capture_exception →
+        # untagged GEO-TDS-BACKEND-11, unfilterable). Add the `op` tag + node_id
+        # (via capture_op_exc) + returning-context (the gate states active when
+        # the error fired, since route() spans the resolver/cascade). No control-
+        # flow change — same except, same downstream fallback.
+        capture_op_exc(
+            OP_ROUTE_ERROR, e,
+            click_id=req.click_id, country=req.country,
+            resolver_enabled=settings.returning_resolver_enabled,
+            routing_enabled=settings.returning_routing_enabled,
+        )
         emit_checkpoint("click.route_failed", {"error": str(e)[:200]})
         if x_test_id:
             emit_checkpoint("click.decide_out", {
@@ -1688,6 +1711,8 @@ async def receive_sync(
     # `_build_push_headers` in admin-api SyncService), bind it so the
     # `node.sync_apply_*` checkpoints land in the same obs:test:<id>
     # stream as the upstream mutation.
+    # SEC-L1 — same whitelist gate as the /decide handler (tag pollution guard).
+    x_test_id = x_test_id if _is_valid_test_id(x_test_id) else ""
     if x_test_id:
         sentry_sdk.set_tag("test_id", x_test_id)
         set_test_id(x_test_id)

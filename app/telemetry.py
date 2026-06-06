@@ -84,6 +84,7 @@ OP_LEGACY_COLLECTOR = "legacy_collector"  # shim absorbed pre-F.29 shape
 # a click somewhere unexpected with NO signal). All emitted via
 # `capture_op_msg_throttled` so a single misconfigured entity can't flood
 # Sentry on every click.
+OP_ROUTE_ERROR = "route_error"          # G-LOW-2 — route() catch-all (GEO-TDS-BACKEND-11)
 OP_CRITERIA_SKIP = "criteria_skip"      # B12 — malformed flow criteria JSON skipped
 OP_FLOW_LOAD = "flow_load"              # D4  — flow HASH load empty/partial → None
 OP_PARAM_PARSE = "param_parse"          # D10 — param_mappings JSON unparseable

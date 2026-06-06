@@ -750,6 +750,12 @@ def _decision_reason(result: dict, timing: dict, attr: dict) -> str:
     rv = timing.get("route_via")
     rs = result.get("routing_status")
     if rv == "flow_cascade_block" or rs == "blocked" or result.get("blocked"):
+        # v2 F-DOMAIN-BLOCKED — an unmatched-subdomain EDGE block (set by the
+        # domain-resolution sentinel) is distinct from a flow-authored block;
+        # 05-data-provenance §5 lists `domain_blocked` as its own value. Keyed
+        # off the raw `routing_result` so a flow block stays `blocked_by_flow`.
+        if timing.get("result") == "blocked_unmatched_subdomain":
+            return "domain_blocked"
         return "blocked_by_flow"
     if rs == "no_match":
         return "no_campaign_match"
@@ -761,6 +767,20 @@ def _decision_reason(result: dict, timing: dict, attr: dict) -> str:
     if rv == "legacy_split":
         return "matched_legacy_split"
     if rv == "flow_cascade":
+        # v2 F-REASON-V2 — refine the returning-specific SUBSET of a flow match
+        # into its own closed-vocab reason (06-EXECUTABLE-PLAN §7) so it is
+        # filterable via `decision_reason` (not only the separate sticky_status/
+        # audience_pool columns). A plain first-pool / new / DARK click
+        # (sticky_status 'na', audience_pool 'first') stays `matched_flow` ⇒
+        # byte-identical when returning routing is OFF. Existing non-flow_cascade
+        # reasons above are untouched.
+        sticky_status = attr.get("sticky_status")
+        if sticky_status == "hit":
+            return "sticky_pin_hit"
+        if sticky_status == "invalid_closed":
+            return "fresh_repin"
+        if attr.get("audience_pool") == "returning":
+            return "override_returning_flow"
         return "matched_flow"
     return "no_campaign_match"
 

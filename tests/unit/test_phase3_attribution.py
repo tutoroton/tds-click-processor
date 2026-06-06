@@ -460,6 +460,53 @@ class TestDecisionReason:
     def test_always_set_defensive_default(self):
         assert _decision_reason({}, {}, {}) == "no_campaign_match"
 
+    # ── v2 F-REASON-V2: returning-specific refinements of a flow_cascade match
+    def test_sticky_pin_hit(self):
+        r = _decision_reason(
+            {}, {"route_via": "flow_cascade"},
+            {"sticky_status": "hit", "audience_pool": "returning"},
+        )
+        assert r == "sticky_pin_hit"
+
+    def test_fresh_repin(self):
+        r = _decision_reason(
+            {}, {"route_via": "flow_cascade"},
+            {"sticky_status": "invalid_closed", "audience_pool": "returning"},
+        )
+        assert r == "fresh_repin"
+
+    def test_override_returning_flow(self):
+        # returning pool won, no sticky pin involved (miss/minted/na) →
+        # override_returning_flow.
+        r = _decision_reason(
+            {}, {"route_via": "flow_cascade"},
+            {"sticky_status": "miss", "audience_pool": "returning"},
+        )
+        assert r == "override_returning_flow"
+
+    def test_first_pool_stays_matched_flow_byte_identical(self):
+        # DARK / new / first-pool click (sticky 'na', audience 'first') is
+        # UNCHANGED — the prime-directive byte-identical case.
+        assert _decision_reason(
+            {}, {"route_via": "flow_cascade"},
+            {"sticky_status": "na", "audience_pool": "first"},
+        ) == "matched_flow"
+        # also unchanged when attr carries no returning keys at all
+        assert _decision_reason({}, {"route_via": "flow_cascade"}, {}) == "matched_flow"
+
+    # ── v2 F-DOMAIN-BLOCKED: edge subdomain block ≠ flow block
+    def test_domain_blocked(self):
+        r = _decision_reason(
+            {"blocked": True}, {"result": "blocked_unmatched_subdomain"}, {},
+        )
+        assert r == "domain_blocked"
+
+    def test_flow_block_unchanged_not_domain_blocked(self):
+        # a flow-authored block stays blocked_by_flow (no subdomain marker).
+        assert _decision_reason(
+            {"blocked": True}, {"route_via": "flow_cascade_block"}, {},
+        ) == "blocked_by_flow"
+
 
 class TestA2ProvenanceFields:
     def _result(self, attr_extra=None):
@@ -479,7 +526,9 @@ class TestA2ProvenanceFields:
         f = _phase3_attribution_fields(
             result, ClickRequest(click_id="c1"), {"route_via": "flow_cascade"}, _RDT,
         )
-        assert f["decision_reason"] == "matched_flow"
+        # v2 F-REASON-V2 — audience_pool='returning' (returning pool won, no
+        # sticky pin) refines the flow match to `override_returning_flow`.
+        assert f["decision_reason"] == "override_returning_flow"
         assert f["winning_scope_type"] == "buyer"
         assert f["winning_scope_id"] == 5
         assert f["audience_pool"] == "returning"
@@ -487,7 +536,7 @@ class TestA2ProvenanceFields:
         assert f["target_selection_path"] == "pinned"
         trace = json.loads(f["routing_trace"])
         assert trace["candidates"] == 3
-        assert trace["decision_reason"] == "matched_flow"  # folded into trace
+        assert trace["decision_reason"] == "override_returning_flow"  # folded into trace
 
     def test_defaults_when_absent(self):
         f = _phase3_attribution_fields(

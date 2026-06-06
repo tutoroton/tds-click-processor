@@ -49,6 +49,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import re
 import secrets
 import time
 from dataclasses import dataclass, field
@@ -79,6 +80,23 @@ _SIGNAL_TIER_LABEL = {_TIER_FUID: "funnel_user_id"}
 def _tier_label(tier: str) -> str:
     """Map an internal key-tier to its canonical signal_tier provenance label."""
     return _SIGNAL_TIER_LABEL.get(tier, tier)
+
+
+# SEC-M2 — a uid minted by this resolver is ``secrets.token_hex(16)`` = exactly
+# 32 lowercase hex chars. A value READ BACK from a signal map (``id:{co}:{tier}:
+# {val}``) is attacker-influenceable (the signal value is advertiser-supplied)
+# and could be corrupt/poisoned. Before a read-back uid is trusted as identity
+# — and especially before it is concatenated into a sticky/history Redis KEY
+# (``sticky:{co}:{uid}:{camp}`` / ``id:{co}:uid:{uid}:offers`` …) — it MUST
+# match this shape, else we FAIL OPEN AS NEW (ignore the hit; no key built from
+# untrusted bytes). A freshly minted uid always matches → zero effect on the
+# happy path (byte-identical).
+_UID_RE = re.compile(r"^[0-9a-f]{32}$")
+
+
+def _valid_uid(uid) -> bool:
+    return isinstance(uid, str) and _UID_RE.match(uid) is not None
+
 
 # Bound the campaigns-seen set so a pathological caller can't grow one uid's
 # profile without limit (cardinality guard). A real uid touches a handful of
@@ -206,14 +224,19 @@ async def resolve_identity(
     # record WHICH tier won. identity_conflict (v2 R, log-not-merge): two
     # present signals resolve to DIFFERENT existing uids — we flag it but do
     # NOT live-merge, adopting the highest-precedence uid.
+    # SEC-M2 — only a SHAPE-VALID read-back uid is trusted. A corrupt/poisoned
+    # signal-map value is ignored (treated as a miss for that tier) so it is
+    # never adopted as identity nor concatenated into a sticky/history key.
     resolved_uid: str | None = None
     winner_tier = signals[0][0]
     for (tier, _value), hit in zip(signals, hits):
-        if hit:
+        if hit and _valid_uid(hit):
             resolved_uid = hit
             winner_tier = tier
             break
-    identity_conflict = len({h for h in hits if h}) > 1
+    # Conflict is computed over VALID hits only — a malformed value is not a
+    # competing identity.
+    identity_conflict = len({h for h in hits if h and _valid_uid(h)}) > 1
 
     if resolved_uid is None:
         # NEW USER — mint on the highest-precedence present signal, in-band NX.
@@ -230,8 +253,19 @@ async def resolve_identity(
         # Race lost — adopt the winner's uid; NOT unique (G7). The uid was
         # minted microseconds ago → no campaigns seen yet → fresh (B/C False).
         adopted = await r.get(top_key)
+        # SEC-M2 — the read-back winner must be shape-valid before we adopt it
+        # as identity. A malformed value (corruption / poison at the key) →
+        # FAIL OPEN AS NEW (uid="" → segment A, no persistent identity, no key
+        # built from untrusted bytes). A normal race always reads our own
+        # token_hex winner → valid → unchanged.
+        if not _valid_uid(adopted):
+            return IdentityResult(
+                uid="", is_unique=True, is_returning=False, is_roaming=False,
+                signal_tier=_tier_label(_TIER_NONE),
+                identity_conflict=identity_conflict,
+            )
         return IdentityResult(
-            uid=adopted or new_uid, is_unique=False, is_returning=False,
+            uid=adopted, is_unique=False, is_returning=False,
             is_roaming=False, signal_tier=_tier_label(top_tier),
             identity_conflict=identity_conflict,
         )

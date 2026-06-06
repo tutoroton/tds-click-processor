@@ -212,10 +212,10 @@ class TestSignalGating:
 
     async def test_funnel_user_id_outranks_vid_on_conflict(self):
         r = _fr()
-        await r.set(_sig_key(1, "fuid", _hash("U")), "uidA")
-        await r.set(_sig_key(1, "vid", "V"), "uidB")
+        await r.set(_sig_key(1, "fuid", _hash("U")), "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        await r.set(_sig_key(1, "vid", "V"), "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
         res = await _resolve(r, fuid="U", vid="V", campaign="10", trusted=True)
-        assert res.uid == "uidA"  # highest-precedence (funnel_user_id) wins
+        assert res.uid == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"  # highest-precedence (funnel_user_id) wins
         assert res.is_unique is False
         assert res.signal_tier == "funnel_user_id"  # DOC-1 canonical label
         # vid↔fuid resolve to DIFFERENT uids → conflict flagged (log-not-merge),
@@ -224,18 +224,56 @@ class TestSignalGating:
 
     async def test_no_conflict_when_signals_agree(self):
         r = _fr()
-        await r.set(_sig_key(1, "fuid", _hash("U")), "uidA")
-        await r.set(_sig_key(1, "vid", "V"), "uidA")  # SAME uid
+        await r.set(_sig_key(1, "fuid", _hash("U")), "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        await r.set(_sig_key(1, "vid", "V"), "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")  # SAME uid
         res = await _resolve(r, fuid="U", vid="V", campaign="10", trusted=True)
-        assert res.uid == "uidA"
+        assert res.uid == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         assert res.identity_conflict is False
         assert res.signal_tier == "funnel_user_id"  # DOC-1 canonical label
 
     async def test_signal_tier_vid_when_only_vid_resolves(self):
         r = _fr()
-        await r.set(_sig_key(1, "vid", "V"), "uidB")
+        await r.set(_sig_key(1, "vid", "V"), "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
         res = await _resolve(r, vid="V", campaign="10")
-        assert res.uid == "uidB" and res.signal_tier == "vid"
+        assert res.uid == "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" and res.signal_tier == "vid"
+        assert res.identity_conflict is False
+
+
+# ============================================================
+# SEC-M2 — read-back uid shape validation (fail-open as new on malformed)
+# ============================================================
+
+class TestSecM2UidValidation:
+    async def test_valid_uid_helper(self):
+        from app.identity import _valid_uid
+        assert _valid_uid("a" * 32) is True               # token_hex(16) shape
+        assert _valid_uid("ABCDEF" + "a" * 26) is False   # uppercase rejected
+        assert _valid_uid("a" * 31) is False              # too short
+        assert _valid_uid("a" * 33) is False              # too long
+        assert _valid_uid("../inject" + "a" * 23) is False  # key-injection chars
+        assert _valid_uid("") is False and _valid_uid(None) is False
+
+    async def test_malformed_readback_not_adopted_fails_open_new(self):
+        # A poisoned/corrupt signal-map value must NEVER be adopted as identity
+        # nor concatenated into a sticky/history key. The hit is ignored → mint
+        # NX fails on the existing (garbage) key → adopted read-back invalid →
+        # uid="" (segment A, new). The garbage is NOT returned.
+        r = _fr()
+        await r.set(_sig_key(1, "vid", "V"), "this-is-not-a-valid-uid")
+        res = await _resolve(r, vid="V", campaign="10")
+        assert res.uid == ""                  # garbage NOT adopted
+        assert res.is_unique is True          # treated as new
+        assert res.is_returning is False and res.is_roaming is False
+
+    async def test_malformed_lower_tier_falls_through_to_valid(self):
+        # Top tier (fuid) holds garbage, lower tier (vid) holds a VALID uid →
+        # the garbage hit is skipped, the valid vid uid is adopted.
+        r = _fr()
+        await r.set(_sig_key(1, "fuid", _hash("U")), "garbage")
+        await r.set(_sig_key(1, "vid", "V"), "c" * 32)
+        res = await _resolve(r, fuid="U", vid="V", campaign="10", trusted=True)
+        assert res.uid == "c" * 32 and res.signal_tier == "vid"
+        # the malformed fuid value is not counted as a competing identity
         assert res.identity_conflict is False
 
 

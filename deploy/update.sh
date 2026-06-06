@@ -157,6 +157,23 @@ git reset --hard "origin/$BRANCH"
 NEW_SHA="$(git rev-parse --short HEAD)"
 echo "=== STEP: fetch === new_sha=$NEW_SHA prev_sha=$PREV_SHA"
 
+# Returning-users v2 (B2 fix) — ensure the dedicated noeviction identity-redis
+# sibling is running. The compose now declares `identity-redis` + a
+# compose-literal TDS_IDENTITY_REDIS_URL on click-processor. BUT the swap below
+# uses `up -d --no-deps click-processor`, which will NOT start a newly-added
+# sibling — so a node whose compose just gained identity-redis would have the
+# URL set with no container behind it, and the resolver boot-gate would DEGRADE
+# (routing stays fine, returning inert). Start it here, idempotently and
+# non-disruptively (no-op if already running; NEVER touches click-processor),
+# in BOTH the forward and no-op paths so an at-tip node still converges. On an
+# older mirror without the service this is a harmless no-op. NB the chicken-egg:
+# the FIRST redeploy onto this update.sh runs the OLD in-memory script (no
+# self-heal) — convergence completes on the SECOND redeploy. The degrade gate
+# keeps routing safe in between.
+echo "=== STEP: identity-store === ensuring identity-redis is up (idempotent)"
+$COMPOSE up -d identity-redis 2>/dev/null \
+  || echo "  (no identity-redis service in this compose — skipping)"
+
 if [ "$NEW_SHA" = "$PREV_SHA" ]; then
   # Nothing to do — already at tip. Run the health-gate anyway to
   # confirm the node is healthy (operator may have triggered Deploy

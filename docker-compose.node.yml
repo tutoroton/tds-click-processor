@@ -59,6 +59,14 @@ services:
       - .env
     environment:
       - TDS_REDIS_URL=redis://redis:6379/0
+      # Returning-user identity store (DECISION-edge-identity-architecture.md, B2
+      # fix). A COMPOSE-LITERAL (not .env) so the URL can NEVER be present
+      # without the container behind it — the two ship together in this tracked
+      # file. Points at the dedicated `identity-redis` service below
+      # (`noeviction`), NOT the routing `redis` (which evicts — see B1). When the
+      # resolver gate is OFF this client is never opened (zero cost); when ON,
+      # the boot gate verifies this instance is reachable + noeviction.
+      - TDS_IDENTITY_REDIS_URL=redis://identity-redis:6379/0
       # TDS_TDS_SECRET_KEY (the name pydantic env_prefix="TDS_" + field
       # `tds_secret_key` actually reads) comes from the env_file: render-env.sh
       # ALWAYS writes BOTH TDS_SECRET_KEY and TDS_TDS_SECRET_KEY into .env, so no
@@ -76,6 +84,8 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+      identity-redis:
+        condition: service_healthy
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8100/health')"]
@@ -87,6 +97,11 @@ services:
   redis:
     image: redis:7-alpine
     container_name: tds-redis
+    # ROUTING cache — DISPOSABLE/evictable by design (rebuildable from PG via
+    # sync, per rule `architecture` "Redis is disposable cache"). volatile-lru
+    # is the correct degradation under memory pressure. Identity does NOT live
+    # here (see identity-redis) — an LRU eviction of an identity key would
+    # silently turn a returning user back into "new" + drop sticky pins (B1).
     command: redis-server --maxmemory 256mb --maxmemory-policy volatile-lru --appendonly yes
     volumes:
       - tds-redis-data:/data
@@ -97,8 +112,31 @@ services:
       timeout: 3s
       retries: 3
 
+  identity-redis:
+    image: redis:7-alpine
+    container_name: tds-identity-redis
+    # RETURNING-USER identity store — AUTHORITATIVE, MUST NOT evict
+    # (DECISION-edge-identity-architecture.md L2; D30). `noeviction` ⇒ under
+    # memory pressure writes fail LOUD (caller fails-open to "new") rather than
+    # silently dropping a uid/pin. The resolver boot gate
+    # (`identity.assert_identity_namespace_safe`) verifies this policy at boot
+    # and DEGRADES the resolver (never downs the node) if it can't. Rebuildable
+    # from ClickHouse, so the appendonly file is a restart convenience, not a
+    # durability guarantee. Separate instance from the routing cache so the two
+    # keyspaces never compete for memory.
+    command: redis-server --maxmemory 256mb --maxmemory-policy noeviction --appendonly yes
+    volumes:
+      - tds-identity-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+
 volumes:
   tds-redis-data:
+  tds-identity-data:
   tds-caddy-data:
   tds-caddy-config:
   tds-click-queue:

@@ -363,12 +363,14 @@ class Settings(BaseSettings):
     # identity key silently degrades a returning user back to "new", drops
     # sticky pins, AND competes with the routing cache for memory. The boot
     # gate (`identity.assert_identity_namespace_safe`, run when the resolver
-    # is enabled) enforces this:
-    #   * non-local + empty ⇒ REFUSE TO START (we will NOT silently reuse the
-    #     evictable routing Redis);
-    #   * non-local + set ⇒ must be reachable AND `maxmemory-policy
-    #     noeviction`, else refuse;
-    #   * local ⇒ warn only, reuse of the routing Redis is acceptable for dev.
+    # is enabled) enforces this — and after the 2026-06-06 incident it DEGRADES
+    # rather than refusing, so a misconfigured store can never down a node:
+    #   * non-local + empty ⇒ DEGRADE (disable the resolver in-memory + LOUD
+    #     CRITICAL/Sentry, then boot legacy — we will NOT silently reuse the
+    #     evictable routing Redis, and we will NOT take the node offline);
+    #   * non-local + set but unreachable / not `noeviction` ⇒ DEGRADE likewise;
+    #   * local ⇒ STRICT (raise) — dev must notice misconfig; reuse of the
+    #     routing Redis is acceptable for local dev only.
     # Point this at a separate instance/DB before enabling the resolver for a
     # tenant in any non-local environment.
     #

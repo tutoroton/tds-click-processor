@@ -441,31 +441,82 @@ async def assert_identity_namespace_safe() -> None:
       acceptable for dev; we probe + log the policy so the requirement stays
       visible.
 
-    Raises ``RuntimeError`` to abort startup in the non-local refuse cases.
+    NON-LOCAL behaviour is now DEGRADE-not-refuse (2026-06-06 incident fix):
+    a missing/unreachable/evicting identity store disables the resolver
+    in-memory + alerts (CRITICAL + Sentry) and the node boots with legacy
+    routing — it does NOT abort startup (that took whole edge nodes offline).
+    LOCAL still raises so a dev fixes the misconfig before shipping.
     """
     if not settings.returning_resolver_enabled:
         return
 
     is_local = settings.environment in _LOCAL_ENVIRONMENTS
 
-    if not settings.identity_redis_url:
-        if not is_local:
+    # v2 P0.3 incident-hardening (2026-06-06): in a NON-LOCAL env an edge node
+    # serving production traffic must NEVER be taken down because the OPTIONAL
+    # returning-user feature's identity store is absent/misconfigured. This gate
+    # used to RAISE → the click-processor refused to boot → the whole node
+    # stopped routing (the worker fell back to its default redirect — a live
+    # outage on every node that got the resolver env ON without a provisioned
+    # identity Redis). Now we DEGRADE: on ANY store failure, disable the resolver
+    # in-memory (the runtime gate then skips all identity I/O → byte-identical
+    # legacy routing) + emit a LOUD CRITICAL + Sentry alert. Fail-SAFE for
+    # routing, fail-LOUD for the operator — never silent. Local dev stays strict
+    # (a dev should fix the misconfig before it ships).
+    try:
+        if not settings.identity_redis_url:
+            if is_local:
+                # Local dev — reuse the routing Redis, probe + warn only.
+                await _probe_identity_policy(required=False)
+                return
             raise RuntimeError(
-                "TDS_IDENTITY_REDIS_URL must be set when the returning-user "
-                "resolver is ENABLED in a non-local environment "
-                f"(TDS_ENVIRONMENT={settings.environment!r}). The identity "
-                "keyspace requires a dedicated `maxmemory-policy noeviction` "
-                "Redis — an evicted identity key silently degrades a returning "
-                "visitor to 'new' and loses sticky pins. Refusing to silently "
-                "reuse the evictable routing Redis; point TDS_IDENTITY_REDIS_URL "
-                "at a dedicated no-eviction instance."
+                "TDS_IDENTITY_REDIS_URL is empty while the returning resolver is "
+                "ENABLED — a dedicated noeviction identity Redis is required."
             )
-        # Local dev — reuse the routing Redis, probe + warn only.
-        await _probe_identity_policy(required=False)
-        return
+        # A dedicated identity URL is configured — verify reachability + policy.
+        await _probe_identity_policy(required=not is_local)
+    except RuntimeError as exc:
+        if is_local:
+            raise  # local: keep strict so a dev fixes it before shipping
+        _degrade_resolver(str(exc))
 
-    # A dedicated identity URL is configured — verify reachability + policy.
-    await _probe_identity_policy(required=not is_local)
+
+def _degrade_resolver(reason: str) -> None:
+    """Disable the returning resolver (+ routing) in-memory and alert LOUDLY.
+
+    Called from the boot gate when the identity store is unavailable in a
+    non-local env, so the node BOOTS (routing intact, byte-identical legacy
+    path) instead of refusing to start. The runtime resolver gate (`router.py`
+    reads `settings.returning_resolver_enabled`) then skips all identity I/O.
+    NOT silent: a CRITICAL log + a Sentry alert tell the operator to provision a
+    dedicated noeviction identity Redis before the returning feature can run on
+    this node."""
+    logger.critical(
+        "RETURNING RESOLVER AUTO-DISABLED at boot (%s) — node boots with the "
+        "resolver OFF (legacy routing, byte-identical) instead of refusing to "
+        "start. Provision a dedicated noeviction identity Redis + set "
+        "TDS_IDENTITY_REDIS_URL to enable returning-user routing on this node. "
+        "TDS_ENVIRONMENT=%s.", reason, settings.environment,
+    )
+    try:
+        import sentry_sdk
+
+        with sentry_sdk.new_scope() as scope:
+            scope.set_tag("op", "identity_boot_gate")
+            scope.set_extra("environment", settings.environment)
+            scope.set_extra("reason", reason)
+            sentry_sdk.capture_message(
+                "Returning resolver auto-disabled at boot (identity store unavailable)",
+                level="error",
+            )
+    except Exception:  # pragma: no cover — alerting must never block boot
+        pass
+    try:
+        settings.returning_resolver_enabled = False
+        settings.returning_routing_enabled = False
+    except Exception:  # pragma: no cover — frozen-model fallback
+        object.__setattr__(settings, "returning_resolver_enabled", False)
+        object.__setattr__(settings, "returning_routing_enabled", False)
 
 
 async def _probe_identity_policy(*, required: bool) -> None:

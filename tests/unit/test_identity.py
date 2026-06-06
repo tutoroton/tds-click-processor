@@ -585,9 +585,11 @@ def _patch_identity_redis(monkeypatch, fake):
 
 
 class TestIdentityNamespaceGate:
-    """The boot gate: refuse-to-start in non-local when the identity Redis is
-    absent or evicting; warn-only in local; pure no-op when the resolver is
-    OFF (dark default → every existing node boots byte-identically)."""
+    """The boot gate: DEGRADE-not-refuse in non-local when the identity Redis is
+    absent or evicting (2026-06-06 incident fix — a missing optional-feature
+    store must never take an edge node offline); warn-only in local; pure no-op
+    when the resolver is OFF (dark default → every existing node boots
+    byte-identically)."""
 
     async def test_resolver_off_is_noop_even_nonlocal_empty(self, monkeypatch):
         # The dark default: OFF ⇒ never raises, even in a non-local env with
@@ -605,12 +607,18 @@ class TestIdentityNamespaceGate:
         _patch_identity_redis(monkeypatch, _FakeIdentityRedis(policy="allkeys-lru"))
         await identity.assert_identity_namespace_safe()  # must not raise
 
-    async def test_nonlocal_empty_url_refuses(self, monkeypatch):
+    async def test_nonlocal_empty_url_degrades(self, monkeypatch):
+        # Incident fix (2026-06-06): non-local + resolver ON + no identity URL
+        # → DEGRADE (disable the resolver in-memory + alert, then boot) rather
+        # than refuse-to-start, so a missing optional-feature store never takes
+        # an edge node offline. Routing continues byte-identical (legacy).
         monkeypatch.setattr(settings, "returning_resolver_enabled", True)
+        monkeypatch.setattr(settings, "returning_routing_enabled", True)
         monkeypatch.setattr(settings, "environment", "staging")
         monkeypatch.setattr(settings, "identity_redis_url", "")
-        with pytest.raises(RuntimeError, match="TDS_IDENTITY_REDIS_URL"):
-            await identity.assert_identity_namespace_safe()
+        await identity.assert_identity_namespace_safe()  # must NOT raise
+        assert settings.returning_resolver_enabled is False
+        assert settings.returning_routing_enabled is False
 
     async def test_nonlocal_noeviction_ok(self, monkeypatch):
         monkeypatch.setattr(settings, "returning_resolver_enabled", True)
@@ -619,21 +627,29 @@ class TestIdentityNamespaceGate:
         _patch_identity_redis(monkeypatch, _FakeIdentityRedis(policy="noeviction"))
         await identity.assert_identity_namespace_safe()  # must not raise
 
-    async def test_nonlocal_eviction_policy_refuses(self, monkeypatch):
+    async def test_nonlocal_eviction_policy_degrades(self, monkeypatch):
+        # Incident fix: a CONFIRMED evicting identity Redis in non-local
+        # degrades (disable resolver, boot) instead of refusing to start.
         monkeypatch.setattr(settings, "returning_resolver_enabled", True)
+        monkeypatch.setattr(settings, "returning_routing_enabled", True)
         monkeypatch.setattr(settings, "environment", "production")
         monkeypatch.setattr(settings, "identity_redis_url", "redis://id:6379/0")
         _patch_identity_redis(monkeypatch, _FakeIdentityRedis(policy="allkeys-lru"))
-        with pytest.raises(RuntimeError, match="eviction"):
-            await identity.assert_identity_namespace_safe()
+        await identity.assert_identity_namespace_safe()  # must NOT raise
+        assert settings.returning_resolver_enabled is False
+        assert settings.returning_routing_enabled is False
 
-    async def test_nonlocal_unreachable_refuses(self, monkeypatch):
+    async def test_nonlocal_unreachable_degrades(self, monkeypatch):
+        # Incident fix: an unreachable identity Redis in non-local degrades
+        # (disable resolver, boot) instead of refusing to start.
         monkeypatch.setattr(settings, "returning_resolver_enabled", True)
+        monkeypatch.setattr(settings, "returning_routing_enabled", True)
         monkeypatch.setattr(settings, "environment", "staging")
         monkeypatch.setattr(settings, "identity_redis_url", "redis://id:6379/0")
         _patch_identity_redis(monkeypatch, _FakeIdentityRedis(reachable=False))
-        with pytest.raises(RuntimeError, match="unreachable"):
-            await identity.assert_identity_namespace_safe()
+        await identity.assert_identity_namespace_safe()  # must NOT raise
+        assert settings.returning_resolver_enabled is False
+        assert settings.returning_routing_enabled is False
 
     async def test_nonlocal_unreadable_policy_tolerated(self, monkeypatch):
         # Managed Redis may restrict CONFIG GET — we cannot prove a misconfig,

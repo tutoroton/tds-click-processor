@@ -1320,6 +1320,28 @@ async def decide(
         _phase3_attribution_fields(result, req, timing, _utc_now_ms_iso())
     )
 
+    # P3 (2026-06-06) — MINT / re-stamp the signed `_tds_id` identity cookie for
+    # the worker (P4) to emit as a Set-Cookie, so a returning user is recognized
+    # gap-free cross-node (the cookie carries the WHO, eliminating the vid→uid
+    # GET). Computed ONCE here (before the dedup gate) and injected into BOTH
+    # response dicts below — the worker takes the first response from a race, so
+    # the duplicate-skipped path must carry it too. DARK: when the resolver is
+    # OFF or the codec is disabled, `mint_identity_cookie` returns None → the
+    # `set_identity` key is OMITTED → the JSON is byte-identical to legacy.
+    # `seen` MUST include the current campaign ∪ the recent-≤16 already-seen.
+    _set_identity = None
+    attribution = result.get("attribution") or {}
+    if settings.returning_resolver_enabled and attribution.get("uid"):
+        _seen = set(attribution.get("campaigns_seen") or ())
+        if result.get("campaign_id"):
+            _seen.add(result["campaign_id"])
+        _set_identity = identity.mint_identity_cookie(
+            company_id=attribution.get("company_id"),
+            uid=attribution["uid"],
+            campaigns_seen=_seen,
+            incoming_token=req.identity_token,
+        )
+
     # H1 fix (2026-05-11): idempotency gate BEFORE XADD.
     #
     # Without this, a CF Worker retry on its 2s `AbortSignal.timeout`
@@ -1364,6 +1386,8 @@ async def decide(
             (time.perf_counter() - t_endpoint_start) * 1000, 2,
         )
         response = {"url": result["url"], "status": 302, "timing": timing}
+        if _set_identity is not None:
+            response["set_identity"] = _set_identity
         if x_test_id:
             response["echoed_test_id"] = x_test_id
             emit_checkpoint("click.decide_out", {
@@ -1497,6 +1521,8 @@ async def decide(
     timing["endpoint_total_ms"] = round((time.perf_counter() - t_endpoint_start) * 1000, 2)
 
     response = {"url": result["url"], "status": 302, "timing": timing}
+    if _set_identity is not None:
+        response["set_identity"] = _set_identity
     if x_test_id:
         response["echoed_test_id"] = x_test_id
         # Success-path checkpoint with full timing breakdown.

@@ -456,7 +456,10 @@ class TestRouterGate:
         monkeypatch.setattr(settings, "returning_resolver_enabled", True)
 
         async def _stamp(**k):
-            return IdentityResult(uid="UID-OK", is_unique=False, is_returning=True)
+            return IdentityResult(
+                uid="UID-OK", is_unique=False, is_returning=True,
+                campaigns_seen=frozenset({"7", "9"}),
+            )
 
         monkeypatch.setattr(identity, "resolve_and_stamp", _stamp)
         _, _, attr = await _build_campaign_attribution(
@@ -465,6 +468,12 @@ class TestRouterGate:
         assert attr["uid"] == "UID-OK"
         assert attr["is_unique"] is False
         assert attr["is_returning"] is True
+        # P3 mint — the router MUST thread company_id + the resolver's
+        # campaigns-seen set into attribution so /decide can re-stamp the cookie.
+        # (Guards the wiring the main.py injection tests can't see — they mock
+        # route() and fabricate attribution.)
+        assert attr["company_id"] == 1  # _to_int(_campaign company_id "1")
+        assert attr["campaigns_seen"] == frozenset({"7", "9"})
 
 
 # ============================================================

@@ -424,6 +424,11 @@ async def _build_campaign_attribution(
             attribution["prev_offers"] = ident.prev_offers
             attribution["prev_targets"] = ident.prev_targets
             attribution["prev_subs"] = ident.prev_subs
+            # P3 mint — the company_id + recent campaigns-seen set the /decide
+            # handler needs to re-stamp the signed `_tds_id` cookie (the current
+            # campaign is unioned in at the mint call site).
+            attribution["company_id"] = buyer_chain["company_id"]
+            attribution["campaigns_seen"] = ident.campaigns_seen
         except Exception as e:  # fail-open — never fail the click
             capture_op_msg_throttled(
                 OP_IDENTITY, buyer_chain["company_id"],

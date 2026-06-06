@@ -124,6 +124,12 @@ class IdentityResult:
     history sets (P3-written), read in RT#2 ONLY for a returning visitor when
     `with_history` is requested (routing enabled). Empty for new users / when
     routing is OFF. The cascade reads these to match the P4 `prev_*` criteria.
+
+    `campaigns_seen` (P3 mint) is the uid's recent campaigns-seen set, read on
+    the SAME RT#2 pipeline (no extra round-trip) for any seen-before user so the
+    node can re-stamp the cookie's `seen` hint cross-restamp. Empty frozenset
+    for a brand-new user (nothing seen yet — the current campaign is unioned in
+    by the mint call site, not here).
     """
 
     uid: str
@@ -135,6 +141,7 @@ class IdentityResult:
     prev_offers: frozenset = field(default_factory=frozenset)
     prev_targets: frozenset = field(default_factory=frozenset)
     prev_subs: frozenset = field(default_factory=frozenset)
+    campaigns_seen: frozenset = field(default_factory=frozenset)
 
 
 def _hash(value: str) -> str:
@@ -184,6 +191,60 @@ def _seen_key(company_id: int, uid: str) -> str:
     """Alias for the campaigns-seen set key (the token's `seen` hint unions
     into the SAME set the legacy path reads/writes — they are one store)."""
     return _campaigns_key(company_id, uid)
+
+
+def mint_identity_cookie(
+    *,
+    company_id,
+    uid: str,
+    campaigns_seen,
+    incoming_token: str | None,
+) -> str | None:
+    """Mint / re-stamp the signed `_tds_id` cookie value for a returning user.
+
+    The cookie is the WHO carrier (R4): re-stamping every visit refreshes `exp`
+    and folds the current campaign into `seen`, so the user stays gap-free
+    cross-node. This is fail-OPEN — ANY anomaly returns ``None`` (no cookie), so
+    a mint failure NEVER interrupts the redirect. Returns ``None`` when there is
+    nothing to emit (no uid, or the codec is disabled / no active kid).
+
+    `first_seen` is PRESERVED cross-restamp: the cookie itself is the first-seen
+    anchor, so when a valid incoming token of the SAME tenant is present we carry
+    its `fs` forward rather than resetting it to now (a re-stamp must not look
+    like a brand-new identity). A token of a DIFFERENT tenant, or none/invalid,
+    yields ``fs = now`` (multi-tenant: never inherit another company's anchor).
+    """
+    try:
+        if not uid or not idtok.is_enabled():
+            return None  # dark / signing disabled ⇒ nothing to emit
+        cid = int(company_id)
+
+        now = int(time.time())
+        exp = now + settings.returning_uid_ttl_seconds
+
+        # first_seen carries over only from a same-tenant valid token; else now.
+        fs = now
+        if incoming_token:
+            claims = idtok.verify(incoming_token)
+            if claims is not None and claims.get("c") == cid:
+                try:
+                    fs = int(claims["fs"])
+                except (KeyError, TypeError, ValueError):
+                    fs = now
+
+        # seen = sorted unique purely-numeric campaign ids, capped to recent-16
+        # (the codec also caps, but bound here so the carried hint is the most
+        # recent ones — drop non-digit buckets like the "" defensive sentinel).
+        nums = sorted({int(c) for c in campaigns_seen if str(c).isdigit()})
+        if len(nums) > idtok.MAX_SEEN:
+            nums = nums[-idtok.MAX_SEEN:]
+
+        return idtok.sign(
+            company_id=cid, uid=uid, first_seen=fs, exp=exp, seen=nums,
+        )
+    except Exception as e:  # fail-open — a mint failure must never fail a click
+        logger.warning("identity cookie mint failed (swallowed): %s", e)
+        return None
 
 
 async def resolve_via_token(
@@ -247,21 +308,29 @@ async def resolve_via_token(
             pipe.smembers(_offers_key(company_id, uid))
             pipe.smembers(_targets_key(company_id, uid))
             pipe.smembers(_subs_key(company_id, uid))
+        # P3 mint — read the (now-unioned) campaigns-seen set on the SAME pipeline
+        # so the node can re-stamp the cookie's `seen` hint with no extra RT.
+        pipe.smembers(ckey)
         rt = await pipe.execute()
     except Exception as e:  # fail-open — never block routing on the hint store
         logger.warning("identity token seen-union/read failed (degraded): %s", e)
         # Recognition still succeeds (uid known from the signed token); fall back
         # to "seen this campaign?" unknown ⇒ treat as roaming (seen-before, not
         # provably this-campaign) which is the safe non-first classification.
+        # `campaigns_seen` falls back to the cookie's own hint so the re-stamp
+        # still carries forward what the token already proved (degraded but never
+        # losing the hint).
         return IdentityResult(
             uid=uid, is_unique=False, is_returning=False, is_roaming=True,
             signal_tier=_tier_label(_TIER_TOKEN), identity_conflict=False,
+            campaigns_seen=frozenset(seen_hint),
         )
 
-    # rt layout: [sadd?]  sismember  [offers targets subs]
+    # rt layout: [sadd?]  sismember  [offers targets subs]  campaigns(SMEMBERS)
     idx = 1 if seen_hint else 0
     is_returning = bool(rt[idx])
     is_roaming = not is_returning  # seen-before (token proves it) AND not this campaign
+    campaigns_seen = frozenset(rt[-1] or ())  # last entry = the SMEMBERS read
     if with_history:
         return IdentityResult(
             uid=uid, is_unique=False, is_returning=is_returning,
@@ -270,11 +339,12 @@ async def resolve_via_token(
             prev_offers=frozenset(rt[idx + 1] or ()),
             prev_targets=frozenset(rt[idx + 2] or ()),
             prev_subs=frozenset(rt[idx + 3] or ()),
+            campaigns_seen=campaigns_seen,
         )
     return IdentityResult(
         uid=uid, is_unique=False, is_returning=is_returning,
         is_roaming=is_roaming, signal_tier=_tier_label(_TIER_TOKEN),
-        identity_conflict=False,
+        identity_conflict=False, campaigns_seen=campaigns_seen,
     )
 
 
@@ -400,10 +470,14 @@ async def resolve_identity(
         pipe.smembers(_offers_key(company_id, resolved_uid))
         pipe.smembers(_targets_key(company_id, resolved_uid))
         pipe.smembers(_subs_key(company_id, resolved_uid))
+    # P3 mint — campaigns-seen set on the SAME RT#2 pipeline (no extra round-trip)
+    # so the node can re-stamp the cookie's `seen` hint for cross-node recognition.
+    pipe.smembers(_campaigns_key(company_id, resolved_uid))
     rt2 = await pipe.execute()  # RT#2
 
     is_returning = bool(rt2[0])
     is_roaming = not is_returning  # seen-before AND not this campaign
+    campaigns_seen = frozenset(rt2[-1] or ())  # last entry = the SMEMBERS read
     if with_history:
         return IdentityResult(
             uid=resolved_uid, is_unique=False, is_returning=is_returning,
@@ -412,11 +486,12 @@ async def resolve_identity(
             prev_offers=frozenset(rt2[1] or ()),
             prev_targets=frozenset(rt2[2] or ()),
             prev_subs=frozenset(rt2[3] or ()),
+            campaigns_seen=campaigns_seen,
         )
     return IdentityResult(
         uid=resolved_uid, is_unique=False, is_returning=is_returning,
         is_roaming=is_roaming, signal_tier=_tier_label(winner_tier),
-        identity_conflict=identity_conflict,
+        identity_conflict=identity_conflict, campaigns_seen=campaigns_seen,
     )
 
 

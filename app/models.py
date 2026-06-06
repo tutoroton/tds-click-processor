@@ -176,6 +176,12 @@ class ClickResponse(BaseModel):
     """Response to CF Worker — where to redirect the user."""
     url: str
     status: int = 302
+    # P3 (2026-06-06) — the signed `_tds_id` value the node MINTED/re-stamped for
+    # this returning-user identity, for the worker (P4) to emit as a Set-Cookie.
+    # The node does NOT set an HTTP cookie header itself — node↔worker is JSON.
+    # `None` ⇒ dark / nothing to emit (resolver OFF, codec disabled, or no uid):
+    # the field is then OMITTED from the response → byte-identical to legacy.
+    set_identity: str | None = None
 
 
 class HealthResponse(BaseModel):

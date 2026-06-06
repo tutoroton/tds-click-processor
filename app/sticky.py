@@ -30,6 +30,7 @@ from __future__ import annotations
 import logging
 
 from app.redis_client import get_identity_redis
+from app.telemetry import OP_STICKY_WRITE, capture_op_msg_throttled
 
 logger = logging.getLogger("tds.sticky")
 
@@ -71,6 +72,13 @@ async def set_sticky_nx(company_id, uid: str, campaign_id, target_id, ttl: int) 
                     nx=True, ex=ttl)
     except Exception as e:  # pragma: no cover — fail-open
         logger.warning("sticky set_nx failed (swallowed): %s", e)
+        # G-LOW-1 — surface the swallowed pin WRITE failure (throttled per
+        # company). Fail-open preserved: the click already routed.
+        capture_op_msg_throttled(
+            OP_STICKY_WRITE, company_id,
+            f"sticky set_nx failed (swallowed): {e}",
+            company_id=company_id, uid=uid, op="set_nx",
+        )
 
 
 async def repin(company_id, uid: str, campaign_id, target_id, ttl: int) -> None:
@@ -85,3 +93,10 @@ async def repin(company_id, uid: str, campaign_id, target_id, ttl: int) -> None:
         await r.set(sticky_key(company_id, uid, campaign_id), str(target_id), ex=ttl)
     except Exception as e:  # pragma: no cover — fail-open
         logger.warning("sticky repin failed (swallowed): %s", e)
+        # G-LOW-1 — surface the swallowed re-pin WRITE failure (throttled per
+        # company). Fail-open preserved: the click already routed.
+        capture_op_msg_throttled(
+            OP_STICKY_WRITE, company_id,
+            f"sticky repin failed (swallowed): {e}",
+            company_id=company_id, uid=uid, op="repin",
+        )

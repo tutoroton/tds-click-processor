@@ -67,6 +67,13 @@ OP_DISK_PRESSURE = "disk_pressure"
 # per company) when the resolver raises and the click degrades to legacy flags.
 OP_IDENTITY = "identity_resolve"
 
+# G-LOW-1 (SEC-M1) — returning-user WRITE-fail paths that used to swallow a Redis
+# error with only a log line (no Sentry). Throttled per company so a persistent
+# identity-Redis fault surfaces ONCE per window, not per click. Read failures
+# stay silent (benign: a missed pin → normal selection, the click still routes).
+OP_IDENTITY_PERSIST = "identity_persist"  # deferred uid/profile/history write failed
+OP_STICKY_WRITE = "sticky_write"          # sticky pin SET NX / repin failed
+
 # Per-click verdict outcomes (Sprint 2.2+)
 OP_DEADLETTER = "deadletter"   # click hit max-attempts after rejections
 OP_PARTIAL_ACK = "partial_ack"  # batch had mixed accepted+rejected

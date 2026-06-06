@@ -57,6 +57,7 @@ from dataclasses import dataclass, field
 from app.config import _LOCAL_ENVIRONMENTS, settings
 from app.history import _offers_key, _subs_key, _targets_key
 from app.redis_client import get_identity_redis
+from app.telemetry import OP_IDENTITY_PERSIST, capture_op_msg_throttled
 
 logger = logging.getLogger(__name__)
 
@@ -353,6 +354,15 @@ async def persist_identity(
             )
     except Exception as e:  # pragma: no cover — best-effort, never fail a click
         logger.warning("identity persist failed (swallowed): %s", e)
+        # G-LOW-1 — surface the swallowed WRITE failure to Sentry (throttled per
+        # company so a persistent identity-Redis fault is ONE event/window, not
+        # one per click). Still fail-open: capture never raises, the click is
+        # already routed + XADD'd. uid is the canonical hex id (not PII).
+        capture_op_msg_throttled(
+            OP_IDENTITY_PERSIST, company_id,
+            f"identity persist failed (swallowed): {e}",
+            company_id=company_id, uid=uid,
+        )
 
 
 async def resolve_and_stamp(

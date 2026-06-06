@@ -58,6 +58,18 @@ class ClickRequest(BaseModel):
         ),
     )
     visitor_id: str | None = Field(default=None, max_length=128, pattern=r'^[a-zA-Z0-9_\-]*$')
+    # Signed identity cookie (`_tds_id`) value — Layer-1 RECOGNITION (P2, dark).
+    # SoT: docs/development/returning-users-v2/DECISION-edge-identity-architecture.md.
+    # The worker forwards the raw cookie value here (P4); the node VERIFIES it
+    # in-process (HMAC) to recognize a returning user with ZERO store hit,
+    # dual-accepting the legacy `_tds_vid` path. Absent (old worker / P2) ⇒ None
+    # ⇒ byte-identical legacy resolution. Bounded; charset is the cookie wire
+    # shape `b64url(payload).b64url(sig)` (base64url alphabet + the dot
+    # separator). A non-matching value simply fails verify (fail-open), so the
+    # pattern is a cheap pre-filter, not a security boundary.
+    identity_token: str | None = Field(
+        default=None, max_length=512, pattern=r'^[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+$'
+    )
     is_returning: bool = False
     # Stage 3 · Phase 4 S2 — edge quality signals from CF Bot Management
     # (fail-open false at the worker on a non-Enterprise zone). Bools so a

@@ -659,3 +659,161 @@ class TestIdentityNamespaceGate:
         monkeypatch.setattr(settings, "identity_redis_url", "redis://id:6379/0")
         _patch_identity_redis(monkeypatch, _FakeIdentityRedis(policy_readable=False))
         await identity.assert_identity_namespace_safe()  # must not raise
+
+
+# ============================================================
+# P2 — signed `_tds_id` token dual-accept (in-process recognition)
+# ============================================================
+from app import identity_token as idtok  # noqa: E402
+
+_TOK_KEY = "k" * 40
+_TOK_UID = "0123456789abcdef0123456789abcdef"
+
+
+def _enable_codec(monkeypatch, *, keys=f"1:{_TOK_KEY}", active="1"):
+    monkeypatch.setattr(settings, "identity_cookie_keys", keys)
+    monkeypatch.setattr(settings, "identity_cookie_active_kid", active)
+
+
+def _mk_token(*, company_id, uid=_TOK_UID, seen=None, exp=None, kid=1):
+    import time as _t
+    return idtok.sign(
+        company_id=company_id, uid=uid, first_seen=1,
+        exp=exp if exp is not None else int(_t.time()) + 3600,
+        seen=seen or [], kid=kid,
+    )
+
+
+class _GetSpy:
+    """Wraps a fakeredis client and records every direct GET key + every
+    pipeline GET key, so a test can assert NO `vid→uid` GET was issued."""
+
+    def __init__(self, real):
+        self._real = real
+        self.get_keys: list = []
+
+    def pipeline(self, *a, **k):
+        return _GetSpyPipe(self._real.pipeline(*a, **k), self)
+
+    def __getattr__(self, name):
+        attr = getattr(self._real, name)
+        if name == "get":
+            async def spy_get(key, *a, **k):
+                self.get_keys.append(key)
+                return await attr(key, *a, **k)
+            return spy_get
+        return attr
+
+
+class _GetSpyPipe:
+    def __init__(self, real, parent):
+        self._real = real
+        self._parent = parent
+
+    def get(self, key, *a, **k):
+        self._parent.get_keys.append(key)
+        return self._real.get(key, *a, **k)
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+class TestTokenDualAccept:
+    async def test_valid_token_skips_vid_uid_get(self, monkeypatch):
+        _enable_codec(monkeypatch)
+        spy = _GetSpy(_fr())
+        tok = _mk_token(company_id=1)
+        res = await resolve_identity(
+            spy, company_id=1, funnel_user_id=None, visitor_id="VID1",
+            campaign_id="10", source_trusted=False, ttl=TTL, identity_token=tok,
+        )
+        assert res.uid == _TOK_UID
+        assert res.is_unique is False           # token proves seen-before
+        assert res.signal_tier == "token"
+        # The decisive assertion: NO `id:1:vid:VID1` GET was issued — recognition
+        # was an in-process HMAC verify, zero store hit for the uid.
+        assert _sig_key(1, "vid", "VID1") not in spy.get_keys
+        assert not any(str(k).startswith("id:1:vid:") for k in spy.get_keys)
+
+    async def test_token_seen_hint_makes_returning(self, monkeypatch):
+        _enable_codec(monkeypatch)
+        r = _fr()
+        # Token carries campaign 10 in its seen hint → same-campaign return = B.
+        tok = _mk_token(company_id=1, seen=[10])
+        res = await resolve_identity(
+            r, company_id=1, funnel_user_id=None, visitor_id=None,
+            campaign_id="10", source_trusted=False, ttl=TTL, identity_token=tok,
+        )
+        assert (res.is_returning, res.is_roaming) == (True, False)
+        # Hint was unioned into the LOCAL set.
+        assert await r.sismember(_campaigns_key(1, _TOK_UID), "10")
+
+    async def test_token_roaming_different_campaign(self, monkeypatch):
+        _enable_codec(monkeypatch)
+        r = _fr()
+        tok = _mk_token(company_id=1, seen=[10])  # seen 10, now hitting 20
+        res = await resolve_identity(
+            r, company_id=1, funnel_user_id=None, visitor_id=None,
+            campaign_id="20", source_trusted=False, ttl=TTL, identity_token=tok,
+        )
+        assert (res.is_returning, res.is_roaming) == (False, True)
+
+    async def test_company_mismatch_not_adopted(self, monkeypatch):
+        """Multi-tenant: a token minted for company 1 presented on company 2 ⇒
+        token NOT adopted; falls back to legacy → fresh mint for company 2 with
+        a DIFFERENT uid. No cross-tenant identity adoption."""
+        _enable_codec(monkeypatch)
+        r = _fr()
+        tok = _mk_token(company_id=1, uid=_TOK_UID)
+        res = await resolve_identity(
+            r, company_id=2, funnel_user_id=None, visitor_id="VID2",
+            campaign_id="10", source_trusted=False, ttl=TTL, identity_token=tok,
+        )
+        assert res.uid != _TOK_UID          # did NOT adopt the cross-tenant uid
+        assert res.is_unique is True        # fell back → fresh mint for company 2
+        assert res.signal_tier == "vid"     # legacy path won, not token
+
+    async def test_malformed_token_falls_back(self, monkeypatch):
+        _enable_codec(monkeypatch)
+        r = _fr()
+        res = await resolve_identity(
+            r, company_id=1, funnel_user_id=None, visitor_id="VID1",
+            campaign_id="10", source_trusted=False, ttl=TTL,
+            identity_token="garbage.notavalidsig",
+        )
+        assert res.is_unique is True and res.signal_tier == "vid"  # legacy mint
+
+    async def test_expired_token_falls_back(self, monkeypatch):
+        _enable_codec(monkeypatch)
+        r = _fr()
+        tok = _mk_token(company_id=1, exp=1)  # long past
+        res = await resolve_identity(
+            r, company_id=1, funnel_user_id=None, visitor_id="VID1",
+            campaign_id="10", source_trusted=False, ttl=TTL, identity_token=tok,
+        )
+        assert res.signal_tier == "vid"  # token expired → legacy path
+
+    async def test_codec_disabled_byte_identical(self, monkeypatch):
+        """Gate OFF (no keys): even a structurally valid token is ignored ⇒
+        byte-identical legacy resolution."""
+        # Build a token while codec ON...
+        _enable_codec(monkeypatch)
+        tok = _mk_token(company_id=1)
+        # ...then disable the codec → verify fails-open, legacy path runs.
+        monkeypatch.setattr(settings, "identity_cookie_keys", "")
+        monkeypatch.setattr(settings, "identity_cookie_active_kid", "")
+        r = _fr()
+        res = await resolve_identity(
+            r, company_id=1, funnel_user_id=None, visitor_id="VID1",
+            campaign_id="10", source_trusted=False, ttl=TTL, identity_token=tok,
+        )
+        assert res.is_unique is True and res.signal_tier == "vid"
+
+    async def test_no_token_unchanged_legacy(self, monkeypatch):
+        _enable_codec(monkeypatch)
+        r = _fr()
+        res = await resolve_identity(
+            r, company_id=1, funnel_user_id=None, visitor_id="VID1",
+            campaign_id="10", source_trusted=False, ttl=TTL, identity_token=None,
+        )
+        assert res.is_unique is True and res.signal_tier == "vid"

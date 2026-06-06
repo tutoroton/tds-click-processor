@@ -404,6 +404,10 @@ async def _build_campaign_attribution(
                 campaign_id=campaign_id,
                 source_trusted=source_trusted,
                 with_history=with_history,
+                # P2 dual-accept: signed `_tds_id` cookie value (None until the
+                # worker forwards it in P4) → in-process HMAC recognition,
+                # skipping the `vid → uid` Redis GET. Dark when absent.
+                identity_token=req.identity_token,
             )
             attribution["uid"] = ident.uid
             attribution["is_unique"] = ident.is_unique

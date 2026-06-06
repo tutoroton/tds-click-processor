@@ -54,6 +54,7 @@ import secrets
 import time
 from dataclasses import dataclass, field
 
+from app import identity_token as idtok
 from app.config import _LOCAL_ENVIRONMENTS, settings
 from app.history import _offers_key, _subs_key, _targets_key
 from app.redis_client import get_identity_redis
@@ -66,6 +67,7 @@ logger = logging.getLogger(__name__)
 # the resolution algorithm (R2 §5 pluggability).
 _TIER_FUID = "fuid"   # funnel_user_id (L2)
 _TIER_VID = "vid"     # cookie visitor id (L1)
+_TIER_TOKEN = "token"  # signed `_tds_id` cookie (L1, verified in-process) — P2
 _TIER_NONE = "none"   # no usable identity signal on this click (case A)
 
 # DOC-1 — the `signal_tier` PROVENANCE label uses the canonical reserved-slot
@@ -178,6 +180,104 @@ def _profile_key(company_id: int, uid: str) -> str:
     return f"id:{company_id}:uid:{uid}"
 
 
+def _seen_key(company_id: int, uid: str) -> str:
+    """Alias for the campaigns-seen set key (the token's `seen` hint unions
+    into the SAME set the legacy path reads/writes — they are one store)."""
+    return _campaigns_key(company_id, uid)
+
+
+async def resolve_via_token(
+    r,
+    *,
+    company_id: int,
+    identity_token: str | None,
+    campaign_id,
+    with_history: bool = False,
+) -> IdentityResult | None:
+    """Layer-1 RECOGNITION via the signed `_tds_id` cookie (P2, dual-accept).
+
+    Returns an ``IdentityResult`` when the token VERIFIES, is for THIS tenant
+    (``token.c == company_id`` — multi-tenant hard boundary), and carries a
+    shape-valid uid; otherwise ``None`` (the caller falls back to the legacy
+    ``vid → uid`` path). This is the in-process HMAC recognition that SKIPS the
+    ``vid → uid`` Redis GET (RT#1 of the legacy path) entirely — uid comes from
+    the cookie, no store hit for recognition.
+
+    Multi-tenant (rule `multi-tenant-isolation`): a token minted for company A
+    presented on company B's campaign ⇒ ``c`` mismatch ⇒ ``None`` ⇒ we do NOT
+    adopt cross-tenant identity; the user resolves fresh for B.
+
+    Best-effort `seen`-hint union (fail-open): the token carries a recent-16
+    campaigns-seen HINT; we union it into the node-local campaigns set so
+    cross-node is_returning is correct, but a failure NEVER blocks routing — the
+    seen set is authoritative-in-Redis (rebuildable from CH), the cookie is only
+    a hint. ``is_returning`` / ``is_roaming`` are recomputed from the LOCAL set
+    (after the union), never frozen from the cookie.
+    """
+    if not identity_token:
+        return None
+    claims = idtok.verify(identity_token)
+    if claims is None:
+        return None
+    # Multi-tenant scope — the token is host-scoped, NOT company-scoped. Only the
+    # node knows company_id; a `c` mismatch must fall back to fresh (no leak).
+    if claims.get("c") != company_id:
+        return None
+    uid = claims.get("u")
+    # Defense-in-depth: even a validly signed uid is shape-gated before any key
+    # is built from it (SEC-M2 posture, in case of a key-compromise downgrade).
+    if not _valid_uid(uid):
+        return None
+
+    # Best-effort union of the cookie's `seen` hint into the local set, then
+    # recompute campaign-relative flags from the LOCAL (now-unioned) set. The
+    # union and the read share one pipeline → at most 1 round-trip for the union
+    # path; the SISMEMBER reflects the freshly-unioned membership.
+    bucket = _campaign_bucket(campaign_id)
+    seen_hint = [str(c) for c in (claims.get("seen") or [])]
+    ckey = _seen_key(company_id, uid)
+    try:
+        pipe = r.pipeline()
+        if seen_hint:
+            # Union the hint (commutative — races are benign per R6). Bounded by
+            # MAX_SEEN at mint time; no TTL slide here (persist_identity owns TTL).
+            pipe.sadd(ckey, *seen_hint)
+        pipe.sismember(ckey, bucket)
+        if with_history:
+            pipe.smembers(_offers_key(company_id, uid))
+            pipe.smembers(_targets_key(company_id, uid))
+            pipe.smembers(_subs_key(company_id, uid))
+        rt = await pipe.execute()
+    except Exception as e:  # fail-open — never block routing on the hint store
+        logger.warning("identity token seen-union/read failed (degraded): %s", e)
+        # Recognition still succeeds (uid known from the signed token); fall back
+        # to "seen this campaign?" unknown ⇒ treat as roaming (seen-before, not
+        # provably this-campaign) which is the safe non-first classification.
+        return IdentityResult(
+            uid=uid, is_unique=False, is_returning=False, is_roaming=True,
+            signal_tier=_tier_label(_TIER_TOKEN), identity_conflict=False,
+        )
+
+    # rt layout: [sadd?]  sismember  [offers targets subs]
+    idx = 1 if seen_hint else 0
+    is_returning = bool(rt[idx])
+    is_roaming = not is_returning  # seen-before (token proves it) AND not this campaign
+    if with_history:
+        return IdentityResult(
+            uid=uid, is_unique=False, is_returning=is_returning,
+            is_roaming=is_roaming, signal_tier=_tier_label(_TIER_TOKEN),
+            identity_conflict=False,
+            prev_offers=frozenset(rt[idx + 1] or ()),
+            prev_targets=frozenset(rt[idx + 2] or ()),
+            prev_subs=frozenset(rt[idx + 3] or ()),
+        )
+    return IdentityResult(
+        uid=uid, is_unique=False, is_returning=is_returning,
+        is_roaming=is_roaming, signal_tier=_tier_label(_TIER_TOKEN),
+        identity_conflict=False,
+    )
+
+
 async def resolve_identity(
     r,
     *,
@@ -188,6 +288,7 @@ async def resolve_identity(
     source_trusted: bool,
     ttl: int,
     with_history: bool = False,
+    identity_token: str | None = None,
 ) -> IdentityResult:
     """Critical-path resolution: signals → canonical uid + redefined flags.
 
@@ -204,7 +305,22 @@ async def resolve_identity(
 
     Round-trips: RT#1 = pipelined GET of each present signal map; RT#2 =
     mint-NX (new user) OR campaigns SISMEMBER (seen-before). ≤2 either way.
+
+    DUAL-ACCEPT (P2): if a signed ``_tds_id`` token is present, verifies, and is
+    for THIS tenant, recognition is an in-process HMAC verify — uid comes from
+    the cookie with NO ``vid → uid`` Redis GET (the legacy RT#1 is skipped). On
+    any token miss/failure we fall through to the unchanged legacy path.
     """
+    token_result = await resolve_via_token(
+        r,
+        company_id=company_id,
+        identity_token=identity_token,
+        campaign_id=campaign_id,
+        with_history=with_history,
+    )
+    if token_result is not None:
+        return token_result
+
     signals = _present_signals(funnel_user_id, visitor_id, source_trusted)
 
     # Case A (R2 §1.3): no usable signal — a cookie-less, untrusted-funnel
@@ -373,6 +489,7 @@ async def resolve_and_stamp(
     campaign_id,
     source_trusted: bool,
     with_history: bool = False,
+    identity_token: str | None = None,
 ) -> IdentityResult:
     """Router entrypoint: resolve on the identity Redis, then SCHEDULE the
     deferred writes (fire-and-forget). Returns the result to stamp onto the
@@ -394,6 +511,7 @@ async def resolve_and_stamp(
         source_trusted=source_trusted,
         ttl=ttl,
         with_history=with_history,
+        identity_token=identity_token,
     )
     # Deferred writes off the critical path. create_task so the response is not
     # blocked; the task body is fully error-swallowing.

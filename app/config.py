@@ -382,6 +382,34 @@ class Settings(BaseSettings):
     identity_redis_url: str = ""
     returning_uid_ttl_seconds: int = 15_552_000  # 180 days
 
+    # ------------------------------------------------------------------
+    # Signed identity cookie (`_tds_id`) — Layer-1 RECOGNITION (P2, DARK).
+    # SoT: docs/development/returning-users-v2/DECISION-edge-identity-architecture.md
+    #
+    # A signed cookie carries the immutable WHO of a returning user so any edge
+    # node recognizes them with a single in-process HMAC verify and ZERO store
+    # hit (no cross-node replication ⇒ gap-free). The codec lives in
+    # `app/identity_token.py`; P2 only VERIFIES (dual-accept with legacy
+    # `_tds_vid`), minting is P3.
+    #
+    # `identity_cookie_keys` — the signing key RING, form `kid:secret,kid:secret`
+    # (kid = small non-negative int; secret = raw key, UTF-8). This is a
+    # DEDICATED identity key, explicitly NOT `tds_secret_key` (X-TDS-Key): so
+    # rotating it never makes the fleet "look new", and a routing-secret leak
+    # cannot forge identity. Empty ⇒ codec disabled ⇒ verify returns None
+    # (fail-open to legacy) ⇒ byte-identical to pre-P2.
+    #
+    # ROTATION: add a NEW kid as `identity_cookie_active_kid` (used to sign in
+    # P3) while keeping the OLD kid(s) in `identity_cookie_keys` for the overlap
+    # window, so cookies signed by the old key still VERIFY. Drop a kid from the
+    # ring only after every cookie it signed has expired (180d max-age).
+    #
+    # `identity_cookie_active_kid` — the kid used for signing/re-stamping (P3).
+    # Must be present in `identity_cookie_keys`. Verify accepts ANY kid in the
+    # ring regardless of this value (that is what makes rotation gap-free).
+    identity_cookie_keys: str = ""
+    identity_cookie_active_kid: str = ""
+
     # P4 (2026-06-05) — returning-user SEGMENTED ROUTING. Separate gate from the
     # resolver so identity can be computed/observed (P2/P3) WITHOUT changing
     # routing selection. DARK by default: OFF ⇒ the cascade is single-pass,

@@ -218,6 +218,15 @@ class HealthResponse(BaseModel):
     sync_version: int = 0
     uptime_seconds: float
 
+    # Returning-users v2 — the EFFECTIVE (post-boot-gate) state of the identity
+    # resolver on this node. Reflects `settings.returning_resolver_enabled` AFTER
+    # `assert_identity_namespace_safe` ran: True ⇒ resolver armed (identity-redis
+    # reachable + noeviction); False ⇒ either the env gate is off OR the boot-gate
+    # DEGRADED it (identity store unavailable at startup). Lets an operator (and
+    # `deploy/update.sh`) SEE whether returning recognition is actually live on a
+    # node — not just whether the .env flag is set. Default False (dark).
+    returning_resolver_active: bool = False
+
     # F.29 Sprint 1.4 shipper visibility ---------------------------------
     # Whether the click shipper task is actively shipping. False on
     # standalone/escape-hatch modes (intentional) AND on silent task

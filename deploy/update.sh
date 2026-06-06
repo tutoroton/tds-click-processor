@@ -179,13 +179,30 @@ if [ "$NEW_SHA" = "$PREV_SHA" ]; then
   # confirm the node is healthy (operator may have triggered Deploy
   # specifically because they suspect a crash). Skip the build/swap.
   echo "=== STEP: no-op === already at tip; verifying health only."
-  # ...UNLESS we just healed .env above (added the returning toggles to a
-  # node provisioned before they existed) — the running container still has
-  # the OLD env, so force-recreate it to pick up the new keys. No rebuild
-  # needed (the image is unchanged); --force-recreate swaps the container in
-  # place. Idempotent: on the next deploy ENV_HEALED=0 → plain health check.
-  if [ "$ENV_HEALED" = "1" ]; then
-    echo "=== STEP: env-heal === .env gained returning toggles; force-recreating click-processor"
+  # Force-recreate click-processor on the no-op path when EITHER:
+  #  (a) we just healed .env above (added the returning toggles to a node
+  #      provisioned before they existed) — the running container has the OLD
+  #      env; OR
+  #  (b) the resolver is ENABLED in .env but the RUNNING container reports it
+  #      INACTIVE — i.e. the boot-gate DEGRADED it because identity-redis was
+  #      unreachable when click-processor booted (the chicken-egg: redeploy #1
+  #      ran the old in-memory script that started click-processor BEFORE the
+  #      identity-redis sibling existed). identity-redis is up now (started
+  #      above), so a single recreate re-runs the boot-gate WITH the store
+  #      reachable → the resolver ARMS. Precise: only on a real degraded
+  #      mismatch (queried via /health) → no needless blips on an already-active
+  #      node. No rebuild (image unchanged); --force-recreate swaps in place.
+  NEED_RECREATE="$ENV_HEALED"
+  if [ "$NEED_RECREATE" != "1" ] && grep -q '^TDS_RETURNING_RESOLVER_ENABLED=true' .env; then
+    RESOLVER_ACTIVE="$(curl -sf "http://localhost:${TDS_PORT:-8100}/health" 2>/dev/null \
+      | grep -o '"returning_resolver_active":[^,}]*' | grep -o '[a-z]*$' || echo unknown)"
+    if [ "$RESOLVER_ACTIVE" = "false" ]; then
+      echo "=== STEP: resolver-arm === resolver enabled but INACTIVE (booted before identity-redis); recreating to re-run the boot-gate"
+      NEED_RECREATE=1
+    fi
+  fi
+  if [ "$NEED_RECREATE" = "1" ]; then
+    echo "=== STEP: recreate === force-recreating click-processor (env-heal or resolver-arm)"
     $COMPOSE up -d --no-deps --force-recreate click-processor
   fi
   if health_gate "health-noop"; then

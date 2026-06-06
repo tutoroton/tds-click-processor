@@ -1616,6 +1616,10 @@ async def health():
         campaigns_loaded=campaigns_count,
         sync_version=int(sync_ver) if sync_ver else 0,
         uptime_seconds=round(time.time() - START_TIME, 1),
+        # Effective resolver state AFTER the boot-gate ran (degrade flips this
+        # False even when the .env flag is true) — the operator/deploy signal for
+        # "is returning recognition actually live on this node".
+        returning_resolver_active=settings.returning_resolver_enabled,
         # F.29 Sprint 1.4 — shipper visibility (single source of truth
         # in ShipperMetrics dataclass; ``to_health_dict`` ensures any
         # future field added there is wired into the response).

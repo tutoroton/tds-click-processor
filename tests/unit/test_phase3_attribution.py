@@ -204,9 +204,13 @@ class TestPhase3AttributionFields:
         assert f["cost"] == 0
 
     def test_schema_version_constant(self):
-        # v4 — Phase 4 S2 added is_unique/is_bot/is_proxy/cf_ray/
-        # request_id/arrival_ts to the producer contract.
-        assert _CLICK_SCHEMA_VERSION == 4
+        # v5 — Returning-users v2 added the provenance tail (uid / is_returning
+        # / is_roaming / signal_tier / decision_reason / audience_pool /
+        # returning_mode / sticky_status / flags_semantics_version / …) to the
+        # producer contract. Lockstep with collector KNOWN_CLICK_SCHEMA_VERSION=5
+        # (64af87f) — an OLD producer (v4) against the v5 consumer is tolerated
+        # by the §4b skew detector (absent cols → CH defaults).
+        assert _CLICK_SCHEMA_VERSION == 5
 
     def test_is_unique_derived_from_visitor_cookie(self):
         # S2 — is_unique is a click-processor derivation: a NEW visitor

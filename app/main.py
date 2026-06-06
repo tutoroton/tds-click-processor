@@ -717,11 +717,16 @@ _RESERVED_SLOT_COLUMNS: tuple[str, ...] = (
 #        version, now joined by the sync builder).
 #   v4 — Phase 4 S2: quality + correlation columns (is_unique / is_bot /
 #        is_proxy / cf_ray / request_id / arrival_ts).
+#   v5 — Returning-users v2: the provenance tail (uid / is_returning /
+#        is_roaming / signal_tier / identity_conflict / decision_reason /
+#        winning_scope_type / winning_scope_id / audience_pool /
+#        target_selection_path / returning_mode / sticky_status /
+#        routing_trace / flags_semantics_version).
 # The collector's §4b skew detector tolerates an OLD producer (lower
 # version / absent) against a NEW consumer during a rolling deploy —
 # absent columns simply land as CH defaults. Keep in lockstep with
-# collector `writer.KNOWN_CLICK_SCHEMA_VERSION`.
-_CLICK_SCHEMA_VERSION = 4
+# collector `writer.KNOWN_CLICK_SCHEMA_VERSION` (bumped to 5 in 64af87f).
+_CLICK_SCHEMA_VERSION = 5
 
 
 def _utc_now_ms_iso() -> str:

@@ -81,6 +81,16 @@ TDS_SENTRY_ENVIRONMENT=${TDS_SENTRY_ENVIRONMENT:-}
 TDS_DIAG_TRACES_BOOST=${TDS_DIAG_TRACES_BOOST:-false}
 TDS_DIAG_OBS_STREAM=${TDS_DIAG_OBS_STREAM:-false}
 TDS_DIAG_VERBOSE_LOGS=${TDS_DIAG_VERBOSE_LOGS:-false}
+# Returning-users v2 — the per-NODE master enable for the identity resolver +
+# segmented routing. The click-processor gates the whole feature on
+# (TDS_RETURNING_RESOLVER_ENABLED AND per-company settings.returning); the env
+# is the global kill-switch, the per-company gate is the operative per-tenant
+# control. Default ON in production so a company that enables the feature in the
+# admin panel actually activates it on the edge (the audit found nodes shipped
+# without these → resolver inert despite company gate ON). Override to false to
+# kill the feature fleet-wide regardless of company settings.
+TDS_RETURNING_RESOLVER_ENABLED=${TDS_RETURNING_RESOLVER_ENABLED:-true}
+TDS_RETURNING_ROUTING_ENABLED=${TDS_RETURNING_ROUTING_ENABLED:-true}
 TDS_CODE_VERSION=${code_version}
 EOF
 echo "render-env: wrote $ENV_FILE (node=$TDS_NODE_ID region=$TDS_NODE_REGION version=$code_version)"

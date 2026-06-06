@@ -80,6 +80,28 @@ if [ ! -f .env ]; then
   exit 1
 fi
 
+# Returning-users v2 — ensure the per-node master enable for the identity
+# resolver + segmented routing is present in .env. update.sh PRESERVES .env
+# across code updates (never regenerates it via render-env.sh), so a node
+# provisioned before these keys existed would never get them from a code
+# redeploy — the resolver stays inert despite the per-company gate being ON in
+# the admin panel (the 2026-06-06 audit found exactly this). Append-only +
+# idempotent: an existing value is NEVER overwritten (an operator who set it
+# false to kill the feature keeps that) — only a MISSING key is added with the
+# production default (true). ENV_HEALED=1 when something was appended, so the
+# no-op fast-path below still force-recreates to pick up the new env.
+ENV_HEALED=0
+ensure_env_default() {
+  local key="$1" val="$2"
+  if ! grep -q "^${key}=" .env; then
+    printf '%s=%s\n' "$key" "$val" >> .env
+    ENV_HEALED=1
+    echo "update.sh: healed .env — added ${key}=${val}"
+  fi
+}
+ensure_env_default TDS_RETURNING_RESOLVER_ENABLED true
+ensure_env_default TDS_RETURNING_ROUTING_ENABLED true
+
 # F.36 N3 — snapshot the SHA we are about to leave. This is the
 # rollback target if the new code fails health-gate. Captured BEFORE
 # any git fetch so a botched fetch doesn't itself become the
@@ -140,6 +162,15 @@ if [ "$NEW_SHA" = "$PREV_SHA" ]; then
   # confirm the node is healthy (operator may have triggered Deploy
   # specifically because they suspect a crash). Skip the build/swap.
   echo "=== STEP: no-op === already at tip; verifying health only."
+  # ...UNLESS we just healed .env above (added the returning toggles to a
+  # node provisioned before they existed) — the running container still has
+  # the OLD env, so force-recreate it to pick up the new keys. No rebuild
+  # needed (the image is unchanged); --force-recreate swaps the container in
+  # place. Idempotent: on the next deploy ENV_HEALED=0 → plain health check.
+  if [ "$ENV_HEALED" = "1" ]; then
+    echo "=== STEP: env-heal === .env gained returning toggles; force-recreating click-processor"
+    $COMPOSE up -d --no-deps --force-recreate click-processor
+  fi
   if health_gate "health-noop"; then
     echo "=== STEP: done === no-op (already at $NEW_SHA), node healthy"
     exit 0

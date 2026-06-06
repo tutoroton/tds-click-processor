@@ -91,6 +91,15 @@ TDS_DIAG_VERBOSE_LOGS=${TDS_DIAG_VERBOSE_LOGS:-false}
 # kill the feature fleet-wide regardless of company settings.
 TDS_RETURNING_RESOLVER_ENABLED=${TDS_RETURNING_RESOLVER_ENABLED:-true}
 TDS_RETURNING_ROUTING_ENABLED=${TDS_RETURNING_ROUTING_ENABLED:-true}
+# Returning-users v2 — the DEDICATED signing key ring for the `_tds_id` identity
+# cookie (NOT TDS_SECRET_KEY). Form: `kid:secret,kid:secret`. ALL nodes in a
+# fleet MUST carry the SAME ring so a cookie minted on one node verifies on every
+# other (cross-node gap-free recognition). The value is a deployment secret
+# supplied by the caller (cloud-init exports it from the admin-api config); it is
+# NEVER in the public mirror. Empty ⇒ codec disabled ⇒ the node still resolves
+# returning users via the legacy _tds_vid path, just without the signed cookie.
+TDS_IDENTITY_COOKIE_KEYS=${TDS_IDENTITY_COOKIE_KEYS:-}
+TDS_IDENTITY_COOKIE_ACTIVE_KID=${TDS_IDENTITY_COOKIE_ACTIVE_KID:-1}
 TDS_CODE_VERSION=${code_version}
 EOF
 echo "render-env: wrote $ENV_FILE (node=$TDS_NODE_ID region=$TDS_NODE_REGION version=$code_version)"

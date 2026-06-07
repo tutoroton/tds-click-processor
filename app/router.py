@@ -24,6 +24,7 @@ fallback when no flow matches at any scope level — this makes the
 migration safe for campaigns whose flows haven't yet been authored.
 """
 
+import functools
 import json
 import logging
 import math
@@ -562,6 +563,24 @@ def _non_routed_result(
     }
 
 
+def _identity_macros(attribution: dict[str, Any]) -> dict[str, Any]:
+    """FIX-LD-F1 (2026-06-07) — project the resolved returning-user identity onto
+    the macro-values shape `build_url` consumes for `{uid}`, `{is_unique}`,
+    `{is_returning}`, `{is_roaming}`.
+
+    `uid` → the canonical hex string, or `None` when the resolver produced
+    nothing (DARK / anonymous / resolver OFF / fail-open) so `{uid}` collapses
+    cleanly. The three flags pass through `bool(...)` → `build_url` renders them
+    `true` / `false` (DARK ⇒ all `False` ⇒ `false`, the sensible default), never
+    a leftover `{macro}`. Pure dict projection — no I/O, latency-neutral."""
+    return {
+        "uid": attribution.get("uid") or None,
+        "is_unique": bool(attribution.get("is_unique")),
+        "is_returning": bool(attribution.get("is_returning")),
+        "is_roaming": bool(attribution.get("is_roaming")),
+    }
+
+
 def _allowed_availability(
     campaign: dict[str, Any], attribution: dict[str, Any]
 ) -> frozenset[str]:
@@ -598,18 +617,22 @@ def _resolve_fallback_template(
     campaign_id: str,
     source_mappings,
     campaign_mappings,
+    identity: dict[str, Any] | None = None,
 ) -> str | None:
     """v2 F-MACRO-1 — macro-resolve a campaign `fallback_url` BEFORE it is served.
     Reuses `build_url` (the single substitution chokepoint: `safe_substitute` +
     the full values dict) so a terminal_fallback URL never leaks a literal
     `{macro}`. `None` template → `None` (node-default path stays raw; it carries
-    no macros). Offer/target macros collapse cleanly (no offer on this path)."""
+    no macros). Offer/target macros collapse cleanly (no offer on this path).
+    `identity` (FIX-LD-F1) threads the returning-user macros so a fallback URL
+    template with `{uid}` / flags resolves too (DARK ⇒ empty uid + 'false')."""
     if not template:
         return None
     return build_url(
         template, req, campaign_id, "",
         source_mappings=source_mappings,
         campaign_mappings=campaign_mappings,
+        identity=identity,
     )
 
 
@@ -685,6 +708,12 @@ async def _route_via_campaign(
         )
     )
     buyer_chain = _attribution_buyer_chain(attribution)
+
+    # FIX-LD-F1 — returning-user macro projection for {uid}/{is_*}, resolved ONCE
+    # from this click's attribution and threaded to every URL-build path (cascade
+    # action, legacy split, terminal_fallback) so the four macros resolve
+    # uniformly. DARK / anon ⇒ empty uid + 'false' flags (no literal {macro}).
+    identity_macros = _identity_macros(attribution)
 
     # v2 C2 — the availability classes a target may have to be served for THIS
     # click, computed ONCE and threaded to every delivery path (cascade action +
@@ -762,7 +791,7 @@ async def _route_via_campaign(
             binding_id=binding_id, binding_alias=binding_alias,
             fallback_url=_resolve_fallback_template(
                 campaign.get("fallback_url"), req, campaign_id,
-                source_mappings, campaign_mappings,
+                source_mappings, campaign_mappings, identity_macros,
             ),
         )
 
@@ -785,7 +814,7 @@ async def _route_via_campaign(
             # v2 F-MACRO-1 — macro-resolved before serve (no literal {macro} leak).
             fallback_url=_resolve_fallback_template(
                 campaign.get("fallback_url"), req, campaign_id,
-                source_mappings, campaign_mappings,
+                source_mappings, campaign_mappings, identity_macros,
             ),
         )
 
@@ -801,6 +830,7 @@ async def _route_via_campaign(
         url_template, req, campaign_id, offer.get("_id", ""),
         source_mappings=source_mappings,
         campaign_mappings=campaign_mappings,
+        identity=identity_macros,
     )
     timing["url_build_ms"] = _ms_since(t0)
     timing["target_resolved"] = target_url is not None
@@ -841,6 +871,7 @@ async def _resolve_action_with_sticky(
     returning_visitor: bool,
     flow_id: str | None,
     allowed_avail=frozenset({"active"}),
+    identity_macros: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any] | None, str]:
     """v2 Phase S — resolve the destination, applying the sticky pin when active.
 
@@ -859,12 +890,20 @@ async def _resolve_action_with_sticky(
     FAIL-OPEN: every sticky Redis op swallows errors (a fault degrades to normal
     selection); the click always routes + is XADD'd.
     """
+    # FIX-LD-F1 — bind the returning-user identity macros onto `build_url` so the
+    # action-executor delivery paths (redirect / offer / split) and the sticky
+    # pin resolve `{uid}`/`{is_*}` without threading a new kwarg through every
+    # per-action helper. `identity_macros=None` → DARK defaults (empty uid +
+    # 'false' flags), byte-identical to the pre-fix collapse for non-identity
+    # templates.
+    _build_url = functools.partial(build_url, identity=identity_macros)
+
     async def _normal() -> dict[str, Any] | None:
         return await action_executor.execute_action(
             r, flow, req, campaign_id,
             source_mappings=source_mappings,
             campaign_mappings=campaign_mappings,
-            build_url_fn=build_url,
+            build_url_fn=_build_url,
             allowed_avail=allowed_avail,
         )
 
@@ -884,7 +923,7 @@ async def _resolve_action_with_sticky(
             avail = (target.get("availability") if target else None) or "active"
             if target and target.get("url") and avail in allowed:
                 pinned = action_executor.pinned_target_result(
-                    target, pinned_tid, req, campaign_id, build_url,
+                    target, pinned_tid, req, campaign_id, _build_url,
                     source_mappings, campaign_mappings, flow_id,
                 )
                 if pinned is not None:
@@ -1082,6 +1121,11 @@ async def _try_flow_cascade(
         returning_visitor=seen_before,
         flow_id=flow_id_str,
         allowed_avail=allowed_avail,
+        # FIX-LD-F1 — thread the returning-user macros so cascade-delivered URLs
+        # resolve {uid}/{is_returning}/{is_roaming}/{is_unique}. attribution
+        # carries them post-`_build_campaign_attribution`; uid/flags are stable
+        # across the later flow-id mutations on this same dict.
+        identity_macros=_identity_macros(attribution),
     )
     attribution["sticky_status"] = sticky_status
 
@@ -1780,6 +1824,7 @@ def build_url(
     campaign_mappings: list[dict[str, Any]] | None = None,
     target_id: str | None = None,
     flow_id: str | None = None,
+    identity: dict[str, Any] | None = None,
 ) -> str:
     """Build the redirect URL by substituting macros in `template`.
 
@@ -1826,6 +1871,12 @@ def build_url(
             `redirect` actions which have no target.
         flow_id: Winning flow PK (`{flow_id}`). NULL when caller
             doesn't have one (legacy split path).
+        identity: Per-click returning-user macro projection from the
+            resolved attribution (FIX-LD-F1) — the keys `uid`,
+            `is_unique`, `is_returning`, `is_roaming`. See
+            `_identity_macros`. `None` (the default) → `{uid}` collapses
+            to empty and the three flags render `false`, so a DARK /
+            anonymous click never leaks a literal `{macro}`.
 
     Returns:
         Final URL string. Never contains a literal `{macro}` —
@@ -1927,6 +1978,23 @@ def build_url(
     values["offer_target_id"] = str(target_id) if target_id else None
     values["flow_id"] = str(flow_id) if flow_id else None
     values["visitor_id"] = req.visitor_id or None
+
+    # Identity layer (FIX-LD-F1, 2026-06-07) — returning-user macros from the
+    # resolved attribution. System-fixed names (like the technical layer): a
+    # param-mapping cannot remap them, so they sit AFTER the slot layer and win.
+    #   {uid}          — canonical hex uid; '' / None (DARK / anon / resolver
+    #                    OFF) → None → collapses cleanly via safe_substitute.
+    #   {is_unique} {is_returning} {is_roaming} — booleans, rendered 'true' /
+    #                    'false' by macros._coerce_value (the SAME lowercase the
+    #                    cascade returning-criterion palette uses). They DEFAULT
+    #                    to False when no identity was resolved, so a DARK click
+    #                    renders 'false' (sensible default) rather than leaking
+    #                    a literal {macro}.
+    ident = identity or {}
+    values["uid"] = ident.get("uid") or None
+    values["is_unique"] = bool(ident.get("is_unique"))
+    values["is_returning"] = bool(ident.get("is_returning"))
+    values["is_roaming"] = bool(ident.get("is_roaming"))
 
     # Step 3 — safe substitute (handles NULL collapse + URL encoding).
     return safe_substitute(template, values)

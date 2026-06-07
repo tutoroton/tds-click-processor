@@ -94,6 +94,13 @@ def _redis_with_lists_and_hashes(
             # `offer_target:{tid}` `availability`.
             self._ops.append(("hget", key, field))
 
+        def exists(self, key):
+            # Dead-offer fix (2026-06-07) — the availability loader EXISTS-checks
+            # `offer_target:{tid}` to tell a desynced/evicted HASH (absent →
+            # unavailable) from a present-but-no-`availability`-field one (active).
+            # A HASH is "present" iff it's in the `hashes` map.
+            self._ops.append(("exists", key, None))
+
         async def execute(self):
             out = []
             for op, key, field in self._ops:
@@ -103,6 +110,8 @@ def _redis_with_lists_and_hashes(
                     out.append(dict(hashes.get(key, {})))
                 elif op == "hget":
                     out.append(hashes.get(key, {}).get(field))
+                elif op == "exists":
+                    out.append(1 if key in hashes else 0)
             return out
 
     redis = MagicMock()
@@ -899,6 +908,54 @@ class TestAvailabilityCascade:
             click_attrs={"geo": "US", "os": "ios", "device_type": "mobile"},
         )
         assert winner["_id"] == "20"
+
+    @pytest.mark.asyncio
+    async def test_missing_target_hash_floors_dead_flow_and_repicks(self):
+        # Dead-offer fix (2026-06-07) — buyer flow pins target 7 whose HASH is
+        # ABSENT (its offer was PAUSED → desynced; R1-DEAD-1). Pre-fix the floor
+        # read None→'active', the dead flow WON and the click poached a foreign
+        # campaign. Now the absent HASH ⇒ 'missing' (∉ allowed) ⇒ the buyer flow
+        # is floored ⇒ the cascade re-picks the servable company flow (target 9
+        # present + active). Scope-uniform: the dead flow is the MORE specific one.
+        flows = {
+            "flow:10": _offer_flow(fid="10", scope_type="buyer", scope_id=5, target_id=7),
+            "flow:20": _offer_flow(fid="20", scope_type="company", scope_id=1, target_id=9),
+        }
+        hashes = {
+            **flows,
+            # offer_target:7 intentionally ABSENT — paused-offer desync.
+            "offer_target:9": {"availability": "active"},
+        }
+        lists = {
+            "campaign:1:flows": [],
+            "flows:scope:1:buyer:5": ["10"],
+            "flows:scope:1:company:1": ["20"],
+        }
+        r = _redis_with_lists_and_hashes(lists, hashes)
+        winner = await resolve_flow(
+            r, campaign_id="1", company_id=1, buyer_id=5, team_id=None,
+            department_id=None, custom_group_id=None,
+            click_attrs={"geo": "US", "os": "ios", "device_type": "mobile"},
+        )
+        assert winner["_id"] == "20"  # sibling re-picked, NOT the dead buyer flow
+
+    @pytest.mark.asyncio
+    async def test_all_targets_missing_returns_none(self):
+        # Every pinned target's HASH is absent (desynced) → all flows floored →
+        # no eligible flow → None. The caller then serves the campaign's OWN
+        # terminal_fallback (not a foreign campaign — CF-OBS-1 backstop).
+        flows = {
+            "flow:10": _offer_flow(fid="10", scope_type="company", scope_id=1, target_id=7),
+        }
+        hashes = {**flows}  # offer_target:7 ABSENT
+        lists = {"campaign:1:flows": [], "flows:scope:1:company:1": ["10"]}
+        r = _redis_with_lists_and_hashes(lists, hashes)
+        winner = await resolve_flow(
+            r, campaign_id="1", company_id=1, buyer_id=None, team_id=None,
+            department_id=None, custom_group_id=None,
+            click_attrs={"geo": "US", "os": "ios", "device_type": "mobile"},
+        )
+        assert winner is None
 
     @pytest.mark.asyncio
     async def test_draining_blocks_new_serves_returning(self):

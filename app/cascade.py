@@ -98,6 +98,14 @@ _MAX_FLOWS_PER_CLICK = 200
 _MAX_REJECTED_COMPACT = 3
 _MAX_REJECTED_DIAGNOSTIC = 25
 
+# Dead-offer fix (2026-06-07) — sentinel availability for a target whose HASH is
+# ABSENT from Redis (offer paused → desynced / target evicted / drifted). It is
+# in NO allowed set, so `_filter_by_availability` floors the flow and
+# `_pick_winner` re-picks a servable sibling instead of letting the dead flow win
+# and poach a foreign campaign. Distinct from a PRESENT hash with no
+# `availability` field (pre-076 → 'active', byte-identical for live targets).
+_AVAIL_MISSING: Final[str] = "missing"
+
 
 async def resolve_flow(
     r,
@@ -416,12 +424,19 @@ async def _load_target_availability(
 ) -> dict[str, str]:
     """`{target_id: availability}` for every PINNED target across the flows.
 
-    ONE pipelined HGET per referenced target. Returns `{}` when no flow pins a
-    target (redirect/block-only campaign) → zero extra Redis cost. FAIL-OPEN:
-    any Redis error → `{}` → the availability filter excludes nothing (a click
-    is NEVER lost because availability state is unreadable). A target HASH
-    missing the `availability` field (synced before migration 076) defaults to
-    'active' in the filter.
+    ONE pipelined EXISTS + HGET per referenced target. Returns `{}` when no flow
+    pins a target (redirect/block-only campaign) → zero extra Redis cost.
+    FAIL-OPEN: any Redis ERROR → `{}` → the availability filter excludes nothing
+    (a click is NEVER lost because availability state is unreadable).
+
+    Dead-offer fix (2026-06-07): distinguish a target whose HASH is ABSENT (its
+    offer was paused → desynced, or the target was evicted/drifted) from one that
+    is PRESENT but pre-migration-076 (no `availability` field). An absent HASH ⇒
+    `_AVAIL_MISSING` (∉ the allowed set ⇒ the flow is floored, so `_pick_winner`
+    re-picks a servable sibling at any scope instead of the dead flow winning and
+    poaching a foreign campaign). A present HASH with no `availability` field ⇒
+    'active' (byte-identical for live targets). Only a Redis ERROR fails open; a
+    CONFIRMED-absent HASH is a definite exclude.
     """
     tids: set[str] = set()
     for f in flows:
@@ -431,16 +446,21 @@ async def _load_target_availability(
     ordered = list(tids)
     pipe = r.pipeline()
     for tid in ordered:
+        pipe.exists(f"offer_target:{tid}")
         pipe.hget(f"offer_target:{tid}", "availability")
     try:
-        vals = await pipe.execute()
+        raw = await pipe.execute()
     except Exception as exc:  # pragma: no cover — fail-open to all-active
         logger.warning(
             "cascade: availability load failed (%s) — treating all targets "
             "active (fail-open)", exc,
         )
         return {}
-    return {tid: (val or "active") for tid, val in zip(ordered, vals)}
+    out: dict[str, str] = {}
+    for i, tid in enumerate(ordered):
+        exists, avail = raw[i * 2], raw[i * 2 + 1]
+        out[tid] = (avail or "active") if exists else _AVAIL_MISSING
+    return out
 
 
 def _filter_by_availability(

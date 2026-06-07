@@ -62,25 +62,82 @@ def _wid(flow):
 
 
 # ============================================================
-# Zero-regression (segmented routing OFF)
+# Zero-regression for LEGACY flows + F-LC-1 (returning flows
+# inert under fresh / DARK — audience routing OFF)
 # ============================================================
 
 class TestOffByteIdentical:
-    async def test_off_ignores_audience_partition(self):
-        # OFF: ALL flows considered regardless of audience — a 'returning' flow
-        # with a lower seq_id wins exactly as it would pre-P4 (no audience field).
+    async def test_off_legacy_flows_byte_identical(self):
+        # OFF + only first/legacy flows → lowest seq_id wins exactly as pre-P4.
+        # The partition leaves every 'first' (and missing-audience) flow in the
+        # candidate pool, so legacy behaviour is untouched.
+        r = await _setup({
+            "F1": _flow("F1", audience="first", seq_id=2),
+            "F2": _flow("F2", audience="first", seq_id=1),
+        })
+        flow = await _resolve(r, seen_before=True, audience_routing=False)
+        assert _wid(flow) == "F2"  # lower seq_id wins among first-pool flows
+
+    async def test_off_returning_flow_inert_first_flow_wins(self):
+        # F-LC-1: OFF → a 'returning' flow (even with a LOWER seq_id) is INERT;
+        # the first-pool flow wins instead of the returning flow (D5).
         r = await _setup({
             "F1": _flow("F1", audience="first", seq_id=2),
             "F2": _flow("F2", audience="returning", seq_id=1),
         })
         flow = await _resolve(r, seen_before=True, audience_routing=False)
-        assert _wid(flow) == "F2"  # lower seq_id wins, audience irrelevant when OFF
+        assert _wid(flow) == "F1"  # returning flow excluded under OFF
 
-    async def test_off_returning_flow_eligible_for_new_user(self):
-        # OFF + a single 'returning' flow → still eligible (no partition).
+    async def test_off_lone_returning_flow_inert_returns_none(self):
+        # F-LC-1: OFF + a single 'returning' flow → inert → no flow wins → None
+        # (caller falls back to legacy split selection). Pre-fix this returned F1.
         r = await _setup({"F1": _flow("F1", audience="returning")})
         flow = await _resolve(r, seen_before=False, audience_routing=False)
+        assert flow is None
+
+
+# ============================================================
+# F-LC-1 (audit-2 MED) — returning-audience flow must be INERT
+# under fresh / DARK, and must NOT mislabel a new visitor's click
+# with audience_pool=returning (→ decision_reason=override_returning_flow).
+# Evidence: docs/development/audit-findings/2/raw-LIVE-C-v2.md.
+# ============================================================
+
+class TestFLC1ReturningFlowInertUnderFresh:
+    async def test_fresh_returning_flow_no_criteria_does_not_serve_new_visitor(self):
+        # The exact F-LC-1 shape: fresh campaign (audience_routing OFF) + a
+        # returning-audience flow WITHOUT returning criteria (match-all, so it
+        # would match a new visitor) + a first default. Pre-fix the returning
+        # flow won and the click was stamped audience_pool=returning. Post-fix
+        # the returning flow is inert and the first default serves.
+        r = await _setup({
+            "R1": _flow("R1", audience="returning", seq_id=1),  # match-all
+            "F1": _flow("F1", audience="first", seq_id=2, is_default=True),
+        })
+        flow = await _resolve(r, seen_before=False, audience_routing=False)
         assert _wid(flow) == "F1"
+        # The winner's audience drives router.py's `audience_pool` → it MUST NOT
+        # be 'returning' (else _decision_reason → override_returning_flow).
+        assert (flow.get("audience") or "first") != "returning"
+
+    async def test_fresh_lone_returning_flow_falls_through_to_legacy(self):
+        # Fresh + ONLY a returning flow → inert → None → caller uses legacy
+        # split selection. No flow → no audience_pool=returning mislabel.
+        r = await _setup({"R1": _flow("R1", audience="returning", seq_id=1)})
+        flow = await _resolve(r, seen_before=False, audience_routing=False)
+        assert flow is None
+
+    async def test_returning_routing_on_returning_flow_still_serves(self):
+        # COUNTER-TEST: with returning routing ON and a returning (seen_before)
+        # visitor, the returning-audience flow STILL serves correctly in the
+        # returning pool — the F-LC-1 fix did not regress the live feature.
+        r = await _setup({
+            "R1": _flow("R1", audience="returning", seq_id=1),
+            "F1": _flow("F1", audience="first", seq_id=2),
+        })
+        flow = await _resolve(r, seen_before=True, audience_routing=True)
+        assert _wid(flow) == "R1"
+        assert flow.get("audience") == "returning"  # serves from returning pool
 
 
 # ============================================================

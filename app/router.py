@@ -35,6 +35,7 @@ from typing import Any, NamedTuple
 import sentry_sdk
 from app import action_executor, cascade, identity, sticky
 from app.config import settings
+from app.diag import get_test_id
 from app.enrichment import enrich_buyer
 from app.macros import safe_substitute
 from app.models import ClickRequest
@@ -872,6 +873,7 @@ async def _resolve_action_with_sticky(
     flow_id: str | None,
     allowed_avail=frozenset({"active"}),
     identity_macros: dict[str, Any] | None = None,
+    trace: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any] | None, str]:
     """v2 Phase S — resolve the destination, applying the sticky pin when active.
 
@@ -905,6 +907,7 @@ async def _resolve_action_with_sticky(
             campaign_mappings=campaign_mappings,
             build_url_fn=_build_url,
             allowed_avail=allowed_avail,
+            trace=trace,
         )
 
     if not sticky_active:
@@ -1043,6 +1046,14 @@ async def _try_flow_cascade(
     cascade_trace: dict[str, Any] = {
         "buyer_enrichment": "ok" if buyer_chain.get("buyer_id") else "absent",
     }
+    # v2 LD-F2 / D22 — a VALID `X-Test-Id` (validated + bound by the /decide
+    # middleware via `set_test_id`) flips the trace to Mode-B (heavy): the
+    # cascade emits the FULL rejected-criteria list with per-flow descriptors;
+    # without it the trace stays the compact steady-state form. `get_test_id()`
+    # is "" for normal traffic ⇒ light path ⇒ no per-click cost (the cost
+    # invariant). The raw header is NEVER read here — only the validated,
+    # context-bound value (no SEC-L1 regression).
+    diagnostic = bool(get_test_id())
     flow = await cascade.resolve_flow(
         r,
         campaign_id=campaign_id,
@@ -1062,6 +1073,7 @@ async def _try_flow_cascade(
         # together with returning routing — one clean switch, no dual meaning).
         returning_visitor=seen_before if audience_routing else False,
         trace=cascade_trace,
+        diagnostic=diagnostic,
     )
     attribution["routing_trace"] = cascade_trace
     if flow is None:
@@ -1126,6 +1138,9 @@ async def _try_flow_cascade(
         # carries them post-`_build_campaign_attribution`; uid/flags are stable
         # across the later flow-id mutations on this same dict.
         identity_macros=_identity_macros(attribution),
+        # v2 LD-F2 — same trace dict the cascade populated; the split executor
+        # folds its weights/picked + per-leg availability exclusions into it.
+        trace=cascade_trace,
     )
     attribution["sticky_status"] = sticky_status
 

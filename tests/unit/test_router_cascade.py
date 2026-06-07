@@ -1502,3 +1502,83 @@ class TestStickyPhaseS:
         assert result is not None and "T7" in result["url"]  # routed despite error
         # status reflects the lookup miss (get failed → None → miss); no crash.
         assert result["attribution"]["sticky_status"] == "miss"
+
+
+# ============================================================
+# v2 LD-F2 — X-Test-Id heavy/light gating wired through route():
+# get_test_id() (bound by the /decide middleware from a VALID X-Test-Id)
+# flips the cascade trace to Mode-B. Pins the audit-2 MED remediation
+# end-to-end (router → cascade → attribution.routing_trace).
+# ============================================================
+
+
+class TestLDF2TraceGatingE2E:
+    CAMPAIGN = "70"
+
+    def _redis(self) -> FakeRedis:
+        # Winner flow 700 (geo in [US]) + 5 rejected flows (geo in [CA]) so the
+        # compact cap (3) vs diagnostic (uncapped) difference is observable.
+        hashes = {
+            f"campaign:{self.CAMPAIGN}": {"company_id": "1", "priority": "0"},
+            "flow:700": {
+                "campaign_id": self.CAMPAIGN, "scope_type": "company",
+                "scope_id": "1", "seq_id": "1", "is_default": "0",
+                "criteria": json.dumps([{"type": "geo", "op": "in", "values": ["US"]}]),
+                "action_type": "redirect",
+                "action_config": json.dumps({"url": "https://lp/{click_id}"}),
+            },
+        }
+        flow_ids = ["700"]
+        for n in range(701, 706):
+            hashes[f"flow:{n}"] = {
+                "campaign_id": self.CAMPAIGN, "scope_type": "company",
+                "scope_id": "1", "seq_id": str(n), "is_default": "0",
+                "criteria": json.dumps([{"type": "geo", "op": "in", "values": ["CA"]}]),
+                "action_type": "redirect",
+                "action_config": json.dumps({"url": "https://no/{click_id}"}),
+            }
+            flow_ids.append(str(n))
+        return FakeRedis(
+            sets={
+                "geo:US": {self.CAMPAIGN}, "device:mobile": {self.CAMPAIGN},
+                "os:ios": {self.CAMPAIGN}, "campaigns:active": {self.CAMPAIGN},
+            },
+            hashes=hashes,
+            lists={f"campaign:{self.CAMPAIGN}:flows": flow_ids},
+        )
+
+    def _trace(self, result: dict) -> dict:
+        return result["attribution"]["routing_trace"]
+
+    def test_no_test_id_light_trace(self):
+        """No X-Test-Id bound → compact trace: criteria present, rejected
+        capped at 3, no per-flow criteria detail."""
+        from app.diag import set_test_id
+
+        set_test_id("")  # explicit: no test id bound
+        try:
+            result = _route_with(self._redis(), _click())
+        finally:
+            set_test_id("")  # tear down for the next test
+        assert result is not None
+        crit = self._trace(result)["criteria"]
+        assert crit["winner_matched"] == ["geo in [US]"]
+        assert len(crit["rejected"]) == 3
+        assert crit["rejected_truncated"] == 2
+        assert all("criteria" not in e for e in crit["rejected"])
+
+    def test_valid_test_id_heavy_trace(self):
+        """A VALID X-Test-Id bound → Mode-B trace: rejected uncapped + each
+        rejected entry carries full criteria descriptors."""
+        from app.diag import set_test_id
+
+        set_test_id("11111111-2222-3333-4444-555555555555")
+        try:
+            result = _route_with(self._redis(), _click())
+        finally:
+            set_test_id("")  # tear down so other tests see no test id
+        assert result is not None
+        crit = self._trace(result)["criteria"]
+        assert len(crit["rejected"]) == 5  # cap lifted
+        assert "rejected_truncated" not in crit
+        assert crit["rejected"][0]["criteria"] == ["geo in [CA]"]

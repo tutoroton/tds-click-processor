@@ -87,6 +87,18 @@ SCOPE_PRIORITY: tuple[str, ...] = (
 _MAX_FLOWS_PER_CLICK = 200
 
 
+# v2 LD-F2 — `routing_trace.criteria.rejected` bounds (D22 / §05 Tier-3).
+# Compact-always: at most this many rejected flows are echoed into the
+# steady-state trace (ids + the one failing criterion each, no full
+# criteria JSON). Under the `X-Test-Id` diagnostic header the cap lifts to
+# `_MAX_REJECTED_DIAGNOSTIC` and each entry gains its full criteria
+# descriptors — the "heavy parts gated behind X-Test-Id" half of D22. The
+# diagnostic cap keeps the JSON bounded so the `main.py` 4000-char defensive
+# truncation never cuts mid-string even on a pathological candidate flood.
+_MAX_REJECTED_COMPACT = 3
+_MAX_REJECTED_DIAGNOSTIC = 25
+
+
 async def resolve_flow(
     r,
     *,
@@ -101,6 +113,7 @@ async def resolve_flow(
     audience_routing: bool = False,
     returning_visitor: bool = False,
     trace: dict[str, Any] | None = None,
+    diagnostic: bool = False,
 ) -> dict[str, Any] | None:
     """Resolve the winning flow for a click via scope cascade.
 
@@ -223,6 +236,16 @@ async def resolve_flow(
     # the criteria + availability filters keeps `_pick_winner` pure over its
     # survivor list (purity preserved — the two cascade passes stay independent).
     avail_map = await _load_target_availability(r, flows)
+    # v2 LD-F2 — Tier-3 deep-dive sinks. Allocated only when a trace dict is
+    # threaded (every live click passes one; pure-unit `_pick_winner` tests do
+    # not), so the no-trace path stays byte-identical. `_filter_by_criteria` /
+    # `_filter_by_availability` append into these as they ALREADY walk each
+    # flow — no extra pass on the hot path (per the cost invariant: capture
+    # alongside, don't recompute).
+    rejected_sink: list[dict[str, Any]] | None = [] if trace is not None else None
+    avail_excluded_sink: list[tuple[str, str]] | None = (
+        [] if trace is not None else None
+    )
     if trace is not None:
         trace["candidates"] = len(deduped)
         trace["loaded"] = len(flows)
@@ -232,8 +255,14 @@ async def resolve_flow(
         ]
 
     def _eligible(pool: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        crit = _filter_by_criteria(pool, click_attrs)
-        avail = _filter_by_availability(crit, avail_map, returning_visitor)
+        crit = _filter_by_criteria(
+            pool, click_attrs,
+            rejected_sink=rejected_sink, diagnostic=diagnostic,
+        )
+        avail = _filter_by_availability(
+            crit, avail_map, returning_visitor,
+            excluded_sink=avail_excluded_sink,
+        )
         if trace is not None:
             trace["availability_excluded"] += len(crit) - len(avail)
         return avail
@@ -270,7 +299,73 @@ async def resolve_flow(
         trace["winning_scope_type"] = winner.get("scope_type")
         trace["winning_scope_id"] = _safe_int(winner.get("scope_id"))
         trace["audience_pool"] = winner.get("audience") or "first"
+    if trace is not None:
+        _finalize_criteria_trace(
+            trace, winner, rejected_sink, diagnostic=diagnostic,
+        )
+        _finalize_availability_trace(trace, avail_excluded_sink)
     return winner
+
+
+def _finalize_criteria_trace(
+    trace: dict[str, Any],
+    winner: dict[str, Any] | None,
+    rejected_sink: list[dict[str, Any]] | None,
+    *,
+    diagnostic: bool,
+) -> None:
+    """v2 LD-F2 — fold the criteria deep-dive into `trace["criteria"]` (D22).
+
+    `winner_matched` = the winning flow's own criteria descriptors (it satisfied
+    ALL of them — AND semantics). `rejected` = flows dropped by the criteria
+    filter, each with the ONE failing criterion. Compact-always caps the list at
+    `_MAX_REJECTED_COMPACT` (ids + reason); under `X-Test-Id` (`diagnostic`) the
+    cap lifts and each entry carries its full criteria descriptors — the
+    heavy/gated half of D22. Absent when nothing has criteria (match-all winner,
+    no rejections) → byte-identical for a trivial single-flow campaign.
+    """
+    crit_obj: dict[str, Any] = {}
+    if winner is not None:
+        crit_obj["winner_matched"] = _criteria_descriptors(
+            _parse_criteria(winner.get("criteria", "[]"))
+        )
+    if rejected_sink:
+        cap = _MAX_REJECTED_DIAGNOSTIC if diagnostic else _MAX_REJECTED_COMPACT
+        shown = rejected_sink[:cap]
+        crit_obj["rejected"] = shown
+        if len(rejected_sink) > len(shown):
+            crit_obj["rejected_truncated"] = len(rejected_sink) - len(shown)
+    if crit_obj:
+        trace["criteria"] = crit_obj
+
+
+def _finalize_availability_trace(
+    trace: dict[str, Any],
+    avail_excluded_sink: list[tuple[str, str]] | None,
+) -> None:
+    """v2 LD-F2 — fold the cascade flow-level availability exclusions into
+    `trace["availability"]` (D22 / §05 Tier-3). Records the SPECIFIC
+    `excluded_target_ids` (the int `availability_excluded` counter only ever
+    held a count) + the availability state that caused the first exclusion.
+    `action_executor._execute_split` MERGES its per-leg exclusions into the same
+    sub-object later (shared trace dict), so split-leg drops are visible too —
+    the LD-F2 evidence's blind spot. Absent when nothing was drained/closed →
+    byte-identical when the availability floor excludes nothing."""
+    if not avail_excluded_sink:
+        return
+    ids: list[int] = []
+    seen: set[int] = set()
+    for tid, _avail in avail_excluded_sink:
+        ti = _safe_int(tid)
+        if ti not in seen:
+            seen.add(ti)
+            ids.append(ti)
+    avail = trace.setdefault("availability", {})
+    existing = avail.setdefault("excluded_target_ids", [])
+    for ti in ids:
+        if ti not in existing:
+            existing.append(ti)
+    avail.setdefault("reason", avail_excluded_sink[0][1])
 
 
 def _partition_audience(
@@ -352,6 +447,8 @@ def _filter_by_availability(
     flows: list[dict[str, Any]],
     avail_map: dict[str, str],
     returning_visitor: bool,
+    *,
+    excluded_sink: list[tuple[str, str]] | None = None,
 ) -> list[dict[str, Any]]:
     """Pre-selection availability floor (v2 Phase A, plan §4 step 7).
 
@@ -384,7 +481,15 @@ def _filter_by_availability(
             continue
         if any(avail_map.get(t, "active") in allowed for t in tids):
             survivors.append(f)
-        # else: every pinned target unavailable for the class → EXCLUDE
+        else:
+            # every pinned target unavailable for the class → EXCLUDE. v2 LD-F2:
+            # record the specific (target_id, availability) drops for the trace
+            # (decision unchanged — this only OBSERVES the exclusion).
+            if excluded_sink is not None:
+                for t in tids:
+                    av = avail_map.get(t, "active")
+                    if av not in allowed:
+                        excluded_sink.append((t, av))
     return survivors
 
 
@@ -465,9 +570,112 @@ async def _load_flow_records(r, flow_ids: list[str]) -> list[dict[str, Any]]:
     return flows
 
 
+def _parse_criteria(criteria_raw: Any) -> list[dict[str, Any]]:
+    """Parse a flow's `criteria` field into a list, defensively. Returns `[]`
+    on malformed JSON (callers distinguish 'empty = match-all' from 'malformed'
+    earlier; this is the observability-side parse for trace descriptors)."""
+    try:
+        parsed = (
+            json.loads(criteria_raw)
+            if isinstance(criteria_raw, str)
+            else criteria_raw
+        )
+    except (json.JSONDecodeError, TypeError):
+        return []
+    return parsed if isinstance(parsed, list) else []
+
+
+def _criteria_descriptors(criteria: list[dict[str, Any]]) -> list[str]:
+    """Compact, bounded human-readable descriptors for a flow's criteria —
+    e.g. `["geo in [US,CA]", "device_type not_in [bot]"]`. Used only when
+    building the trace (cold relative to routing). Per-criterion values are
+    capped (count + length) so a 500-value criterion cannot bloat the JSON."""
+    out: list[str] = []
+    for c in criteria:
+        if isinstance(c, dict):
+            out.append(_format_criterion(c))
+    return out
+
+
+def _format_criterion(c: dict[str, Any]) -> str:
+    """One criterion → compact `"<dim> <op> [<≤5 values>]"` string (bounded)."""
+    dim = c.get("type", "?")
+    op = c.get("op", "in")
+    vals = c.get("values", []) or []
+    joined = ",".join(str(v) for v in vals[:5])
+    if len(joined) > 60:
+        joined = joined[:57] + "..."
+    op_label = "not_in" if op == "not_in" else ("in" if op == "in" else str(op))
+    return f"{dim} {op_label} [{joined}]"
+
+
+def _first_failing_criterion(
+    criteria: list[dict[str, Any]], click_attrs: dict[str, str],
+) -> dict[str, Any] | None:
+    """The first criterion that does NOT hold (AND semantics), or `None` if all
+    hold. SINGLE source of truth for criteria evaluation — `_criteria_match` is
+    the bool wrapper, and the trace's rejected-reason builder formats the
+    returned criterion. One walk = no decision/explanation drift.
+
+    Supports `op='in'` / `op='not_in'`; per-type casing per `_CASE_PRESERVE`;
+    set-valued history dims (prev_offer / prev_offer_target / prev_sub) use
+    intersection. Identical decision logic to the pre-LD-F2 `_criteria_match`.
+    """
+    for c in criteria:
+        if not isinstance(c, dict):
+            return {"type": "?", "op": "?", "values": []}
+        dim = c.get("type", "")
+        op = c.get("op", "in")
+        raw_values = c.get("values", []) or []
+        click_val = click_attrs.get(dim, "")
+
+        # P4 — set-valued dims: the click "value" is the user's HISTORY set, so
+        # membership becomes intersection. ONLY a set click_val takes this
+        # branch, so every base (str) dim is byte-identical to pre-P4.
+        if isinstance(click_val, (set, frozenset)):
+            cvals = frozenset(
+                v.lower() if isinstance(v, str) else v for v in raw_values
+            )
+            hist = frozenset(
+                x.lower() if isinstance(x, str) else x for x in click_val
+            )
+            hit = bool(hist & cvals)
+            if op == "in":
+                if not hit:
+                    return c
+            elif op == "not_in":
+                if hit:
+                    return c
+            else:
+                return c
+            continue
+
+        if dim in _CASE_PRESERVE:
+            values = frozenset(v for v in raw_values if isinstance(v, str))
+        else:
+            values = frozenset(
+                v.lower() if isinstance(v, str) else v for v in raw_values
+            )
+
+        if op == "in":
+            if click_val not in values:
+                return c
+        elif op == "not_in":
+            if click_val in values:
+                return c
+        else:
+            # Unknown operator — fail safe. Matches admin-api's CRITERION
+            # validator which rejects unknown ops at write time.
+            return c
+    return None
+
+
 def _filter_by_criteria(
     flows: list[dict[str, Any]],
     click_attrs: dict[str, str],
+    *,
+    rejected_sink: list[dict[str, Any]] | None = None,
+    diagnostic: bool = False,
 ) -> list[dict[str, Any]]:
     """Per `SCOPE-CASCADE.md` step 2 — criteria match.
 
@@ -475,6 +683,12 @@ def _filter_by_criteria(
     linked traffic_target at sync time). Empty list = match-all.
     Malformed JSON = skip (don't treat as match-all — same defensive
     rule as `resolve_target` in `router.py`).
+
+    v2 LD-F2: when `rejected_sink` is provided, every flow dropped by the
+    criteria filter is appended as `{flow_id, failed}` (the one failing
+    criterion); under `diagnostic` each entry also carries its full criteria
+    descriptors. The SURVIVOR set is unchanged with or without the sink —
+    capture is pure observation alongside the walk the filter already does.
     """
     survivors: list[dict[str, Any]] = []
     for flow in flows:
@@ -502,14 +716,29 @@ def _filter_by_criteria(
                 level="warning",
                 flow_id=fid,
             )
+            if rejected_sink is not None:
+                rejected_sink.append(
+                    {"flow_id": fid, "failed": "malformed criteria JSON"}
+                )
             continue
 
         if not criteria:
             survivors.append(flow)
             continue
 
-        if _criteria_match(criteria, click_attrs):
+        failing = _first_failing_criterion(criteria, click_attrs)
+        if failing is None:
             survivors.append(flow)
+        elif rejected_sink is not None:
+            entry: dict[str, Any] = {
+                "flow_id": flow.get("_id"),
+                "failed": _format_criterion(failing),
+            }
+            if diagnostic:
+                # heavy/gated half of D22 — full criteria descriptors per
+                # rejected flow (only under X-Test-Id, bounded list).
+                entry["criteria"] = _criteria_descriptors(criteria)
+            rejected_sink.append(entry)
 
     return survivors
 
@@ -536,69 +765,10 @@ _CASE_PRESERVE: Final[frozenset[str]] = frozenset({
 def _criteria_match(
     criteria: list[dict[str, Any]], click_attrs: dict[str, str],
 ) -> bool:
-    """All criteria must hold (AND semantics).
-
-    Supports `op='in'` and `op='not_in'`. Per-type casing per
-    `_CASE_PRESERVE` above — `geo` / `region` / `browser` / `language`
-    keep their value verbatim, all other dims lowercase both sides.
-
-    Membership uses a `frozenset` for O(1) check instead of `O(n)`
-    list scan. Admin-api caps `values` at 500 strings per criterion
-    (`traffic_targets/schemas.py`), so the constant-factor win
-    matters at the upper bound — 50 flows × 20 criteria × 500 values
-    via list scan = 500k ops/click vs `~1k` set lookups (security
-    audit 2026-04-28 HIGH-004 mitigation).
-    """
-    for c in criteria:
-        if not isinstance(c, dict):
-            return False
-        dim = c.get("type", "")
-        op = c.get("op", "in")
-        raw_values = c.get("values", []) or []
-        click_val = click_attrs.get(dim, "")
-
-        # P4 — set-valued dims (prev_offer / prev_offer_target / prev_sub): the
-        # click "value" is the user's HISTORY set, so membership becomes
-        # intersection. `in` = history hit ANY criterion value; `not_in` = none.
-        # ONLY a set click_val takes this branch, so every base (str) dim — and
-        # the offer_target inline matcher, which never carries set values — is
-        # byte-identical to pre-P4.
-        if isinstance(click_val, (set, frozenset)):
-            cvals = frozenset(
-                v.lower() if isinstance(v, str) else v for v in raw_values
-            )
-            hist = frozenset(
-                x.lower() if isinstance(x, str) else x for x in click_val
-            )
-            hit = bool(hist & cvals)
-            if op == "in":
-                if not hit:
-                    return False
-            elif op == "not_in":
-                if hit:
-                    return False
-            else:
-                return False
-            continue
-
-        if dim in _CASE_PRESERVE:
-            values = frozenset(v for v in raw_values if isinstance(v, str))
-        else:
-            values = frozenset(
-                v.lower() if isinstance(v, str) else v for v in raw_values
-            )
-
-        if op == "in":
-            if click_val not in values:
-                return False
-        elif op == "not_in":
-            if click_val in values:
-                return False
-        else:
-            # Unknown operator — fail safe. Matches admin-api's CRITERION
-            # validator which rejects unknown ops at write time.
-            return False
-    return True
+    """All criteria must hold (AND semantics) — bool wrapper over
+    `_first_failing_criterion` (the SINGLE evaluation walk; see its docstring
+    for op/casing/set-dim semantics + the HIGH-004 frozenset rationale)."""
+    return _first_failing_criterion(criteria, click_attrs) is None
 
 
 def _pick_winner(

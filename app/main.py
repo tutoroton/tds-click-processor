@@ -849,9 +849,13 @@ def _phase3_attribution_fields(
         # Default-safe "na" when sticky mode wasn't active for this click.
         "sticky_status": attr.get("sticky_status") or "na",
         # routing_trace — COMPACT JSON (scope_walk, candidate/loaded/excluded
-        # counts, winning scope, buyer_enrichment) + decision_reason. Bounded
-        # so a pathological flood can't bloat the click row. Heavy per-candidate
-        # / rejected-criteria detail (X-Test-Id gated) is a deferred extension.
+        # counts, winning scope, buyer_enrichment) + decision_reason. v2 LD-F2
+        # (D22 / §05 Tier-3): also carries the deep-dive sub-objects
+        # `criteria` (winner_matched + ≤3 rejected), `split` (weights+picked),
+        # and `availability` (excluded_target_ids+reason) — built by the cascade
+        # + split executor. Heavy parts (full rejected-criteria descriptors,
+        # uncapped) are gated behind a valid `X-Test-Id`. Bounded so a
+        # pathological flood can't bloat the click row.
         "routing_trace": json.dumps(
             {**(attr.get("routing_trace") or {}), "decision_reason": decision_reason},
             separators=(",", ":"),

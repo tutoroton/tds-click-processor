@@ -938,3 +938,181 @@ class TestAvailabilityCascade:
             click_attrs={"geo": "US", "os": "ios", "device_type": "mobile"},
         )
         assert winner is None
+
+
+# ============================================================
+# v2 LD-F2 — routing_trace deep-dive (D22 / §05 Tier-3):
+# criteria.{winner_matched,rejected} + availability.excluded_target_ids
+# + the X-Test-Id heavy/light gating. Pins the audit-2 MED remediation.
+# ============================================================
+
+
+def _crit_flow(*, fid, scope_type="company", scope_id=1, seq_id=1, criteria, target_id=None):
+    """A flow with explicit criteria (offer-action when target_id given, else
+    redirect — so the availability floor is/ isn't engaged as the test needs)."""
+    f = _make_flow(
+        fid=fid, scope_type=scope_type, scope_id=scope_id, seq_id=seq_id,
+        criteria=criteria,
+        action_type="offer" if target_id is not None else "redirect",
+    )
+    if target_id is not None:
+        f["action_config"] = json.dumps({"offer_id": 1, "target_id": target_id})
+    return f
+
+
+class TestLDF2CriteriaTrace:
+    @pytest.mark.asyncio
+    async def test_winner_matched_and_rejected_recorded(self):
+        """(a) winner with criteria → trace.criteria carries winner_matched
+        descriptors AND the rejected flow with its failing criterion."""
+        flows = {
+            # winner: geo in [US] (matches the US click)
+            "flow:10": _crit_flow(fid="10", seq_id=1, criteria=[{"type": "geo", "op": "in", "values": ["US"]}]),
+            # rejected: geo in [CA] (US click fails it)
+            "flow:20": _crit_flow(fid="20", seq_id=2, criteria=[{"type": "geo", "op": "in", "values": ["CA"]}]),
+        }
+        lists = {"campaign:1:flows": ["10", "20"], "flows:scope:1:company:1": []}
+        r = _redis_with_lists_and_hashes(lists, flows)
+        trace: dict = {}
+        winner = await resolve_flow(
+            r, campaign_id="1", company_id=1, buyer_id=None, team_id=None,
+            department_id=None, custom_group_id=None,
+            click_attrs={"geo": "US", "os": "ios", "device_type": "mobile"},
+            trace=trace,
+        )
+        assert winner["_id"] == "10"
+        crit = trace["criteria"]
+        assert crit["winner_matched"] == ["geo in [US]"]
+        assert crit["rejected"] == [{"flow_id": "20", "failed": "geo in [CA]"}]
+        # compact (no X-Test-Id) → rejected entry has NO full-criteria detail.
+        assert "criteria" not in crit["rejected"][0]
+
+    @pytest.mark.asyncio
+    async def test_match_all_winner_has_empty_winner_matched(self):
+        """A match-all winner (empty criteria) records winner_matched=[]."""
+        flows = {"flow:10": _crit_flow(fid="10", criteria=[])}
+        lists = {"campaign:1:flows": ["10"], "flows:scope:1:company:1": []}
+        r = _redis_with_lists_and_hashes(lists, flows)
+        trace: dict = {}
+        winner = await resolve_flow(
+            r, campaign_id="1", company_id=1, buyer_id=None, team_id=None,
+            department_id=None, custom_group_id=None,
+            click_attrs={"geo": "US", "os": "ios", "device_type": "mobile"},
+            trace=trace,
+        )
+        assert winner["_id"] == "10"
+        assert trace["criteria"]["winner_matched"] == []
+        # no rejections → no rejected key
+        assert "rejected" not in trace["criteria"]
+
+    @pytest.mark.asyncio
+    async def test_compact_caps_rejected_at_three_heavy_lifts_and_details(self):
+        """(d) X-Test-Id gating: light path caps rejected at 3 with no per-flow
+        criteria; diagnostic=True lifts the cap AND adds full descriptors."""
+        # 5 rejected flows (all geo in [CA] — the US click fails each) + 1 winner.
+        flows = {"flow:1": _crit_flow(fid="1", seq_id=1, criteria=[{"type": "geo", "op": "in", "values": ["US"]}])}
+        ids = ["1"]
+        for n in range(2, 7):
+            flows[f"flow:{n}"] = _crit_flow(
+                fid=str(n), seq_id=n,
+                criteria=[{"type": "geo", "op": "in", "values": ["CA"]}],
+            )
+            ids.append(str(n))
+        lists = {"campaign:1:flows": ids, "flows:scope:1:company:1": []}
+
+        # Light (no diagnostic)
+        r = _redis_with_lists_and_hashes(lists, flows)
+        light: dict = {}
+        await resolve_flow(
+            r, campaign_id="1", company_id=1, buyer_id=None, team_id=None,
+            department_id=None, custom_group_id=None,
+            click_attrs={"geo": "US", "os": "ios", "device_type": "mobile"},
+            trace=light, diagnostic=False,
+        )
+        assert len(light["criteria"]["rejected"]) == 3
+        assert light["criteria"]["rejected_truncated"] == 2
+        assert all("criteria" not in e for e in light["criteria"]["rejected"])
+
+        # Heavy (X-Test-Id present → diagnostic=True)
+        r2 = _redis_with_lists_and_hashes(lists, flows)
+        heavy: dict = {}
+        await resolve_flow(
+            r2, campaign_id="1", company_id=1, buyer_id=None, team_id=None,
+            department_id=None, custom_group_id=None,
+            click_attrs={"geo": "US", "os": "ios", "device_type": "mobile"},
+            trace=heavy, diagnostic=True,
+        )
+        assert len(heavy["criteria"]["rejected"]) == 5  # cap lifted
+        assert "rejected_truncated" not in heavy["criteria"]
+        # heavy entries carry full criteria descriptors
+        assert heavy["criteria"]["rejected"][0]["criteria"] == ["geo in [CA]"]
+
+    @pytest.mark.asyncio
+    async def test_no_trace_is_byte_identical_no_sink_cost(self):
+        """resolve_flow without a trace dict behaves exactly as before (the
+        pure-unit / no-observability path) — no exceptions, same winner."""
+        flows = {
+            "flow:10": _crit_flow(fid="10", seq_id=1, criteria=[{"type": "geo", "op": "in", "values": ["US"]}]),
+            "flow:20": _crit_flow(fid="20", seq_id=2, criteria=[{"type": "geo", "op": "in", "values": ["CA"]}]),
+        }
+        lists = {"campaign:1:flows": ["10", "20"], "flows:scope:1:company:1": []}
+        r = _redis_with_lists_and_hashes(lists, flows)
+        winner = await resolve_flow(
+            r, campaign_id="1", company_id=1, buyer_id=None, team_id=None,
+            department_id=None, custom_group_id=None,
+            click_attrs={"geo": "US", "os": "ios", "device_type": "mobile"},
+        )
+        assert winner["_id"] == "10"
+
+
+class TestLDF2AvailabilityTrace:
+    @pytest.mark.asyncio
+    async def test_excluded_target_ids_recorded(self):
+        """(c) availability floor excludes a target → trace.availability
+        carries the specific excluded_target_ids + the reason."""
+        # buyer flow → target 7 CLOSED (excluded), company flow → target 9 active.
+        flows = {
+            "flow:10": _offer_flow(fid="10", scope_type="buyer", scope_id=5, target_id=7),
+            "flow:20": _offer_flow(fid="20", scope_type="company", scope_id=1, target_id=9),
+        }
+        hashes = {
+            **flows,
+            "offer_target:7": {"availability": "closed"},
+            "offer_target:9": {"availability": "active"},
+        }
+        lists = {
+            "campaign:1:flows": [],
+            "flows:scope:1:buyer:5": ["10"],
+            "flows:scope:1:company:1": ["20"],
+        }
+        r = _redis_with_lists_and_hashes(lists, hashes)
+        trace: dict = {}
+        winner = await resolve_flow(
+            r, campaign_id="1", company_id=1, buyer_id=5, team_id=None,
+            department_id=None, custom_group_id=None,
+            click_attrs={"geo": "US", "os": "ios", "device_type": "mobile"},
+            trace=trace,
+        )
+        assert winner["_id"] == "20"  # fell through to company
+        assert trace["availability"]["excluded_target_ids"] == [7]
+        assert trace["availability"]["reason"] == "closed"
+        # the legacy int counter is still maintained (decision_reason consumer)
+        assert trace["availability_excluded"] == 1
+
+    @pytest.mark.asyncio
+    async def test_all_active_no_availability_subobject(self):
+        """Nothing drained/closed → no availability sub-object (byte-identical
+        steady state)."""
+        flows = {"flow:10": _offer_flow(fid="10", scope_type="company", scope_id=1, target_id=7)}
+        hashes = {**flows, "offer_target:7": {"availability": "active"}}
+        lists = {"campaign:1:flows": [], "flows:scope:1:company:1": ["10"]}
+        r = _redis_with_lists_and_hashes(lists, hashes)
+        trace: dict = {}
+        await resolve_flow(
+            r, campaign_id="1", company_id=1, buyer_id=None, team_id=None,
+            department_id=None, custom_group_id=None,
+            click_attrs={"geo": "US", "os": "ios", "device_type": "mobile"},
+            trace=trace,
+        )
+        assert "availability" not in trace
+        assert trace["availability_excluded"] == 0

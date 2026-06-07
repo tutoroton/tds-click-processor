@@ -609,3 +609,93 @@ class TestTargetSelectionPath:
         )
         assert result is not None
         assert result["target_selection_path"] == "split_weighted"
+
+
+# ============================================================
+# v2 LD-F2 — routing_trace.split (D22 / §05 Tier-3): weights + picked,
+# plus per-leg availability exclusions merged into trace.availability.
+# ============================================================
+
+
+class TestLDF2SplitTrace:
+    @pytest.mark.asyncio
+    async def test_split_records_weights_and_picked(self):
+        """(b) split action with a trace dict → trace.split carries the
+        surviving legs' weights, the total, and the picked target."""
+        flow = _flow("split", {
+            "offers": [
+                {"offer_id": 5, "target_id": 7, "weight": 70},
+                {"offer_id": 6, "target_id": 9, "weight": 30},
+            ],
+        })
+        r = _redis_with_hashes({
+            "offer_target:7": {"url": "https://t-7", "is_default": "0", "availability": "active"},
+            "offer_target:9": {"url": "https://t-9", "is_default": "0", "availability": "active"},
+        })
+        trace: dict = {}
+        result = await execute_action(
+            r, flow, _click(), "1",
+            source_mappings=None, campaign_mappings=None,
+            build_url_fn=_stub_build_url(), trace=trace,
+        )
+        assert result is not None
+        split = trace["split"]
+        # both surviving legs recorded with their weights; total = sum.
+        assert split["weights"] == [{"target_id": 7, "w": 70}, {"target_id": 9, "w": 30}]
+        assert split["total"] == 100
+        # picked = whichever leg the weighted draw chose (== the served target).
+        assert split["picked"] in (7, 9)
+        assert split["picked"] == int(result["target_id"])
+
+    @pytest.mark.asyncio
+    async def test_split_closed_leg_recorded_in_availability(self):
+        """A split leg whose target is closed is excluded AND its target_id
+        lands in trace.availability.excluded_target_ids — the per-leg blind
+        spot the cascade flow-level counter never saw (LD-F2 camp-85 evidence)."""
+        flow = _flow("split", {
+            "offers": [
+                {"offer_id": 5, "target_id": 7, "weight": 50},   # closed → excluded
+                {"offer_id": 6, "target_id": 9, "weight": 50},   # active → served
+            ],
+        })
+        r = _redis_with_hashes({
+            "offer_target:7": {"url": "https://t-7", "is_default": "0", "availability": "closed"},
+            "offer_target:9": {"url": "https://t-9", "is_default": "0", "availability": "active"},
+        })
+        trace: dict = {}
+        result = await execute_action(
+            r, flow, _click(), "1",
+            source_mappings=None, campaign_mappings=None,
+            build_url_fn=_stub_build_url(),
+            allowed_avail=frozenset({"active"}), trace=trace,
+        )
+        assert result is not None and result["target_id"] == "9"
+        assert trace["availability"]["excluded_target_ids"] == [7]
+        assert trace["availability"]["reason"] == "closed"
+        # the served leg is the picked one in the split sub-object
+        assert trace["split"]["picked"] == 9
+
+    @pytest.mark.asyncio
+    async def test_no_trace_split_byte_identical(self):
+        """No trace dict → split executes exactly as before (no exception)."""
+        flow = _flow("split", {"offers": [{"offer_id": 5, "target_id": 7, "weight": 100}]})
+        r = _redis_with_hashes({"offer_target:7": {"url": "https://t-7", "is_default": "0"}})
+        result = await execute_action(
+            r, flow, _click(), "1",
+            source_mappings=None, campaign_mappings=None, build_url_fn=_stub_build_url(),
+        )
+        assert result is not None and result["target_id"] == "7"
+
+    @pytest.mark.asyncio
+    async def test_offer_action_no_split_subobject(self):
+        """A non-split action never writes trace.split (byte-identical)."""
+        flow = _flow("offer", {"offer_id": 5, "target_id": 7})
+        r = _redis_with_hashes({"offer_target:7": {"url": "https://t-7", "is_default": "0"}})
+        trace: dict = {}
+        result = await execute_action(
+            r, flow, _click(), "1",
+            source_mappings=None, campaign_mappings=None,
+            build_url_fn=_stub_build_url(), trace=trace,
+        )
+        assert result is not None
+        assert "split" not in trace

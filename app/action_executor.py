@@ -63,6 +63,32 @@ __all__ = ["execute_action", "pinned_target_result", "BLOCK_RESULT", "UNAVAILABL
 UNAVAILABLE_RESULT: dict[str, Any] = {"unavailable": True, "url": None}
 
 
+def _safe_target_int(tid: Any) -> int | None:
+    """Coerce a target_id to int for the trace (matches the int shape the CH
+    `offer_target_id` column + §05 example use). Non-numeric / absent → None
+    (a split leg may resolve to the offer default with no pinned target_id)."""
+    if tid is None:
+        return None
+    try:
+        return int(tid)
+    except (ValueError, TypeError):
+        return None
+
+
+def _record_split_excluded(trace: dict[str, Any], tid: str, availability: str) -> None:
+    """v2 LD-F2 — merge a split-leg availability exclusion into the SHARED
+    `trace["availability"]` sub-object the cascade also writes (router threads
+    one trace dict through both). Dedups target ids; keeps the first reason."""
+    ti = _safe_target_int(tid)
+    if ti is None:
+        return
+    avail = trace.setdefault("availability", {})
+    ids = avail.setdefault("excluded_target_ids", [])
+    if ti not in ids:
+        ids.append(ti)
+    avail.setdefault("reason", availability)
+
+
 def _avail_ok(availability: Any, allowed_avail) -> bool:
     """Availability gate shared by every delivery path. Fail-open: a missing /
     empty / pre-migration-076 `availability` field defaults to 'active' (mirrors
@@ -126,6 +152,7 @@ async def execute_action(
     campaign_mappings: list | None,
     build_url_fn,
     allowed_avail=frozenset({"active"}),
+    trace: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Translate a winning flow into a concrete routing result.
 
@@ -169,7 +196,7 @@ async def execute_action(
     if action_type == "split":
         return await _execute_split(r, config, req, campaign_id, build_url_fn,
                                      source_mappings, campaign_mappings, flow_id,
-                                     allowed_avail)
+                                     allowed_avail, trace=trace)
     if action_type == "block":
         return BLOCK_RESULT
 
@@ -257,6 +284,7 @@ async def _execute_split(
     campaign_mappings,
     flow_id: str | None,
     allowed_avail,
+    trace: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """`split` — weighted random pick over `action_config.offers`."""
     entries = config.get("offers")
@@ -321,12 +349,18 @@ async def _execute_split(
     kept_valid: list[dict[str, Any]] = []
     kept_weights: list[int] = []
     excluded_on_avail = False
+    # v2 LD-F2 — collect the per-leg availability drops for the trace so a split
+    # whose leg is closed/draining is visible (the cascade flow-level
+    # `availability_excluded` counter never saw per-leg exclusions — the LD-F2
+    # evidence's specific blind spot, camp 85). Pure observation.
     for entry, w in zip(valid, weights):
         tid = entry.get("target_id")
         if _is_positive_int(tid) and not _avail_ok(
             avail_map.get(str(tid), "active"), allowed_avail
         ):
             excluded_on_avail = True
+            if trace is not None:
+                _record_split_excluded(trace, str(tid), avail_map.get(str(tid), "active"))
             continue
         kept_valid.append(entry)
         kept_weights.append(w)
@@ -339,6 +373,19 @@ async def _execute_split(
     valid, weights = kept_valid, kept_weights
 
     chosen = random.choices(valid, weights=weights, k=1)[0]
+    # v2 LD-F2 — record the split decision into the trace (D22 / §05 Tier-3):
+    # the surviving legs' weights, their total, and the picked leg's target.
+    # Compact-always (cheap: the weights/pick are already in hand here). Absent
+    # on a non-split action → byte-identical for offer/redirect/block flows.
+    if trace is not None:
+        trace["split"] = {
+            "weights": [
+                {"target_id": _safe_target_int(e.get("target_id")), "w": w}
+                for e, w in zip(valid, weights)
+            ],
+            "total": sum(weights),
+            "picked": _safe_target_int(chosen.get("target_id")),
+        }
     result = await _resolve_offer_url(
         r, str(chosen["offer_id"]), chosen.get("target_id"),
         req, campaign_id, build_url_fn,

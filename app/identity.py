@@ -443,6 +443,30 @@ async def resolve_identity(
         commit=commit,
     )
     if token_result is not None:
+        # CF-2 (crash-test 2026-06-07) — observability of a token≠trusted-fuid
+        # divergence. The signed `_tds_id` token is the authoritative WHO carrier
+        # (edge-identity design) and STAYS the adopted uid — routing is
+        # byte-identical. But when this click ALSO carries a trusted
+        # `funnel_user_id`, a DIFFERENT existing `fuid→uid` mapping is a silent
+        # SPLIT we previously could not even SEE (this function returns the token
+        # result BEFORE `_present_signals` ever reads the fuid map). GATED read:
+        # only when `source_trusted ∧ funnel_user_id` (the rare case) → ZERO extra
+        # I/O on the common path, honouring the <5ms budget. We FLAG
+        # `identity_conflict` WITHOUT merging (log-not-merge, SoT §1) — no maps
+        # touched, no split worsened; only the conflict flag changes. SPLIT-only,
+        # never a MERGE (the token uid is cookie-bound to one browser) — see
+        # VALIDATE-CF2.md.
+        if source_trusted and funnel_user_id and token_result.uid:
+            try:
+                fuid_uid = await r.get(
+                    _sig_key(company_id, _TIER_FUID, _hash(funnel_user_id))
+                )
+            except Exception:  # fail-open — never block routing on the probe
+                fuid_uid = None
+            # Only a SHAPE-VALID, DIFFERENT existing uid is a real conflict
+            # (SEC-M2: a corrupt/poisoned map value is not a competing identity).
+            if _valid_uid(fuid_uid) and fuid_uid != token_result.uid:
+                token_result = replace(token_result, identity_conflict=True)
         return token_result
 
     signals = _present_signals(funnel_user_id, visitor_id, source_trusted)

@@ -970,3 +970,70 @@ class TestTokenDualAccept:
             r, company_id=1, identity_token=tok, campaign_id="20", commit=True,
         )
         assert (diff.is_returning, diff.is_roaming) == (False, True)
+
+    async def test_token_trusted_fuid_divergence_flags_conflict(self, monkeypatch):
+        """CF-2: a valid token (uid A) presented WITH a trusted funnel_user_id
+        that maps to a DIFFERENT existing uid B → the token uid A is still
+        adopted (byte-identical routing), but identity_conflict is now flagged
+        (log-not-merge). Pre-fix this divergence was structurally invisible (the
+        token path returned before the fuid map was ever read)."""
+        _enable_codec(monkeypatch)
+        r = _fr()
+        uid_b = "b" * 32  # a DIFFERENT shape-valid uid
+        await r.set(_sig_key(1, "fuid", _hash("user-b")), uid_b)
+        tok = _mk_token(company_id=1, seen=[10])  # token uid = _TOK_UID (A)
+        res = await resolve_identity(
+            r, company_id=1, funnel_user_id="user-b", visitor_id=None,
+            campaign_id="10", source_trusted=True, ttl=TTL, identity_token=tok,
+        )
+        assert res.uid == _TOK_UID            # token uid adopted (WHO unchanged)
+        assert res.signal_tier == "token"     # still token-tier
+        assert res.identity_conflict is True  # divergence now observable
+        # No merge — the fuid map is untouched (still points at uid B).
+        assert await r.get(_sig_key(1, "fuid", _hash("user-b"))) == uid_b
+
+    async def test_token_trusted_fuid_same_uid_no_conflict(self, monkeypatch):
+        """CF-2: a trusted fuid mapping to the SAME uid as the token is no
+        conflict — the flag stays False."""
+        _enable_codec(monkeypatch)
+        r = _fr()
+        await r.set(_sig_key(1, "fuid", _hash("user-a")), _TOK_UID)
+        tok = _mk_token(company_id=1, seen=[10])
+        res = await resolve_identity(
+            r, company_id=1, funnel_user_id="user-a", visitor_id=None,
+            campaign_id="10", source_trusted=True, ttl=TTL, identity_token=tok,
+        )
+        assert res.uid == _TOK_UID
+        assert res.identity_conflict is False
+
+    async def test_token_untrusted_fuid_not_read_no_conflict(self, monkeypatch):
+        """CF-2 gating: an UNTRUSTED source's fuid is never consulted (G6) → no
+        extra GET, no conflict — byte-identical to pre-CF-2 even with a divergent
+        fuid map present."""
+        _enable_codec(monkeypatch)
+        spy = _GetSpy(_fr())
+        await spy.set(_sig_key(1, "fuid", _hash("user-b")), "b" * 32)
+        spy.get_keys.clear()  # ignore the seed write's bookkeeping
+        tok = _mk_token(company_id=1, seen=[10])
+        res = await resolve_identity(
+            spy, company_id=1, funnel_user_id="user-b", visitor_id=None,
+            campaign_id="10", source_trusted=False, ttl=TTL, identity_token=tok,
+        )
+        assert res.uid == _TOK_UID
+        assert res.identity_conflict is False
+        # The fuid map was NOT read (gated off when source is untrusted).
+        assert not any("fuid" in str(k) for k in spy.get_keys)
+
+    async def test_token_no_fuid_no_extra_read(self, monkeypatch):
+        """CF-2 gating: a token WITHOUT a funnel_user_id on the click issues no
+        extra read and never flags a conflict (the common hot path)."""
+        _enable_codec(monkeypatch)
+        spy = _GetSpy(_fr())
+        tok = _mk_token(company_id=1, seen=[10])
+        res = await resolve_identity(
+            spy, company_id=1, funnel_user_id=None, visitor_id=None,
+            campaign_id="10", source_trusted=True, ttl=TTL, identity_token=tok,
+        )
+        assert res.uid == _TOK_UID
+        assert res.identity_conflict is False
+        assert not any("fuid" in str(k) for k in spy.get_keys)

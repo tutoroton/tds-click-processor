@@ -802,9 +802,31 @@ async def _route_via_campaign(
     timing["offer_ms"] = _ms_since(t0)
     if not offer:
         if fall_through_on_no_route:
-            # Domain matched but no flow + no legacy offer — let geo
-            # targeting try. The geo branch (if it also lands here) will
-            # emit the G2 non-routed sentinel.
+            # CF-OBS-1 (2026-06-07): the domain/?c= binding matched a campaign
+            # that has NO flow + NO legacy offer. If the bound campaign declares
+            # its OWN terminal_fallback, serve THAT (no foreign poach, no
+            # cross-attribution) rather than returning None to fall through to
+            # global geo and re-attribute the click to a foreign campaign. Only a
+            # campaign with NO terminal_fallback falls through — preserving the
+            # legitimate bare-domain catch-all (a host pointed at a campaign with
+            # no terminal config genuinely wants the global-geo path).
+            # `_resolve_fallback_template(None, ...) → None` is the precise
+            # discriminator "did the admin configure a terminal_fallback".
+            # Byte-identical for any campaign without a fallback_url.
+            own_fallback = _resolve_fallback_template(
+                campaign.get("fallback_url"), req, campaign_id,
+                source_mappings, campaign_mappings, identity_macros,
+            )
+            if own_fallback:
+                timing["route_total_ms"] = _ms_since(t_branch)
+                timing["result"] = "no_offer"
+                return _non_routed_result(
+                    campaign_id, attribution, timing,
+                    binding_id=binding_id, binding_alias=binding_alias,
+                    fallback_url=own_fallback,
+                )
+            # No own terminal_fallback — let geo targeting try. The geo branch
+            # (if it also lands here) will emit the G2 non-routed sentinel.
             return None
         timing["route_total_ms"] = _ms_since(t_branch)
         timing["result"] = "no_offer"

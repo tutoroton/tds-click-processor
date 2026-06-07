@@ -595,8 +595,13 @@ def _extra_click_dims(req: ClickRequest) -> dict[str, str]:
     never populated (isp_asn / time_of_day / day_of_week), now derived from data
     ALREADY on the click (zero worker change):
 
-      * isp_asn      — ``req.asn`` as a digit string; 0/absent → "" (fail-closed
-        on ``in``; a real ``not_in [0]`` now correctly excludes asn-0).
+      * isp_asn      — ``req.asn`` as a digit string, ALWAYS (``req.asn`` is an
+        int that defaults to 0 = CF's no-data sentinel, ``request.cf?.asn || 0``;
+        it is never None). asn 0 → "0" — a MATCHABLE value: an operator's
+        ``not_in ['0']`` (exclude unknown/datacenter ASN) correctly EXCLUDES a
+        no-ASN click, and ``in ['0']`` targets it. ``in [<real asn>]`` on a 0
+        click still fails closed ("0" ∉ the list). Mapping 0 → "" would re-open
+        the CF-3 ``not_in [0]`` fail-open ("" ∉ ['0'] → exclusion no-op).
       * time_of_day  — the UTC hour of ``req.arrival_ts``, un-padded ("0".."23").
       * day_of_week  — the UTC weekday of ``req.arrival_ts`` ("mon".."sun").
 
@@ -605,7 +610,7 @@ def _extra_click_dims(req: ClickRequest) -> dict[str, str]:
     the criterion help text. An absent/malformed ``arrival_ts`` (old worker)
     leaves time_of_day/day_of_week "" → fail-closed on ``in`` (a ``not_in`` on
     such a click still fails open, bounded to the legacy-worker edge)."""
-    isp_asn = str(req.asn) if req.asn else ""
+    isp_asn = str(req.asn)  # always digits; 0 (no-data) → "0" (matchable)
     time_of_day = ""
     day_of_week = ""
     ts = req.arrival_ts

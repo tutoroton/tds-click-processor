@@ -74,12 +74,14 @@ def test_extra_dims_isp_asn_from_req_asn():
     assert _extra_click_dims(_req(asn=13335))["isp_asn"] == "13335"
 
 
-def test_extra_dims_isp_asn_zero_is_empty_fail_closed():
-    """asn=0 is CF's no-data sentinel (`request.cf?.asn || 0`) ⇒ "" so an
-    `in [<real asn>]` fails closed on a no-ASN click (we never match phantom
-    data). A `not_in` on the no-data case stays open by nature — bounded + rare,
-    same accepted residual as an absent arrival_ts."""
-    assert _extra_click_dims(_req(asn=0))["isp_asn"] == ""
+def test_extra_dims_isp_asn_zero_is_matchable_string():
+    """asn=0 is CF's no-data sentinel (`request.cf?.asn || 0`) and req.asn is an
+    int that is ALWAYS present (default 0) → it maps to the MATCHABLE string
+    "0", NOT "". This lets an operator's `not_in ['0']` exclude unknown/
+    datacenter-ASN traffic (the CF-3 repro) and `in ['0']` target it; an
+    `in [<real asn>]` on a 0 click still fails closed ("0" ∉ the list). Mapping
+    0 → "" would re-open the not_in fail-open."""
+    assert _extra_click_dims(_req(asn=0))["isp_asn"] == "0"
 
 
 def test_extra_dims_temporal_utc_unpadded():
@@ -129,6 +131,29 @@ def test_isp_asn_not_in_excludes_matching():
     attrs = {"geo": "US", "isp_asn": "13335"}
     assert _first_failing_criterion(
         [{"type": "isp_asn", "op": "not_in", "values": ["13335"]}], attrs) is not None
+
+
+def test_isp_asn_not_in_zero_excludes_no_asn_click_end_to_end():
+    """CF-3 ORIGINAL repro (EX4: `isp_asn not_in [0]` WON for an asn-0 click).
+    Built end-to-end through `_extra_click_dims` → matcher: asn 0 → "0" so
+    "0" in ['0'] → criterion FAILS → the flow/target is EXCLUDED. Pre-follow-up
+    asn 0 → "" → the exclusion was a no-op (fail-open) and the repro stayed
+    open."""
+    attrs = {"geo": "US", **_extra_click_dims(_req(asn=0))}
+    assert attrs["isp_asn"] == "0"
+    excluded = _first_failing_criterion(
+        [{"type": "isp_asn", "op": "not_in", "values": ["0"]}], attrs)
+    assert excluded is not None  # asn-0 click is EXCLUDED (repro closed)
+
+
+def test_isp_asn_in_zero_targets_no_asn_click():
+    """The dual: `in ['0']` TARGETS the no-ASN click (matchable), while
+    `in [<real asn>]` on a 0 click fails closed."""
+    attrs = {"geo": "US", **_extra_click_dims(_req(asn=0))}
+    assert _first_failing_criterion(
+        [{"type": "isp_asn", "op": "in", "values": ["0"]}], attrs) is None
+    assert _first_failing_criterion(
+        [{"type": "isp_asn", "op": "in", "values": ["13335"]}], attrs) is not None
 
 
 def test_day_of_week_admin_value_uppercase_lowercased():

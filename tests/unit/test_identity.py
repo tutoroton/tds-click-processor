@@ -27,6 +27,7 @@ from app.identity import (
     _sig_key,
     persist_identity,
     resolve_identity,
+    resolve_via_token,
 )
 from app.models import ClickRequest
 from app.router import _build_campaign_attribution
@@ -854,8 +855,12 @@ class TestTokenDualAccept:
     async def test_token_fault_emits_throttled_telemetry(self, monkeypatch):
         """SEC-LOW-02 (audit-2): a token-path Redis fault (seen-union/read)
         surfaces a throttled Sentry signal (OP_IDENTITY) instead of degrading
-        silently. Recognition still succeeds (uid from the signed token);
-        classification fails-open to roaming."""
+        silently. Recognition still succeeds (uid from the signed token).
+
+        CF-1 form-4b (2026-06-07): the degraded branch now honours the signed
+        `seen` hint — a SAME-campaign returner is classified is_returning even
+        during the Redis blip (the hint is proof the uid saw this campaign).
+        Only a campaign NOT in the hint degrades to roaming (covered below)."""
         _enable_codec(monkeypatch)
         tok = _mk_token(company_id=1, seen=[10])
         captured: list = []
@@ -880,8 +885,88 @@ class TestTokenDualAccept:
             _BoomRedis(), company_id=1, funnel_user_id=None, visitor_id=None,
             campaign_id="10", source_trusted=False, ttl=TTL, identity_token=tok,
         )
-        # Degraded but recognized — fail-open.
+        # Degraded but recognized — fail-open. CF-1 form-4b: hint proves campaign
+        # 10 was seen → is_returning even on the degraded branch.
         assert res.uid == _TOK_UID
-        assert (res.is_returning, res.is_roaming) == (False, True)
+        assert (res.is_returning, res.is_roaming) == (True, False)
         # Telemetry fired with the canonical OP_IDENTITY op tag.
         assert captured and captured[0][0] == identity.OP_IDENTITY
+
+    async def test_token_fault_different_campaign_degrades_roaming(self, monkeypatch):
+        """CF-1 form-4b complement: on the degraded branch a campaign NOT in the
+        signed hint still degrades to roaming (seen-before, not provably this
+        campaign) — the safe non-first classification is preserved."""
+        _enable_codec(monkeypatch)
+        tok = _mk_token(company_id=1, seen=[10])  # hint covers 10, we hit 20
+
+        class _BoomPipe:
+            def __getattr__(self, name):
+                if name == "execute":
+                    async def _ex():
+                        raise RuntimeError("redis down")
+                    return _ex
+                return lambda *a, **k: None
+
+        class _BoomRedis:
+            def pipeline(self, *a, **k):
+                return _BoomPipe()
+
+        res = await resolve_identity(
+            _BoomRedis(), company_id=1, funnel_user_id=None, visitor_id=None,
+            campaign_id="20", source_trusted=False, ttl=TTL, identity_token=tok,
+        )
+        assert res.uid == _TOK_UID
+        assert (res.is_returning, res.is_roaming) == (False, True)
+        # Hint still carried forward for the cookie re-stamp (no shrink).
+        assert "10" in res.campaigns_seen
+
+    async def test_token_seen_hint_returning_on_commit_false(self, monkeypatch):
+        """CF-1: cold local set + signed hint=[10], hitting campaign 10 with
+        commit=False (the domain fall-through branch) must classify
+        is_returning=True WITHOUT a SADD. Pre-fix this read the COLD local set
+        (union skipped on commit=False) → mis-stamped is_returning=False /
+        is_roaming=True for a cross-node returner on its first cold-node hit."""
+        _enable_codec(monkeypatch)
+        r = _fr()
+        tok = _mk_token(company_id=1, seen=[10])
+        res = await resolve_via_token(
+            r, company_id=1, identity_token=tok, campaign_id="10", commit=False,
+        )
+        assert (res.is_returning, res.is_roaming) == (True, False)
+        # Side-effect-free: the SADD was deferred — the local set stays COLD.
+        assert not await r.sismember(_campaigns_key(1, _TOK_UID), "10")
+        # The cookie hint is preserved for the re-stamp (no shrink).
+        assert "10" in res.campaigns_seen
+
+    async def test_token_commit_false_no_cookie_shrink(self, monkeypatch):
+        """CF-1 ALT#1: a multi-campaign cookie must NOT lose history on a cold
+        commit=False hit. Pre-fix campaigns_seen = the cold SMEMBERS (empty) →
+        the re-stamp dropped campaigns 20 & 30 from the durable cookie."""
+        _enable_codec(monkeypatch)
+        r = _fr()
+        tok = _mk_token(company_id=1, seen=[10, 20, 30])
+        res = await resolve_via_token(
+            r, company_id=1, identity_token=tok, campaign_id="10", commit=False,
+        )
+        assert {"10", "20", "30"} <= set(res.campaigns_seen)
+        # No write happened — the local set is still cold.
+        assert not await r.smembers(_campaigns_key(1, _TOK_UID))
+
+    async def test_token_commit_true_byte_identical(self, monkeypatch):
+        """CF-1 invariant: the commit=True path is unchanged — the union SADD
+        runs, the SISMEMBER reads warm, and the `or hint` is redundant. A
+        different-campaign hit still classifies roaming (bucket ∉ hint)."""
+        _enable_codec(monkeypatch)
+        r = _fr()
+        tok = _mk_token(company_id=1, seen=[10])
+        # Same campaign → returning, AND the SADD landed (commit=True).
+        same = await resolve_via_token(
+            r, company_id=1, identity_token=tok, campaign_id="10", commit=True,
+        )
+        assert (same.is_returning, same.is_roaming) == (True, False)
+        assert await r.sismember(_campaigns_key(1, _TOK_UID), "10")
+        # Different campaign → roaming (bucket "20" ∉ hint {10}).
+        diff = await resolve_via_token(
+            r, company_id=1, identity_token=tok, campaign_id="20", commit=True,
+        )
+        assert (diff.is_returning, diff.is_roaming) == (False, True)

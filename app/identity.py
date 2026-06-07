@@ -341,23 +341,38 @@ async def resolve_via_token(
             f"identity token seen-union/read failed; degraded to roaming: {e}",
             level="warning", company_id=company_id, uid=uid,
         )
-        # Recognition still succeeds (uid known from the signed token); fall back
-        # to "seen this campaign?" unknown ⇒ treat as roaming (seen-before, not
-        # provably this-campaign) which is the safe non-first classification.
-        # `campaigns_seen` falls back to the cookie's own hint so the re-stamp
-        # still carries forward what the token already proved (degraded but never
-        # losing the hint).
+        # Recognition still succeeds (uid known from the signed token). CF-1
+        # form-4b (2026-06-07): even on the degraded branch the signed `seen`
+        # hint is in hand and is proof the uid saw this campaign — honour it
+        # rather than hardcoding is_returning=False. Without this, a same-campaign
+        # returner is mis-stamped roaming during a transient identity-Redis blip
+        # regardless of commit. `campaigns_seen` already falls back to the hint so
+        # the re-stamp never loses history.
+        _hint_set = frozenset(seen_hint)
+        _degraded_returning = bucket in _hint_set
         return IdentityResult(
-            uid=uid, is_unique=False, is_returning=False, is_roaming=True,
+            uid=uid, is_unique=False, is_returning=_degraded_returning,
+            is_roaming=not _degraded_returning,
             signal_tier=_tier_label(_TIER_TOKEN), identity_conflict=False,
-            campaigns_seen=frozenset(seen_hint),
+            campaigns_seen=_hint_set,
         )
 
     # rt layout: [sadd?]  sismember  [offers targets subs]  campaigns(SMEMBERS)
     idx = 1 if union else 0
-    is_returning = bool(rt[idx])
+    # CF-1 fix (2026-06-07): membership = LOCAL set OR the cookie's signed hint.
+    # On the side-effect-free (commit=False) fall-through branch the SADD is
+    # skipped, so the local SISMEMBER reads a COLD set and a cross-node returner
+    # was mis-stamped is_returning=False/is_roaming=True on the first hit at a
+    # cold node. The hint is signed proof the uid saw this campaign — fold it
+    # into the READ (not a write) so classification is correct without mutating
+    # state. Defer only the SADD. Byte-identical for commit=True (the union
+    # already SADD'd the hint → sismember=1 → the `or` is redundant).
+    _hint_set = frozenset(seen_hint)
+    is_returning = bool(rt[idx]) or (bucket in _hint_set)
     is_roaming = not is_returning  # seen-before (token proves it) AND not this campaign
-    campaigns_seen = frozenset(rt[-1] or ())  # last entry = the SMEMBERS read
+    # campaigns_seen feeds the cookie re-stamp; union the hint so a cold-node
+    # commit=False hit does NOT SHRINK the durable cookie's seen-history.
+    campaigns_seen = frozenset(rt[-1] or ()) | _hint_set  # last entry = SMEMBERS
     if with_history:
         return IdentityResult(
             uid=uid, is_unique=False, is_returning=is_returning,

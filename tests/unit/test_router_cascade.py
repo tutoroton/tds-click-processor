@@ -1444,6 +1444,88 @@ class TestStickyPhaseS:
         assert result["attribution"]["sticky_status"] == "invalid_closed"
         assert redis.strings.get("sticky:1:U:10") == "7"
 
+    def test_closed_pin_repin_unavailable_is_honest_status(self):
+        # C-L-1 (audit-2 2026-06-07): focused on `_resolve_action_with_sticky`.
+        # The pin (target 9) is CLOSED and the re-pick (_normal → execute_action)
+        # yields UNAVAILABLE — every candidate target drained/closed (reachable
+        # when the cascade pre-floor kept the flow, e.g. an offer flow with no
+        # pinned target whose offer-default drifted closed). NO re-pin happens,
+        # so the status must be the honest "invalid_closed_term", NOT
+        # "invalid_closed" (which main.py maps to decision_reason `fresh_repin`).
+        import asyncio
+        from app import action_executor, sticky as sticky_mod
+        from app.config import settings
+
+        routing = FakeRedis(hashes={
+            "offer_target:9": {"url": "https://T9", "availability": "closed",
+                               "offer_id": "1"},
+        })
+        ident = FakeRedis(strings={"sticky:1:U:10": "9"})  # stale closed pin
+
+        async def _gir():
+            return ident
+
+        async def _unavailable(*a, **k):
+            return action_executor.UNAVAILABLE_RESULT
+
+        async def _runner():
+            with patch.object(sticky_mod, "get_identity_redis", _gir), \
+                 patch.object(action_executor, "execute_action", _unavailable), \
+                 patch.object(settings, "returning_uid_ttl_seconds", 1000):
+                return await router._resolve_action_with_sticky(
+                    routing, {"action_type": "offer"}, _click(), "10",
+                    source_mappings={}, campaign_mappings={},
+                    sticky_active=True, uid="U", company_id=1,
+                    seen_before=True, returning_visitor=True,
+                    flow_id="1", allowed_avail=frozenset({"active", "draining"}),
+                )
+
+        result, status = asyncio.run(_runner())
+        assert result is action_executor.UNAVAILABLE_RESULT
+        assert status == "invalid_closed_term"
+        assert status != "invalid_closed"  # would falsely map to fresh_repin
+        # No re-pin — the stale (closed) pin is left untouched.
+        assert ident.strings.get("sticky:1:U:10") == "9"
+
+    def test_closed_pin_genuine_repin_still_invalid_closed(self):
+        # C-L-1 guard: when the re-pick DOES yield a routable target, the status
+        # stays "invalid_closed" (a genuine re-pin → decision_reason fresh_repin),
+        # unchanged by the C-L-1 fix.
+        import asyncio
+        from app import action_executor, sticky as sticky_mod
+        from app.config import settings
+
+        routing = FakeRedis(hashes={
+            "offer_target:9": {"url": "https://T9", "availability": "closed",
+                               "offer_id": "1"},
+        })
+        ident = FakeRedis(strings={"sticky:1:U:10": "9"})
+
+        async def _gir():
+            return ident
+
+        async def _repick(*a, **k):
+            return {"url": "https://T7", "target_id": "7",
+                    "target_selection_path": "offer_default"}
+
+        async def _runner():
+            with patch.object(sticky_mod, "get_identity_redis", _gir), \
+                 patch.object(action_executor, "execute_action", _repick), \
+                 patch.object(settings, "returning_uid_ttl_seconds", 1000):
+                return await router._resolve_action_with_sticky(
+                    routing, {"action_type": "offer"}, _click(), "10",
+                    source_mappings={}, campaign_mappings={},
+                    sticky_active=True, uid="U", company_id=1,
+                    seen_before=True, returning_visitor=True,
+                    flow_id="1", allowed_avail=frozenset({"active", "draining"}),
+                )
+
+        result, status = asyncio.run(_runner())
+        assert status == "invalid_closed"
+        assert result["target_id"] == "7"
+        # Genuine re-pin overwrote the stale pin to the fresh target.
+        assert ident.strings.get("sticky:1:U:10") == "7"
+
     def test_returning_no_pin_mints_miss(self):
         redis = self._redis(offer_targets={
             "7": {"url": "https://T7/{click_id}", "availability": "active", "offer_id": "1"},

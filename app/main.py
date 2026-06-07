@@ -845,8 +845,12 @@ def _phase3_attribution_fields(
         # sticky), or "na" when routing not live / not a returning visitor.
         # Default-safe "na" when the router didn't stamp it (resolver OFF).
         "returning_mode": attr.get("returning_mode") or "na",
-        # v2 Phase S — sticky pin outcome (hit/miss/minted/invalid_closed/na).
-        # Default-safe "na" when sticky mode wasn't active for this click.
+        # v2 Phase S — sticky pin outcome (hit/miss/minted/invalid_closed/
+        # invalid_closed_term/na). Default-safe "na" when sticky mode
+        # wasn't active for this click. `invalid_closed_term` (C-L-1,
+        # audit-2): the pin was closed AND the re-pick had no available target →
+        # terminal_fallback, NOT a re-pin (distinct from `invalid_closed`, which
+        # maps to decision_reason `fresh_repin`).
         "sticky_status": attr.get("sticky_status") or "na",
         # routing_trace — COMPACT JSON (scope_walk, candidate/loaded/excluded
         # counts, winning scope, buyer_enrichment) + decision_reason. v2 LD-F2

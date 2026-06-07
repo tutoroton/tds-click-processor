@@ -824,6 +824,26 @@ async def _route_via_campaign(
     # path never RE-SERVES a drained/closed target; an unavailable target is
     # skipped → falls to the offer's available default / bare url (byte-identical
     # when all targets active).
+    # OBS-B1/B2 (audit-2 2026-06-07) — ACCEPTED DRIFT-ONLY RESIDUAL, documented.
+    # `resolve_target` returns None both when (a) the offer has NO targets at all
+    # (legit → serve the offer's own `url`), and when (b) the offer HAS targets
+    # but ALL were availability-excluded (drained/closed). In case (b) the legacy
+    # path serves the bare `offer.url` rather than the campaign terminal_fallback
+    # — bypassing the no-dead-end availability machine. This is NOT fixed by a
+    # contract change here because:
+    #   * It is NOT reachable via authored config — admin-api rejects an offer /
+    #     split that has no valid active target, so a live offer always has at
+    #     least one servable target. Case (b) only arises from DRIFT (every target
+    #     manually drained/closed out-of-band), out of the availability-machine
+    #     scope by design.
+    #   * The bare `offer.url` is itself an admin-AUTHORED destination, so even in
+    #     the drift case the click routes to a real URL (not a 404 dead-end) — the
+    #     only gap is provenance (offer.url vs campaign terminal_fallback).
+    #   * A clean distinction would change `resolve_target`'s deliberate C2
+    #     contract ("all-excluded → None → bare url") and break its pinning test
+    #     (`test_c2_availability_delivery.test_closed_default_excluded`) — higher
+    #     risk than the residual it removes. The cascade path already routes
+    #     all-unavailable flows to terminal_fallback (the reachable case).
     t0 = time.perf_counter()
     target_url = await resolve_target(r, offer, req, allowed_avail)
     url_template = target_url if target_url else offer.get("url", "")
@@ -931,12 +951,25 @@ async def _resolve_action_with_sticky(
                 )
                 if pinned is not None:
                     return pinned, "hit"
-            # Pin closed / missing / no url → re-pick the flow's target, repin.
+            # Pin closed / missing / no url → re-pick the flow's target.
             result = await _normal()
             tid = result.get("target_id") if result else None
             if tid:
+                # Genuine re-pin to a fresh, available target (the click serves
+                # it; decision_reason `fresh_repin`).
                 await sticky.repin(company_id, uid, campaign_id, tid, ttl)
-            return result, "invalid_closed"
+                return result, "invalid_closed"
+            # C-L-1 (audit-2 2026-06-07): the pin was invalid AND the re-pick
+            # produced NO routable target (every sibling also drained/closed →
+            # UNAVAILABLE / terminal_fallback, or a plain no-offer None). No
+            # re-pin happened, so reporting "invalid_closed" — which main.py maps
+            # to decision_reason `fresh_repin` — would falsely advertise a re-pin
+            # that did not occur. The click routes to terminal_fallback (the
+            # availability_excluded short-circuit handles that, decision_reason
+            # already `terminal_fallback`); emit an honest sticky_status so the
+            # column never claims a re-pin. Only reachable when a target drifted
+            # closed → byte-identical when nothing is drained/closed.
+            return result, "invalid_closed_term"
         # Returning visitor, no pin (e.g. minted before sticky was enabled).
         result = await _normal()
         tid = result.get("target_id") if result else None

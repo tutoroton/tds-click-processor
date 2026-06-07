@@ -52,7 +52,7 @@ import logging
 import re
 import secrets
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from app import identity_token as idtok
 from app.config import _LOCAL_ENVIRONMENTS, settings
@@ -254,8 +254,16 @@ async def resolve_via_token(
     identity_token: str | None,
     campaign_id,
     with_history: bool = False,
+    commit: bool = True,
 ) -> IdentityResult | None:
     """Layer-1 RECOGNITION via the signed `_tds_id` cookie (P2, dual-accept).
+
+    `commit` (LA-F1, 2026-06-07) — when False this resolve is SIDE-EFFECT-FREE:
+    the best-effort `seen`-hint SADD union (the only write on this path) is
+    SKIPPED so a campaign that may FALL THROUGH (the domain branch) never
+    mutates identity state. Recognition + classification (SISMEMBER/SMEMBERS
+    reads) are unchanged; the caller commits the writes only once the campaign
+    is confirmed to serve.
 
     Returns an ``IdentityResult`` when the token VERIFIES, is for THIS tenant
     (``token.c == company_id`` — multi-tenant hard boundary), and carries a
@@ -297,11 +305,14 @@ async def resolve_via_token(
     bucket = _campaign_bucket(campaign_id)
     seen_hint = [str(c) for c in (claims.get("seen") or [])]
     ckey = _seen_key(company_id, uid)
+    union = bool(seen_hint) and commit
     try:
         pipe = r.pipeline()
-        if seen_hint:
+        if union:
             # Union the hint (commutative — races are benign per R6). Bounded by
             # MAX_SEEN at mint time; no TTL slide here (persist_identity owns TTL).
+            # Skipped on a side-effect-free (commit=False) resolve — a fall-through
+            # campaign must not write (LA-F1).
             pipe.sadd(ckey, *seen_hint)
         pipe.sismember(ckey, bucket)
         if with_history:
@@ -327,7 +338,7 @@ async def resolve_via_token(
         )
 
     # rt layout: [sadd?]  sismember  [offers targets subs]  campaigns(SMEMBERS)
-    idx = 1 if seen_hint else 0
+    idx = 1 if union else 0
     is_returning = bool(rt[idx])
     is_roaming = not is_returning  # seen-before (token proves it) AND not this campaign
     campaigns_seen = frozenset(rt[-1] or ())  # last entry = the SMEMBERS read
@@ -359,8 +370,19 @@ async def resolve_identity(
     ttl: int,
     with_history: bool = False,
     identity_token: str | None = None,
+    commit: bool = True,
 ) -> IdentityResult:
     """Critical-path resolution: signals → canonical uid + redefined flags.
+
+    `commit` (LA-F1, 2026-06-07) — when False the resolve is SIDE-EFFECT-FREE:
+    a brand-new user's uid is generated LOCALLY but NOT minted (no `SET NX`), and
+    the token seen-hint union is skipped. Classification is still correct (all
+    reads), so the cascade can evaluate the campaign being routed; the caller
+    `commit_resolution`s the deferred writes ONLY once the campaign is confirmed
+    to SERVE this click. This is the fix for the domain `fall_through` path, where
+    a campaign that matched the domain but routes nowhere previously minted a uid
+    + wrote its campaign into campaigns-seen as a side effect of merely being
+    evaluated — poisoning a brand-new visitor's identity (audit-2 LA-F1).
 
     Concurrency-safe (gate G7): a NEW user mints via ``SET NX``; the winner
     reports ``is_unique=True``, a racing first-click reads back the winner's
@@ -387,6 +409,7 @@ async def resolve_identity(
         identity_token=identity_token,
         campaign_id=campaign_id,
         with_history=with_history,
+        commit=commit,
     )
     if token_result is not None:
         return token_result
@@ -430,6 +453,16 @@ async def resolve_identity(
         new_uid = secrets.token_hex(16)
         top_tier, top_value = signals[0]
         top_key = _sig_key(company_id, top_tier, top_value)
+        if not commit:
+            # Side-effect-free (LA-F1): the campaign is only being EVALUATED and
+            # may fall through. Hand back a LOCAL uid (not minted) so the cascade
+            # can route, but write NOTHING. `commit_resolution` performs the NX
+            # mint (with THIS uid) only when the campaign is confirmed to serve.
+            return IdentityResult(
+                uid=new_uid, is_unique=True, is_returning=False,
+                is_roaming=False, signal_tier=_tier_label(top_tier),
+                identity_conflict=identity_conflict,
+            )
         won = await r.set(top_key, new_uid, nx=True, ex=ttl)  # RT#2
         if won:
             return IdentityResult(
@@ -565,6 +598,7 @@ async def resolve_and_stamp(
     source_trusted: bool,
     with_history: bool = False,
     identity_token: str | None = None,
+    commit: bool = True,
 ) -> IdentityResult:
     """Router entrypoint: resolve on the identity Redis, then SCHEDULE the
     deferred writes (fire-and-forget). Returns the result to stamp onto the
@@ -574,6 +608,12 @@ async def resolve_and_stamp(
     matched campaign so is_returning/is_roaming are campaign-relative.
     `with_history` (P5) — the caller passes the two-layer routing gate (env
     AND per-company); only then are the prev_* history sets read (in RT#2).
+
+    `commit` (LA-F1, 2026-06-07) — when False the call is SIDE-EFFECT-FREE: the
+    new-user uid is NOT minted and persist is NOT scheduled. The router uses this
+    when EVALUATING a campaign that may fall through (the domain branch). Once the
+    campaign is confirmed to serve, `commit_resolution(result, ...)` performs the
+    deferred mint + persist exactly once, for the SERVING campaign only.
     """
     r = await get_identity_redis()
     ttl = settings.returning_uid_ttl_seconds
@@ -587,10 +627,12 @@ async def resolve_and_stamp(
         ttl=ttl,
         with_history=with_history,
         identity_token=identity_token,
+        commit=commit,
     )
     # Deferred writes off the critical path. create_task so the response is not
-    # blocked; the task body is fully error-swallowing.
-    if result.uid:
+    # blocked; the task body is fully error-swallowing. SKIPPED on a
+    # side-effect-free resolve (commit=False) — the caller commits on serve.
+    if commit and result.uid:
         asyncio.create_task(
             persist_identity(
                 r,
@@ -604,6 +646,74 @@ async def resolve_and_stamp(
             )
         )
     return result
+
+
+async def commit_resolution(
+    result: IdentityResult,
+    *,
+    company_id: int,
+    funnel_user_id: str | None,
+    visitor_id: str | None,
+    campaign_id,
+    source_trusted: bool,
+) -> IdentityResult:
+    """Commit the side-effects of a previously SIDE-EFFECT-FREE resolve (LA-F1).
+
+    Called by the router ONLY once a campaign that was evaluated with
+    ``resolve_and_stamp(commit=False)`` is confirmed to SERVE this click (the
+    domain branch did not fall through). Performs exactly the writes that
+    ``commit=True`` would have, against the SERVING campaign:
+
+      * NEW user (``is_unique``) — NX-mint the LOCAL uid the resolve handed back.
+        If a concurrent click won the race first, adopt that winner and flip
+        ``is_unique`` to False (mirrors the in-band race handling). A corrupt
+        read-back fails open (keep our uid).
+      * SEEN-BEFORE user — the uid already exists in its signal map; nothing to
+        mint, only persist.
+
+    Then schedules the deferred ``persist_identity`` (campaigns-seen SADD for the
+    SERVING campaign + signal attach + TTL slide). Returns the (possibly uid-/
+    is_unique-updated) result so the caller can re-stamp the attribution.
+
+    Fail-open: any error is swallowed (the click is already routed) and the
+    original result is returned unchanged.
+    """
+    if not result.uid:
+        return result  # segment A — no persistent identity to commit
+    try:
+        r = await get_identity_redis()
+        ttl = settings.returning_uid_ttl_seconds
+        out = result
+        if result.is_unique:
+            # The uid was generated locally during the side-effect-free resolve
+            # but never minted — NX-mint it now (the campaign serves).
+            signals = _present_signals(funnel_user_id, visitor_id, source_trusted)
+            if signals:
+                top_tier, top_value = signals[0]
+                top_key = _sig_key(company_id, top_tier, top_value)
+                won = await r.set(top_key, result.uid, nx=True, ex=ttl)
+                if not won:
+                    adopted = await r.get(top_key)
+                    if _valid_uid(adopted) and adopted != result.uid:
+                        # Lost the race — adopt the canonical winner; NOT unique.
+                        out = replace(result, uid=adopted, is_unique=False)
+                    # Corrupt read-back → fail open as new (keep our minted uid).
+        asyncio.create_task(
+            persist_identity(
+                r,
+                company_id=company_id,
+                uid=out.uid,
+                funnel_user_id=funnel_user_id,
+                visitor_id=visitor_id,
+                campaign_id=campaign_id,
+                source_trusted=source_trusted,
+                ttl=ttl,
+            )
+        )
+        return out
+    except Exception as e:  # fail-open — a commit failure must never fail a click
+        logger.warning("identity commit_resolution failed (swallowed): %s", e)
+        return result
 
 
 async def assert_identity_namespace_safe() -> None:

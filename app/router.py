@@ -173,6 +173,11 @@ async def route(req: ClickRequest) -> dict | None:
                 fall_through_on_no_route=True,
             )
             if routed is not None:
+                # LA-F1 — the domain campaign SERVED (did not fall through), so
+                # commit its side-effect-free identity resolution now (mint +
+                # campaigns-seen for THIS serving campaign). No-op when the
+                # resolver is off / nothing was deferred.
+                await _commit_deferred_identity(routed.get("attribution"))
                 return routed
 
         # Domain matched but no usable routing path — fall through to geo targeting.
@@ -320,6 +325,8 @@ async def _build_campaign_attribution(
     campaign: dict[str, Any],
     campaign_id: str,
     req: ClickRequest,
+    *,
+    commit_identity: bool = True,
 ) -> tuple[list[dict[str, Any]] | None, list[dict[str, Any]] | None, dict[str, Any]]:
     """Resolve the click's full attribution for one matched campaign.
 
@@ -408,7 +415,26 @@ async def _build_campaign_attribution(
                 # worker forwards it in P4) → in-process HMAC recognition,
                 # skipping the `vid → uid` Redis GET. Dark when absent.
                 identity_token=req.identity_token,
+                # LA-F1 (2026-06-07): when this campaign is only being EVALUATED
+                # and may FALL THROUGH (the domain branch), resolve
+                # SIDE-EFFECT-FREE — no mint, no persist. The mint + campaigns-seen
+                # write must happen ONLY for the campaign that actually serves the
+                # click. The serving path commits via `_commit_deferred_identity`.
+                commit=commit_identity,
             )
+            # LA-F1 — stash the args needed to commit the deferred writes once the
+            # campaign is confirmed to serve. Popped (never reaches the click
+            # record) by `_commit_deferred_identity`; harmlessly discarded if the
+            # campaign falls through (this whole attribution dict is dropped).
+            if not commit_identity:
+                attribution["_identity_deferred"] = {
+                    "result": ident,
+                    "company_id": buyer_chain["company_id"],
+                    "funnel_user_id": slots.get("funnel_user_id"),
+                    "visitor_id": req.visitor_id,
+                    "campaign_id": campaign_id,
+                    "source_trusted": source_trusted,
+                }
             attribution["uid"] = ident.uid
             attribution["is_unique"] = ident.is_unique
             # v2 R — is_returning is now CAMPAIGN-relative; is_roaming = seen
@@ -438,6 +464,42 @@ async def _build_campaign_attribution(
             logger.warning("identity resolver failed — fail-open to legacy: %s", e)
 
     return source_mappings, campaign_mappings, attribution
+
+
+async def _commit_deferred_identity(attribution: dict[str, Any] | None) -> None:
+    """LA-F1 (2026-06-07) — commit a side-effect-free identity resolution once the
+    campaign is confirmed to SERVE this click.
+
+    The domain branch resolves identity with ``commit=False`` (no mint, no
+    persist) because that campaign may FALL THROUGH to geo targeting; a campaign
+    that routes nowhere must never mint a uid nor write itself into campaigns-seen
+    (that poisoned a brand-new visitor's identity — audit-2 LA-F1). When the
+    campaign DOES serve, the router calls this to perform the deferred mint +
+    persist exactly once, for the serving campaign, and re-stamps the resolved
+    uid / is_unique onto the attribution.
+
+    Pops the private ``_identity_deferred`` payload so it never reaches the click
+    record. No-op when nothing was deferred (resolver off, or the geo/terminal
+    branch already committed inline). Fail-open: any error is swallowed."""
+    if not attribution:
+        return
+    deferred = attribution.pop("_identity_deferred", None)
+    if not deferred:
+        return
+    try:
+        committed = await identity.commit_resolution(
+            deferred["result"],
+            company_id=deferred["company_id"],
+            funnel_user_id=deferred["funnel_user_id"],
+            visitor_id=deferred["visitor_id"],
+            campaign_id=deferred["campaign_id"],
+            source_trusted=deferred["source_trusted"],
+        )
+        # Re-stamp — a lost NX race may have adopted a different canonical uid.
+        attribution["uid"] = committed.uid
+        attribution["is_unique"] = committed.is_unique
+    except Exception as e:  # fail-open — never fail a click on a commit error
+        logger.warning("deferred identity commit failed — fail-open: %s", e)
 
 
 def _company_returning_enabled(campaign: dict[str, Any]) -> bool:
@@ -610,8 +672,17 @@ async def _route_via_campaign(
     # `_try_flow_cascade` on EVERY routed click (before the no-flow
     # check), so lifting it here adds no new round-trip — it just stops
     # the already-computed result from being discarded.
+    # LA-F1 (2026-06-07): when this branch may FALL THROUGH (the domain branch,
+    # `fall_through_on_no_route=True`), resolve identity SIDE-EFFECT-FREE — a
+    # campaign that matches the domain but routes nowhere must NOT mint a uid nor
+    # write itself into campaigns-seen. The serving path commits the deferred
+    # writes once (the geo/terminal branch resolves with commit=True as before,
+    # byte-identical).
     source_mappings, campaign_mappings, attribution = (
-        await _build_campaign_attribution(r, campaign, campaign_id, req)
+        await _build_campaign_attribution(
+            r, campaign, campaign_id, req,
+            commit_identity=not fall_through_on_no_route,
+        )
     )
     buyer_chain = _attribution_buyer_chain(attribution)
 

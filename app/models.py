@@ -67,8 +67,15 @@ class ClickRequest(BaseModel):
     # shape `b64url(payload).b64url(sig)` (base64url alphabet + the dot
     # separator). A non-matching value simply fails verify (fail-open), so the
     # pattern is a cheap pre-filter, not a security boundary.
+    # SEC-LOW-01 (audit-2 2026-06-07): cap is 1024 to match the worker's
+    # `_validIdentityCookie` length guard. The codec's largest valid PAYLOAD is
+    # 512 B (`identity_token._MAX_PAYLOAD_BYTES`), which base64url-encodes to
+    # ~683 chars for the payload PLUS a 43-char b64 sig + the dot separator
+    # (~727 total). A 512 cap could 422 a near-max token at the edge (which would
+    # fail verify anyway → fail-open), so 1024 keeps the pre-filter strictly
+    # looser than what the codec itself will reject.
     identity_token: str | None = Field(
-        default=None, max_length=512, pattern=r'^[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+$'
+        default=None, max_length=1024, pattern=r'^[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+$'
     )
     is_returning: bool = False
     # Stage 3 · Phase 4 S2 — edge quality signals from CF Bot Management

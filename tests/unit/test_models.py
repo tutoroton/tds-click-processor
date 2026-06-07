@@ -117,6 +117,43 @@ class TestVisitorIdValidation:
             ClickRequest(click_id="test", visitor_id="vid<script>")
 
 
+class TestIdentityTokenValidation:
+    """SEC-LOW-01 (audit-2 2026-06-07): `identity_token` max_length raised
+    512 → 1024 to match the worker `_validIdentityCookie` guard and stay
+    strictly looser than the codec's largest verifiable token (~727 chars)."""
+
+    @staticmethod
+    def _tok(payload_len: int) -> str:
+        # b64url(payload).b64url(sig) shape; sig is the trailing 43 chars (a
+        # SHA-256 b64url-nopad sig is always 43). payload fills the rest minus
+        # the dot separator. Charset matches the field pattern.
+        sig = "s" * 43
+        payload = "p" * (payload_len - 43 - 1)
+        return f"{payload}.{sig}"
+
+    def test_token_512_to_1024_now_passes(self):
+        # 600-char token (512 < len <= 1024) — would have 422'd at the old 512
+        # cap; now validates (matches the field pattern, under the 1024 bound).
+        tok = self._tok(600)
+        assert len(tok) == 600
+        req = ClickRequest(click_id="test", identity_token=tok)
+        assert req.identity_token == tok
+
+    def test_token_at_1024_passes(self):
+        tok = self._tok(1024)
+        assert len(tok) == 1024
+        req = ClickRequest(click_id="test", identity_token=tok)
+        assert len(req.identity_token) == 1024
+
+    def test_token_exceeds_1024_rejected(self):
+        with pytest.raises(ValidationError):
+            ClickRequest(click_id="test", identity_token=self._tok(1025))
+
+    def test_token_none_ok(self):
+        req = ClickRequest(click_id="test", identity_token=None)
+        assert req.identity_token is None
+
+
 class TestQueryParamsValidation:
     """Vector 2.8 — strict `dict[str, str]` query_params at the
     Pydantic boundary. Closes type-confusion class of bugs before

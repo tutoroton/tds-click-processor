@@ -826,3 +826,62 @@ class TestTokenDualAccept:
             campaign_id="10", source_trusted=False, ttl=TTL, identity_token=None,
         )
         assert res.is_unique is True and res.signal_tier == "vid"
+
+    async def test_seen_hint_retrimmed_to_max_seen(self, monkeypatch):
+        """SEC-LOW-03 (audit-2): a forged/compromised token whose claims carry
+        MORE than MAX_SEEN campaigns (bypassing the codec's own decode cap) must
+        still union at most MAX_SEEN entries into the local campaigns-seen set.
+        We simulate the bypass by patching `idtok.verify` to hand back oversized
+        claims (a real `verify` would reject count > MAX_SEEN)."""
+        import time as _t
+        _enable_codec(monkeypatch)
+        r = _fr()
+        oversized = list(range(100, 100 + idtok.MAX_SEEN + 20))  # 36 > 16
+        fake_claims = {
+            "v": 1, "kid": 1, "c": 1, "u": _TOK_UID, "fs": 1,
+            "exp": int(_t.time()) + 3600, "seen": oversized,
+        }
+        monkeypatch.setattr(idtok, "verify", lambda *a, **k: fake_claims)
+        res = await resolve_identity(
+            r, company_id=1, funnel_user_id=None, visitor_id=None,
+            campaign_id="999", source_trusted=False, ttl=TTL,
+            identity_token="forged.token",
+        )
+        assert res.uid == _TOK_UID
+        members = await r.smembers(_campaigns_key(1, _TOK_UID))
+        assert len(members) <= idtok.MAX_SEEN  # SADD fan-out bounded
+
+    async def test_token_fault_emits_throttled_telemetry(self, monkeypatch):
+        """SEC-LOW-02 (audit-2): a token-path Redis fault (seen-union/read)
+        surfaces a throttled Sentry signal (OP_IDENTITY) instead of degrading
+        silently. Recognition still succeeds (uid from the signed token);
+        classification fails-open to roaming."""
+        _enable_codec(monkeypatch)
+        tok = _mk_token(company_id=1, seen=[10])
+        captured: list = []
+        monkeypatch.setattr(
+            identity, "capture_op_msg_throttled",
+            lambda op, dedup, msg, **kw: captured.append((op, dedup, msg, kw)) or True,
+        )
+
+        class _BoomPipe:
+            def __getattr__(self, name):
+                if name == "execute":
+                    async def _ex():
+                        raise RuntimeError("redis down")
+                    return _ex
+                return lambda *a, **k: None
+
+        class _BoomRedis:
+            def pipeline(self, *a, **k):
+                return _BoomPipe()
+
+        res = await resolve_identity(
+            _BoomRedis(), company_id=1, funnel_user_id=None, visitor_id=None,
+            campaign_id="10", source_trusted=False, ttl=TTL, identity_token=tok,
+        )
+        # Degraded but recognized — fail-open.
+        assert res.uid == _TOK_UID
+        assert (res.is_returning, res.is_roaming) == (False, True)
+        # Telemetry fired with the canonical OP_IDENTITY op tag.
+        assert captured and captured[0][0] == identity.OP_IDENTITY

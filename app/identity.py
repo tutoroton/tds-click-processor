@@ -58,7 +58,7 @@ from app import identity_token as idtok
 from app.config import _LOCAL_ENVIRONMENTS, settings
 from app.history import _offers_key, _subs_key, _targets_key
 from app.redis_client import get_identity_redis
-from app.telemetry import OP_IDENTITY_PERSIST, capture_op_msg_throttled
+from app.telemetry import OP_IDENTITY, OP_IDENTITY_PERSIST, capture_op_msg_throttled
 
 logger = logging.getLogger(__name__)
 
@@ -303,7 +303,12 @@ async def resolve_via_token(
     # union and the read share one pipeline → at most 1 round-trip for the union
     # path; the SISMEMBER reflects the freshly-unioned membership.
     bucket = _campaign_bucket(campaign_id)
-    seen_hint = [str(c) for c in (claims.get("seen") or [])]
+    # SEC-LOW-03 (audit-2 2026-06-07): re-trim the hint to MAX_SEEN inline before
+    # the SADD. `idtok.verify` already refuses a token whose declared seen-count
+    # exceeds MAX_SEEN, so a NORMAL token can never overflow here — this is pure
+    # defense-in-depth for a key-compromise / forged-payload path (a signer that
+    # bypassed the codec's own cap), bounding the SADD fan-out regardless.
+    seen_hint = [str(c) for c in (claims.get("seen") or [])][: idtok.MAX_SEEN]
     ckey = _seen_key(company_id, uid)
     union = bool(seen_hint) and commit
     try:
@@ -325,6 +330,17 @@ async def resolve_via_token(
         rt = await pipe.execute()
     except Exception as e:  # fail-open — never block routing on the hint store
         logger.warning("identity token seen-union/read failed (degraded): %s", e)
+        # SEC-LOW-02 (audit-2 2026-06-07): surface the swallowed token-path Redis
+        # fault to Sentry (parity with the SEC-M1 resolver fail-open at
+        # router.py). Without this, a same-campaign returner silently mis-segments
+        # as roaming during a Redis blip with ZERO signal. Throttled per company
+        # (OP_IDENTITY) so a persistent fault is ONE event/window, not one per
+        # click. `capture_*` never raises — still fail-open.
+        capture_op_msg_throttled(
+            OP_IDENTITY, company_id,
+            f"identity token seen-union/read failed; degraded to roaming: {e}",
+            level="warning", company_id=company_id, uid=uid,
+        )
         # Recognition still succeeds (uid known from the signed token); fall back
         # to "seen this campaign?" unknown ⇒ treat as roaming (seen-before, not
         # provably this-campaign) which is the safe non-first classification.
@@ -484,6 +500,25 @@ async def resolve_identity(
                 signal_tier=_tier_label(_TIER_NONE),
                 identity_conflict=identity_conflict,
             )
+        # LA-F2 (audit-2 2026-06-07) — ACCEPTED TRANSIENT, documented residual.
+        # All three flags are False here (is_unique False because we lost the NX
+        # race; is_returning/is_roaming False because the winner minted the uid
+        # microseconds ago and its async `persist_identity` campaigns-seen SADD
+        # has not landed yet). This momentarily violates 00-VISION §2 ("flags
+        # mutually exclusive, exactly one true"), but the invariant is a STEADY-
+        # STATE property — this is exactly edge-case D4 ("two rapid clicks before
+        # the async history write lands … not a within-visit guarantee"). It is
+        # NOT fixed deliberately:
+        #   * The fix would require making the campaigns-seen write SYNCHRONOUS on
+        #     the hot path (breaking the <5ms latency budget + the fire-and-forget
+        #     persist design), OR flipping a flag (is_returning/is_roaming) which
+        #     is a ROUTING-semantics change for a sub-millisecond race window —
+        #     both worse than the residual.
+        #   * It is fail-SAFE: the uid still converges to ONE canonical id (G7);
+        #     the only cost is analytics under-counting a brand-new user's
+        #     concurrent burst by at most the burst size. No data loss, no
+        #     routing harm, no cross-tenant leak. Rare (same new user, same
+        #     instant, multiple in-flight first clicks).
         return IdentityResult(
             uid=adopted, is_unique=False, is_returning=False,
             is_roaming=False, signal_tier=_tier_label(top_tier),

@@ -30,7 +30,8 @@ import logging
 import math
 import random
 import time
-from typing import Any, NamedTuple
+from datetime import datetime, timezone
+from typing import Any, Final, NamedTuple
 
 import sentry_sdk
 from app import action_executor, cascade, identity, sticky
@@ -582,6 +583,48 @@ def _identity_macros(attribution: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# CF-3 (2026-06-07): day_of_week index → mon..sun label (Python weekday():
+# Monday=0). Matches the admin validator's accepted {mon..sun} value set.
+_DOW_LABELS: Final[tuple[str, ...]] = (
+    "mon", "tue", "wed", "thu", "fri", "sat", "sun",
+)
+
+
+def _extra_click_dims(req: ClickRequest) -> dict[str, str]:
+    """CF-3 — the 3 criterion dims admin-api accepts but the matcher historically
+    never populated (isp_asn / time_of_day / day_of_week), now derived from data
+    ALREADY on the click (zero worker change):
+
+      * isp_asn      — ``req.asn`` as a digit string; 0/absent → "" (fail-closed
+        on ``in``; a real ``not_in [0]`` now correctly excludes asn-0).
+      * time_of_day  — the UTC hour of ``req.arrival_ts``, un-padded ("0".."23").
+      * day_of_week  — the UTC weekday of ``req.arrival_ts`` ("mon".."sun").
+
+    TZ = UTC (``arrival_ts`` is the worker's edge-arrival instant, ISO-8601 Z), so
+    the operator's criteria match in UTC, not visitor-local time — documented in
+    the criterion help text. An absent/malformed ``arrival_ts`` (old worker)
+    leaves time_of_day/day_of_week "" → fail-closed on ``in`` (a ``not_in`` on
+    such a click still fails open, bounded to the legacy-worker edge)."""
+    isp_asn = str(req.asn) if req.asn else ""
+    time_of_day = ""
+    day_of_week = ""
+    ts = req.arrival_ts
+    if ts:
+        try:
+            dt = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone(
+                timezone.utc
+            )
+            time_of_day = str(dt.hour)
+            day_of_week = _DOW_LABELS[dt.weekday()]
+        except (ValueError, TypeError):
+            pass
+    return {
+        "isp_asn": isp_asn,
+        "time_of_day": time_of_day,
+        "day_of_week": day_of_week,
+    }
+
+
 def _allowed_availability(
     campaign: dict[str, Any], attribution: dict[str, Any]
 ) -> frozenset[str]:
@@ -1041,11 +1084,15 @@ async def _try_flow_cascade(
     # (slot resolve + buyer enrich) happen there now; this function owns
     # steps c (cascade) + d (action) and records the routing-decision ids
     # it discovers into the shared `attribution` dict (Phase 3).
-    # F.17 (2026-05-03): 7-dim click_attrs. Each value's casing matches what
+    # F.17 (2026-05-03) + CF-3 (2026-06-07): 10-dim base click_attrs (the 7 UA/geo
+    # dims + isp_asn / time_of_day / day_of_week). Each value's casing matches what
     # admin-api validates — see `cascade._CASE_PRESERVE` for which dims preserve
     # case (geo / region / browser / language) vs lowercase (os / device_type /
-    # city). Values that CF or the parser couldn't resolve fall through as `""`
-    # — `op=in` fails closed (no match), `op=not_in` passes everyone.
+    # city). A KNOWN dim whose value CF or the parser couldn't resolve falls
+    # through as `""` — `op=in` fails closed (no match), `op=not_in` passes
+    # everyone (unchanged). A dim OUTSIDE the evaluated set (cascade.
+    # KNOWN_EVALUATED_DIMS) now fails CLOSED in the matcher (CF-3, no not_in
+    # fail-open).
     click_attrs: dict[str, Any] = {
         "geo": (req.country or "").upper(),
         "os": parse_os(req.user_agent).lower(),
@@ -1054,6 +1101,10 @@ async def _try_flow_cascade(
         "region": req.region or "",                # CF human name verbatim
         "city": (req.city or "").lower(),          # case-insensitive match
         "language": parse_accept_language(req.accept_language),
+        # CF-3 (2026-06-07): isp_asn / time_of_day / day_of_week — admin-accepted
+        # base dims that were never populated (dead criteria). Derived from data
+        # already on the click (req.asn / req.arrival_ts, UTC) — zero worker change.
+        **_extra_click_dims(req),
     }
 
     # P4 — returning-user segmented routing. `seen_before` = the uid existed
@@ -1628,8 +1679,8 @@ async def resolve_target(
             target_list.append(t)
     target_list.sort(key=lambda x: x["_priority"], reverse=True)
 
-    # F.17 (2026-05-03): legacy offer-target picker — same 7-dim
-    # click_attrs as the cascade path above. Inline matcher mirrors
+    # F.17 (2026-05-03) + CF-3 (2026-06-07): legacy offer-target picker — same
+    # 10-dim base click_attrs as the cascade path above. Inline matcher mirrors
     # `cascade._CASE_PRESERVE` for the 4 dims that preserve case
     # (geo / region / browser / language); the rest are lowercased
     # both sides. Drift between this matcher and `cascade._criteria_match`
@@ -1643,6 +1694,10 @@ async def resolve_target(
         "region": req.region or "",
         "city": (req.city or "").lower(),
         "language": parse_accept_language(req.accept_language),
+        # CF-3 (2026-06-07): kept in lockstep with the cascade builder above —
+        # populate isp_asn / time_of_day / day_of_week so an offer_target
+        # criterion on them evaluates instead of silently reading "".
+        **_extra_click_dims(req),
     }
 
     default_url = None
@@ -1686,6 +1741,14 @@ async def resolve_target(
             else:
                 values = [v.lower() if isinstance(v, str) else v for v in raw_values]
             click_val = click_attrs.get(dim, "")
+
+            # CF-3 (2026-06-07): fail-CLOSED on an unknown/unevaluated dim — kept
+            # in lockstep with `cascade._first_failing_criterion` so a `not_in`
+            # exclusion on an unimplemented dim cannot silently pass for all
+            # traffic (fail-open). An unknown dim drops this target.
+            if dim not in cascade.KNOWN_EVALUATED_DIMS:
+                match = False
+                break
 
             if op == "in" and click_val not in values:
                 match = False

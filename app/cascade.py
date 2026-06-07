@@ -649,6 +649,16 @@ def _first_failing_criterion(
         raw_values = c.get("values", []) or []
         click_val = click_attrs.get(dim, "")
 
+        # CF-3 (2026-06-07): fail-CLOSED on a dim the evaluator does not know how
+        # to populate. Without this, an admin-accepted-but-unevaluated dim (or a
+        # legacy/future criterion type) reads click_val="" → a `not_in` exclusion
+        # silently passes for ALL traffic (fail-OPEN — "block these" becomes
+        # "allow all"). Treat any unknown dim as a non-match so the flow/target is
+        # dropped. The known returning dims pass this gate and fail-closed via the
+        # empty-value `in` test when absent (audience-gated population).
+        if dim not in KNOWN_EVALUATED_DIMS:
+            return c
+
         # P4 — set-valued dims: the click "value" is the user's HISTORY set, so
         # membership becomes intersection. ONLY a set click_val takes this
         # branch, so every base (str) dim is byte-identical to pre-P4.
@@ -780,6 +790,32 @@ def _filter_by_criteria(
 _CASE_PRESERVE: Final[frozenset[str]] = frozenset({
     "geo", "region", "browser", "language",
 })
+
+# CF-3 (crash-test 2026-06-07): the dims the click-processor evaluator KNOWS how
+# to populate. A criterion on any dim OUTSIDE this set is fail-CLOSED (the flow /
+# target is dropped) instead of letting `op=not_in` pass on the empty "" value —
+# which would silently turn an operator's "block these" into "allow all" for an
+# unimplemented/legacy/future dim (the CF-3 fail-open). Must stay a SUPERSET of
+# every base criterion type admin-api accepts (`app/common/parameters.py`
+# CRITERION_TYPES) — pinned by `tests/unit/test_criteria_contract.py`.
+#
+#   * BASE (always populated, both matchers) — geo/region/city/os/device_type/
+#     browser/language + isp_asn/time_of_day/day_of_week (the 3 added by CF-3).
+#   * RETURNING (conditionally populated in the cascade path under audience
+#     routing; never in the offer_target matcher per schema) — is_returning /
+#     is_roaming / prev_offer / prev_offer_target / prev_sub. They are KNOWN
+#     dims: when absent they correctly fail-closed via the empty-value `in` test,
+#     not via this gate.
+_EVALUATED_BASE_DIMS: Final[frozenset[str]] = frozenset({
+    "geo", "region", "city", "os", "device_type", "browser", "language",
+    "isp_asn", "time_of_day", "day_of_week",
+})
+_EVALUATED_RETURNING_DIMS: Final[frozenset[str]] = frozenset({
+    "is_returning", "is_roaming", "prev_offer", "prev_offer_target", "prev_sub",
+})
+KNOWN_EVALUATED_DIMS: Final[frozenset[str]] = (
+    _EVALUATED_BASE_DIMS | _EVALUATED_RETURNING_DIMS
+)
 
 
 def _criteria_match(

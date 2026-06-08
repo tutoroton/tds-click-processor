@@ -135,13 +135,22 @@ async def apply_snapshot(redis, snapshot: dict) -> dict:
                 # HSET is idempotent — overwrites fields in-place, no delete needed
                 write_pipe.hset(key, mapping={k: str(v) for k, v in value.items()})
         elif key_type == "set" and isinstance(value, list):
+            # A-2: DELETE unconditionally (hoisted above the value guard)
+            # so a collection that transitions all-the-way to empty in PG
+            # clears its stale members on the node. HSET/SADD never remove
+            # omitted/absent members, and an emptied always-emitted set —
+            # e.g. `campaigns:active` — would otherwise keep its old IDs.
+            # For a NON-empty set this is byte-identical to before (delete
+            # + sadd); the only new behaviour is the empty case issuing one
+            # DELETE. DELETE of an absent key is a harmless no-op.
+            write_pipe.delete(key)
             if value:
-                # For sets: delete + sadd to ensure exact membership (no stale members)
-                write_pipe.delete(key)
+                # delete + sadd ensures exact membership (no stale members)
                 write_pipe.sadd(key, *value)
         elif key_type == "list" and isinstance(value, list):
+            # A-2: same hoist as the set branch — an emptied list clears.
+            write_pipe.delete(key)
             if value:
-                write_pipe.delete(key)
                 write_pipe.rpush(key, *value)
         else:
             write_pipe.set(key, str(value))
@@ -244,6 +253,29 @@ async def pull_from_central(redis) -> dict | None:
         if not resp_data.get("data"):
             logger.warning("Central snapshot has no data")
             return None
+
+        # A-4: the pull path must self-enforce version monotonicity, in
+        # parity with the push handler (`/admin/sync` in main.py). The
+        # push HTTP handler guards against a stale snapshot regressing
+        # `sync:version`; the periodic pull bypassed it (apply_snapshot
+        # writes sync:version unconditionally). A pull that received an
+        # older snapshot — e.g. central serving a stale cached
+        # `_last_snapshot` mid-rebuild — would silently roll the node's
+        # routing version backwards. Mirror the push guard EXACTLY here;
+        # do NOT push it into apply_snapshot (load-bearing, source-pinned,
+        # driven by tests with arbitrary versions). The three correctness
+        # cases hold: equal version re-applies (`< current` is false),
+        # a fresh node (current==0) skips the guard and applies its first
+        # pull, and an upgrade applies.
+        incoming = resp_data.get("sync_version", 0)
+        current_str = await redis.get("sync:version")
+        current = int(current_str) if current_str else 0
+        if current > 0 and incoming < current:
+            logger.warning(
+                "Pull rejected downgrade: incoming v%d < current v%d",
+                incoming, current,
+            )
+            return {"status": "rejected", "reason": "version downgrade", "keys_written": 0}
 
         stats = await apply_snapshot(redis, resp_data)
         logger.info("Pull from central complete: %d keys", stats["keys_written"])

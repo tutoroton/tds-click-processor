@@ -378,7 +378,16 @@ class Settings(BaseSettings):
     # so memory tracks the ACTIVE returning audience, not all-time uids.
     # 180 days (R3 §6 recommendation; 1-year ceiling is a per-tenant
     # opt-in handled in admin config later, not here).
-    returning_resolver_enabled: bool = False
+    # Default TRUE: the feature is important-by-default, and the deploy tooling
+    # (deploy/render-env.sh) already forces `true`, so the bare code default
+    # matches — a node/env that doesn't set the var still gets the feature.
+    # SAFE: behaviour stays gated by the PER-COMPANY check in router.py
+    # (`_company_returning_enabled`, reads `returning_resolver` from the campaign
+    # HASH, default closed) — env-true alone changes NO routing until a company
+    # opts in. The boot gate (app/identity.py) DEGRADES-not-crashes if the
+    # identity-redis store is absent in a non-local env, and warns-only in a
+    # local-class env (`local`/`development`) — so local boot stays quiet.
+    returning_resolver_enabled: bool = True
     identity_redis_url: str = ""
     returning_uid_ttl_seconds: int = 15_552_000  # 180 days
 
@@ -419,7 +428,13 @@ class Settings(BaseSettings):
     # see 'first' flows only. Requires returning_resolver_enabled to be ON too
     # (seen_before / prev_* come from the resolver); if routing is ON but the
     # resolver is OFF, seen_before is never true → first-pool only (fail-safe).
-    returning_routing_enabled: bool = False
+    #
+    # Default TRUE for the same reason as `returning_resolver_enabled` above:
+    # the deploy tooling already forces `true`, and segmented routing stays
+    # gated by the PER-COMPANY `_company_routing_enabled` check (router.py,
+    # reads `returning_routing` from the campaign HASH, default closed) — so
+    # env-true alone changes no routing until a company opts in.
+    returning_routing_enabled: bool = True
 
     model_config = {"env_prefix": "TDS_"}
 

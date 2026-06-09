@@ -9,6 +9,13 @@ services:
       - TDS_NODE_REGION=${TDS_NODE_REGION:-eu}
       - TDS_ENVIRONMENT=${TDS_ENVIRONMENT:-development}
       - TDS_REDIS_URL=redis://redis:6379/0
+      # Returning-users v2: the CODE default is now `true` (prod/edge nodes ship
+      # it on via deploy/render-env.sh). This standalone LOCAL stack has no
+      # dedicated identity-redis, so pin both gates OFF here to keep local boot
+      # quiet (otherwise the resolver's identity-policy probe warns each start).
+      # Override by exporting the vars before `docker compose up`.
+      - TDS_RETURNING_RESOLVER_ENABLED=${TDS_RETURNING_RESOLVER_ENABLED:-false}
+      - TDS_RETURNING_ROUTING_ENABLED=${TDS_RETURNING_ROUTING_ENABLED:-false}
       - TDS_SECRET_KEY=${TDS_SECRET_KEY:-}
       - TDS_CENTRAL_URL=${TDS_CENTRAL_URL:-}
       - TDS_CENTRAL_API_KEY=${TDS_CENTRAL_API_KEY:-}

@@ -1173,9 +1173,9 @@ class TestAvailabilityClassGating:
         camp = {"company_id": "1", "priority": "0", "returning_resolver": "1"}
         if company_routing:
             camp["returning_routing"] = "1"
-            # v2 Phase M — the partition (and thus the returning availability
-            # class) now also requires a non-fresh campaign returning_mode.
-            camp["returning_mode"] = "override"
+            # MODEL V3 — the partition (and thus the returning availability class)
+            # is gated by EXISTENCE, not a mode: routing live + the campaign has
+            # NOT opted out via `disable_returning_flows`. No mode field needed.
         redis = FakeRedis(
             sets={
                 "geo:US": {campaign_id}, "device:mobile": {campaign_id},
@@ -1207,18 +1207,24 @@ class TestAvailabilityClassGating:
 
 
 # ============================================================
-# v2 Phase M — returning_mode (campaign default + flow override)
+# MODEL V3 — existence-driven returning partition + disable flag + campaign mode
 # ============================================================
 
 
-class TestReturningModePhaseM:
-    """fresh (default) routes a returning visitor AS NEW (partition off);
-    override = v1 partition; sticky = like override (no pin, Phase S); routing
-    OFF ⇒ mode inert (byte-identical). A 'returning'-audience flow keyed on
-    is_returning is the discriminator: it only matches when the partition
-    injects the is_returning dim (audience_routing ON)."""
+class TestReturningModeV3:
+    """MODEL V3: the returning partition activates by the EXISTENCE of a
+    returning flow in scope, NOT a per-campaign override mode. The partition is
+    gated by `audience_routing` = routing live AND the campaign has NOT opted out
+    via `disable_returning_flows`. The campaign `returning_mode` (fresh|sticky)
+    no longer gates the partition — it only governs the recorded effective mode +
+    the Phase-S sticky pin. A 'returning'-audience flow keyed on is_returning is
+    the discriminator: it only matches when the partition injects the is_returning
+    dim (audience_routing ON). The cascade's empty-returning-pool fallthrough is
+    what makes "existence" work — no returning flow ⇒ the returning pass is a
+    no-op ⇒ the click routes fresh."""
 
-    def _route(self, *, campaign_returning_mode, routing_enabled):
+    def _route(self, *, campaign_returning_mode, routing_enabled,
+               disable_returning_flows=False):
         from app import identity as identity_mod
         from app.identity import IdentityResult
         from app.config import settings
@@ -1229,6 +1235,8 @@ class TestReturningModePhaseM:
             "returning_resolver": "1", "returning_routing": "1",
             "returning_mode": campaign_returning_mode,
         }
+        if disable_returning_flows:
+            camp["disable_returning_flows"] = "1"
         ret_flow = {
             "campaign_id": campaign_id, "scope_type": "company", "scope_id": "1",
             "seq_id": "1", "is_default": "0", "audience": "returning",
@@ -1259,42 +1267,62 @@ class TestReturningModePhaseM:
              patch.object(identity_mod, "resolve_and_stamp", _stamp):
             return _route_with(redis, _click())
 
-    def test_override_routes_via_returning_pool(self):
-        r = self._route(campaign_returning_mode="override", routing_enabled=True)
-        assert "RET" in r["url"]  # returning partition applied → returning flow
-        assert r["attribution"]["returning_mode"] == "override"
-
-    def test_fresh_routes_returning_as_new(self):
+    def test_fresh_with_returning_flow_activates_partition(self):
+        # MODEL V3 (existence-driven, (a)) — campaign_mode=fresh + disable flag
+        # UNSET + a returning flow EXISTS in scope ⇒ the partition is ACTIVE and a
+        # seen_before visitor routes via the returning pool. This is the core V3
+        # flip: under v2 fresh disabled the partition; under V3 only the disable
+        # flag does. Recorded mode = the campaign mode (fresh).
         r = self._route(campaign_returning_mode="fresh", routing_enabled=True)
+        assert "RET" in r["url"]  # partition ACTIVE (existence-driven)
+        assert r["attribution"]["returning_mode"] == "fresh"
+
+    def test_disable_flag_forces_fallthrough(self):
+        # MODEL V3 (b) — the per-campaign `disable_returning_flows` flag suppresses
+        # the partition even though a returning flow exists ⇒ the seen_before
+        # visitor routes through the first/fresh pool (the headline behavioral
+        # assertion). The recorded `returning_mode` still reflects the campaign
+        # mode in force for a seen_before visitor under live routing (the recorded
+        # mode is mode-of-record, independent of whether the partition activated).
+        r = self._route(
+            campaign_returning_mode="fresh", routing_enabled=True,
+            disable_returning_flows=True,
+        )
         assert "FIRST" in r["url"]  # partition DISABLED → routed as new
         assert r["attribution"]["returning_mode"] == "fresh"
 
-    def test_sticky_routes_like_override_no_pin(self):
+    def test_sticky_mode_routes_via_returning_pool(self):
+        # campaign_mode=sticky + returning flow exists ⇒ partition active; the
+        # returning flow keeps its own pick (D35 — sticky pin does NOT override a
+        # returning winner). Recorded mode = sticky.
         r = self._route(campaign_returning_mode="sticky", routing_enabled=True)
-        assert "RET" in r["url"]  # sticky = override partition (pin is Phase S)
+        assert "RET" in r["url"]
         assert r["attribution"]["returning_mode"] == "sticky"
 
-    def test_routing_off_mode_inert_byte_identical(self):
-        # routing OFF ⇒ partition off regardless of mode ⇒ routed as new; the
+    def test_routing_off_partition_inert_byte_identical(self):
+        # routing OFF ⇒ partition off regardless of mode/flag ⇒ routed as new; the
         # recorded mode is "na" (returning routing not live).
-        r = self._route(campaign_returning_mode="override", routing_enabled=False)
+        r = self._route(campaign_returning_mode="sticky", routing_enabled=False)
         assert "FIRST" in r["url"]
         assert r["attribution"]["returning_mode"] == "na"
 
-    def test_flow_override_beats_campaign_in_recorded_mode(self):
-        # campaign override but the WINNING returning flow declares sticky →
-        # effective recorded mode = flow override (flow ?? campaign).
+    def test_recorded_mode_is_campaign_mode_no_flow_override(self):
+        # MODEL V3 — the per-flow returning_mode override was REMOVED. Even if a
+        # (dormant / legacy) returning_mode value rode on the winning flow HASH,
+        # the router no longer reads it: the recorded effective mode is ALWAYS the
+        # campaign mode (here fresh), never a flow-level value.
         from app import identity as identity_mod
         from app.identity import IdentityResult
         from app.config import settings
 
         campaign_id = "10"
         camp = {"company_id": "1", "priority": "0", "returning_resolver": "1",
-                "returning_routing": "1", "returning_mode": "override"}
+                "returning_routing": "1", "returning_mode": "fresh"}
         ret_flow = {
             "campaign_id": campaign_id, "scope_type": "company", "scope_id": "1",
             "seq_id": "1", "is_default": "0", "audience": "returning",
-            "returning_mode": "sticky",  # flow override
+            # A stale/dormant flow-level value the V3 router MUST ignore.
+            "returning_mode": "sticky",
             "criteria": json.dumps([{"type": "is_returning", "op": "in", "values": ["true"]}]),
             "action_type": "redirect",
             "action_config": json.dumps({"url": "https://RET/{click_id}"}),
@@ -1314,7 +1342,8 @@ class TestReturningModePhaseM:
              patch.object(identity_mod, "resolve_and_stamp", _stamp):
             r = _route_with(redis, _click())
         assert "RET" in r["url"]
-        assert r["attribution"]["returning_mode"] == "sticky"  # flow ?? campaign
+        # campaign mode (fresh), NOT the flow-level "sticky" — per-flow override gone.
+        assert r["attribution"]["returning_mode"] == "fresh"
 
 
 # ============================================================
@@ -1549,15 +1578,59 @@ class TestStickyPhaseS:
         assert "T7" in result["url"]  # company-1 click ignores company-2 pin
         assert result["attribution"]["sticky_status"] == "miss"  # no company-1 pin
 
-    def test_mode_override_no_sticky_logic(self):
-        # mode=override (not sticky) → no pin logic; byte-identical offer pick.
-        redis = self._redis(returning_mode="override", offer_targets={
+    def test_mode_fresh_no_sticky_logic(self):
+        # MODEL V3 — mode=fresh (not sticky) → no pin logic; byte-identical offer
+        # pick. (Under V3 `override` is gone; fresh is the non-sticky mode and the
+        # first-pool flow here still activates the partition by existence, but the
+        # sticky pin only fires under mode=sticky.)
+        redis = self._redis(returning_mode="fresh", offer_targets={
             "7": {"url": "https://T7/{click_id}", "availability": "active", "offer_id": "1"},
         })
         result = self._run(redis, is_unique=False)
         assert "T7" in result["url"]
         assert result["attribution"]["sticky_status"] == "na"
         assert redis.strings.get("sticky:1:U:10") is None  # nothing pinned
+
+    def test_d35_returning_flow_winner_not_overridden_by_sticky_pin(self):
+        # MODEL V3 / D35 precedence — when the winning flow comes from the
+        # RETURNING pool, its OWN offer pick is served; the campaign sticky pin
+        # does NOT override it (precedence: returning-flow > sticky pin > fresh).
+        # Here a returning-audience offer flow (target 7) wins for a seen_before
+        # visitor under mode=sticky, with a stale pin → target 9 PRESENT. The pin
+        # must be IGNORED: sticky is suppressed for a returning winner, so the
+        # click serves T7 (the returning flow's pick), not T9 (the pin), and
+        # sticky_status is "na" (sticky_active was False for this winner).
+        campaign_id = "10"
+        camp = {
+            "company_id": "1", "priority": "0",
+            "returning_resolver": "1", "returning_routing": "1",
+            "returning_mode": "sticky",
+        }
+        ret_flow = {
+            "campaign_id": campaign_id, "scope_type": "company", "scope_id": "1",
+            "seq_id": "1", "is_default": "0", "audience": "returning",
+            "criteria": json.dumps([{"type": "is_returning", "op": "in", "values": ["true"]}]),
+            "action_type": "offer",
+            "action_config": json.dumps({"offer_id": 1, "target_id": 7}),
+        }
+        redis = FakeRedis(
+            sets={"geo:US": {campaign_id}, "device:mobile": {campaign_id},
+                  "os:ios": {campaign_id}, "campaigns:active": {campaign_id}},
+            hashes={
+                f"campaign:{campaign_id}": camp, "flow:1": ret_flow,
+                "offer_target:7": {"url": "https://T7/{click_id}",
+                                   "availability": "active", "offer_id": "1"},
+                "offer_target:9": {"url": "https://T9/{click_id}",
+                                   "availability": "active", "offer_id": "1"},
+            },
+            lists={f"campaign:{campaign_id}:flows": ["1"]},
+            strings={"sticky:1:U:10": "9"},  # stale pin → target 9 (MUST be ignored)
+        )
+        result = self._run(redis, is_unique=False)  # seen_before → returning pool
+        assert "T7" in result["url"]  # returning flow's OWN pick, NOT the pin
+        assert "T9" not in result["url"]
+        assert result["attribution"]["sticky_status"] == "na"  # sticky suppressed
+        assert result["attribution"]["audience_pool"] == "returning"
 
     def test_routing_off_byte_identical(self):
         redis = self._redis(offer_targets={

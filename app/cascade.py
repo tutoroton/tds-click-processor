@@ -125,19 +125,26 @@ async def resolve_flow(
 ) -> dict[str, Any] | None:
     """Resolve the winning flow for a click via scope cascade.
 
-    P4 returning-user segmented routing (DARK unless `audience_routing`):
-      * `audience_routing=False` (default) → single pass over the FIRST pool
-        only. Returning-audience flows are INERT (F-LC-1, audit-2): under fresh
-        / DARK a returning flow must never serve a click (D5). Byte-identical to
-        pre-P4 for any legacy flow set — every flow with a missing/unknown
-        audience defaults to 'first', so only explicitly returning-tagged flows
-        are excluded. `seen_before` is ignored.
+    Returning-user segmented routing (MODEL V3 — existence-driven; DARK unless
+    `audience_routing`). The partition is gated upstream by `audience_routing`
+    (returning routing live for the company AND the campaign has not opted out
+    via `disable_returning_flows`); whether a returning flow actually EXISTS in
+    scope is handled HERE by the empty-returning-pool fallthrough:
+      * `audience_routing=False` (routing OFF / partition disabled) → single pass
+        over the FIRST pool only. Returning-audience flows are INERT: a returning
+        flow must never serve a click while the partition is off. Byte-identical
+        to non-returning routing for any legacy flow set — every flow with a
+        missing/unknown audience defaults to 'first', so only explicitly
+        returning-tagged flows are excluded. `seen_before` is ignored.
       * `audience_routing=True` → partition the loaded flows by `flow.audience`
         (default 'first'). A `seen_before` visitor (B∪C — NOT the is_returning
-        flag) evaluates the 'returning' pool FIRST and, on no match, FALLS
-        THROUGH to the 'first' pool. A new visitor sees the 'first' pool only.
-        `_pick_winner` is pure over its survivor list, so the two passes are
-        independent — the fallthrough cannot perturb first-pool selection.
+        flag) evaluates the 'returning' pool FIRST and, on no match (including
+        when NO returning flow exists in scope), FALLS THROUGH to the 'first'
+        pool. A new visitor sees the 'first' pool only. `_pick_winner` is pure
+        over its survivor list, so the two passes are independent — the
+        fallthrough cannot perturb first-pool selection. This natural fallthrough
+        is what makes returning routing "activate by existence": with no returning
+        flow present the returning pass is a no-op and the click routes fresh.
 
     Args:
         r: Redis async client.
@@ -282,18 +289,18 @@ async def resolve_flow(
     winner: dict[str, Any] | None
     returning_flows, first_flows = _partition_audience(flows)
     if not audience_routing:
-        # F-LC-1 (audit-2 MED) — under fresh / DARK (audience routing OFF) a
-        # returning-audience flow is INERT: it must NEVER serve a click (D5).
-        # Pre-fix this branch picked over ALL flows, so a returning-audience
-        # flow WITHOUT returning criteria (match-all / base-dim only) could win
-        # for a NEW visitor and falsely stamp the click with
-        # decision_reason=override_returning_flow + audience_pool=returning.
-        # Restricting to the FIRST pool drops returning flows from candidacy, so
-        # the cascade falls through to a first/default flow (or to legacy split
-        # selection when the first pool is empty). Byte-identical for any pre-P4
-        # flow set — every legacy/unknown-audience flow defaults to the first
-        # pool in `_partition_audience`, so only explicitly returning-tagged
-        # flows are excluded. `seen_before` is ignored under OFF.
+        # MODEL V3 — when the partition is OFF (returning routing not live for the
+        # company, OR the campaign opted out via `disable_returning_flows`) a
+        # returning-audience flow is INERT: it must NEVER serve a click. A
+        # returning-audience flow WITHOUT returning criteria (match-all / base-dim
+        # only) could otherwise win for a NEW visitor and falsely stamp the click
+        # with audience_pool=returning. Restricting to the FIRST pool drops
+        # returning flows from candidacy, so the cascade falls through to a
+        # first/default flow (or to legacy split selection when the first pool is
+        # empty). Byte-identical to non-returning routing for any legacy flow set
+        # — every legacy/unknown-audience flow defaults to the first pool in
+        # `_partition_audience`, so only explicitly returning-tagged flows are
+        # excluded. `seen_before` is ignored under OFF.
         winner = _pick_winner(_eligible(first_flows), click_levels)
     else:
         winner = None

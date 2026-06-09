@@ -524,6 +524,28 @@ def _company_routing_enabled(campaign: dict[str, Any]) -> bool:
     )
 
 
+def _campaign_returning_flows_disabled(campaign: dict[str, Any]) -> bool:
+    """MODEL V3 — per-campaign opt-OUT of the returning-flow partition, read FREE
+    from the already-fetched campaign HASH.
+
+    V3 activates returning routing by the EXISTENCE of a returning-only flow in
+    scope (the cascade's empty-returning-pool fallthrough handles "no returning
+    flow" naturally), NOT by a per-campaign override mode. This flag is the only
+    per-campaign override left: when set, the campaign's returning partition is
+    suppressed and every visitor — returning or not — is routed through the
+    first/fresh pool (the campaign `returning_mode` fresh|sticky fallthrough
+    still applies).
+
+    FAIL-OPEN: absent / empty / unparseable ⇒ False ⇒ NOT disabled ⇒ partition
+    eligible. Admin sync emits `disable_returning_flows` as "1"/"0" (B2); until
+    a full sync rebuild populates it, the field is absent → not-disabled, which
+    is the activation-preserving default (a returning flow that exists stays
+    eligible exactly as before the gate flip)."""
+    return str(campaign.get("disable_returning_flows", "")).strip().lower() in (
+        "1", "true", "yes",
+    )
+
+
 def _non_routed_result(
     campaign_id: str,
     attribution: dict[str, Any],
@@ -639,16 +661,19 @@ def _allowed_availability(
     `_route_via_campaign` and threaded (no recompute-drift).
 
       returning visitor (seen_before, under live returning routing) → {active, draining}
-      everyone else (incl. routing OFF / mode fresh / new visitor)     → {active}
+      everyone else (incl. routing OFF / partition disabled / new visitor) → {active}
 
-    Gated identically to the audience partition: routing OFF ⇒ `returning_visitor`
-    is False ⇒ {active} ⇒ a 'draining' target blocks all ⇒ TOTAL byte-identical
-    invariant with production dark (all targets 'active' → every class passes)."""
+    Gated identically to the audience partition (MODEL V3): routing OFF, OR the
+    campaign's `disable_returning_flows` flag set ⇒ `returning_visitor` is False
+    ⇒ {active} ⇒ a 'draining' target blocks all ⇒ TOTAL byte-identical invariant
+    with production dark (all targets 'active' → every class passes). This MUST
+    stay the exact mirror of the main-route gate in `_try_flow_cascade`."""
     returning_live = settings.returning_routing_enabled and _company_routing_enabled(
         campaign
     )
-    mode = (campaign.get("returning_mode") or "fresh").strip().lower()
-    audience_routing = returning_live and mode != "fresh"
+    audience_routing = returning_live and not _campaign_returning_flows_disabled(
+        campaign
+    )
     seen_before = bool(attribution.get("uid")) and (
         attribution.get("is_unique") is False
     )
@@ -1117,18 +1142,26 @@ async def _try_flow_cascade(
     # conflating them silently drops segment C, R4 G1). Only meaningful when the
     # P2 resolver produced a uid; absent → False → first pool only (zero-regress
     # when the resolver / routing is OFF).
-    # v2 Phase M — the returning-audience PARTITION is gated by the CAMPAIGN
-    # returning_mode (the only mode known pre-flow-selection). 'fresh' (the
-    # default) DISABLES the partition ⇒ a returning visitor is routed AS NEW;
-    # 'override' / 'sticky' ENABLE the v1 2-pass. `returning_live` (env AND
-    # per-company, mode-INDEPENDENT) gates whether returning_mode is meaningful
-    # for THIS click — used to record the effective mode after selection.
-    # routing OFF OR mode 'fresh' ⇒ no partition ⇒ byte-identical.
+    # MODEL V3 — the returning-audience PARTITION is gated by EXISTENCE, not by a
+    # per-campaign override mode. `audience_routing` only decides whether the
+    # cascade RUNS the 2-pass (returning pool first, fall through to first pool);
+    # whether a returning flow actually EXISTS in scope is handled naturally by
+    # the cascade's empty-returning-pool fallthrough (`cascade.resolve_flow`). So
+    # the gate is simply "returning routing live for this company AND the campaign
+    # has not opted out via `disable_returning_flows`". The campaign `returning_mode`
+    # (fresh|sticky) no longer gates the partition — it governs only the
+    # fallthrough/recorded mode + the Phase-S sticky pin (read below). routing OFF
+    # OR partition disabled ⇒ no 2-pass ⇒ byte-identical to non-returning routing.
+    # MUST stay the exact mirror of `_allowed_availability`'s gate.
     returning_live = settings.returning_routing_enabled and _company_routing_enabled(
         campaign
     )
+    # `campaign_mode` (fresh|sticky) is KEPT — it drives the recorded effective
+    # mode + the sticky pin below; it no longer participates in the gate.
     campaign_mode = (campaign.get("returning_mode") or "fresh").strip().lower()
-    audience_routing = returning_live and campaign_mode != "fresh"
+    audience_routing = returning_live and not _campaign_returning_flows_disabled(
+        campaign
+    )
     seen_before = bool(attribution.get("uid")) and (
         attribution.get("is_unique") is False
     )
@@ -1205,15 +1238,15 @@ async def _try_flow_cascade(
     attribution["winning_scope_id"] = _to_int(flow.get("scope_id"))
     attribution["audience_pool"] = flow.get("audience") or "first"
 
-    # v2 Phase M — record the EFFECTIVE returning_mode actually in force for a
-    # returning visitor under live returning routing: flow override ?? campaign
-    # ?? 'fresh'. "na" when routing is not live OR this is not a returning
-    # visitor (mode is a returning-visitor concept). The PARTITION already used
-    # `campaign_mode` (pre-selection); the flow override refines only what is
-    # RECORDED + (Phase S) the sticky pin.
-    effective_mode = (flow.get("returning_mode") or "").strip().lower() or campaign_mode
-    # The PARTITION already used `campaign_mode` (pre-selection); the flow
-    # override refines only the RECORDED mode + the Phase-S sticky pin.
+    # MODEL V3 — record the EFFECTIVE returning_mode actually in force for a
+    # returning visitor under live returning routing: the CAMPAIGN mode
+    # (fresh|sticky). The per-flow `returning_mode` override was REMOVED in V3 —
+    # the mode is a purely campaign-level concept now (the flow HASH no longer
+    # carries it; the DB column is kept dormant). "na" when routing is not live OR
+    # this is not a returning visitor (mode is a returning-visitor concept). The
+    # campaign mode drives only what is RECORDED + (Phase S) the sticky pin — it
+    # never gates the partition (that is existence-driven, see the gate above).
+    effective_mode = campaign_mode
     if returning_live and (seen_before or effective_mode == "sticky"):
         attribution["returning_mode"] = effective_mode
     else:
@@ -1223,12 +1256,19 @@ async def _try_flow_cascade(
     # a live `sticky`-mode campaign with a uid (block/redirect have no offer
     # pick to pin; no uid ⇒ nothing to key on). Replaces the action's offer
     # pick with the validated (uid,campaign)→target pin. FAIL-OPEN end-to-end.
+    #
+    # MODEL V3 / D35 precedence — a winning RETURNING-audience flow keeps its OWN
+    # offer pick; the campaign sticky pin does NOT override it (precedence is
+    # returning-flow > sticky pin > fresh). The sticky pin applies ONLY when the
+    # fallthrough served a first-pool winner. So suppress sticky when the winner
+    # came from the returning pool (`flow.audience == "returning"`).
     uid = attribution.get("uid") or ""
     sticky_active = (
         returning_live
         and effective_mode == "sticky"
         and bool(uid)
         and (flow.get("action_type") or "") in ("offer", "split")
+        and (flow.get("audience") or "first") != "returning"
     )
     company_id = buyer_chain["company_id"]
     flow_id_str = str(flow.get("_id")) if flow.get("_id") else None

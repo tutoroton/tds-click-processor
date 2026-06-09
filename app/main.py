@@ -786,6 +786,11 @@ def _decision_reason(result: dict, timing: dict, attr: dict) -> str:
         if sticky_status == "invalid_closed":
             return "fresh_repin"
         if attr.get("audience_pool") == "returning":
+            # A flow from the RETURNING pool won. MODEL V3 — the partition is now
+            # existence-driven (no `override` mode); the `override_returning_flow`
+            # value NAME is retained as-is for analytics-contract stability (CH
+            # column + dashboard filters key on this literal). Reads as
+            # "returning-flow match"; the leading `override_` is legacy vocab only.
             return "override_returning_flow"
         return "matched_flow"
     return "no_campaign_match"
@@ -841,9 +846,11 @@ def _phase3_attribution_fields(
         "audience_pool": attr.get("audience_pool") or "none",
         "action_type": attr.get("action_type", ""),
         "target_selection_path": attr.get("target_selection_path", ""),
-        # v2 Phase M — effective returning_mode actually used (fresh/override/
-        # sticky), or "na" when routing not live / not a returning visitor.
-        # Default-safe "na" when the router didn't stamp it (resolver OFF).
+        # MODEL V3 — effective returning_mode actually used (fresh/sticky), or
+        # "na" when routing not live / not a returning visitor. The `override`
+        # mode was removed in V3 (the partition is existence-driven, gated by the
+        # campaign `disable_returning_flows` flag, not a mode). Default-safe "na"
+        # when the router didn't stamp it (resolver OFF).
         "returning_mode": attr.get("returning_mode") or "na",
         # v2 Phase S — sticky pin outcome (hit/miss/minted/invalid_closed/
         # invalid_closed_term/na). Default-safe "na" when sticky mode

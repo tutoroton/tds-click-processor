@@ -213,7 +213,7 @@ class TestAllowedAvailabilityRule:
     def test_new_visitor_active_only(self):
         # no uid → not seen_before → {active}
         assert router._allowed_availability(
-            {"returning_routing": "1", "returning_mode": "override"},
+            {"returning_routing": "1"},
             {"uid": "", "is_unique": True},
         ) == ACTIVE
 
@@ -221,24 +221,38 @@ class TestAllowedAvailabilityRule:
         monkeypatch.setattr(settings, "returning_routing_enabled", False)
         # even a seen_before returning visitor → {active} when routing OFF
         assert router._allowed_availability(
-            {"returning_routing": "1", "returning_mode": "override"},
+            {"returning_routing": "1"},
             {"uid": "u1", "is_unique": False},
         ) == ACTIVE
 
     def test_returning_visitor_routing_on_active_draining(self, monkeypatch):
         monkeypatch.setattr(settings, "returning_routing_enabled", True)
+        # MODEL V3 — partition active by existence (routing on, disable flag
+        # unset) ⇒ a seen_before returning visitor may serve a draining target.
         assert router._allowed_availability(
-            {"returning_routing": "1", "returning_mode": "override"},
+            {"returning_routing": "1"},
             {"uid": "u1", "is_unique": False},
         ) == RETURNING
 
-    def test_mode_fresh_active_only(self, monkeypatch):
+    def test_disable_flag_active_only(self, monkeypatch):
         monkeypatch.setattr(settings, "returning_routing_enabled", True)
-        # mode fresh disables the partition ⇒ {active} even for a returning uid
+        # MODEL V3 — the per-campaign `disable_returning_flows` flag suppresses the
+        # partition ⇒ {active} even for a returning uid (the V3 successor to the
+        # old mode=fresh gate). FAIL-OPEN: absent flag ⇒ partition eligible.
+        assert router._allowed_availability(
+            {"returning_routing": "1", "disable_returning_flows": "1"},
+            {"uid": "u1", "is_unique": False},
+        ) == ACTIVE
+
+    def test_mode_fresh_no_longer_disables_partition(self, monkeypatch):
+        monkeypatch.setattr(settings, "returning_routing_enabled", True)
+        # MODEL V3 flip — campaign_mode=fresh NO LONGER disables the partition (the
+        # disable flag does). A returning uid under routing-on + fresh + no disable
+        # flag now gets the returning availability class.
         assert router._allowed_availability(
             {"returning_routing": "1", "returning_mode": "fresh"},
             {"uid": "u1", "is_unique": False},
-        ) == ACTIVE
+        ) == RETURNING
 
 
 # ============================================================

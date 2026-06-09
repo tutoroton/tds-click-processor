@@ -1224,7 +1224,7 @@ class TestReturningModeV3:
     no-op ⇒ the click routes fresh."""
 
     def _route(self, *, campaign_returning_mode, routing_enabled,
-               disable_returning_flows=False):
+               disable_returning_flows=False, include_returning_flow=True):
         from app import identity as identity_mod
         from app.identity import IdentityResult
         from app.config import settings
@@ -1250,13 +1250,21 @@ class TestReturningModeV3:
             "action_type": "redirect",
             "action_config": json.dumps({"url": "https://FIRST/{click_id}"}),
         }
+        # MODEL V3 cornerstone: with NO returning flow in scope the returning
+        # pass is a no-op (empty pool) and the click falls through to fresh —
+        # `include_returning_flow=False` exercises that "activation by existence".
+        hashes = {f"campaign:{campaign_id}": camp, "flow:2": first_flow}
+        flow_list = ["2"]
+        if include_returning_flow:
+            hashes["flow:1"] = ret_flow
+            flow_list = ["1", "2"]
         redis = FakeRedis(
             sets={
                 "geo:US": {campaign_id}, "device:mobile": {campaign_id},
                 "os:ios": {campaign_id}, "campaigns:active": {campaign_id},
             },
-            hashes={f"campaign:{campaign_id}": camp, "flow:1": ret_flow, "flow:2": first_flow},
-            lists={f"campaign:{campaign_id}:flows": ["1", "2"]},
+            hashes=hashes,
+            lists={f"campaign:{campaign_id}:flows": flow_list},
         )
 
         async def _stamp(**kw):
@@ -1290,6 +1298,19 @@ class TestReturningModeV3:
         )
         assert "FIRST" in r["url"]  # partition DISABLED → routed as new
         assert r["attribution"]["returning_mode"] == "fresh"
+
+    def test_no_returning_flow_in_scope_routes_fresh(self):
+        # MODEL V3 cornerstone (activation BY EXISTENCE) — routing live + a
+        # seen_before visitor + partition NOT disabled, but NO returning-audience
+        # flow exists in scope ⇒ the returning pass is a no-op (empty pool) ⇒ the
+        # cascade falls through to the first pool ⇒ the visitor routes FRESH.
+        # Absent a returning flow an ACTIVE partition changes nothing — this is
+        # exactly what makes "existence drives activation" true.
+        r = self._route(
+            campaign_returning_mode="fresh", routing_enabled=True,
+            include_returning_flow=False,
+        )
+        assert "FIRST" in r["url"]  # empty returning pool → fresh fallthrough
 
     def test_sticky_mode_routes_via_returning_pool(self):
         # campaign_mode=sticky + returning flow exists ⇒ partition active; the

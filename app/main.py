@@ -457,20 +457,6 @@ def _sync_secret_matches(x_tds_key: str) -> bool:
 # Click event-time resolution (F.24 Phase 5.1b)
 # ============================================================================
 
-def _resolve_fallback_url() -> str:
-    """Resolve the global fallback URL for blocked / no-match clicks.
-
-    Single chokepoint so the fallback destination is configurable. Today it
-    returns the node's env-configured ``settings.fallback_url``. GROUNDWORK
-    (F-1, 2026-05-25): this is the one place an admin-pushed override will be
-    read from synced config (delivered via the snapshot push) — wiring the
-    admin settings UI is a tracked roadmap item. Centralising the three call
-    sites (route_error / no_match / blocked) here means that future change is a
-    one-function edit with NO behavioural change today.
-    """
-    return settings.fallback_url
-
-
 # Plausibility window for a click_id-derived ms epoch: 2020-01-01 ..
 # 2100-01-01. A genuine edge click_id always decodes inside this; a
 # random/legacy 24-hex string whose prefix happens to be valid hex but
@@ -1095,12 +1081,14 @@ async def decide(
                 smoke_fp, exc,
             )
             sentry_sdk.capture_exception(exc)
-        # Return a benign 302 to the fallback URL. The smoke gate
+        # Return a benign worker-fallback 302 signal. The smoke gate
         # doesn't inspect the response body — only the central stream.
+        # F-2: the node carries no fallback URL — flag the Worker instead.
         return ClickResponse(
-            url=f"{settings.fallback_url}?reason=smoke_test"
-                f"&click_id={quote(req.click_id, safe='')}",
+            url="",
             status=302,
+            fallback=True,
+            fallback_reason="smoke_test",
         )
 
     # Traffic simulation framework (Phase 1, 2026-05-09) +
@@ -1171,9 +1159,13 @@ async def decide(
                 "outcome": "route_error",
                 "endpoint_total_ms": round((time.perf_counter() - t_endpoint_start) * 1000, 2),
             })
+        # F-2: no node-level fallback URL — signal the Worker to redirect to
+        # ITS admin-configured FALLBACK_URL (it appends reason + click_id).
         return ClickResponse(
-            url=f"{_resolve_fallback_url()}?reason=error&click_id={quote(req.click_id, safe='')}",
+            url="",
             status=302,
+            fallback=True,
+            fallback_reason="error",
         )
 
     # F-1 (2026-05-25): no_match AND blocked clicks are NOT dropped — they
@@ -1207,11 +1199,18 @@ async def decide(
             # otherwise.
             reason = result.get("routing_status") or "non_routed"
         # v2 Phase A — per-campaign terminal fallback. The non_routed sentinel
-        # carries `campaign.fallback_url` (synced); prefer it over the node
-        # default. NO-DEAD-END: a matched-but-unroutable click (all targets
-        # unavailable / no flow / no offer) still gets a recorded redirect.
-        # None ⇒ node default (byte-identical).
-        fb_base = (result.get("fallback_url") if result else None) or _resolve_fallback_url()
+        # carries `campaign.fallback_url` (synced); when the admin configured
+        # one, the node still serves THAT absolute redirect (NO-DEAD-END: a
+        # matched-but-unroutable click gets the campaign's own lander).
+        #
+        # F-2 (2026-06-10): the node-level DEFAULT fallback URL is gone — the
+        # Worker is the single fallback owner. Without a campaign fallback_url
+        # the node answers `fallback: true` + reason and NO url; the Worker
+        # redirects to its admin-configured FALLBACK_URL (workers.settings),
+        # appending reason + click_id itself. The click is still fully
+        # recorded (landing_url = "") — extra_params.routing_status tells the
+        # story in the click log.
+        fb_base = result.get("fallback_url") if result else None
         # Copy the timing dict — `setdefault` below would otherwise mutate
         # the object `route()` returned (benign today, fragile on reuse).
         fb_timing = {} if result is None else dict(result.get("timing") or {})
@@ -1219,13 +1218,18 @@ async def decide(
         # Preserve the router-resolved attribution (blocked + non_routed
         # sentinels carry it); no-campaign no_match has none.
         attribution = None if result is None else result.get("attribution")
-        # Separator: node default ("https://adstudy.dev") has no query → "?"
-        # (byte-identical to pre-v2). A per-campaign fallback_url MAY carry its
-        # own query string → "&" so the appended reason/click_id stay valid.
-        fb_sep = "&" if "?" in fb_base else "?"
+        if fb_base:
+            # Separator: a per-campaign fallback_url MAY carry its own query
+            # string → "&" so the appended reason/click_id stay valid.
+            fb_sep = "&" if "?" in fb_base else "?"
+            fb_url = (f"{fb_base}{fb_sep}reason={reason}"
+                      f"&click_id={quote(req.click_id, safe='')}")
+            worker_fallback = False
+        else:
+            fb_url = ""
+            worker_fallback = True
         result = {
-            "url": f"{fb_base}{fb_sep}reason={reason}"
-                   f"&click_id={quote(req.click_id, safe='')}",
+            "url": fb_url,
             "campaign_id": None if result is None else result.get("campaign_id"),
             "offer_id": None,
             "binding_id": 0 if result is None else result.get("binding_id", 0),
@@ -1237,6 +1241,9 @@ async def decide(
             # Surfaced into click_record.extra_params below so the fallback
             # click is queryable (extra_params->>'routing_status').
             "routing_status": reason,
+            # F-2 — threaded into BOTH /decide exits (first-seen + duplicate)
+            # so the Worker knows to apply ITS fallback URL.
+            "worker_fallback": worker_fallback,
         }
         emit_checkpoint(f"click.{reason}", {"click_id": req.click_id})
 
@@ -1401,6 +1408,11 @@ async def decide(
             (time.perf_counter() - t_endpoint_start) * 1000, 2,
         )
         response = {"url": result["url"], "status": 302, "timing": timing}
+        # F-2 — the duplicate of a worker-fallback click must carry the same
+        # fallback signal, or a raced/retried no-route click would lose it.
+        if result.get("worker_fallback"):
+            response["fallback"] = True
+            response["fallback_reason"] = result.get("routing_status") or "no_match"
         if _set_identity is not None:
             response["set_identity"] = _set_identity
         if x_test_id:
@@ -1536,6 +1548,12 @@ async def decide(
     timing["endpoint_total_ms"] = round((time.perf_counter() - t_endpoint_start) * 1000, 2)
 
     response = {"url": result["url"], "status": 302, "timing": timing}
+    # F-2 — worker-owned fallback: no-route clicks ship `fallback: true` (+
+    # reason) instead of a node-built URL; the Worker redirects to its own
+    # admin-configured FALLBACK_URL.
+    if result.get("worker_fallback"):
+        response["fallback"] = True
+        response["fallback_reason"] = result.get("routing_status") or "no_match"
     if _set_identity is not None:
         response["set_identity"] = _set_identity
     if x_test_id:

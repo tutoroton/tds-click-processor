@@ -180,9 +180,20 @@ class ClickRequest(BaseModel):
 
 
 class ClickResponse(BaseModel):
-    """Response to CF Worker — where to redirect the user."""
-    url: str
+    """Response to CF Worker — where to redirect the user.
+
+    F-2 (2026-06-10) — Worker-owned fallback contract. ``fallback=True`` with
+    an empty ``url`` tells the Worker "no route here — redirect to YOUR
+    admin-configured FALLBACK_URL", appending ``fallback_reason`` + click_id
+    itself. The node carries NO default fallback URL of its own anymore (the
+    per-campaign ``campaigns.fallback_url``, when configured, still arrives as
+    a normal absolute ``url`` — that one is an admin setting, not a node
+    default).
+    """
+    url: str = ""
     status: int = 302
+    fallback: bool = False
+    fallback_reason: str | None = None
     # P3 (2026-06-06) — the signed `_tds_id` value the node MINTED/re-stamped for
     # this returning-user identity, for the worker (P4) to emit as a Set-Cookie.
     # The node does NOT set an HTTP cookie header itself — node↔worker is JSON.

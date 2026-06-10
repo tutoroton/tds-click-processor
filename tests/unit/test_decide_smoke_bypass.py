@@ -9,7 +9,8 @@ pollute analytics OR consume routing CPU:
   * Skip campaign matching / Redis lookups / postback queue / dedup.
   * XADD a minimal ``smoke_test=True`` payload to ``stream:clicks`` so
     the shipper sends it to central as usual.
-  * Return a benign 302 to the fallback URL.
+  * Return a benign worker-fallback 302 signal (F-2: the node
+    carries no fallback URL; the Worker owns the destination).
 
 Auth (X-TDS-Key) is still enforced upstream — smoke clicks come from
 operator-invoked tooling against a legitimately deployed edge node with
@@ -81,7 +82,7 @@ def _smoke_payload(click_id: str = "smoke-test-deadbeef") -> dict:
 
 def test_smoke_test_prefix_bypasses_routing_and_xadds(client, patched_auth):
     """Happy path: ``smoke-test-deadbeef`` click_id → bypass → XADD to
-    ``stream:clicks`` with the canonical payload shape → 302 to fallback.
+    ``stream:clicks`` with the canonical payload shape → worker-fallback 302.
     The route() function MUST NOT be called for the bypass path."""
     fake_redis = MagicMock()
     fake_redis.xadd = AsyncMock(return_value="1-0")
@@ -98,9 +99,12 @@ def test_smoke_test_prefix_bypasses_routing_and_xadds(client, patched_auth):
     assert r.status_code == 200
     body = r.json()
     assert body["status"] == 302
-    assert body["url"].startswith("http")
-    assert "smoke_test" in body["url"]  # reason=smoke_test in URL
-    assert "click_id=smoke-test-deadbeef" in body["url"]
+    # F-2: the node carries no fallback URL — the smoke bypass answers the
+    # worker-fallback signal (the smoke gate only inspects the central
+    # stream, never this body).
+    assert body["url"] == ""
+    assert body["fallback"] is True
+    assert body["fallback_reason"] == "smoke_test"
 
     # Routing pipeline MUST NOT have fired.
     fake_route.assert_not_awaited()

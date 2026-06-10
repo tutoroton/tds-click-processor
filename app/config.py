@@ -106,8 +106,12 @@ class Settings(BaseSettings):
     # disabled (push-only); set it to the admin-api host to re-enable.
     sync_url: str = ""
 
-    # Fallback URL when routing fails
-    fallback_url: str = "https://adstudy.dev"
+    # F-2 (2026-06-10): the node-level default fallback URL is GONE. The
+    # Worker is the single fallback owner (`workers.settings.fallback_url`,
+    # admin-configured, deployed to CF as FALLBACK_URL): a no-route /decide
+    # answers `{"fallback": true, "fallback_reason": ...}` and the Worker
+    # builds the destination itself. Per-campaign `campaigns.fallback_url`
+    # (admin setting) still produces a normal absolute redirect on the node.
 
     # Sentry (from env, never hardcode)
     sentry_dsn: str = ""

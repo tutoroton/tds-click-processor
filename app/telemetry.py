@@ -73,6 +73,7 @@ OP_IDENTITY = "identity_resolve"
 # stay silent (benign: a missed pin → normal selection, the click still routes).
 OP_IDENTITY_PERSIST = "identity_persist"  # deferred uid/profile/history write failed
 OP_STICKY_WRITE = "sticky_write"          # sticky pin SET NX / repin failed
+OP_IDENTITY_STORE_PRESSURE = "identity_store_pressure"  # CAP-1 — identity-redis ≥80%/≥95% of maxmemory
 
 # Per-click verdict outcomes (Sprint 2.2+)
 OP_DEADLETTER = "deadletter"   # click hit max-attempts after rejections

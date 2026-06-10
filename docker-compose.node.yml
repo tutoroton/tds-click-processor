@@ -124,7 +124,18 @@ services:
     # from ClickHouse, so the appendonly file is a restart convenience, not a
     # durability guarantee. Separate instance from the routing cache so the two
     # keyspaces never compete for memory.
-    command: redis-server --maxmemory 256mb --maxmemory-policy noeviction --appendonly yes
+    #
+    # CAP-1 (2026-06-10): maxmemory is RESIZABLE per node. Default 512mb
+    # (~1M visitors at ~550B each: ~4 identity keys + 1 sticky pin, 180d
+    # sliding TTL). Override in the node's .env (TDS_IDENTITY_REDIS_MAXMEMORY,
+    # e.g. "1gb") + `docker compose -f docker-compose.node.yml up -d
+    # identity-redis` — update.sh already runs that on every deploy, and the
+    # AOF volume reloads the keyspace across the recreate (no identity loss).
+    # Live resize without restart: `docker exec tds-identity-redis redis-cli
+    # CONFIG SET maxmemory 1gb` (then mirror it into .env so it survives).
+    # Saturation alerts: /health reports identity_store_* and the node fires
+    # throttled Sentry warnings at ≥80% / errors at ≥95% (see app/main.py).
+    command: redis-server --maxmemory ${TDS_IDENTITY_REDIS_MAXMEMORY:-512mb} --maxmemory-policy noeviction --appendonly yes
     volumes:
       - tds-identity-data:/data
     restart: unless-stopped

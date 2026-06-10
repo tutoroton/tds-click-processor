@@ -1599,18 +1599,21 @@ class TestStickyPhaseS:
         assert "T7" in result["url"]  # company-1 click ignores company-2 pin
         assert result["attribution"]["sticky_status"] == "miss"  # no company-1 pin
 
-    def test_mode_fresh_no_sticky_logic(self):
-        # MODEL V3 — mode=fresh (not sticky) → no pin logic; byte-identical offer
-        # pick. (Under V3 `override` is gone; fresh is the non-sticky mode and the
-        # first-pool flow here still activates the partition by existence, but the
-        # sticky pin only fires under mode=sticky.)
+    def test_mode_fresh_tracks_pin_but_never_serves_it(self):
+        # MODEL V3 + B-track (2026-06-10) — mode=fresh → the PIN never gates
+        # the pick (byte-identical offer selection, sticky_status "na"), but
+        # fresh now TRACKS: the served target overwrites the (uid, campaign)
+        # pin so a later flip to sticky freezes the LAST offer the visitor
+        # actually received (was: fresh never touched pins → re-enabling
+        # sticky resurrected the first-ever pin).
         redis = self._redis(returning_mode="fresh", offer_targets={
             "7": {"url": "https://T7/{click_id}", "availability": "active", "offer_id": "1"},
         })
         result = self._run(redis, is_unique=False)
         assert "T7" in result["url"]
         assert result["attribution"]["sticky_status"] == "na"
-        assert redis.strings.get("sticky:1:U:10") is None  # nothing pinned
+        # B-track bookkeeping: pin now equals the just-served target.
+        assert redis.strings.get("sticky:1:U:10") == "7"
 
     def test_d35_returning_flow_winner_not_overridden_by_sticky_pin(self):
         # MODEL V3 / D35 precedence — when the winning flow comes from the

@@ -40,16 +40,23 @@ from app.diag import (
 )
 from app import history, identity
 from app.models import ClickRequest, ClickResponse, HealthResponse
-from app.redis_client import get_redis, close_redis, close_identity_redis
+from app.redis_client import (
+    get_redis,
+    get_identity_redis,
+    close_redis,
+    close_identity_redis,
+)
 from app.router import route, get_full_ua_info, parse_accept_language, coerce_cost
 from app.ua_parser import warmup as warmup_ua_parser
 from app.shipper import assert_shipper_ready, run_shipper
 from app.shipper_metrics import metrics as shipper_metrics
 from app.telemetry import (
     OP_DISK_PRESSURE,
+    OP_IDENTITY_STORE_PRESSURE,
     OP_ROUTE_ERROR,
     capture_op_exc,
     capture_op_msg,
+    capture_op_msg_throttled,
 )
 from app.disk_queue import (
     check_disk_pressure,
@@ -1640,6 +1647,56 @@ async def health():
             # Directory may not exist yet on first boot — leave as None.
             disk_free_bytes = None
 
+    # CAP-1 (2026-06-10) — identity-store saturation visibility. The identity
+    # Redis is noeviction (D30): when FULL, identity writes fail loud-but-
+    # swallowed (clicks still route; returning recognition degrades to "new"
+    # and pins stop updating). That failure mode must never arrive silently —
+    # /health carries used/max/pct on every probe (the docker healthcheck hits
+    # this every 10s → free cadence) and the node fires THROTTLED Sentry
+    # signals at ≥80% (warning) / ≥95% (error), once per hour per threshold.
+    # Wrapped independently — a blip on INFO must never 500 the probe.
+    identity_used_bytes: int | None = None
+    identity_max_bytes: int | None = None
+    identity_used_pct: float | None = None
+    try:
+        ir = await get_identity_redis()
+        mem = await ir.info("memory")
+        identity_used_bytes = int(mem.get("used_memory") or 0)
+        identity_max_bytes = int(mem.get("maxmemory") or 0)
+        if identity_max_bytes > 0:
+            identity_used_pct = round(
+                identity_used_bytes * 100.0 / identity_max_bytes, 1,
+            )
+            if identity_used_pct >= 95.0:
+                capture_op_msg_throttled(
+                    OP_IDENTITY_STORE_PRESSURE, "p95",
+                    f"identity store at {identity_used_pct}% of maxmemory "
+                    f"({identity_used_bytes}/{identity_max_bytes} bytes) — "
+                    "noeviction writes will start failing; raise "
+                    "TDS_IDENTITY_REDIS_MAXMEMORY (see docker-compose.node.yml CAP-1)",
+                    level="error",
+                    window_sec=3600.0,
+                    node_id=settings.node_id,
+                    used_bytes=identity_used_bytes,
+                    max_bytes=identity_max_bytes,
+                )
+            elif identity_used_pct >= 80.0:
+                capture_op_msg_throttled(
+                    OP_IDENTITY_STORE_PRESSURE, "p80",
+                    f"identity store at {identity_used_pct}% of maxmemory "
+                    f"({identity_used_bytes}/{identity_max_bytes} bytes) — "
+                    "plan a resize (TDS_IDENTITY_REDIS_MAXMEMORY)",
+                    level="warning",
+                    window_sec=3600.0,
+                    node_id=settings.node_id,
+                    used_bytes=identity_used_bytes,
+                    max_bytes=identity_max_bytes,
+                )
+    except Exception:
+        # Identity store unreachable (resolver off / early boot) — fields stay
+        # None; the resolver's own boot gate covers that failure class.
+        pass
+
     return HealthResponse(
         # F.32 Track 1 — drift visibility: the git SHA the node is running.
         code_version=settings.code_version,
@@ -1660,6 +1717,9 @@ async def health():
         stream_clicks_length=stream_length,
         disk_queue_size=disk_queue_size,
         disk_free_bytes=disk_free_bytes,
+        identity_store_used_bytes=identity_used_bytes,
+        identity_store_max_bytes=identity_max_bytes,
+        identity_store_used_pct=identity_used_pct,
     )
 
 

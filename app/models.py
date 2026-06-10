@@ -289,3 +289,11 @@ class HealthResponse(BaseModel):
     # pre-flight check uses this against
     # ``settings.disk_queue_min_free_bytes``.
     disk_free_bytes: int | None = None
+    # CAP-1 (2026-06-10) — identity-store (noeviction Redis) saturation
+    # visibility. None when the store is unreachable or maxmemory is
+    # unlimited (local dev). The node itself fires throttled Sentry
+    # signals at ≥80%/≥95% (see /health); these fields give operators +
+    # the admin health snapshot the same numbers.
+    identity_store_used_bytes: int | None = None
+    identity_store_max_bytes: int | None = None
+    identity_store_used_pct: float | None = None

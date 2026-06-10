@@ -989,12 +989,19 @@ async def _resolve_action_with_sticky(
     allowed_avail=frozenset({"active"}),
     identity_macros: dict[str, Any] | None = None,
     trace: dict[str, Any] | None = None,
+    fresh_track: bool = False,
 ) -> tuple[dict[str, Any] | None, str]:
     """v2 Phase S — resolve the destination, applying the sticky pin when active.
 
     Returns `(result, sticky_status)`. When `sticky_active` is False this is a
-    pure pass-through to `execute_action` (status "na" → byte-identical). When
-    active (offer/split flow under a live sticky-mode campaign with a uid):
+    pure pass-through to `execute_action` (status "na") — plus, under
+    `fresh_track` (B-track, 2026-06-10), the served target OVERWRITES the
+    (uid, campaign) pin so the pin always equals the LAST offer the visitor
+    actually received in fresh mode. Flipping the campaign to sticky then
+    freezes exactly that last offer; flipping back to fresh resumes tracking.
+    Pure bookkeeping — never alters THIS click's routing, fail-open like every
+    sticky op, and recorded sticky_status stays "na" (no contract change).
+    When active (offer/split flow under a live sticky-mode campaign with a uid):
 
       * returning visitor + pin AVAILABLE for the class (active|draining) →
         serve the pin, `hit`. (`closed` never serves — the Phase-A availability
@@ -1026,7 +1033,20 @@ async def _resolve_action_with_sticky(
         )
 
     if not sticky_active:
-        return await _normal(), "na"
+        result = await _normal()
+        # B-track — fresh-mode pin tracking: overwrite the pin with the target
+        # this click ACTUALLY served (available by construction — it was just
+        # picked under the availability floor). `repin` = SET EX (sliding TTL,
+        # same 180d window as the uid), swallows Redis errors (fail-open), so
+        # this can never delay or break the redirect.
+        if fresh_track:
+            tid = result.get("target_id") if result else None
+            if tid:
+                await sticky.repin(
+                    company_id, uid, campaign_id, tid,
+                    settings.returning_uid_ttl_seconds,
+                )
+        return result, "na"
 
     ttl = settings.returning_uid_ttl_seconds
     # v2 C2 — use the threaded allowed_avail (computed ONCE in _route_via_campaign)
@@ -1270,6 +1290,20 @@ async def _try_flow_cascade(
         and (flow.get("action_type") or "") in ("offer", "split")
         and (flow.get("audience") or "first") != "returning"
     )
+    # B-track (2026-06-10, user decision) — under FRESH mode the pin TRACKS
+    # the last served offer (overwrite per click), so a later flip to sticky
+    # freezes the visitor on the offer they LAST received, not the one from
+    # the first-ever sticky click. Deliberately the EXACT mirror of the
+    # sticky gate (same D35 returning-audience exclusion: the pin only ever
+    # records what sticky could later legitimately serve), differing only in
+    # the mode. Bookkeeping-only — never alters this click's routing.
+    fresh_track = (
+        returning_live
+        and effective_mode == "fresh"
+        and bool(uid)
+        and (flow.get("action_type") or "") in ("offer", "split")
+        and (flow.get("audience") or "first") != "returning"
+    )
     company_id = buyer_chain["company_id"]
     flow_id_str = str(flow.get("_id")) if flow.get("_id") else None
 
@@ -1278,6 +1312,7 @@ async def _try_flow_cascade(
         source_mappings=source_mappings,
         campaign_mappings=campaign_mappings,
         sticky_active=sticky_active,
+        fresh_track=fresh_track,
         uid=uid,
         company_id=company_id,
         seen_before=seen_before,

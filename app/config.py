@@ -127,8 +127,9 @@ class Settings(BaseSettings):
     full_sync_interval_seconds: int = 60
 
     # T2.1 / G-22 — `stream:clicks` inline MAXLEN cap (zero-loss
-    # foundation). The shipper task XTRIMs the stream to ~10k after
-    # every successful batch ship to central; without this hard cap
+    # foundation). This inline cap is the ONLY capacity ceiling: the
+    # shipper's processed-history trim is MINID-based (AUD-B F1) and
+    # never cuts undelivered entries. Without this hard cap
     # a central-collector outage would let `/decide`'s XADD path
     # grow the stream unbounded → Redis OOM → routing degradation
     # + click loss (`noeviction` policy on edge Redis means writes
@@ -305,6 +306,15 @@ class Settings(BaseSettings):
     shipper_reclaim_interval_sec: float = 30.0
     shipper_reclaim_min_idle_ms: int = 60_000
     shipper_reclaim_max_per_cycle: int = 5_000
+
+    # AUD-B F1 (2026-06-12) — processed-history trim cadence. The shipper
+    # XTRIMs `stream:clicks` with MINID (oldest pending id, else the
+    # group's last-delivered-id) on this interval — replacing the old
+    # per-batch `XTRIM MAXLEN ~10000` that silently destroyed outage
+    # backlog on recovery (the first successful ship after a central
+    # outage trimmed every un-shipped entry older than the newest 10k).
+    # Mirror of process-service `consumer_trim_interval_sec`.
+    shipper_trim_interval_sec: float = 60.0
 
     # ------------------------------------------------------------------
     # Diagnostic mode toggles. All three default `False` — production

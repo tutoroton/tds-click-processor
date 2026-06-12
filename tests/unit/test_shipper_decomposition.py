@@ -33,7 +33,7 @@ import pytest
 
 from app import shipper, shipper_metrics as smm
 from app.shipper import (
-    _ack_and_trim_shipped_batch,
+    _ack_shipped_batch,
     _compute_ack_msg_ids_from_verdict,
     _drain_batch_from_stream,
     _handle_central_unreachable,
@@ -413,7 +413,7 @@ async def test_handle_shipper_loop_error_fixed_2s_sleep():
 
 
 # ===========================================================================
-# _ack_and_trim_shipped_batch
+# _ack_shipped_batch
 # ===========================================================================
 
 
@@ -423,7 +423,7 @@ async def test_ack_and_trim_returns_true_on_empty_ids():
     retried, none ended up in the ack set), the helper short-circuits
     with True. This is the "all rejected, all re-XADDed" legitimate case."""
     redis = AsyncMock()
-    result = await _ack_and_trim_shipped_batch(
+    result = await _ack_shipped_batch(
         redis, set(), batch_size=5, collector_status=207,
     )
     assert result is True
@@ -433,17 +433,18 @@ async def test_ack_and_trim_returns_true_on_empty_ids():
 
 @pytest.mark.asyncio
 async def test_ack_and_trim_success_returns_true():
-    """Happy path: XACK + XTRIM succeed → returns True. No ack_failed
-    ship status recorded."""
+    """Happy path: XACK succeeds → returns True. No ack_failed ship
+    status recorded. AUD-B F1: NO XTRIM here — the old per-batch
+    ``MAXLEN ~10000`` trim destroyed outage backlog on recovery;
+    processed-history hygiene is the loop-clock MINID trim
+    (test_shipper_trim.py)."""
     redis = AsyncMock()
-    result = await _ack_and_trim_shipped_batch(
+    result = await _ack_shipped_batch(
         redis, {"1-0", "2-0"}, batch_size=2, collector_status=202,
     )
     assert result is True
     redis.xack.assert_awaited_once()
-    redis.xtrim.assert_awaited_once_with(
-        STREAM_KEY, maxlen=10000, approximate=True,
-    )
+    redis.xtrim.assert_not_awaited()
     # ack_failed should NOT be set; default is "n/a"
     assert smm.metrics.last_ship_status == "n/a"
 
@@ -457,7 +458,7 @@ async def test_ack_and_trim_records_ack_failed_on_redis_error():
     redis = AsyncMock()
     redis.xack.side_effect = RuntimeError("redis disconnect")
 
-    result = await _ack_and_trim_shipped_batch(
+    result = await _ack_shipped_batch(
         redis, {"1-0"}, batch_size=1, collector_status=202,
     )
     assert result is False
@@ -477,7 +478,7 @@ async def test_ack_and_trim_shim_flag_propagates():
     # We don't directly inspect Sentry extras here (covered by
     # test_shipper_exception_tagging); we just verify ack_failed is
     # still recorded and the helper still returns False.
-    result = await _ack_and_trim_shipped_batch(
+    result = await _ack_shipped_batch(
         redis, {"1-0"}, batch_size=1,
         collector_status=200, shim_active=True,
     )

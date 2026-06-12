@@ -546,9 +546,10 @@ async def _handle_rejected_click(
 # function under ~70 LOC + nesting ≤3:
 #   * ``_compute_ack_msg_ids_from_verdict`` — accepted ∪ duplicates set.
 #   * ``_handle_rejected_in_batch`` — for-loop over rejected_items.
-#   * ``_ack_and_trim_shipped_batch`` — XACK + XTRIM + ack_failed
-#     bookkeeping; returns False on Redis failure so the caller short-
-#     circuits the outcome metrics.
+#   * ``_ack_shipped_batch`` — XACK + ack_failed bookkeeping; returns
+#     False on Redis failure so the caller short-circuits the outcome
+#     metrics. (Processed-history XTRIM moved to the loop-clock
+#     ``_trim_processed_history`` — AUD-B F1.)
 #   * ``_record_new_shape_outcome`` — record_outcome + record_ship +
 #     summary log for the deadletter / partial_ack / success branches.
 #
@@ -985,7 +986,57 @@ async def _handle_rejected_in_batch(
     return deadletter_count
 
 
-async def _ack_and_trim_shipped_batch(
+async def _trim_processed_history(redis_pool) -> int:
+    """XTRIM MINID the entries the shipper group has fully processed.
+
+    AUD-B F1 (2026-06-12) — replaces the post-ack ``XTRIM MAXLEN ~10000``
+    that capped the SURVIVABLE outage backlog at 10k: during a central
+    outage clicks pile up in the stream/PEL, and the first successful
+    batch after recovery used to trim everything older than the newest
+    10k — silently destroying the un-shipped backlog (including
+    PEL-referenced entries, which XAUTOCLAIM then drops as deleted).
+    The XADD-side ``MAXLEN ~ stream_clicks_maxlen`` (1M) remains the only
+    capacity ceiling.
+
+    Mirror of the proven process-service pattern
+    (``app/events/consumer.py`` ``trim_processed``). Safe point:
+
+      * PEL non-empty → oldest PENDING id. Entries ≥ it survive, so the
+        orphaned-PEL reclaim (C3) is untouched — pending is NEVER trimmed.
+      * PEL empty → the group's last-delivered-id. Everything strictly
+        below it is delivered AND ACKed (an un-ACKed delivery would be
+        in the PEL). XTRIM MINID removes only ids < minid, so the
+        boundary entry is kept (one-entry conservatism, harmless).
+
+    Best-effort: any failure skips this round — hygiene must never break
+    the ship loop. Returns the number of entries removed.
+    """
+    try:
+        minid: str | None = None
+        summary = await redis_pool.xpending(STREAM_KEY, GROUP_NAME)
+        if summary.get("pending") and summary.get("min"):
+            minid = str(summary["min"])
+        else:
+            for group in await redis_pool.xinfo_groups(STREAM_KEY):
+                if group.get("name") == GROUP_NAME:
+                    minid = str(group.get("last-delivered-id") or "")
+                    break
+        if not minid or minid == "0-0":
+            return 0  # group missing or nothing delivered yet
+        removed = int(
+            await redis_pool.xtrim(STREAM_KEY, minid=minid, approximate=True)
+        )
+        if removed:
+            logger.info(
+                "Shipper trimmed %s processed entries below %s", removed, minid,
+            )
+        return removed
+    except Exception as exc:  # noqa: BLE001 — hygiene must never kill the loop
+        logger.warning("Shipper processed-history trim failed (skipped): %s", exc)
+        return 0
+
+
+async def _ack_shipped_batch(
     redis_pool,
     ack_msg_ids: set[str] | list[str],
     *,
@@ -993,7 +1044,13 @@ async def _ack_and_trim_shipped_batch(
     collector_status: int,
     shim_active: bool = False,
 ) -> bool:
-    """XACK + XTRIM after a successful batch delivery; log + record on failure.
+    """XACK after a successful batch delivery; log + record on failure.
+
+    AUD-B F1: this helper no longer XTRIMs — the blanket
+    ``MAXLEN ~10000`` trim destroyed outage backlog on recovery.
+    Processed-history hygiene now runs on the loop clock via
+    :func:`_trim_processed_history` (MINID-based, never cuts
+    undelivered/pending entries).
 
     Returns:
         True on success — caller proceeds to record final outcome metrics.
@@ -1013,17 +1070,14 @@ async def _ack_and_trim_shipped_batch(
         return True  # Nothing to ACK (legitimate: all rejected, all retried).
     try:
         await redis_pool.xack(STREAM_KEY, GROUP_NAME, *ack_msg_ids)
-        await redis_pool.xtrim(
-            STREAM_KEY, maxlen=10000, approximate=True,
-        )
     except Exception as ack_exc:  # noqa: BLE001
         if shim_active:
             log_msg = (
-                "Shipper xack/xtrim failure (op=%s) during shim: %s"
+                "Shipper xack failure (op=%s) during shim: %s"
             )
         else:
             log_msg = (
-                "Shipper xack/xtrim failure (op=%s) — batch was "
+                "Shipper xack failure (op=%s) — batch was "
                 "DELIVERED to central but local stream not ACKed. "
                 "Clicks may be re-delivered (at-least-once contract): %s"
             )
@@ -1107,7 +1161,7 @@ async def _process_new_shape_batch(
       1. Builds the click_id → msg_id reverse map.
       2. Computes accepted ∪ duplicates → ack set.
       3. Processes rejected items (retry counter + re-XADD OR deadletter).
-      4. Performs the XACK + XTRIM (short-circuits on Redis impairment).
+      4. Performs the XACK (short-circuits on Redis impairment).
       5. Records outcome metrics + ship status + summary log.
 
     Returns normally on every path; caller continues to the next loop
@@ -1135,7 +1189,7 @@ async def _process_new_shape_batch(
         clicks, click_id_to_msg_id, ack_msg_ids,
     )
 
-    acked = await _ack_and_trim_shipped_batch(
+    acked = await _ack_shipped_batch(
         redis_pool, ack_msg_ids,
         batch_size=batch_size,
         collector_status=response.status_code,
@@ -1171,7 +1225,7 @@ async def _process_legacy_shape_batch(
       * Logs WARN per-batch (operator visibility during rolling deploy).
       * Emits a Sentry breadcrumb ONCE per shipper lifetime (Sprint 2.7a
         one-shot semantics) — burst guard against Sentry quota.
-      * ACK-all msg_ids + XTRIM (delegates to :func:`_ack_and_trim_shipped_batch`).
+      * ACK-all msg_ids (delegates to :func:`_ack_shipped_batch`).
       * Records ``legacy_collector`` ship status + counts whole batch
         as accepted in the success-ratio window (legacy 2xx = all
         delivered from operator's perspective).
@@ -1206,7 +1260,7 @@ async def _process_legacy_shape_batch(
             batch_size=batch_size,
         )
 
-    acked = await _ack_and_trim_shipped_batch(
+    acked = await _ack_shipped_batch(
         redis_pool, msg_ids,
         batch_size=batch_size,
         collector_status=response.status_code,
@@ -1427,6 +1481,12 @@ async def run_shipper(redis_pool):
         # heartbeat, so this check fires roughly every
         # `shipper_reclaim_interval_sec` even on an idle node.
         last_reclaim = time.monotonic()
+        # AUD-B F1 (2026-06-12) — processed-history trim on the same loop
+        # clock (MINID-based, never cuts undelivered/pending entries).
+        # 0.0 → first pass runs immediately (safe by construction), then
+        # every `shipper_trim_interval_sec` — cheap (3 Redis round-trips)
+        # vs the old per-batch MAXLEN trim that destroyed outage backlog.
+        last_trim = 0.0
         async with httpx.AsyncClient(timeout=15.0) as client:
             while True:
                 # Local-iteration default so the httpx.RequestError /
@@ -1447,6 +1507,12 @@ async def run_shipper(redis_pool):
                     if now - last_reclaim >= settings.shipper_reclaim_interval_sec:
                         await _reclaim_shipper_pending(redis_pool, client)
                         last_reclaim = now
+
+                    # AUD-B F1 — periodic processed-history hygiene
+                    # (replaces the per-batch MAXLEN trim). Never raises.
+                    if now - last_trim >= settings.shipper_trim_interval_sec:
+                        last_trim = now
+                        await _trim_processed_history(redis_pool)
 
                     clicks, msg_ids = await _drain_batch_from_stream(redis_pool)
                     if not clicks:

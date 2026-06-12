@@ -606,9 +606,11 @@ async def _acquire_click_dedup(click_id: str) -> bool | None:
         return True if acquired else False
     except Exception as exc:
         # Redis hiccup → log + fail-open. Better one duplicate than one
-        # lost click. ClickHouse downstream dedup on click_id PK is the
-        # eventual safety net. Sentry-capture is intentional — operator
-        # signal that dedup is degraded (not silent).
+        # lost click. tds.events is append-only (no PK/Replacing dedup —
+        # unified-events cutover); the duplicate is neutralized at READ
+        # time per PD-B6 (bounded-overfetch LIMIT 1 BY / uniq
+        # combinators). Sentry-capture is intentional — operator signal
+        # that dedup is degraded (not silent).
         logger.warning(
             "Click dedup SETNX failed for %s: %s — failing open",
             click_id, exc,

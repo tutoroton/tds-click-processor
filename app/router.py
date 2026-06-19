@@ -1494,6 +1494,17 @@ def _safe_id_sort_key(rid: Any) -> tuple[int, int, str]:
 # (admin-api) can deploy in any order.
 _WILDCARD_BASES_KEY = "domains:wildcard"
 
+# F9 (2026-06-19) — SET of base domains that are ARCHIVED campaign routers. The
+# CF Worker route lingers after archive (cleanup deferred), so a click on the
+# archived host still reaches the edge; membership here makes `resolve_domain_
+# campaign` fail CLOSED (404, no geo fall-through) instead of broad-eval leaking
+# the click to a FOREIGN campaign. Scoped to the exact base → other domains of
+# the same campaign are untouched. Written by admin-api's domains sync builder
+# (`keys.DOMAINS_DISABLED`, kept in lockstep). Empty / absent SET ⇒ no host is
+# disabled (behaviour identical to pre-F9), so writer and reader deploy in any
+# order (3-deploy safe).
+_DISABLED_BASES_KEY = "domains:disabled"
+
 
 class DomainResolution(NamedTuple):
     """Outcome of domain-binding resolution for one click.
@@ -1609,6 +1620,29 @@ async def resolve_domain_campaign(r, req: ClickRequest) -> DomainResolution:
     parts = hostname.split(".")
     sub_label = parts[0] if len(parts) >= 3 else ""
     sub_base = ".".join(parts[1:]) if len(parts) >= 3 else ""
+
+    # F9 (2026-06-19): an ARCHIVED campaign-router base must serve NOTHING. Its
+    # CF Worker route lingers after archive (cleanup deferred), so the click
+    # still reaches the edge — without this gate it would fall through to geo
+    # targeting and be broad-eval matched to a FOREIGN campaign (an archived
+    # router leaking traffic to other campaigns). The click's registrable base
+    # is the host itself (apex click) or `sub_base` (one-level subdomain reached
+    # via the lingering `*.{base}` route); if EITHER is a disabled member, fail
+    # CLOSED (404) — scoped to THIS host, so other domains of the same campaign
+    # are untouched. Batched into one round-trip; fail OPEN on a Redis blip (a
+    # transient error must not 404 all traffic — same posture as the §6 wildcard
+    # check below), but log a deterministic failure so it is visible.
+    disabled_checks = [hostname] + ([sub_base] if sub_base else [])
+    try:
+        _dpipe = r.pipeline()
+        for _b in disabled_checks:
+            _dpipe.sismember(_DISABLED_BASES_KEY, _b)
+        if any(await _dpipe.execute()):
+            return _DOMAIN_BLOCKED
+    except Exception as e:  # pragma: no cover — Redis transient
+        logger.warning(
+            "domains:disabled membership check failed (fail-open): %s", e
+        )
 
     # §6: is the candidate base a wildcard-enabled base? Only then does
     # the fail-closed discipline apply. SISMEMBER is O(1) and skipped

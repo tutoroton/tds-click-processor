@@ -110,6 +110,10 @@ class _FakePipeline:
     def exists(self, key):
         self.ops.append(("exists", key))
 
+    def sismember(self, key, member):
+        # F9 — the domains:disabled fail-closed check batches SISMEMBERs.
+        self.ops.append(("sismember", key, member))
+
     def incr(self, key):
         self.ops.append(("incr", key))
 
@@ -139,6 +143,11 @@ class _FakePipeline:
                     or key in self.parent.sets
                 )
                 out.append(1 if exists else 0)
+            elif kind == "sismember":
+                member = op[2]
+                out.append(
+                    1 if member in self.parent.sets.get(key, set()) else 0
+                )
             elif kind == "incr":
                 cur = int(self.parent.strings.get(key, 0))
                 self.parent.strings[key] = str(cur + 1)
@@ -1761,3 +1770,51 @@ class TestLDF2TraceGatingE2E:
         assert len(crit["rejected"]) == 5  # cap lifted
         assert "rejected_truncated" not in crit
         assert crit["rejected"][0]["criteria"] == ["geo in [CA]"]
+
+
+class TestF9DisabledDomainFailClosed:
+    """F9 (2026-06-19): a click on an ARCHIVED campaign-router base (a member of
+    `domains:disabled`) fails CLOSED (404). The lingering CF Worker route still
+    delivers the click to the edge, but it must NOT fall through to geo
+    targeting and broad-eval match a FOREIGN campaign. Scoped to the exact host."""
+
+    def test_disabled_apex_click_blocks_even_when_a_foreign_campaign_would_match(self):
+        # An active campaign WOULD match this click by geo if we fell through —
+        # the block must win, proving the archived host leaks to nobody.
+        redis = FakeRedis(
+            sets={
+                "domains:disabled": {"archived.xyz"},
+                "campaigns:active": {"99"},
+                "geo:US": {"99"},
+            },
+            hashes={"campaign:99": {"name": "foreign"}},
+        )
+        req = ClickRequest(
+            click_id="f9-apex", country="US", user_agent="Mozilla/5.0",
+            hostname="archived.xyz", path="/",
+        )
+        result = _route_with(redis, req)
+        assert result is not None
+        assert result.get("blocked") is True
+        assert result.get("url") is None
+        assert result.get("campaign_id") is None
+
+    def test_disabled_subdomain_click_is_blocked(self):
+        redis = FakeRedis(sets={"domains:disabled": {"archived.xyz"}})
+        req = ClickRequest(
+            click_id="f9-sub", country="US", user_agent="Mozilla/5.0",
+            hostname="go.archived.xyz", path="/",
+        )
+        result = _route_with(redis, req)
+        assert (result or {}).get("blocked") is True
+
+    def test_non_disabled_host_is_not_blocked(self):
+        # Control: a host NOT in domains:disabled falls through (no 404). Other
+        # domains of the same campaign are untouched by another domain's archive.
+        redis = FakeRedis(sets={"domains:disabled": {"archived.xyz"}})
+        req = ClickRequest(
+            click_id="f9-ctrl", country="US", user_agent="Mozilla/5.0",
+            hostname="live.xyz", path="/",
+        )
+        result = _route_with(redis, req)
+        assert not (result or {}).get("blocked")

@@ -538,6 +538,24 @@ async def _offer_default_template(
     """
     if offer.get("has_targets") == "1":
         target_ids = await r.smembers(f"offer:{offer_id}:targets")
+        if not target_ids:
+            # B1/GTD-R44 (source hardening) — has_targets='1' but the target
+            # SET is EMPTY on THIS node: the sync builder hasn't replicated
+            # `offer:{id}:targets` here yet (cross-node race × sync lag). Falling
+            # through to the bare offer.url below mints a click fact with
+            # offer_target_id=None→0, which an offer_target-scoped Cap later
+            # undercounts (the silently-wrong cap). Surface the drift (throttled
+            # per offer id) so an operator sees the unsynced node. ROUTING IS
+            # UNCHANGED — we still serve the bare url below; we do NOT convert a
+            # servable click into a fallback (that would break routing).
+            capture_op_msg_throttled(
+                OP_OFFER_RESOLVE, offer_id,
+                f"offer {offer_id} has_targets=1 but its target set is empty on "
+                "this node (sync drift) — serving bare url with no "
+                "offer_target_id; ot-scoped caps undercount until sync catches up",
+                level="warning",
+                offer_id=offer_id,
+            )
         if target_ids:
             sorted_ids = sorted(target_ids, key=_safe_target_sort_key)
             if len(sorted_ids) > _MAX_TARGETS_PER_OFFER_AT_CLICK:

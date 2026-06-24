@@ -8,10 +8,11 @@ to router internals. Each branch of `execute_action` (redirect / offer
 from __future__ import annotations
 
 import json
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from app import action_executor as ae_mod
 from app.action_executor import (
     BLOCK_RESULT,
     _is_positive_int,
@@ -469,6 +470,57 @@ class TestOfferDefaultTargetGap:
             build_url_fn=_stub_build_url(),
         )
         assert result is None
+
+    @pytest.mark.asyncio
+    async def test_b1_empty_target_set_with_bare_url_serves_bare_and_alerts(self):
+        # B1/GTD-R44 source hardening — has_targets=1 but the targets SET is
+        # EMPTY on this node (sync drift) WHILE a bare offer.url exists. The
+        # click is servable, so routing is UNCHANGED (bare url served,
+        # target_id=None as before) — but we SURFACE the drift via a throttled
+        # OP_OFFER_RESOLVE alert so an operator sees the unsynced node (this
+        # bare-with-None fact is what an ot-scoped Cap later undercounts).
+        flow = _flow("offer", {"offer_id": 5})
+        r = _redis_with_hashes(
+            {"offer:5": {"has_targets": "1", "url": "https://offer.bare/x"}},
+            sets={"offer:5:targets": set()},
+        )
+        build_url = _stub_build_url()
+        with patch.object(ae_mod, "capture_op_msg_throttled") as cap:
+            result = await execute_action(
+                r, flow, _click(), "1",
+                source_mappings=None, campaign_mappings=None,
+                build_url_fn=build_url,
+            )
+        # routing byte-identical: bare url served, no target id fabricated
+        assert result is not None
+        assert result["offer_id"] == "5"
+        assert result["target_id"] is None
+        assert build_url.calls[0][0] == "https://offer.bare/x"
+        # the drift is surfaced (throttled per offer id)
+        cap.assert_called_once()
+        assert cap.call_args.args[0] == ae_mod.OP_OFFER_RESOLVE
+        assert cap.call_args.args[1] == "5"
+
+    @pytest.mark.asyncio
+    async def test_b1_no_alert_when_target_set_present(self):
+        # The drift alert fires ONLY on the empty-set case — a normally-synced
+        # offer (default target present) must NOT emit it (no false drift).
+        flow = _flow("offer", {"offer_id": 5})
+        r = _redis_with_hashes(
+            {
+                "offer:5": {"has_targets": "1", "url": "https://offer.bare/x"},
+                "offer_target:7": {"url": "https://t-default", "is_default": "1"},
+            },
+            sets={"offer:5:targets": {"7"}},
+        )
+        with patch.object(ae_mod, "capture_op_msg_throttled") as cap:
+            result = await execute_action(
+                r, flow, _click(), "1",
+                source_mappings=None, campaign_mappings=None,
+                build_url_fn=_stub_build_url(),
+            )
+        assert result is not None and result["target_id"] == "7"
+        cap.assert_not_called()
 
 
 class TestSplitFloatWeightTruncation:

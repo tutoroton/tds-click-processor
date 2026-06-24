@@ -755,7 +755,10 @@ def _decision_reason(result: dict, timing: dict, attr: dict) -> str:
         # domain-resolution sentinel) is distinct from a flow-authored block;
         # 05-data-provenance §5 lists `domain_blocked` as its own value. Keyed
         # off the raw `routing_result` so a flow block stays `blocked_by_flow`.
-        if timing.get("result") == "blocked_unmatched_subdomain":
+        # R69 — a `blocked_dead_binding` (binding outlived its campaign hash)
+        # is also a domain-level edge block; tag it `domain_blocked` while the
+        # raw `routing_result` stays distinct for drill-down.
+        if timing.get("result") in ("blocked_unmatched_subdomain", "blocked_dead_binding"):
             return "domain_blocked"
         return "blocked_by_flow"
     if rs == "no_match":

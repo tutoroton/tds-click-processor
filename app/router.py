@@ -201,8 +201,33 @@ async def route(req: ClickRequest) -> dict | None:
                 await _commit_deferred_identity(routed.get("attribution"))
                 return routed
 
-        # Domain matched but no usable routing path — fall through to geo targeting.
-        timing["domain_fallthrough"] = True
+            # CF-OBS-1 — the campaign hash is PRESENT but produced no usable
+            # route (no flow/offer and no own terminal_fallback): the legitimate
+            # bare-domain catch-all. Fall through to geo targeting (unchanged).
+            timing["domain_fallthrough"] = True
+        else:
+            # R69 — the binding resolved to a campaign whose HASH is ABSENT
+            # (archived/deleted, or a transient builder-skip / partial-apply /
+            # stale-key window — sync/builders emit a binding key and its
+            # campaign hash under the same `c.status='active'` predicate, so
+            # this is rare but reachable). Fail CLOSED at binding granularity,
+            # mirroring F9 `domains:disabled`: do NOT fall through to geo, which
+            # would re-attribute this click to a FOREIGN active campaign via the
+            # geo branch. The worker serves its controlled fallback (main.py
+            # consumes this block sentinel — F-1/G2/F-2). Zero added Redis call
+            # (this reads the already-fetched empty `hgetall` result).
+            timing["domain_matched"] = False
+            timing["route_total_ms"] = _ms_since(t_start)
+            timing["result"] = "blocked_dead_binding"
+            return {
+                "url": None,
+                "campaign_id": None,
+                "offer_id": None,
+                "binding_id": resolution.binding_id,
+                "binding_alias": resolution.binding_alias,
+                "timing": timing,
+                "blocked": True,
+            }
 
     # Stage 1: UA parsing (cached, should be <0.1ms on cache hit)
     t0 = time.perf_counter()

@@ -4,9 +4,12 @@ Tests cover: device/OS/browser parsing, URL building, weighted selection,
 parameter mapping, edge cases, and malicious inputs.
 """
 
+import json
+
 import pytest
 from unittest.mock import MagicMock
 
+from app.cascade import _first_failing_criterion
 from app.router import (
     parse_device_type,
     parse_os,
@@ -16,6 +19,7 @@ from app.router import (
     resolve_target,
     weighted_select,
     weighted_select_from_dict,
+    _extra_click_dims,
 )
 from app.models import ClickRequest
 
@@ -615,3 +619,42 @@ class TestResolveTargetLegacy:
             },
         )
         assert await resolve_target(r, offer, _ot_click()) == "https://id-2"
+
+    @pytest.mark.asyncio
+    async def test_r72_time_of_day_matcher_parity_cascade_vs_legacy(self):
+        """R72 cross-matcher parity — the cascade matcher
+        (`cascade._first_failing_criterion`) and this legacy `resolve_target`
+        matcher MUST return the SAME verdict over a shared time_of_day matrix.
+        Both consume the shared `cascade.normalize_hour`, so the lockstep is
+        structural — drift between the two matchers is a silent foot-gun."""
+        # (arrival_ts, op, values, expect_match)
+        matrix = [
+            ("2026-06-07T09:30:00Z", "in", ["09"], True),       # 9 vs "09" → match (the fix)
+            ("2026-06-07T09:30:00Z", "not_in", ["09"], False),  # excluded (was a no-op)
+            ("2026-06-08T00:05:00Z", "in", ["00"], True),       # midnight padded
+            ("2026-06-07T13:00:00Z", "in", ["13"], True),       # two-digit unaffected
+            ("2026-06-07T09:30:00Z", "in", ["10"], False),      # genuine no-match
+        ]
+        for arrival_ts, op, values, expect_match in matrix:
+            req = ClickRequest(
+                click_id="parity", country="US",
+                user_agent="Mozilla/5.0 (iPhone)", accept_language="en-US",
+                arrival_ts=arrival_ts, query_params={},
+            )
+            crit = {"type": "time_of_day", "op": op, "values": values}
+            # Cascade matcher verdict (None == match), fed the SAME derived dims.
+            cascade_match = _first_failing_criterion(
+                [crit], _extra_click_dims(req)) is None
+            # Legacy resolve_target verdict (matching url returned == match).
+            offer = {"_id": "5", "has_targets": "1"}
+            r = _ot_redis(
+                {"offer:5:targets": {"7"}},
+                {"offer_target:7": {
+                    "url": "https://hit", "priority": "10", "is_default": "0",
+                    "criteria": json.dumps([crit])}},
+            )
+            legacy_match = (await resolve_target(r, offer, req)) == "https://hit"
+            assert cascade_match == legacy_match == expect_match, (
+                f"matcher disagreement at {arrival_ts} {op} {values}: "
+                f"cascade={cascade_match} legacy={legacy_match}"
+            )

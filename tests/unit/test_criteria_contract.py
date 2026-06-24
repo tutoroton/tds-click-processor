@@ -19,6 +19,7 @@ from __future__ import annotations
 from app.cascade import (
     _EVALUATED_BASE_DIMS,
     _first_failing_criterion,
+    normalize_hour,
 )
 from app.models import ClickRequest
 from app.router import _extra_click_dims
@@ -170,3 +171,75 @@ def test_time_of_day_in_matches():
         [{"type": "time_of_day", "op": "in", "values": ["13", "14"]}], attrs) is None
     assert _first_failing_criterion(
         [{"type": "time_of_day", "op": "in", "values": ["9"]}], attrs) is not None
+
+
+# ---- R72: time_of_day zero-pad normalization (cascade matcher) -------------
+# The edge emits an un-padded hour ("9"); the admin validator accepts BOTH "9"
+# and "09" (`^(0?[0-9]|1[0-9]|2[0-3])$`). Pre-fix a saved "09" criterion never
+# matched a 9:00 click (`in` no-match, `not_in` silent no-op). `normalize_hour`
+# canonicalizes BOTH sides at compare time, time_of_day ONLY.
+
+def test_time_of_day_zero_padded_criterion_matches_unpadded_click():
+    """THE FIX — a saved "09" matches a 9:00 click ("9"). Was: no match."""
+    attrs = {"time_of_day": "9"}
+    assert _first_failing_criterion(
+        [{"type": "time_of_day", "op": "in", "values": ["09"]}], attrs) is None
+
+
+def test_time_of_day_not_in_zero_padded_excludes_unpadded_click():
+    """`not_in ["09"]` now EXCLUDES a 9:00 click (was a silent fail-open no-op)."""
+    attrs = {"time_of_day": "9"}
+    assert _first_failing_criterion(
+        [{"type": "time_of_day", "op": "not_in", "values": ["09"]}], attrs) is not None
+
+
+def test_time_of_day_midnight_padded_matches():
+    """Midnight: click "0" matches both a "00"-saved and a "0"-saved criterion
+    (validator already accepts "00"; zfill would have fail-OPENED here)."""
+    attrs = {"time_of_day": "0"}
+    assert _first_failing_criterion(
+        [{"type": "time_of_day", "op": "in", "values": ["00"]}], attrs) is None
+    assert _first_failing_criterion(
+        [{"type": "time_of_day", "op": "in", "values": ["0"]}], attrs) is None
+
+
+def test_time_of_day_regression_unpadded_and_two_digit_unaffected():
+    """Regression — un-padded and two-digit hours still match as before."""
+    assert _first_failing_criterion(
+        [{"type": "time_of_day", "op": "in", "values": ["9"]}],
+        {"time_of_day": "9"}) is None
+    assert _first_failing_criterion(
+        [{"type": "time_of_day", "op": "in", "values": ["13"]}],
+        {"time_of_day": "13"}) is None
+
+
+def test_time_of_day_absent_click_fails_closed_preserved():
+    """Absent arrival_ts ⇒ click_val "" passes through normalize unchanged →
+    fail-closed on `in`, fail-open on `not_in` (documented legacy semantics,
+    unchanged by R72)."""
+    attrs = {"time_of_day": ""}
+    assert _first_failing_criterion(
+        [{"type": "time_of_day", "op": "in", "values": ["09"]}], attrs) is not None
+    assert _first_failing_criterion(
+        [{"type": "time_of_day", "op": "not_in", "values": ["09"]}], attrs) is None
+
+
+def test_normalize_hour_scope_guard_other_digit_dims_untouched():
+    """SCOPE GUARD — a digit-valued NON-time_of_day dim (isp_asn) is NOT
+    normalized: "09" ≠ "9" stays a no-match, proving the special-case is
+    keyed `dim == "time_of_day"` only."""
+    attrs = {"isp_asn": "09"}
+    assert _first_failing_criterion(
+        [{"type": "isp_asn", "op": "in", "values": ["9"]}], attrs) is not None
+
+
+def test_normalize_hour_unit():
+    """The shared helper: digits → leading-zero-stripped; "" and junk pass
+    through unchanged (zfill is forbidden — it would fail-open at midnight)."""
+    assert normalize_hour("09") == "9"
+    assert normalize_hour("9") == "9"
+    assert normalize_hour("0") == "0"
+    assert normalize_hour("00") == "0"
+    assert normalize_hour("13") == "13"
+    assert normalize_hour("") == ""        # absent arrival → stays "" (fail-closed)
+    assert normalize_hour("9am") == "9am"  # junk passes through (never a real hour)

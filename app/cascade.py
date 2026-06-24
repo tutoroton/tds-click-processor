@@ -694,6 +694,16 @@ def _first_failing_criterion(
                 v.lower() if isinstance(v, str) else v for v in raw_values
             )
 
+        # R72 — time_of_day: the edge emits an un-padded "9" while the admin
+        # validator accepts both "9" and "09"; normalize BOTH sides so a saved
+        # "09" matches a 9:00 click. Scoped to time_of_day ONLY → every other
+        # dim byte-identical. Kept in lockstep with `router.resolve_target`.
+        if dim == "time_of_day":
+            click_val = normalize_hour(click_val)
+            values = frozenset(
+                normalize_hour(v) if isinstance(v, str) else v for v in values
+            )
+
         if op == "in":
             if click_val not in values:
                 return c
@@ -823,6 +833,18 @@ _EVALUATED_RETURNING_DIMS: Final[frozenset[str]] = frozenset({
 KNOWN_EVALUATED_DIMS: Final[frozenset[str]] = (
     _EVALUATED_BASE_DIMS | _EVALUATED_RETURNING_DIMS
 )
+
+
+def normalize_hour(value: str) -> str:
+    """R72 — canonicalize a `time_of_day` value to its leading-zero-stripped form
+    so a saved "09" criterion matches an un-padded "9" click (and vice-versa).
+    "09"/"9"→"9", "00"/"0"→"0". Empty ("" — absent arrival_ts) and non-digit junk
+    pass THROUGH unchanged, so the absent-arrival fail-closed ("" never equals a
+    real hour) is preserved. zfill is FORBIDDEN here ("".zfill(2)=="00" would
+    fail-OPEN at midnight). Shared by BOTH matchers (cascade
+    `_first_failing_criterion` + router `resolve_target`) so they stay in
+    lockstep — router already imports cascade, so no circular import."""
+    return str(int(value)) if value.isdigit() else value
 
 
 def _criteria_match(

@@ -1941,6 +1941,16 @@ async def resolve_target_with_id(
                 match = False
                 break
 
+            # R72 — kept in lockstep with `cascade._first_failing_criterion`:
+            # normalize time_of_day on BOTH sides so a saved "09" matches an
+            # un-padded "9" click. Scoped to time_of_day ONLY.
+            if dim == "time_of_day":
+                click_val = cascade.normalize_hour(click_val)
+                values = [
+                    cascade.normalize_hour(v) if isinstance(v, str) else v
+                    for v in values
+                ]
+
             if op == "in" and click_val not in values:
                 match = False
                 break

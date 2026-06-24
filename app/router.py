@@ -25,6 +25,7 @@ migration safe for campaigns whose flows haven't yet been authored.
 """
 
 import functools
+import hashlib
 import json
 import logging
 import math
@@ -94,6 +95,17 @@ def _ms_since(start: float) -> float:
     return round((time.perf_counter() - start) * 1000, 2)
 
 
+def _seed_from(click_id: str | None) -> int:
+    """R70 — edge-stable per-click seed shared by every raced node so they all
+    make the SAME weighted decision (served == recorded; D2-9 sticky divergence
+    mooted). blake2b ⇒ uniform 64-bit ⇒ the weighted-pick expectation is
+    preserved over the click population (click_ids are ~uniform: 12-hex ms +
+    12-hex random). A null/empty click_id seeds from "" (deterministic, rare)."""
+    return int.from_bytes(
+        hashlib.blake2b((click_id or "").encode(), digest_size=8).digest(), "big"
+    )
+
+
 async def route(req: ClickRequest) -> dict | None:
     """Find matching campaign + offer for this click.
 
@@ -121,6 +133,11 @@ async def route(req: ClickRequest) -> dict | None:
     """
     t_start = time.perf_counter()
     timing = {}
+
+    # R70 — one click-seeded RNG drives every weighted decision on this click's
+    # path (campaign winner, legacy split, the cascade split re-roll). Threaded
+    # as `rng` (default `random` keeps every non-route caller byte-identical).
+    rng = random.Random(_seed_from(req.click_id))
 
     r = await get_redis()
 
@@ -168,6 +185,7 @@ async def route(req: ClickRequest) -> dict | None:
             routed = await _route_via_campaign(
                 r, campaign, domain_campaign_id, req, timing,
                 result_label="domain_matched",
+                rng=rng,
                 binding_id=resolution.binding_id,
                 binding_alias=resolution.binding_alias,
                 # Domain match is NOT terminal — a no-route outcome here
@@ -274,12 +292,13 @@ async def route(req: ClickRequest) -> dict | None:
 
     # Stage 6: Campaign selection (priority + weight)
     t0 = time.perf_counter()
-    winner = _select_winner(eligible)
+    winner = _select_winner(eligible, rng)
     timing["selection_ms"] = _ms_since(t0)
 
     # Stages 6.5-9: flow cascade → action execution → counter increment.
     routed = await _route_via_campaign(
         r, winner, winner["_id"], req, timing, result_label="matched",
+        rng=rng,
     )
     if routed is not None:
         return routed
@@ -293,17 +312,21 @@ async def route(req: ClickRequest) -> dict | None:
     return None
 
 
-def _select_winner(campaigns: list[dict[str, Any]]) -> dict[str, Any] | None:
+def _select_winner(
+    campaigns: list[dict[str, Any]], rng=random,
+) -> dict[str, Any] | None:
     """Pick the routing winner from a list of campaign HASHes.
 
     Top-priority bucket, then weighted-random within it (Stage 6
-    selection). Returns `None` for an empty list.
+    selection). Returns `None` for an empty list. R70 — `rng` defaults to the
+    `random` module so direct callers stay byte-identical; `route()` injects a
+    click-seeded instance.
     """
     if not campaigns:
         return None
     top_priority = max(safe_int(c.get("priority"), 0) for c in campaigns)
     top = [c for c in campaigns if safe_int(c.get("priority"), 0) == top_priority]
-    return weighted_select(top)
+    return weighted_select(top, rng)
 
 
 def _attribution_buyer_chain(attribution: dict[str, Any]) -> dict[str, int | None]:
@@ -718,6 +741,7 @@ async def _route_via_campaign(
     timing: dict[str, Any],
     *,
     result_label: str,
+    rng=random,
     binding_id: int = 0,
     binding_alias: str | None = None,
     fall_through_on_no_route: bool = False,
@@ -804,6 +828,7 @@ async def _route_via_campaign(
         buyer_chain=buyer_chain,
         attribution=attribution,
         allowed_avail=allowed_avail,
+        rng=rng,
     )
     timing["cascade_ms"] = _ms_since(t0)
 
@@ -871,7 +896,7 @@ async def _route_via_campaign(
 
     # Stage 7 — legacy fallback (no flow matched).
     t0 = time.perf_counter()
-    offer = await select_offer(r, campaign_id)
+    offer = await select_offer(r, campaign_id, rng)
     timing["offer_ms"] = _ms_since(t0)
     if not offer:
         if fall_through_on_no_route:
@@ -995,6 +1020,7 @@ async def _resolve_action_with_sticky(
     identity_macros: dict[str, Any] | None = None,
     trace: dict[str, Any] | None = None,
     fresh_track: bool = False,
+    rng=random,
 ) -> tuple[dict[str, Any] | None, str]:
     """v2 Phase S — resolve the destination, applying the sticky pin when active.
 
@@ -1035,6 +1061,7 @@ async def _resolve_action_with_sticky(
             build_url_fn=_build_url,
             allowed_avail=allowed_avail,
             trace=trace,
+            rng=rng,
         )
 
     if not sticky_active:
@@ -1116,6 +1143,7 @@ async def _try_flow_cascade(
     buyer_chain: dict[str, int | None],
     attribution: dict[str, Any],
     allowed_avail=frozenset({"active"}),
+    rng=random,
 ) -> dict[str, Any] | None:
     """Run scope cascade + action execution. Returns None if no flow.
 
@@ -1318,6 +1346,7 @@ async def _try_flow_cascade(
         campaign_mappings=campaign_mappings,
         sticky_active=sticky_active,
         fresh_track=fresh_track,
+        rng=rng,
         uid=uid,
         company_id=company_id,
         seen_before=seen_before,
@@ -1728,8 +1757,10 @@ async def resolve_domain_campaign(r, req: ClickRequest) -> DomainResolution:
     return _NO_DOMAIN_MATCH
 
 
-async def select_offer(r, campaign_id: str) -> dict | None:
-    """Select offer from campaign's split configuration."""
+async def select_offer(r, campaign_id: str, rng=random) -> dict | None:
+    """Select offer from campaign's split configuration. R70 — `rng` defaults to
+    the `random` module (byte-identical for direct callers); `route()` threads a
+    click-seeded instance so raced nodes pick the same legacy offer."""
     try:
         split = await r.hgetall(f"split:{campaign_id}")
         if not split:
@@ -1737,14 +1768,14 @@ async def select_offer(r, campaign_id: str) -> dict | None:
             offer_ids = await r.smembers(offers_key)
             if not offer_ids:
                 return None
-            offer_id = random.choice(sorted(offer_ids))
+            offer_id = rng.choice(sorted(offer_ids))
             offer = await r.hgetall(f"offer:{offer_id}")
             if not offer:
                 return None
             offer["_id"] = offer_id
             return offer
 
-        offer_id = weighted_select_from_dict(split)
+        offer_id = weighted_select_from_dict(split, rng)
         offer = await r.hgetall(f"offer:{offer_id}")
         if not offer:
             return None
@@ -2268,15 +2299,15 @@ def build_url(
     return safe_substitute(template, values)
 
 
-def weighted_select(items: list[dict]) -> dict:
+def weighted_select(items: list[dict], rng=random) -> dict:
     weights = [safe_int(item.get("weight"), 100) for item in items]
-    return random.choices(items, weights=weights, k=1)[0]
+    return rng.choices(items, weights=weights, k=1)[0]
 
 
-def weighted_select_from_dict(d: dict) -> str:
+def weighted_select_from_dict(d: dict, rng=random) -> str:
     keys = list(d.keys())
     weights = [safe_int(w, 1) for w in d.values()]
-    return random.choices(keys, weights=weights, k=1)[0]
+    return rng.choices(keys, weights=weights, k=1)[0]
 
 
 def parse_device_type(ua: str | None) -> str:

@@ -153,6 +153,7 @@ async def execute_action(
     build_url_fn,
     allowed_avail=frozenset({"active"}),
     trace: dict[str, Any] | None = None,
+    rng=random,
 ) -> dict[str, Any] | None:
     """Translate a winning flow into a concrete routing result.
 
@@ -196,7 +197,7 @@ async def execute_action(
     if action_type == "split":
         return await _execute_split(r, config, req, campaign_id, build_url_fn,
                                      source_mappings, campaign_mappings, flow_id,
-                                     allowed_avail, trace=trace)
+                                     allowed_avail, trace=trace, rng=rng)
     if action_type == "block":
         return BLOCK_RESULT
 
@@ -285,8 +286,11 @@ async def _execute_split(
     flow_id: str | None,
     allowed_avail,
     trace: dict[str, Any] | None = None,
+    rng=random,
 ) -> dict[str, Any] | None:
-    """`split` — weighted random pick over `action_config.offers`."""
+    """`split` — weighted random pick over `action_config.offers`. R70 — `rng`
+    defaults to the `random` module (byte-identical for direct callers); the
+    router threads a click-seeded instance so raced nodes pick identically."""
     entries = config.get("offers")
     if not isinstance(entries, list) or len(entries) < 1:
         logger.warning("split action missing offers list — falling back")
@@ -382,7 +386,7 @@ async def _execute_split(
     cand: list[dict[str, Any]] = list(valid)
     cand_w: list[int] = list(weights)
     while cand and sum(cand_w) > 0:
-        chosen = random.choices(cand, weights=cand_w, k=1)[0]
+        chosen = rng.choices(cand, weights=cand_w, k=1)[0]
         result = await _resolve_offer_url(
             r, str(chosen["offer_id"]), chosen.get("target_id"),
             req, campaign_id, build_url_fn,

@@ -15,6 +15,7 @@ import pytest
 from app import action_executor as ae_mod
 from app.action_executor import (
     BLOCK_RESULT,
+    UNAVAILABLE_RESULT,
     _is_positive_int,
     _parse_action_config,
     execute_action,
@@ -751,3 +752,134 @@ class TestLDF2SplitTrace:
         )
         assert result is not None
         assert "split" not in trace
+
+
+# ============================================================
+# R68 (ADR-0034, Option A) — split leg on a PAUSED/absent offer re-rolls to a
+# live leg instead of falling through to legacy re-serve (the camp-35/flow-300
+# ot=0 defect). All-dead ⇒ terminal_fallback, never bare None.
+# ============================================================
+
+
+class TestR68SplitReroll:
+    @pytest.mark.asyncio
+    async def test_split_paused_offer_leg_rerolls_to_live_leg(self):
+        """A leg pointing at a paused/absent offer (its Redis subtree pruned)
+        resolves to bare None; it is dropped and the live leg absorbs its share.
+        Over many picks the dead leg is NEVER served and the result is never
+        None / never UNAVAILABLE — always the live target."""
+        flow = _flow("split", {
+            "offers": [
+                {"offer_id": 5, "target_id": 7, "weight": 50},    # live
+                {"offer_id": 9, "target_id": 99, "weight": 50},   # offer 9 + target 99 absent
+            ],
+        })
+        # Only leg A's target is seeded; offer:9 and offer_target:99 are absent →
+        # leg B resolves to bare None on every pick.
+        r = _redis_with_hashes({
+            "offer_target:7": {"url": "https://live-7", "is_default": "0",
+                               "availability": "active"},
+        })
+        for _ in range(200):
+            result = await execute_action(
+                r, flow, _click(), "1",
+                source_mappings=None, campaign_mappings=None,
+                build_url_fn=_stub_build_url(),
+            )
+            assert result is not None and result is not UNAVAILABLE_RESULT
+            assert result["target_id"] == "7"
+
+    @pytest.mark.asyncio
+    async def test_split_all_legs_unresolvable_returns_unavailable(self):
+        """Every leg points at an absent offer ⇒ UNAVAILABLE_RESULT
+        (terminal_fallback), NEVER bare None (which falls to legacy re-serve =
+        the ot=0 bug). Also pins loop termination (risk #2)."""
+        flow = _flow("split", {
+            "offers": [
+                {"offer_id": 8, "target_id": 80, "weight": 50},
+                {"offer_id": 9, "target_id": 90, "weight": 50},
+            ],
+        })
+        r = _redis_with_hashes({})  # nothing seeded → every leg → bare None
+        result = await execute_action(
+            r, flow, _click(), "1",
+            source_mappings=None, campaign_mappings=None,
+            build_url_fn=_stub_build_url(),
+        )
+        assert result is UNAVAILABLE_RESULT
+
+    @pytest.mark.asyncio
+    async def test_split_reroll_records_survivors_in_trace(self):
+        """After a re-roll, trace.split records only the SURVIVING leg(s); the
+        picked target == the served target."""
+        flow = _flow("split", {
+            "offers": [
+                {"offer_id": 5, "target_id": 7, "weight": 50},    # live
+                {"offer_id": 9, "target_id": 99, "weight": 50},   # dead (absent offer)
+            ],
+        })
+        r = _redis_with_hashes({
+            "offer_target:7": {"url": "https://live-7", "is_default": "0",
+                               "availability": "active"},
+        })
+
+        # Force the dead leg (offer 9) to be picked FIRST so it is dropped and the
+        # trace records only the surviving leg. Patching the module `random`
+        # covers both commits (in R70 the default rng IS this module).
+        def _pick_dead_first(population, weights=None, k=1):
+            for e in population:
+                if e.get("offer_id") == 9:
+                    return [e]
+            return [population[0]]
+
+        trace: dict = {}
+        with patch.object(ae_mod.random, "choices", _pick_dead_first):
+            result = await execute_action(
+                r, flow, _click(), "1",
+                source_mappings=None, campaign_mappings=None,
+                build_url_fn=_stub_build_url(), trace=trace,
+            )
+        assert result is not None and result["target_id"] == "7"
+        assert trace["split"]["weights"] == [{"target_id": 7, "w": 50}]
+        assert trace["split"]["total"] == 50
+        assert trace["split"]["picked"] == int(result["target_id"]) == 7
+
+    @pytest.mark.asyncio
+    async def test_split_avail_blocked_leg_still_unavailable_not_rerolled(self):
+        """Risk #5 — a chosen leg whose offer-default target is availability-
+        excluded returns UNAVAILABLE_RESULT immediately (terminal_fallback); it is
+        NOT re-rolled into a live sibling (only a bare None re-rolls). Guards the
+        C2 drain contract from the re-roll change."""
+        flow = _flow("split", {
+            "offers": [
+                {"offer_id": 5, "weight": 50},                    # offer-default CLOSED
+                {"offer_id": 6, "target_id": 9, "weight": 50},    # live sibling
+            ],
+        })
+        r = _redis_with_hashes(
+            {
+                "offer:5": {"has_targets": "1"},
+                "offer_target:50": {"url": "https://closed", "is_default": "1",
+                                    "availability": "closed", "offer_id": "5"},
+                "offer_target:9": {"url": "https://live-9", "is_default": "0",
+                                   "availability": "active"},
+            },
+            sets={"offer:5:targets": {"50"}},
+        )
+
+        # Force the avail-blocked leg (offer 5, no pinned target → offer-default)
+        # to be chosen first; the live sibling must NOT absorb it.
+        def _pick_blocked_first(population, weights=None, k=1):
+            for e in population:
+                if e.get("offer_id") == 5:
+                    return [e]
+            return [population[0]]
+
+        with patch.object(ae_mod.random, "choices", _pick_blocked_first):
+            result = await execute_action(
+                r, flow, _click(), "1",
+                source_mappings=None, campaign_mappings=None,
+                build_url_fn=_stub_build_url(),
+                allowed_avail=frozenset({"active"}),
+            )
+        assert result is UNAVAILABLE_RESULT

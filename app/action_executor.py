@@ -372,36 +372,57 @@ async def _execute_split(
         return None
     valid, weights = kept_valid, kept_weights
 
-    chosen = random.choices(valid, weights=weights, k=1)[0]
-    # v2 LD-F2 — record the split decision into the trace (D22 / §05 Tier-3):
-    # the surviving legs' weights, their total, and the picked leg's target.
-    # Compact-always (cheap: the weights/pick are already in hand here). Absent
-    # on a non-split action → byte-identical for offer/redirect/block flows.
-    if trace is not None:
-        trace["split"] = {
-            "weights": [
-                {"target_id": _safe_target_int(e.get("target_id")), "w": w}
-                for e, w in zip(valid, weights)
-            ],
-            "total": sum(weights),
-            "picked": _safe_target_int(chosen.get("target_id")),
-        }
-    result = await _resolve_offer_url(
-        r, str(chosen["offer_id"]), chosen.get("target_id"),
-        req, campaign_id, build_url_fn,
-        source_mappings, campaign_mappings,
-        flow_id, allowed_avail,
-    )
-    # The chosen leg's pinned target was already availability-checked above; an
-    # UNAVAILABLE here means its offer-default fallback was also unavailable →
-    # propagate (terminal_fallback, no re-serve).
-    if result is UNAVAILABLE_RESULT:
-        return UNAVAILABLE_RESULT
-    # v2 Phase A2 — the SELECTION mechanism for a split is the weighted pick,
-    # regardless of how the chosen entry's URL resolved underneath.
-    if result is not None:
-        result["target_selection_path"] = "split_weighted"
-    return result
+    # R68 (ADR-0034, Option A) — resolve-with-re-roll. A picked leg whose offer
+    # hash is paused/absent (its Redis subtree pruned by sync) → _resolve_offer_url
+    # returns bare None; drop that leg and re-pick among the surviving, re-normalized
+    # legs so the live legs absorb the dead leg's share (50/50 → 100% live). When
+    # every leg is unresolvable ⇒ UNAVAILABLE_RESULT (terminal_fallback), NEVER bare
+    # None — a bare None falls through to legacy re-serve, which serves a URL but
+    # never stamps offer_target_id (the live camp-35/flow-300 ot=0 defect).
+    cand: list[dict[str, Any]] = list(valid)
+    cand_w: list[int] = list(weights)
+    while cand and sum(cand_w) > 0:
+        chosen = random.choices(cand, weights=cand_w, k=1)[0]
+        result = await _resolve_offer_url(
+            r, str(chosen["offer_id"]), chosen.get("target_id"),
+            req, campaign_id, build_url_fn,
+            source_mappings, campaign_mappings,
+            flow_id, allowed_avail,
+        )
+        # A chosen leg whose pinned/default target was excluded by the availability
+        # floor → terminal_fallback (UNCHANGED C2 drain contract, pinned by
+        # test_all_legs_closed_returns_unavailable). Do NOT re-roll an avail-blocked
+        # leg — only a bare None (unresolvable offer) re-rolls.
+        if result is UNAVAILABLE_RESULT:
+            return UNAVAILABLE_RESULT
+        if result is not None:
+            # v2 LD-F2 — record the split decision (D22 / §05 Tier-3): the SURVIVING
+            # legs' weights, their total, and the picked leg's target. When every leg
+            # resolves (the common case) survivors == the original `valid` ⇒
+            # byte-identical trace; a re-roll records only the survivor set.
+            if trace is not None:
+                trace["split"] = {
+                    "weights": [
+                        {"target_id": _safe_target_int(e.get("target_id")), "w": w}
+                        for e, w in zip(cand, cand_w)
+                    ],
+                    "total": sum(cand_w),
+                    "picked": _safe_target_int(chosen.get("target_id")),
+                }
+            # v2 Phase A2 — the SELECTION mechanism for a split is the weighted pick,
+            # regardless of how the chosen entry's URL resolved underneath.
+            result["target_selection_path"] = "split_weighted"
+            return result
+        # bare None ⇒ unresolvable leg (paused/absent offer) ⇒ drop + re-roll.
+        # `.index` matches the first identity/equality hit; re-rolling either copy
+        # of an equal leg is fine (the survivor weights are unchanged either way).
+        _i = cand.index(chosen)
+        cand.pop(_i)
+        cand_w.pop(_i)
+
+    # Every leg unresolvable (all offers paused/absent) ⇒ terminal_fallback, never
+    # legacy re-serve (the ot=0 bug).
+    return UNAVAILABLE_RESULT
 
 
 async def _resolve_offer_url(

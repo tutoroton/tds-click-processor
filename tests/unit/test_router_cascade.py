@@ -583,6 +583,95 @@ class TestLegacyFallback:
 
 
 # ============================================================
+# R68 (ADR-0034) — legacy Stage-8 now stamps the resolved offer_target_id
+# (was always 0), and `resolve_target` stays a byte-identical wrapper over the
+# new id-returning `resolve_target_with_id`.
+# ============================================================
+
+
+class TestR68LegacyStamp:
+    def test_legacy_split_real_target_stamps_offer_target_id(self):
+        """Campaign with no flows → legacy `select_offer` picks offer 55 →
+        `resolve_target_with_id` finds target 77 → attribution stamps its id
+        (the legacy path recorded offer_target_id=0 before R68)."""
+        campaign_id = "10"
+        offer_id = "55"
+        target_id = "77"
+        redis = FakeRedis(
+            sets={
+                "geo:US": {campaign_id},
+                "device:mobile": {campaign_id},
+                "os:ios": {campaign_id},
+                "campaigns:active": {campaign_id},
+                f"campaign:{campaign_id}:offers": {offer_id},
+                f"offer:{offer_id}:targets": {target_id},
+            },
+            hashes={
+                f"campaign:{campaign_id}": {"company_id": "1", "priority": "0"},
+                f"offer:{offer_id}": {"url": "https://bare", "has_targets": "1"},
+                f"offer_target:{target_id}": {
+                    "url": "https://t-77/{click_id}",
+                    "is_default": "1",
+                    "availability": "active",
+                    "criteria": "[]",
+                    "priority": "0",
+                },
+            },
+            lists={f"campaign:{campaign_id}:flows": []},
+        )
+        result = _route_with(redis, _click())
+        assert result is not None
+        assert result["timing"].get("route_via") == "legacy_split"
+        assert result["attribution"]["offer_target_id"] == int(target_id)
+        assert "t-77" in result["url"]
+
+    def test_resolve_target_wrapper_unchanged(self):
+        """Contract — `resolve_target` returns the same `str | None` as
+        `resolve_target_with_id(...)[0]` for match / default / no-target /
+        all-closed cases (the wrapper must not alter the 11-site signature)."""
+        import asyncio
+
+        async def _both(hashes, sets, offer, avail=frozenset({"active"})):
+            r = FakeRedis(hashes=hashes, sets=sets)
+            wrapped = await router.resolve_target(r, offer, _click(), avail)
+            url, _tid = await router.resolve_target_with_id(r, offer, _click(), avail)
+            return wrapped, url
+
+        # (a) match — empty-criteria target
+        offer = {"_id": "1", "has_targets": "1"}
+        w, u = asyncio.run(_both(
+            {"offer_target:10": {"url": "https://match", "is_default": "0",
+                                 "criteria": "[]", "availability": "active",
+                                 "priority": "0"}},
+            {"offer:1:targets": {"10"}}, offer))
+        assert w == u == "https://match"
+
+        # (b) default — non-matching criteria falls through to the is_default url
+        offer = {"_id": "2", "has_targets": "1"}
+        w, u = asyncio.run(_both(
+            {"offer_target:21": {
+                "url": "https://default", "is_default": "1",
+                "criteria": json.dumps([{"type": "geo", "op": "in", "values": ["RU"]}]),
+                "availability": "active", "priority": "0"}},
+            {"offer:2:targets": {"21"}}, offer))
+        assert w == u == "https://default"
+
+        # (c) no-target — has_targets=0
+        offer = {"_id": "3", "has_targets": "0"}
+        w, u = asyncio.run(_both({}, {}, offer))
+        assert w is u is None
+
+        # (d) all-closed — every target availability-excluded → None
+        offer = {"_id": "4", "has_targets": "1"}
+        w, u = asyncio.run(_both(
+            {"offer_target:40": {"url": "https://closed", "is_default": "1",
+                                 "criteria": "[]", "availability": "closed",
+                                 "priority": "0"}},
+            {"offer:4:targets": {"40"}}, offer, frozenset({"active"})))
+        assert w is u is None
+
+
+# ============================================================
 # Failure modes
 # ============================================================
 

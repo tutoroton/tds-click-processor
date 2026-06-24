@@ -940,7 +940,7 @@ async def _route_via_campaign(
     #     risk than the residual it removes. The cascade path already routes
     #     all-unavailable flows to terminal_fallback (the reachable case).
     t0 = time.perf_counter()
-    target_url = await resolve_target(r, offer, req, allowed_avail)
+    target_url, chosen_tid = await resolve_target_with_id(r, offer, req, allowed_avail)
     url_template = target_url if target_url else offer.get("url", "")
     url = build_url(
         url_template, req, campaign_id, offer.get("_id", ""),
@@ -960,6 +960,11 @@ async def _route_via_campaign(
     attribution["winning_scope_type"] = "legacy"
     attribution["audience_pool"] = "none"
     attribution["target_selection_path"] = "split_weighted"
+    # R68 — stamp the resolved target id on the legacy Stage-8 path so a
+    # legacy-served click records its real offer_target_id (was always 0 — the
+    # broader legacy ot=0 class the split re-roll alone wouldn't reach). None for
+    # a bare-url offer (no target resolved) ⇒ no spurious ot. ADR-0034 defense.
+    attribution["offer_target_id"] = _to_int(chosen_tid)
 
     return {
         "url": url,
@@ -1753,22 +1758,36 @@ async def select_offer(r, campaign_id: str) -> dict | None:
 async def resolve_target(
     r, offer: dict, req: ClickRequest, allowed_avail=frozenset({"active"}),
 ) -> str | None:
-    """Resolve the best matching offer target URL for the click's attributes.
+    """Thin wrapper over `resolve_target_with_id` (R68) — byte-identical
+    signature + `str | None` return. 11 test sites + the Stage-8 caller depend
+    on this exact shape; the id-returning body is `resolve_target_with_id`."""
+    url, _ = await resolve_target_with_id(r, offer, req, allowed_avail)
+    return url
+
+
+async def resolve_target_with_id(
+    r, offer: dict, req: ClickRequest, allowed_avail=frozenset({"active"}),
+) -> tuple[str | None, str | None]:
+    """Resolve the best matching offer target for the click's attributes.
+
+    Returns `(url, target_id)` so the legacy Stage-8 path can stamp the served
+    `offer_target_id` (R68 — closes the legacy ot=0 class). `(None, None)` when
+    the offer has no targets, or none matched and no is_default exists.
 
     If offer has targets (has_targets=1):
       1. Load all target IDs from offer:{offer_id}:targets SET
       2. For each target (sorted by priority DESC), check criteria match
       3. First matching target's url_template wins
       4. Fallback: is_default=1 target
-    If no targets → return None (caller uses offer.url_template)
+    If no targets → return (None, None) (caller uses offer.url_template)
     """
     if offer.get("has_targets") != "1":
-        return None
+        return None, None
 
     offer_id = offer.get("_id", "")
     target_ids = await r.smembers(f"offer:{offer_id}:targets")
     if not target_ids:
-        return None
+        return None, None
 
     # Load all targets in one pipeline. B9 (audit 2026-06-03): sort
     # target_ids NUMERICALLY (via `_safe_id_sort_key`) so the
@@ -1815,6 +1834,7 @@ async def resolve_target(
     }
 
     default_url = None
+    default_tid: str | None = None
 
     # Mirrors `cascade._CASE_PRESERVE`. Kept inline — moving to a
     # shared module would force a circular import (router imports
@@ -1831,6 +1851,7 @@ async def resolve_target(
         # Check if this is the default fallback
         if t.get("is_default") == "1":
             default_url = t.get("url", "")
+            default_tid = t["_id"]
 
         # Parse criteria JSON
         criteria_raw = t.get("criteria", "[]")
@@ -1842,7 +1863,7 @@ async def resolve_target(
 
         # Empty criteria = matches all traffic
         if not criteria:
-            return t.get("url", "")
+            return t.get("url", ""), t["_id"]
 
         # Check each criterion
         match = True
@@ -1872,10 +1893,10 @@ async def resolve_target(
                 break
 
         if match:
-            return t.get("url", "")
+            return t.get("url", ""), t["_id"]
 
     # No criteria match — use default target if exists
-    return default_url
+    return default_url, default_tid
 
 
 # Defensive cap on per-click source enumeration. Realistic campaigns

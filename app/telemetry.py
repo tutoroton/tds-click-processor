@@ -89,6 +89,7 @@ OP_ROUTE_ERROR = "route_error"          # G-LOW-2 — route() catch-all (GEO-TDS
 OP_CRITERIA_SKIP = "criteria_skip"      # B12 — malformed flow criteria JSON skipped
 OP_FLOW_LOAD = "flow_load"              # D4  — flow HASH load empty/partial → None
 OP_PARAM_PARSE = "param_parse"          # D10 — param_mappings JSON unparseable
+OP_PARAM_RULES = "param_rules"          # GTD-R166 W2 — campaign param-rule config/eval fail-open
 OP_OFFER_RESOLVE = "offer_resolve"      # D3  — offer/target row missing → fallback
 OP_SPLIT_FALLBACK = "split_fallback"    # B3  — split had no usable offers → fallback
 

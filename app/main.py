@@ -977,6 +977,11 @@ def _build_extra_params(attribution: dict | None, query_params: dict) -> dict:
     else:
         extras = dict(extras)
     extras.pop("debug", None)
+    # GTD-R166 W2 — `_param_rules` is a SYSTEM-controlled provenance key (written
+    # post-resolution by the record builder). Strip any advertiser-supplied
+    # `?_param_rules=` on EVERY path (matched + no-match) so a forged value can
+    # never survive into `extra_params` and masquerade as real rule provenance.
+    extras.pop("_param_rules", None)
     return extras
 
 
@@ -1332,6 +1337,15 @@ async def decide(
     # matched click's record is byte-identical to before.
     if result.get("routing_status"):
         click_record["extra_params"]["routing_status"] = result["routing_status"]
+    # GTD-R166 W2 — param-rule provenance. Written POST-resolution (like
+    # routing_status), into the SYSTEM key `_param_rules` (advertiser copies
+    # already stripped in `_build_extra_params`), ONLY when ≥1 rule actually
+    # filled a slot. Compact JSON `[{"id": <uuid>, "slots": [...]}]`.
+    _applied = ((result.get("attribution") or {}).get("param_rules") or {}).get("applied")
+    if _applied:
+        click_record["extra_params"]["_param_rules"] = json.dumps(
+            _applied, separators=(",", ":")
+        )
     record_build_ms = round((time.perf_counter() - t_record_start) * 1000, 2)
 
     # Assemble timing before stream write (stream_write_ms added after)

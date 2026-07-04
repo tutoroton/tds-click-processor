@@ -49,7 +49,7 @@ is the SOURCE-WINS contract.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import pytest
 
@@ -293,3 +293,94 @@ def test_duplicate_url_key_last_wins_is_an_upstream_parse_concern():
         campaign_mappings=None,
     )
     assert slots == {"sub5": "DUPB"}
+
+
+# ===========================================================================
+# NEW RUNG (GTD-R166 W2) — post-chain, fill-only campaign parameter rules.
+#
+# Rules run AFTER the resolve_slots value-chain (in
+# `router._build_campaign_attribution`) and fill a slot ONLY if it is still
+# empty. The URL / source-hardcode / campaign-hardcode rungs above are
+# byte-UNCHANGED — every existing CONTRACT row runs with NO rules, proving
+# resolve_slots itself is untouched. These rows pin the ONE new rung:
+#
+#     value = URL(...) > eff_source.hardcode > campaign.hardcode
+#             > FILL-RULE (only if still empty)          <-- NEW, lowest
+#             > NULL
+# ===========================================================================
+
+from app.models import ClickRequest  # noqa: E402
+from app.param_rules import apply_param_rules  # noqa: E402
+from app.router import build_macro_values  # noqa: E402
+
+# A match-ALL rule (empty conditions) that assigns keyword — isolates the
+# fill-vs-occupied precedence from condition matching (covered in
+# test_param_rules.py).
+_KEYWORD_FILL_RULE = [{
+    "id": "rung-rule",
+    "enabled": True,
+    "conditions_logic": "and",
+    "conditions": [],
+    "assignments": [{"slot": "keyword", "value": "RULEFILL"}],
+}]
+
+
+def _resolve_then_rules(url, *, source=None, campaign=None, rules=_KEYWORD_FILL_RULE):
+    """The production order: resolve the full chain, THEN apply post-chain
+    rules over the resolved slots (fill-only)."""
+    req = ClickRequest(click_id="c", country="US", user_agent="", query_params=url)
+    slots, _extras = resolve_slots(
+        query_params=url, source_mappings=source, campaign_mappings=campaign)
+    mv = build_macro_values(req=req, slots=dict(slots), campaign_id="1")
+    out = apply_param_rules(rules_raw=rules, req=req, slots=slots, macro_values=mv)
+    return slots, out
+
+
+def test_rung_fill_applies_only_when_empty_post_chain():
+    """Slot empty after URL+hardcode chain → the fill-rule supplies it."""
+    slots, out = _resolve_then_rules({})
+    assert slots["keyword"] == "RULEFILL"
+    assert out["fills"] == {"keyword": "RULEFILL"}
+
+
+def test_rung_url_value_beats_fill():
+    """URL delivered the slot → 'URL wins' invariant intact; rule is a no-op."""
+    slots, out = _resolve_then_rules({"keyword": "FROMURL"})
+    assert slots["keyword"] == "FROMURL"
+    assert out["fills"] == {}
+
+
+def test_rung_source_hardcode_beats_fill():
+    """eff_source hardcode filled the slot → above the fill-rule; rule no-op."""
+    slots, out = _resolve_then_rules(
+        {}, source=[_m("keyword", default_value="SRCHC")])
+    assert slots["keyword"] == "SRCHC"
+    assert out["fills"] == {}
+
+
+def test_rung_campaign_hardcode_beats_fill():
+    """campaign hardcode filled the slot → above the fill-rule; rule no-op."""
+    slots, out = _resolve_then_rules(
+        {}, campaign=[_m("keyword", default_value="CMPHC")])
+    assert slots["keyword"] == "CMPHC"
+    assert out["fills"] == {}
+
+
+def test_rung_fill_above_null_only():
+    """The fill-rule sits ABOVE NULL: an explicitly-mapped slot that resolved to
+    None (vc6 rung) is still empty → the fill applies."""
+    slots, out = _resolve_then_rules(
+        {}, source=[_m("keyword", alias="ekw")])  # mapped, no value → None
+    assert slots["keyword"] == "RULEFILL"
+    assert out["fills"] == {"keyword": "RULEFILL"}
+
+
+def test_rung_no_rules_leaves_chain_byte_identical():
+    """With NO rules the resolved slots equal the pure-chain result — the rung is
+    purely additive (the whole CONTRACT list above already proves this for
+    resolve_slots; here we prove apply_param_rules is a no-op when empty)."""
+    for raw in (None, [], "[]"):
+        slots, out = _resolve_then_rules(
+            {"keyword": "K", "fbclid": "x"}, rules=raw)
+        assert slots == {"keyword": "K"}
+        assert out == {"fills": {}, "applied": []}

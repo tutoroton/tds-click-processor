@@ -42,6 +42,7 @@ from app.enrichment import enrich_buyer
 from app.macros import safe_substitute
 from app.models import ClickRequest
 from app.redis_client import get_redis
+from app.param_rules import apply_param_rules, parse_param_rules
 from app.resolution import BINDING_SELECTOR_KEY, parse_param_mappings, resolve_slots
 from app.telemetry import OP_IDENTITY, capture_op_msg_throttled
 from app.ua_parser import parse_ua
@@ -410,6 +411,33 @@ async def _build_campaign_attribution(
         source_mappings=source_mappings,
         campaign_mappings=campaign_mappings,
     )
+
+    # Campaign parameter rules (GTD-R166 W2) — evaluate ONCE, post-chain,
+    # fill-only, BEFORE buyer enrichment. Mutates `slots` in place (a rule-filled
+    # `buyer_id` therefore flows through `_resolve_buyer_chain` + the cross-tenant
+    # guard and affects routing scope, the point of this position). The outcome
+    # (`{fills, applied}`) rides on `attribution` — NEVER on `req` (a domain→geo
+    # fall-through drops this whole dict, so fills can't leak across candidate
+    # campaigns) — and `fills` is threaded to `build_url` so the 302 URL and DB
+    # row stay identical.
+    #
+    # Gate on parsed rules FIRST: a campaign with no rules (absent / `[]` / bad
+    # payload — the overwhelming majority) skips the macro-values build entirely,
+    # so a rules-less click pays ZERO extra work (no second `parse_ua`) and is
+    # byte-identical to pre-W2.
+    param_rules_outcome: dict[str, Any] = {"fills": {}, "applied": []}
+    _rules = parse_param_rules(campaign.get("param_rules"))
+    if _rules:
+        param_rules_outcome = apply_param_rules(
+            rules_raw=_rules,
+            req=req,
+            slots=slots,
+            macro_values=build_macro_values(
+                req=req, slots=slots, campaign_id=campaign_id,
+            ),
+            company_id=campaign.get("company_id"),
+        )
+
     buyer_chain = await _resolve_buyer_chain(r, slots, campaign)
 
     # `company_id` ALWAYS from the campaign anchor (never buyer) — the
@@ -431,6 +459,10 @@ async def _build_campaign_attribution(
         "source_id": source_id,
         "slots": slots,
         "extras": slot_extras,
+        # GTD-R166 W2 — {fills, applied}. `fills` threads to build_url;
+        # `applied` becomes the `_param_rules` provenance. Empty when no rule
+        # matched (the common case) → zero downstream effect.
+        "param_rules": param_rules_outcome,
     }
 
     # Returning-user identity (P2, 2026-06-05) — DARK + fail-open.
@@ -740,6 +772,7 @@ def _resolve_fallback_template(
     source_mappings,
     campaign_mappings,
     identity: dict[str, Any] | None = None,
+    param_fills: dict[str, str] | None = None,
 ) -> str | None:
     """v2 F-MACRO-1 — macro-resolve a campaign `fallback_url` BEFORE it is served.
     Reuses `build_url` (the single substitution chokepoint: `safe_substitute` +
@@ -755,6 +788,7 @@ def _resolve_fallback_template(
         source_mappings=source_mappings,
         campaign_mappings=campaign_mappings,
         identity=identity,
+        param_fills=param_fills,
     )
 
 
@@ -838,6 +872,13 @@ async def _route_via_campaign(
     # uniformly. DARK / anon ⇒ empty uid + 'false' flags (no literal {macro}).
     identity_macros = _identity_macros(attribution)
 
+    # GTD-R166 W2 — the campaign parameter-rule fills, resolved ONCE in
+    # `_build_campaign_attribution` and threaded to EVERY URL-build path
+    # (cascade action, legacy split, terminal_fallback) so the 302 URL carries
+    # the same fills the DB row does. Empty `{}` when no rule matched → every
+    # build_url call is byte-identical to pre-W2.
+    param_fills = (attribution.get("param_rules") or {}).get("fills") or {}
+
     # v2 C2 — the availability classes a target may have to be served for THIS
     # click, computed ONCE and threaded to every delivery path (cascade action +
     # legacy Stage 7-8). Same rule + fail-open 'active' default as the cascade
@@ -916,6 +957,7 @@ async def _route_via_campaign(
             fallback_url=_resolve_fallback_template(
                 campaign.get("fallback_url"), req, campaign_id,
                 source_mappings, campaign_mappings, identity_macros,
+                param_fills,
             ),
         )
 
@@ -939,6 +981,7 @@ async def _route_via_campaign(
             own_fallback = _resolve_fallback_template(
                 campaign.get("fallback_url"), req, campaign_id,
                 source_mappings, campaign_mappings, identity_macros,
+                param_fills,
             )
             if own_fallback:
                 timing["route_total_ms"] = _ms_since(t_branch)
@@ -961,6 +1004,7 @@ async def _route_via_campaign(
             fallback_url=_resolve_fallback_template(
                 campaign.get("fallback_url"), req, campaign_id,
                 source_mappings, campaign_mappings, identity_macros,
+                param_fills,
             ),
         )
 
@@ -997,6 +1041,7 @@ async def _route_via_campaign(
         source_mappings=source_mappings,
         campaign_mappings=campaign_mappings,
         identity=identity_macros,
+        param_fills=param_fills,
     )
     timing["url_build_ms"] = _ms_since(t0)
     timing["target_resolved"] = target_url is not None
@@ -1043,6 +1088,7 @@ async def _resolve_action_with_sticky(
     flow_id: str | None,
     allowed_avail=frozenset({"active"}),
     identity_macros: dict[str, Any] | None = None,
+    param_fills: dict[str, str] | None = None,
     trace: dict[str, Any] | None = None,
     fresh_track: bool = False,
     rng=random,
@@ -1076,7 +1122,9 @@ async def _resolve_action_with_sticky(
     # per-action helper. `identity_macros=None` → DARK defaults (empty uid +
     # 'false' flags), byte-identical to the pre-fix collapse for non-identity
     # templates.
-    _build_url = functools.partial(build_url, identity=identity_macros)
+    _build_url = functools.partial(
+        build_url, identity=identity_macros, param_fills=param_fills,
+    )
 
     async def _normal() -> dict[str, Any] | None:
         return await action_executor.execute_action(
@@ -1383,6 +1431,10 @@ async def _try_flow_cascade(
         # carries them post-`_build_campaign_attribution`; uid/flags are stable
         # across the later flow-id mutations on this same dict.
         identity_macros=_identity_macros(attribution),
+        # GTD-R166 W2 — thread the campaign param-rule fills so cascade-delivered
+        # URLs carry the same fills as the DB row. Stable across the later
+        # flow-id mutations on this attribution dict.
+        param_fills=(attribution.get("param_rules") or {}).get("fills") or {},
         # v2 LD-F2 — same trace dict the cascade populated; the split executor
         # folds its weights/picked + per-leg availability exclusions into it.
         trace=cascade_trace,
@@ -2159,6 +2211,7 @@ def build_url(
     target_id: str | None = None,
     flow_id: str | None = None,
     identity: dict[str, Any] | None = None,
+    param_fills: dict[str, str] | None = None,
 ) -> str:
     """Build the redirect URL by substituting macros in `template`.
 
@@ -2211,6 +2264,12 @@ def build_url(
             `_identity_macros`. `None` (the default) → `{uid}` collapses
             to empty and the three flags render `false`, so a DARK /
             anonymous click never leaks a literal `{macro}`.
+        param_fills: Per-click campaign parameter-rule fills (GTD-R166 W2) —
+            `{slot: value}` computed ONCE post-chain in
+            `_build_campaign_attribution` and threaded here so this
+            independent re-resolution overlays the SAME fills → the 302 URL
+            and the DB row never diverge. `None` / empty (no rules matched)
+            → byte-identical to pre-W2.
 
     Returns:
         Final URL string. Never contains a literal `{macro}` —
@@ -2223,9 +2282,57 @@ def build_url(
         campaign_mappings=campaign_mappings,
     )
 
-    # Step 2 — build the macro values dict. Layered so system-fixed
-    # names always win over slot-resolved ones (a misconfigured
-    # mapping cannot accidentally override `{click_id}` etc.).
+    # Param-rules fill overlay (GTD-R166 W2) — apply the SAME fill-only outcome
+    # the attribution computed post-chain so this independent re-resolution
+    # can't make the 302 URL diverge from the DB row. Fill-only by construction:
+    # every key in `param_fills` was empty after the identical chain over the
+    # identical inputs in `_build_campaign_attribution`, so an unconditional
+    # overlay is equivalent to (and clearer than) a re-checked fill.
+    if param_fills:
+        for _slot, _val in param_fills.items():
+            slots[_slot] = _val
+
+    # Step 2 — build the macro values dict via the shared builder (also used to
+    # expand rule-value macros — the "same click-time values dict as landing
+    # macros" the param-rules contract requires; GTD-R166 W2).
+    values = build_macro_values(
+        req=req,
+        slots=slots,
+        campaign_id=campaign_id,
+        offer_id=offer_id,
+        target_id=target_id,
+        flow_id=flow_id,
+        identity=identity,
+    )
+
+    # Step 3 — safe substitute (handles NULL collapse + URL encoding).
+    return safe_substitute(template, values)
+
+
+def build_macro_values(
+    *,
+    req: ClickRequest,
+    slots: dict[str, str | None],
+    campaign_id: str,
+    offer_id: str = "",
+    target_id: str | None = None,
+    flow_id: str | None = None,
+    identity: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build the click-time macro-values dict (the landing-macro value set).
+
+    Extracted from `build_url` (GTD-R166 W2) so it is the SINGLE source of the
+    click-time values dict, reused verbatim by the param-rules engine to expand
+    macro assignment values (contract: rule values resolve from "the same
+    click-time values dict used for landing macros"). Layered so system-fixed
+    names (worker / UA / technical / identity) always win over slot-resolved
+    ones — a misconfigured mapping cannot override `{click_id}` etc.
+
+    The param-rules caller passes `offer_id=""`, `target_id=None`,
+    `flow_id=None`, `identity=None`, so the post-routing macros
+    (`offer_id`/`offer_target_id`/`flow_id`/`uid`) resolve empty at attribution
+    time — exactly matching the click-time-legal allowlist (which EXCLUDES
+    offer/flow/landing/target and returning-user identity macros)."""
     values: dict[str, Any] = {}
 
     # Slot layer (lowest precedence — overwritten by worker/technical
@@ -2330,8 +2437,7 @@ def build_url(
     values["is_returning"] = bool(ident.get("is_returning"))
     values["is_roaming"] = bool(ident.get("is_roaming"))
 
-    # Step 3 — safe substitute (handles NULL collapse + URL encoding).
-    return safe_substitute(template, values)
+    return values
 
 
 def weighted_select(items: list[dict], rng=random) -> dict:

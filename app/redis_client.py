@@ -1,6 +1,7 @@
 """Async Redis connection pool."""
 
 import redis.asyncio as redis
+from redis.asyncio.connection import BlockingConnectionPool
 
 from app.config import settings
 
@@ -10,11 +11,24 @@ pool: redis.Redis | None = None
 async def get_redis() -> redis.Redis:
     global pool
     if pool is None:
-        pool = redis.from_url(
+        # F4 (GTD-R173) — a sized, bounded-wait BlockingConnectionPool replaces
+        # the default non-blocking `ConnectionPool(max_connections=20)`. The old
+        # pool raised `ConnectionError("Too many connections")` synchronously on
+        # exhaustion under a concurrency burst → the routing stage acquiring a
+        # connection fail-opened (offer-miss under load). The blocking pool WAITS
+        # up to `timeout` (per-acquire) for a connection to free instead of
+        # raising; deadlock-free because the hot path holds <=1 conn at any
+        # instant. `socket_timeout`/`socket_connect_timeout` also bound a hung
+        # (not-down) Redis op. All four are env-tunable (config.py). See
+        # FIX-DESIGN-F4.md / FIX-PLAN.md §1.
+        pool = redis.Redis(connection_pool=BlockingConnectionPool.from_url(
             settings.redis_url,
             decode_responses=True,
-            max_connections=20,
-        )
+            max_connections=settings.redis_max_connections,
+            timeout=settings.redis_pool_timeout_seconds,
+            socket_timeout=settings.redis_socket_timeout_seconds,
+            socket_connect_timeout=settings.redis_socket_connect_timeout_seconds,
+        ))
     return pool
 
 
@@ -50,11 +64,19 @@ async def get_identity_redis() -> redis.Redis:
         # Shared instance — reuse the routing pool (one connection set).
         return await get_redis()
     if identity_pool is None:
-        identity_pool = redis.from_url(
+        # F4 (GTD-R173) — identical BlockingConnectionPool treatment on the
+        # SEPARATE identity pool (same env knobs) so a fail-open in the
+        # returning-user identity keyspace can't recur under load either. A
+        # distinct pool means identity acquires never contend with the routing
+        # pool (no cross-pool wait → the deadlock-freedom argument still holds).
+        identity_pool = redis.Redis(connection_pool=BlockingConnectionPool.from_url(
             settings.identity_redis_url,
             decode_responses=True,
-            max_connections=20,
-        )
+            max_connections=settings.redis_max_connections,
+            timeout=settings.redis_pool_timeout_seconds,
+            socket_timeout=settings.redis_socket_timeout_seconds,
+            socket_connect_timeout=settings.redis_socket_connect_timeout_seconds,
+        ))
     return identity_pool
 
 

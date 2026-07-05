@@ -30,6 +30,37 @@ class Settings(BaseSettings):
     # Redis (local, same machine/container)
     redis_url: str = "redis://redis:6379/0"
 
+    # F4 (GTD-R173, 2026-07-05) — routing-Redis connection-pool sizing +
+    # bounded-wait. The pre-F4 pool was the default NON-blocking
+    # `ConnectionPool(max_connections=20)` with NO timeouts (redis_client.py).
+    # redis-py 5.2.1's default pool RAISES `ConnectionError("Too many
+    # connections")` SYNCHRONOUSLY the instant `in_use >= 20` and no idle
+    # connection exists — before any socket op. Under a concurrency burst the
+    # per-worker pool exhausted and whichever routing stage was acquiring a
+    # connection fail-opened; the audit caught the flow-candidate read
+    # (`except → []` → "no flow" → offer-miss). Fix = a `BlockingConnectionPool`
+    # sized >= peak concurrency that WAITS (a connection frees in ~0.2 ms)
+    # instead of raising. Deadlock-free here: the hot path holds <=1 connection
+    # at any instant (every pipeline is buffer-then-execute, released in a
+    # `finally`; no gather/TaskGroup/watch/lock; identity is a separate pool).
+    #
+    # `redis_pool_timeout_seconds` is the PER-ACQUIRE wait (redis-py source +
+    # context7), NOT per-request — a `/decide` makes ~12-18 sequential acquires,
+    # so 0.12 s bounds the worst case (~15 x 0.12 < 1.8 s) safely under the CF
+    # 2 s AbortSignal. Sizing N >= peak means normal load never blocks; the
+    # timeout only bites on a pathological over-subscription, where the request
+    # load-sheds to a RECORDED honest worker fallback (Layer 2), never a silent
+    # misroute. All four are TDS_-prefixed and tunable WITHOUT a rebuild.
+    #
+    # Server headroom: routing Redis `maxclients` default 10000; 128/worker x 2
+    # uvicorn workers (+ identity 128 x 2 when the resolver is live) ~= 512
+    # conns/node << 10000, and ~512 idle conns cost a few MB (`maxmemory 256mb`
+    # bounds DATA, not connections). SoT: FIX-DESIGN-F4.md, FIX-PLAN.md §1.
+    redis_max_connections: int = 128
+    redis_pool_timeout_seconds: float = 0.12
+    redis_socket_timeout_seconds: float = 1.0
+    redis_socket_connect_timeout_seconds: float = 1.0
+
     # Auth (shared secret with CF Worker)
     tds_secret_key: str = ""
 

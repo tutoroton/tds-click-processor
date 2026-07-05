@@ -763,6 +763,14 @@ def _decision_reason(result: dict, timing: dict, attr: dict) -> str:
         return "blocked_by_flow"
     if rs == "no_match":
         return "no_campaign_match"
+    if rs == "flow_read_failed":
+        # F4 (GTD-R173) — a Redis read on the routing-resolution path failed
+        # persistently (retry-once exhausted → cascade.FlowReadError, caught in
+        # router._route_via_campaign). A DISTINCT closed-enum value: this is a
+        # RECORDED honest read-failure, NEVER masqueraded as a genuine
+        # `no_flow_no_offer` (checked before the generic `if rs:` below so the
+        # sentinel's truthy routing_status can't be swallowed into no-flow).
+        return "flow_read_failed"
     if rs:  # no_offer / no_candidates → a campaign matched but nothing routed
         trace = attr.get("routing_trace") or {}
         # All-unavailable (availability floor excluded the flow[s]) → terminal

@@ -93,6 +93,19 @@ OP_PARAM_RULES = "param_rules"          # GTD-R166 W2 — campaign param-rule co
 OP_OFFER_RESOLVE = "offer_resolve"      # D3  — offer/target row missing → fallback
 OP_SPLIT_FALLBACK = "split_fallback"    # B3  — split had no usable offers → fallback
 
+# F4 (GTD-R173, 2026-07-05) — routing-Redis read fail-open closure. Throttled
+# per campaign (dedup_key) so a persistent Redis fault surfaces ONCE per window,
+# not per click.
+OP_FLOW_READ_FAILED = "flow_read_failed"  # Layer 2/2b — a flow/offer/availability
+#                                           Redis read failed after retry-once →
+#                                           RECORDED honest outcome (was a silent
+#                                           fail-open pre-F4: []/{}/None).
+OP_NO_FLOW_NO_OFFER = "no_flow_no_offer"  # Layer 3 — rate signal on the (already
+#                                           correct) genuine no-flow+no-offer
+#                                           dead-end, previously invisible (the
+#                                           click looked "handled") so a future
+#                                           regression pages instead of hiding.
+
 
 # ---------------------------------------------------------------------------
 # Throttled message capture (audit 2026-06-03 P3 observability).

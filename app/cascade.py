@@ -47,17 +47,75 @@ import json
 import logging
 from typing import Any, Final
 
+import redis  # F4 — for the BASE `redis.RedisError` exception class only.
+
 from app.action_executor import _is_positive_int, _parse_action_config
 from app.telemetry import (
     OP_CRITERIA_SKIP,
     OP_FLOW_LOAD,
+    OP_FLOW_READ_FAILED,
     capture_op_msg_throttled,
 )
 
 logger = logging.getLogger("tds.cascade")
 
 
-__all__ = ["resolve_flow", "SCOPE_PRIORITY"]
+__all__ = ["resolve_flow", "SCOPE_PRIORITY", "FlowReadError"]
+
+
+class FlowReadError(Exception):
+    """A Redis read on the flow/offer routing-resolution path FAILED persistently
+    (retry-once exhausted) — F4 (GTD-R173).
+
+    Raised by the flow-cascade reads (`_collect_candidate_ids`,
+    `_load_flow_records`, `_load_target_availability`) and by the legacy
+    `router.select_offer` INSTEAD of the pre-F4 silent fail-open (`return []` /
+    `{}` / `None`). Caught in `router._route_via_campaign` — the one frame holding
+    both `attribution` and `timing` — and turned into a RECORDED non-routed result
+    (`decision_reason="flow_read_failed"`) so the click flows through the normal
+    record → dedup → XADD path and is NEVER (a) dropped [it must not reach
+    route()'s catch-all, which returns before the record path] nor (b)
+    masqueraded as a genuine `no_flow_no_offer`. `stage` labels which read failed
+    (for the Sentry counter tag); the RECORDED decision_reason is uniformly
+    `flow_read_failed`. SoT: FIX-DESIGN-F4.md / FIX-PLAN.md §1.2 Layer 2/2b.
+    """
+
+    def __init__(self, stage: str = "flow") -> None:
+        self.stage = stage
+        super().__init__(f"flow-resolution redis read failed at stage={stage}")
+
+
+async def _execute_pipe_with_retry(build_pipe, *, stage: str, dedup_key: str):
+    """Execute a freshly-built Redis pipeline with RETRY-ONCE, raising
+    `FlowReadError` on a persistent `redis.RedisError` — F4 (GTD-R173).
+
+    `build_pipe` MUST return a NEW, fully-buffered pipeline on each call (a
+    pipeline is single-use — it resets after `execute()`), so the retry re-issues
+    the same idempotent reads (LRANGE/HGETALL/EXISTS+HGET → no double-processing).
+    A transient pool-acquire / socket blip clears on the immediate retry; only a
+    PERSISTENT failure raises (+ a throttled Sentry counter keyed on the offending
+    entity so a hot path can't flood Sentry).
+
+    Catches the BASE `redis.RedisError` — covers the `ConnectionError` the
+    default pool raised on exhaustion AND the `TimeoutError` the new
+    `socket_timeout` can now surface — never `MaxConnectionsError` (absent from
+    the top-level redis 5.2.1 namespace) and never bare `Exception` (which would
+    swallow a genuine logic bug as a read failure).
+    """
+    try:
+        return await build_pipe().execute()
+    except redis.RedisError:
+        pass  # transient — retry once below
+    try:
+        return await build_pipe().execute()
+    except redis.RedisError as exc:
+        capture_op_msg_throttled(
+            OP_FLOW_READ_FAILED, dedup_key,
+            f"cascade: {stage} read failed after retry ({exc!r}) — recording "
+            "flow_read_failed (was a silent fail-open pre-F4)",
+            level="error", stage=stage,
+        )
+        raise FlowReadError(stage) from exc
 
 
 # Specificity ordering from MOST specific to LEAST specific.
@@ -433,8 +491,12 @@ async def _load_target_availability(
 
     ONE pipelined EXISTS + HGET per referenced target. Returns `{}` when no flow
     pins a target (redirect/block-only campaign) → zero extra Redis cost.
-    FAIL-OPEN: any Redis ERROR → `{}` → the availability filter excludes nothing
-    (a click is NEVER lost because availability state is unreadable).
+
+    F4 (GTD-R173) Layer 2b: a PERSISTENT Redis read failure (after retry-once) no
+    longer fails open to `{}` (= all-active, which could serve a CLOSED/draining
+    target under pool exhaustion) — it raises `FlowReadError`, caught in
+    `router._route_via_campaign` as a RECORDED `flow_read_failed` outcome. Only a
+    genuinely target-less flow set returns `{}` (early, above).
 
     Dead-offer fix (2026-06-07): distinguish a target whose HASH is ABSENT (its
     offer was paused → desynced, or the target was evicted/drifted) from one that
@@ -442,8 +504,8 @@ async def _load_target_availability(
     `_AVAIL_MISSING` (∉ the allowed set ⇒ the flow is floored, so `_pick_winner`
     re-picks a servable sibling at any scope instead of the dead flow winning and
     poaching a foreign campaign). A present HASH with no `availability` field ⇒
-    'active' (byte-identical for live targets). Only a Redis ERROR fails open; a
-    CONFIRMED-absent HASH is a definite exclude.
+    'active' (byte-identical for live targets). A CONFIRMED-absent HASH is a
+    definite exclude.
     """
     tids: set[str] = set()
     for f in flows:
@@ -451,18 +513,24 @@ async def _load_target_availability(
     if not tids:
         return {}
     ordered = list(tids)
-    pipe = r.pipeline()
-    for tid in ordered:
-        pipe.exists(f"offer_target:{tid}")
-        pipe.hget(f"offer_target:{tid}", "availability")
-    try:
-        raw = await pipe.execute()
-    except Exception as exc:  # pragma: no cover — fail-open to all-active
-        logger.warning(
-            "cascade: availability load failed (%s) — treating all targets "
-            "active (fail-open)", exc,
-        )
-        return {}
+
+    def _build_pipe():
+        pipe = r.pipeline()
+        for tid in ordered:
+            pipe.exists(f"offer_target:{tid}")
+            pipe.hget(f"offer_target:{tid}", "availability")
+        return pipe
+
+    # F4 (GTD-R173) Layer 2b: retry-once → FlowReadError on persistent failure,
+    # NOT the pre-F4 silent `return {}` (= treat all targets active), which under
+    # pool exhaustion could SERVE a CLOSED/draining target. The new socket_timeout
+    # can newly surface a slow-but-alive availability read as TimeoutError; either
+    # way a RAISED read is now a RECORDED honest outcome upstream, never a silent
+    # serve-closed. A genuinely target-less flow set still returns {} early above.
+    raw = await _execute_pipe_with_retry(
+        _build_pipe, stage="availability",
+        dedup_key=ordered[0] if ordered else "unknown",
+    )
     out: dict[str, str] = {}
     for i, tid in enumerate(ordered):
         exists, avail = raw[i * 2], raw[i * 2 + 1]
@@ -536,35 +604,42 @@ async def _collect_candidate_ids(
     scope level. Order follows fetch order: campaign first, then
     buyer / custom_group / team / department / company. Caller de-dupes.
     """
-    pipe = r.pipeline()
     fetch_log: list[str] = []  # for debug logging only
 
-    pipe.lrange(f"campaign:{campaign_id}:flows", 0, -1)
-    fetch_log.append(f"campaign:{campaign_id}")
+    def _build_pipe():
+        # Rebuilt per attempt — a pipeline is single-use (resets after execute),
+        # so the retry re-issues the same idempotent LRANGEs. `fetch_log` is
+        # debug-only; a duplicate append on the rare retry is inert.
+        pipe = r.pipeline()
+        pipe.lrange(f"campaign:{campaign_id}:flows", 0, -1)
+        fetch_log.append(f"campaign:{campaign_id}")
 
-    if company_id is not None:
-        # Each scope level gets ONE LRANGE. Skip levels with no ID since
-        # `flows:scope:{company}:{type}:None` is meaningless.
-        scope_targets = (
-            ("buyer", buyer_id),
-            ("custom_group", custom_group_id),
-            ("team", team_id),
-            ("department", department_id),
-            ("company", company_id),
-        )
-        for scope_type, scope_id in scope_targets:
-            if scope_id is not None:
-                pipe.lrange(
-                    f"flows:scope:{company_id}:{scope_type}:{scope_id}",
-                    0, -1,
-                )
-                fetch_log.append(f"scope:{scope_type}:{scope_id}")
+        if company_id is not None:
+            # Each scope level gets ONE LRANGE. Skip levels with no ID since
+            # `flows:scope:{company}:{type}:None` is meaningless.
+            scope_targets = (
+                ("buyer", buyer_id),
+                ("custom_group", custom_group_id),
+                ("team", team_id),
+                ("department", department_id),
+                ("company", company_id),
+            )
+            for scope_type, scope_id in scope_targets:
+                if scope_id is not None:
+                    pipe.lrange(
+                        f"flows:scope:{company_id}:{scope_type}:{scope_id}",
+                        0, -1,
+                    )
+                    fetch_log.append(f"scope:{scope_type}:{scope_id}")
+        return pipe
 
-    try:
-        results = await pipe.execute()
-    except Exception as exc:  # pragma: no cover — Redis errors caught by route()
-        logger.warning("cascade: candidate fetch failed: %s", exc)
-        return []
+    # F4 (GTD-R173): retry-once → FlowReadError on persistent failure, NOT the
+    # pre-F4 silent `return []` — that masqueraded a pool-exhaustion / socket
+    # read FAILURE as "genuinely no flows" → offer-miss under load. A SUCCESSFUL
+    # empty read still returns [] (genuinely-flowless campaign, byte-identical).
+    results = await _execute_pipe_with_retry(
+        _build_pipe, stage="candidate", dedup_key=campaign_id,
+    )
 
     out: list[str] = []
     for items in results:
@@ -580,14 +655,20 @@ async def _load_flow_records(r, flow_ids: list[str]) -> list[dict[str, Any]]:
     surface the flow ID without re-reading. Empty/missing rows are
     skipped (sync drift between scope list and flow hash).
     """
-    pipe = r.pipeline()
-    for fid in flow_ids:
-        pipe.hgetall(f"flow:{fid}")
-    try:
-        rows = await pipe.execute()
-    except Exception as exc:  # pragma: no cover
-        logger.warning("cascade: flow load failed: %s", exc)
-        return []
+    def _build_pipe():
+        pipe = r.pipeline()
+        for fid in flow_ids:
+            pipe.hgetall(f"flow:{fid}")
+        return pipe
+
+    # F4 (GTD-R173): retry-once → FlowReadError on persistent failure, NOT the
+    # pre-F4 silent `return []`. A SUCCESSFUL read whose rows are all empty
+    # (sync drift) still yields [] → the caller's D4 drift signal fires (a
+    # genuinely-empty result stays byte-identical); only a RAISED read is honest.
+    rows = await _execute_pipe_with_retry(
+        _build_pipe, stage="flow_load",
+        dedup_key=flow_ids[0] if flow_ids else "unknown",
+    )
 
     flows: list[dict[str, Any]] = []
     for fid, row in zip(flow_ids, rows):

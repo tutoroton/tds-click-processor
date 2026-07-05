@@ -34,6 +34,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Final, NamedTuple
 
+import redis  # F4 — for the BASE `redis.RedisError` exception class only.
 import sentry_sdk
 from app import action_executor, cascade, identity, sticky
 from app.config import settings
@@ -44,7 +45,12 @@ from app.models import ClickRequest
 from app.redis_client import get_redis
 from app.param_rules import apply_param_rules, parse_param_rules
 from app.resolution import BINDING_SELECTOR_KEY, parse_param_mappings, resolve_slots
-from app.telemetry import OP_IDENTITY, capture_op_msg_throttled
+from app.telemetry import (
+    OP_FLOW_READ_FAILED,
+    OP_IDENTITY,
+    OP_NO_FLOW_NO_OFFER,
+    capture_op_msg_throttled,
+)
 from app.ua_parser import parse_ua
 
 logger = logging.getLogger("tds.router")
@@ -885,17 +891,49 @@ async def _route_via_campaign(
     # pre-floor → byte-identical when all targets active / routing OFF.
     allowed_avail = _allowed_availability(campaign, attribution)
 
+    def _flow_read_failed_result() -> dict[str, Any]:
+        """F4 (GTD-R173) — RECORDED honest outcome when a Redis read on the
+        resolution path failed persistently (`cascade.FlowReadError`, raised by
+        the cascade reads or `select_offer` after retry-once).
+
+        Reuses the G2 `_non_routed_result` seam so the click flows through the
+        normal record → dedup → XADD path (it must NOT reach route()'s catch-all,
+        which returns BEFORE the record path → the click would be DROPPED from
+        ClickHouse — worse than today's recorded misroute). The DISTINCT
+        `routing_result="flow_read_failed"` maps to `decision_reason=
+        "flow_read_failed"` (main._decision_reason), so a read failure is never
+        masqueraded as a genuine `no_flow_no_offer`. Emitted in BOTH the domain
+        and geo branches — a read failure is a genuine infra fault best recorded
+        honestly against the matched campaign, not silently re-tried on the same
+        failing Redis via geo. The Sentry counter already fired at the raising
+        read; this only builds the recorded sentinel."""
+        timing["route_total_ms"] = _ms_since(t_branch)
+        timing["result"] = "flow_read_failed"
+        return _non_routed_result(
+            campaign_id, attribution, timing,
+            binding_id=binding_id, binding_alias=binding_alias,
+            fallback_url=_resolve_fallback_template(
+                campaign.get("fallback_url"), req, campaign_id,
+                source_mappings, campaign_mappings, identity_macros, param_fills,
+            ),
+        )
+
     # Stage 6.5 — flow cascade.
     t0 = time.perf_counter()
-    cascade_result = await _try_flow_cascade(
-        r, campaign, campaign_id, req,
-        source_mappings=source_mappings,
-        campaign_mappings=campaign_mappings,
-        buyer_chain=buyer_chain,
-        attribution=attribution,
-        allowed_avail=allowed_avail,
-        rng=rng,
-    )
+    try:
+        cascade_result = await _try_flow_cascade(
+            r, campaign, campaign_id, req,
+            source_mappings=source_mappings,
+            campaign_mappings=campaign_mappings,
+            buyer_chain=buyer_chain,
+            attribution=attribution,
+            allowed_avail=allowed_avail,
+            rng=rng,
+        )
+    except cascade.FlowReadError:
+        # F4 — a flow-candidate / flow-load / availability read failed
+        # persistently → RECORDED flow_read_failed, never a silent no-flow.
+        return _flow_read_failed_result()
     timing["cascade_ms"] = _ms_since(t0)
 
     if cascade_result is not None:
@@ -963,7 +1001,12 @@ async def _route_via_campaign(
 
     # Stage 7 — legacy fallback (no flow matched).
     t0 = time.perf_counter()
-    offer = await select_offer(r, campaign_id, rng)
+    try:
+        offer = await select_offer(r, campaign_id, rng)
+    except cascade.FlowReadError:
+        # F4 Layer 2b — the legacy split/offer read failed persistently →
+        # RECORDED flow_read_failed, never a silent None → misroute under load.
+        return _flow_read_failed_result()
     timing["offer_ms"] = _ms_since(t0)
     if not offer:
         if fall_through_on_no_route:
@@ -994,6 +1037,19 @@ async def _route_via_campaign(
             # No own terminal_fallback — let geo targeting try. The geo branch
             # (if it also lands here) will emit the G2 non-routed sentinel.
             return None
+        # F4 (GTD-R173) Layer 3 — count the genuine no-flow + no-legacy-offer
+        # dead-end RATE (throttled per campaign per window). This is the CORRECT
+        # outcome for a genuinely flowless + offerless campaign, but pre-F4 the
+        # click looked "handled" (recorded, redirected to fallback) so an
+        # offer-miss REGRESSION — the F4 failure mode resurfacing under load —
+        # was invisible. A Sentry alert rule keys off the rate of this op so a
+        # spike pages instead of hiding.
+        capture_op_msg_throttled(
+            OP_NO_FLOW_NO_OFFER, campaign_id,
+            f"no_flow_no_offer: campaign {campaign_id} matched but had no flow "
+            "and no legacy offer — served fallback (F4 Layer 3 rate signal)",
+            level="info",
+        )
         timing["route_total_ms"] = _ms_since(t_branch)
         timing["result"] = "no_offer"
         return _non_routed_result(
@@ -1837,8 +1893,17 @@ async def resolve_domain_campaign(r, req: ClickRequest) -> DomainResolution:
 async def select_offer(r, campaign_id: str, rng=random) -> dict | None:
     """Select offer from campaign's split configuration. R70 — `rng` defaults to
     the `random` module (byte-identical for direct callers); `route()` threads a
-    click-seeded instance so raced nodes pick the same legacy offer."""
-    try:
+    click-seeded instance so raced nodes pick the same legacy offer.
+
+    F4 (GTD-R173) Layer 2b: a PERSISTENT Redis read failure (after retry-once) no
+    longer fails open to `None` (a silent no-offer → misroute under load) — it
+    raises `cascade.FlowReadError`, caught in `_route_via_campaign` as a RECORDED
+    `flow_read_failed` outcome. The new socket_timeout can newly surface a
+    slow-but-alive read as TimeoutError. A NON-Redis error (e.g. a malformed
+    split) preserves the pre-F4 fail-open-to-no-offer (a recorded
+    no_flow_no_offer via the caller) — F4 upgrades ONLY the Redis-read path, so a
+    genuine logic bug is never masqueraded as flow_read_failed."""
+    async def _attempt() -> dict | None:
         split = await r.hgetall(f"split:{campaign_id}")
         if not split:
             offers_key = f"campaign:{campaign_id}:offers"
@@ -1858,8 +1923,29 @@ async def select_offer(r, campaign_id: str, rng=random) -> dict | None:
             return None
         offer["_id"] = offer_id
         return offer
+
+    try:
+        return await _attempt()
+    except redis.RedisError:
+        pass  # transient — retry once below (idempotent reads)
     except Exception as e:
-        logger.error("select_offer failed: %s", e)
+        # Non-Redis error (e.g. malformed split → weighted_select). Preserve the
+        # pre-F4 fail-open-to-no-offer (recorded no_flow_no_offer upstream), NOT
+        # a FlowReadError and NOT a dropped click.
+        logger.error("select_offer failed (non-redis): %s", e)
+        return None
+    try:
+        return await _attempt()
+    except redis.RedisError as exc:
+        capture_op_msg_throttled(
+            OP_FLOW_READ_FAILED, campaign_id,
+            f"select_offer: legacy offer read failed after retry ({exc!r}) — "
+            "recording flow_read_failed (was a silent fail-open pre-F4)",
+            level="error", stage="offer",
+        )
+        raise cascade.FlowReadError("offer") from exc
+    except Exception as e:
+        logger.error("select_offer failed (non-redis, retry): %s", e)
         return None
 
 

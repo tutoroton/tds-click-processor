@@ -100,16 +100,28 @@ TDS_RETURNING_ROUTING_ENABLED=${TDS_RETURNING_ROUTING_ENABLED:-true}
 # returning users via the legacy _tds_vid path, just without the signed cookie.
 TDS_IDENTITY_COOKIE_KEYS=${TDS_IDENTITY_COOKIE_KEYS:-}
 TDS_IDENTITY_COOKIE_ACTIVE_KID=${TDS_IDENTITY_COOKIE_ACTIVE_KID:-1}
+TDS_CODE_VERSION=${code_version}
+EOF
+
 # GTD-R75 / ADR-0055 — capacity auto-config, computed at provision time from
 # the droplet size slug (WEB_CONCURRENCY read directly by the Dockerfile CMD,
 # no TDS_ prefix; TDS_REDIS_MAX_CONNECTIONS read by config.py's pydantic
-# Settings). Empty fallback (NOT a hardcoded number) — an unset/parse-failed
-# value writes nothing usable, so click-processor's own defaults (the
-# Dockerfile's WEB_CONCURRENCY default of 2 / config.py's
-# redis_max_connections default of 128) govern unopposed. Existing nodes
-# re-provisioned with no capacity config resolved stay byte-unchanged.
-WEB_CONCURRENCY=${WEB_CONCURRENCY:-}
-TDS_REDIS_MAX_CONNECTIONS=${TDS_REDIS_MAX_CONNECTIONS:-}
-TDS_CODE_VERSION=${code_version}
-EOF
+# Settings, a plain `int` field with no env_ignore_empty). Unlike the rest of
+# this heredoc's `${VAR:-}` empty-string fallbacks (all consumed as plain
+# strings/booleans downstream), these two feed one shell int-default
+# (`${WEB_CONCURRENCY:-2}`, immune to an empty value) and one pydantic `int`
+# field (NOT immune — `TDS_REDIS_MAX_CONNECTIONS=""` in the container env
+# raises ValidationError(int_parsing) at Settings() construction = import-time
+# crash-loop). So these two lines are APPENDED CONDITIONALLY, mirroring
+# cloud-init's own conditional-export convention — ABSENT from .env entirely
+# (not present-but-empty) whenever the value wasn't resolved, so click-
+# processor's own defaults (Dockerfile's WEB_CONCURRENCY default of 2 /
+# config.py's redis_max_connections default of 128) govern unopposed.
+if [ -n "${WEB_CONCURRENCY:-}" ]; then
+  echo "WEB_CONCURRENCY=${WEB_CONCURRENCY}" >> "$ENV_FILE"
+fi
+if [ -n "${TDS_REDIS_MAX_CONNECTIONS:-}" ]; then
+  echo "TDS_REDIS_MAX_CONNECTIONS=${TDS_REDIS_MAX_CONNECTIONS}" >> "$ENV_FILE"
+fi
+
 echo "render-env: wrote $ENV_FILE (node=$TDS_NODE_ID region=$TDS_NODE_REGION version=$code_version)"

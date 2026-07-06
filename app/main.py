@@ -17,6 +17,7 @@ import hashlib
 import hmac
 import json
 import logging
+import os
 import shutil
 import time
 from datetime import datetime, timezone
@@ -1747,6 +1748,15 @@ async def health():
         identity_store_used_bytes=identity_used_bytes,
         identity_store_max_bytes=identity_max_bytes,
         identity_store_used_pct=identity_used_pct,
+        # GTD-R75 / ADR-0055 — the honest capacity-verification loop.
+        # web_concurrency reads the SAME env var + default the Dockerfile
+        # CMD's `${WEB_CONCURRENCY:-2}` used to pick this process's own
+        # worker count — faithful to what actually started, not what
+        # provisioning intended. redis_max_connections is the
+        # pydantic-resolved value already in `settings` (reflects whatever
+        # env/default actually took effect at Settings() construction).
+        web_concurrency=int(os.environ.get("WEB_CONCURRENCY", "2")),
+        redis_max_connections=settings.redis_max_connections,
     )
 
 

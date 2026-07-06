@@ -297,3 +297,18 @@ class HealthResponse(BaseModel):
     identity_store_used_bytes: int | None = None
     identity_store_max_bytes: int | None = None
     identity_store_used_pct: float | None = None
+
+    # GTD-R75 / ADR-0055 — the honest capacity-verification loop. These two
+    # report the EFFECTIVE config the running process actually has, not what
+    # provisioning INTENDED to inject — admin-api compares this against its
+    # own intended values (auto_web_concurrency/auto_pool_size) to stamp
+    # capacity_applied (true/false/unverified) rather than trusting a pure
+    # computation. web_concurrency is read straight from the process's own
+    # environment (the same WEB_CONCURRENCY the Dockerfile CMD's
+    # `${WEB_CONCURRENCY:-2}` consumed to pick the worker count) — this
+    # process is one of those workers, so its own env IS the value that
+    # governed. redis_max_connections is the pydantic-resolved
+    # settings.redis_max_connections (already reflects whatever env/default
+    # actually took effect).
+    web_concurrency: int = 2
+    redis_max_connections: int = 128

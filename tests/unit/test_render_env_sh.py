@@ -55,6 +55,8 @@ def test_writes_full_canonical_key_set(tmp_path):
         "TDS_SMOKE_PROBE_SECRET",
         "TDS_SENTRY_DSN", "TDS_DIAG_TRACES_BOOST", "TDS_DIAG_OBS_STREAM",
         "TDS_DIAG_VERBOSE_LOGS", "TDS_CODE_VERSION",
+        # GTD-R75 / ADR-0055 — capacity auto-config
+        "WEB_CONCURRENCY", "TDS_REDIS_MAX_CONNECTIONS",
     ):
         assert key in env, f"missing key {key}"
 
@@ -121,3 +123,23 @@ def test_missing_required_field_fails(tmp_path):
 def test_explicit_code_version_stamped(tmp_path):
     _run(tmp_path, {"TDS_CODE_VERSION": "abc1234"})
     assert _env_dict(tmp_path)["TDS_CODE_VERSION"] == "abc1234"
+
+
+def test_capacity_config_empty_by_default(tmp_path):
+    """GTD-R75 / ADR-0055 — unset ⇒ empty, NOT a hardcoded number. An
+    existing node re-provisioned with no resolved capacity config must stay
+    byte-unchanged: click-processor's own Dockerfile (`${WEB_CONCURRENCY:-2}`)
+    / config.py (`redis_max_connections = 128`) defaults govern unopposed."""
+    _run(tmp_path)
+    env = _env_dict(tmp_path)
+    assert env["WEB_CONCURRENCY"] == ""
+    assert env["TDS_REDIS_MAX_CONNECTIONS"] == ""
+
+
+def test_capacity_config_passthrough(tmp_path):
+    """When provisioning resolved a config (cores parsed), both values pass
+    straight through into .env unmodified."""
+    _run(tmp_path, {"WEB_CONCURRENCY": "8", "TDS_REDIS_MAX_CONNECTIONS": "256"})
+    env = _env_dict(tmp_path)
+    assert env["WEB_CONCURRENCY"] == "8"
+    assert env["TDS_REDIS_MAX_CONNECTIONS"] == "256"

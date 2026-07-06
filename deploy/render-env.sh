@@ -100,6 +100,16 @@ TDS_RETURNING_ROUTING_ENABLED=${TDS_RETURNING_ROUTING_ENABLED:-true}
 # returning users via the legacy _tds_vid path, just without the signed cookie.
 TDS_IDENTITY_COOKIE_KEYS=${TDS_IDENTITY_COOKIE_KEYS:-}
 TDS_IDENTITY_COOKIE_ACTIVE_KID=${TDS_IDENTITY_COOKIE_ACTIVE_KID:-1}
+# GTD-R75 / ADR-0055 — capacity auto-config, computed at provision time from
+# the droplet size slug (WEB_CONCURRENCY read directly by the Dockerfile CMD,
+# no TDS_ prefix; TDS_REDIS_MAX_CONNECTIONS read by config.py's pydantic
+# Settings). Empty fallback (NOT a hardcoded number) — an unset/parse-failed
+# value writes nothing usable, so click-processor's own defaults (the
+# Dockerfile's WEB_CONCURRENCY default of 2 / config.py's
+# redis_max_connections default of 128) govern unopposed. Existing nodes
+# re-provisioned with no capacity config resolved stay byte-unchanged.
+WEB_CONCURRENCY=${WEB_CONCURRENCY:-}
+TDS_REDIS_MAX_CONNECTIONS=${TDS_REDIS_MAX_CONNECTIONS:-}
 TDS_CODE_VERSION=${code_version}
 EOF
 echo "render-env: wrote $ENV_FILE (node=$TDS_NODE_ID region=$TDS_NODE_REGION version=$code_version)"

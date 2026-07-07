@@ -107,6 +107,93 @@ def test_capture_op_exc_sets_op_and_node_id_tags():
     assert extras_kwargs == {"free_bytes": 512, "click_id": "X"}
 
 
+def test_capture_op_exc_tags_param_is_searchable_not_extras():
+    """LOSSFIX P3 (2026-07-07, alert-rule wiring) — `tags=` must land
+    via `set_tag` (Sentry issue-alert rules can filter on these),
+    never `set_extra` (rules CANNOT filter on extras/context data).
+    This is what makes the `OP_LOOP_ITERATION` `failure_kind !=
+    TimeoutError` alert rule spec (ALERT-RULES.md) mechanically real
+    rather than aspirational."""
+    exc = TimeoutError("idle gap")
+
+    scope_mock = MagicMock()
+    push_scope_mock = MagicMock()
+    push_scope_mock.__enter__ = MagicMock(return_value=scope_mock)
+    push_scope_mock.__exit__ = MagicMock(return_value=False)
+
+    with patch("app.telemetry.sentry_sdk") as mock_sentry:
+        mock_sentry.push_scope.return_value = push_scope_mock
+        capture_op_exc(
+            OP_LOOP_ITERATION, exc,
+            tags={"failure_kind": type(exc).__name__},
+            context="reclaim",
+        )
+
+    scope_mock.set_tag.assert_any_call("op", OP_LOOP_ITERATION)
+    scope_mock.set_tag.assert_any_call("node_id", "test-node-AU")
+    scope_mock.set_tag.assert_any_call("failure_kind", "TimeoutError")
+    # `context` stays a plain extra — no alert rule needs to filter on it.
+    scope_mock.set_extra.assert_called_once_with("context", "reclaim")
+
+
+def test_capture_op_exc_tags_defaults_to_empty_no_crash():
+    """Callers that never pass `tags=` (every pre-P3 call site) must
+    be completely unaffected — backward compatible."""
+    exc = RuntimeError("boom")
+    scope_mock = MagicMock()
+    push_scope_mock = MagicMock()
+    push_scope_mock.__enter__ = MagicMock(return_value=scope_mock)
+    push_scope_mock.__exit__ = MagicMock(return_value=False)
+
+    with patch("app.telemetry.sentry_sdk") as mock_sentry:
+        mock_sentry.push_scope.return_value = push_scope_mock
+        capture_op_exc(OP_BATCH_POST, exc, batch_size=1)
+
+    scope_mock.set_tag.assert_any_call("op", OP_BATCH_POST)
+    scope_mock.set_extra.assert_called_once_with("batch_size", 1)
+
+
+# ---------------------------------------------------------------------------
+# Source-pin — every OP_LOOP_ITERATION call site tags failure_kind
+# (LOSSFIX P3, 2026-07-07, alert-rule wiring)
+# ---------------------------------------------------------------------------
+
+
+def test_every_op_loop_iteration_call_site_tags_failure_kind():
+    """`op=loop_iteration AND failure_kind != TimeoutError` (the
+    ALERT-RULES.md filter) must behave predictably across EVERY call
+    site that emits this op tag — not just the main shipper-loop
+    catch-all. shipper.py has three OP_LOOP_ITERATION captures (the
+    main-loop catch-all + two reclaim-cycle catch-alls); all three
+    must pass `tags={"failure_kind": ...}`, or a reclaim-path event
+    with no failure_kind tag would behave unpredictably against the
+    filter (Sentry's "tag != X" semantics on a MISSING tag are not
+    something to rely on)."""
+    import re
+    from pathlib import Path
+
+    src_path = Path(__file__).parent.parent.parent / "app" / "shipper.py"
+    src = src_path.read_text()
+
+    # Anchored to `_capture_op_exc(` specifically (not the `logger.error`
+    # calls that also mention OP_LOOP_ITERATION) — tolerant of either
+    # call-site formatting style (args on one line vs each own line).
+    call_count = len(re.findall(r"_capture_op_exc\(\s*OP_LOOP_ITERATION,\s*exc,", src))
+    tagged_count = src.count('tags={"failure_kind": type(exc).__name__}')
+    assert call_count == 3, (
+        f"Expected exactly 3 OP_LOOP_ITERATION call sites in shipper.py, "
+        f"found {call_count} — update this pin if the count genuinely "
+        f"changed (and verify each new/removed site's failure_kind "
+        f"tagging)."
+    )
+    assert tagged_count == 3, (
+        f"Expected all 3 OP_LOOP_ITERATION call sites to tag "
+        f"failure_kind (searchable, not **extras) — found {tagged_count}. "
+        "A call site missing this tag breaks the "
+        "`failure_kind != TimeoutError` alert filter's predictability."
+    )
+
+
 # ---------------------------------------------------------------------------
 # capture_op_msg — message tagging (used by /decide disk-pressure path)
 # ---------------------------------------------------------------------------

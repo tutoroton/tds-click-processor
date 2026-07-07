@@ -207,19 +207,36 @@ def _reset_throttle_for_tests() -> None:
     _throttle_state.clear()
 
 
-def capture_op_exc(op_name: str, exc: BaseException, **extras: object) -> None:
+def capture_op_exc(
+    op_name: str,
+    exc: BaseException,
+    tags: dict[str, str] | None = None,
+    **extras: object,
+) -> None:
     """Capture an exception to Sentry with the F.29 ``op`` tag scheme.
 
     Args:
         op_name: One of the ``OP_*`` constants above.
         exc: The exception object to report.
+        tags: LOSSFIX P3 (2026-07-07, alert-rule wiring) — additional
+            SEARCHABLE tags (e.g. ``{"failure_kind": type(exc).__name__}``).
+            Unlike ``**extras`` below, a Sentry issue-alert rule CAN
+            filter on these (the classic "event's tags match" condition
+            only sees indexed tags, never `set_extra` context) — use
+            this when a caller's alert spec needs to filter/exclude by
+            a dynamic value (see ``OP_LOOP_ITERATION``'s
+            ``failure_kind != TimeoutError`` filter in
+            docs/development/lossfix-p3-2026-07-07/ALERT-RULES.md).
         **extras: Additional context (e.g. ``msg_id``, ``batch_size``).
             Each key becomes a Sentry "extras" entry — visible in the
-            issue detail but not searchable as a tag.
+            issue detail but NOT searchable as a tag (use ``tags=``
+            above for anything an alert rule needs to filter on).
     """
     with sentry_sdk.push_scope() as scope:
         scope.set_tag("op", op_name)
         scope.set_tag("node_id", settings.node_id)
+        for key, value in (tags or {}).items():
+            scope.set_tag(key, value)
         for key, value in extras.items():
             scope.set_extra(key, value)
         sentry_sdk.capture_exception(exc)

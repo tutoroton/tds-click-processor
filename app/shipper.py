@@ -833,11 +833,19 @@ async def _reclaim_shipper_pending(redis_pool, http_client) -> dict[str, int]:
             await _ensure_local_consumer_group(redis_pool)
         else:
             logger.warning("Shipper reclaim ResponseError: %s", exc)
-            _capture_op_exc(OP_LOOP_ITERATION, exc, context="reclaim")
+            _capture_op_exc(
+                OP_LOOP_ITERATION, exc,
+                tags={"failure_kind": type(exc).__name__},
+                context="reclaim",
+            )
         return counts
     except Exception as exc:  # noqa: BLE001 — never break the main loop
         logger.warning("Shipper reclaim cycle failed: %s", exc)
-        _capture_op_exc(OP_LOOP_ITERATION, exc, context="reclaim")
+        _capture_op_exc(
+            OP_LOOP_ITERATION, exc,
+            tags={"failure_kind": type(exc).__name__},
+            context="reclaim",
+        )
         return counts
 
 
@@ -1416,10 +1424,17 @@ async def _handle_shipper_loop_error(exc: Exception) -> None:
         "Shipper loop catch-all (op=%s): %s",
         OP_LOOP_ITERATION, exc,
     )
+    # LOSSFIX P3 (2026-07-07, alert-rule wiring) — failure_kind is a
+    # searchable TAG (not `**extras`, which Sentry issue-alert rules
+    # cannot filter on) so the `op=loop_iteration AND failure_kind !=
+    # TimeoutError` alert rule (see ALERT-RULES.md) actually works:
+    # the fleet fires TimeoutError-class on every idle gap >1s (F-6,
+    # steady-state until T-7 lands) — a naive rule on `op` alone would
+    # page permanently on expected traffic.
     _capture_op_exc(
         OP_LOOP_ITERATION,
         exc,
-        failure_kind=type(exc).__name__,
+        tags={"failure_kind": type(exc).__name__},
     )
     shipper_metrics.record_ship("loop_error", batch_size=0)
     await asyncio.sleep(2)

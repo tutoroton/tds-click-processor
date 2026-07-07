@@ -323,3 +323,28 @@ class HealthResponse(BaseModel):
     # actually took effect).
     web_concurrency: int = 2
     redis_max_connections: int = 128
+
+    # LOSSFIX P3 (2026-07-07, L6) — observability depth. Every field here
+    # is a CACHED read (the watermark sampler's in-memory state, the M1
+    # observability loop's cached stream-length sample) — never a new
+    # per-request Redis round-trip, mirroring the existing D3/CAP-1
+    # discipline above. Lets an operator (and the P4 abort-guard) read a
+    # node's spill/backpressure/dedup posture from ONE /health call.
+    #
+    # P2 c3 watermark state — used_memory% and whether new real clicks
+    # are currently diverting to the disk-segment fallback.
+    watermark_spill_mode: bool = False
+    watermark_used_memory_pct: float = 0.0
+    # None = never sampled yet (fresh boot, within the boot grace).
+    watermark_sample_age_seconds: float | None = None
+    # M1 — the entry-count reject threshold + whether the CACHED signal
+    # is currently at/over it (mirrors `main._check_stream_backpressure`
+    # exactly, so this reflects the SAME decision the hot path makes,
+    # not a possibly-fresher-but-different live XLEN).
+    stream_clicks_reject_threshold: int = 0
+    stream_backpressure_active: bool = False
+    # The live click_dedup_ttl_seconds value in effect (config
+    # passthrough — zero-cost, "dedup-key pressure if cheaply
+    # available" per the P3 brief; a live SCAN/DBSIZE count would NOT
+    # be cheap, so this is the pressure signal actually exposed).
+    click_dedup_ttl_seconds: int = 0

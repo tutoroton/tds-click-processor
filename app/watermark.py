@@ -60,6 +60,18 @@ class WatermarkState:
             return float("inf")
         return time.monotonic() - self._last_sampled_monotonic
 
+    def sample_age_or_none(self) -> float | None:
+        """LOSSFIX P3 (2026-07-07, L6) — /health-safe variant of
+        :meth:`sample_age`. `float('inf')` is a fine internal sentinel
+        for the `is_stale()` comparison, but it is NOT valid JSON —
+        `json.dumps(float('inf'))` emits the non-standard literal
+        `Infinity`, which many strict downstream parsers (dashboards,
+        the P4 abort-guard) reject. Never-sampled reports as `None`
+        instead, which every JSON consumer already handles."""
+        if self._last_sampled_monotonic is None:
+            return None
+        return self.sample_age()
+
     def is_stale(self) -> bool:
         return self.sample_age() > settings.watermark_staleness_sec
 

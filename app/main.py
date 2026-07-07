@@ -1963,6 +1963,17 @@ async def health():
         # None; the resolver's own boot gate covers that failure class.
         pass
 
+    # LOSSFIX P3 (2026-07-07, L6) — observability depth. Every read here
+    # is a CACHED signal (the watermark sampler's in-memory state, the
+    # M1 observability loop's cached stream-length sample via
+    # `_check_stream_backpressure()`) — never a new Redis round-trip on
+    # this hot polling path. Pure attribute reads / a function call over
+    # an already-cached value — nothing here can itself raise.
+    watermark_spill_mode = watermark_state.spill_mode
+    watermark_used_memory_pct = watermark_state.used_memory_pct
+    watermark_sample_age_seconds = watermark_state.sample_age_or_none()
+    stream_backpressure_active = _check_stream_backpressure()
+
     return HealthResponse(
         # F.32 Track 1 — drift visibility: the git SHA the node is running.
         code_version=settings.code_version,
@@ -1997,6 +2008,13 @@ async def health():
         # env/default actually took effect at Settings() construction).
         web_concurrency=int(os.environ.get("WEB_CONCURRENCY", "2")),
         redis_max_connections=settings.redis_max_connections,
+        # LOSSFIX P3 (2026-07-07, L6) — see the cached-read block above.
+        watermark_spill_mode=watermark_spill_mode,
+        watermark_used_memory_pct=watermark_used_memory_pct,
+        watermark_sample_age_seconds=watermark_sample_age_seconds,
+        stream_clicks_reject_threshold=settings.stream_clicks_maxlen,
+        stream_backpressure_active=stream_backpressure_active,
+        click_dedup_ttl_seconds=settings.click_dedup_ttl_seconds,
     )
 
 

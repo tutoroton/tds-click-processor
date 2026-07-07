@@ -462,11 +462,13 @@ async def drain_to_redis(redis) -> dict:
                 )
 
         try:
+            # M1 (LOSSFIX P1b, 2026-07-07) — no `maxlen` here, and NO new
+            # gate: the existing stop-on-first-failure below is this
+            # phase's self-limit for the drain path (watermark-gated
+            # drain pacing is P2 / L4 — do not half-build it here).
             await redis.xadd(
                 "stream:clicks",
                 {"data": data.decode("utf-8")},
-                maxlen=settings.stream_clicks_maxlen,
-                approximate=True,
             )
         except Exception as exc:  # noqa: BLE001 — broad on purpose
             # XADD raised → Redis still impaired. Stop the drain

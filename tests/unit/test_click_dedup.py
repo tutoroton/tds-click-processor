@@ -192,9 +192,21 @@ class TestSourcePins:
 
     def test_decide_handler_calls_dedup_before_xadd(self):
         """The `/decide` source MUST call `_acquire_click_dedup`
-        BEFORE the `r.xadd(\"stream:clicks\", ...)` line. A future
-        refactor that moves the dedup AFTER the XADD defeats the
-        whole purpose — would still double-write before checking."""
+        BEFORE the REAL click's `r.xadd("stream:clicks", ...)` line. A
+        future refactor that moves the dedup AFTER the XADD defeats the
+        whole purpose — would still double-write before checking.
+
+        LOSSFIX P1b (2026-07-07) — anchored on `json.dumps(click_record`
+        rather than a bare `xadd(` search: `/decide` has a SECOND,
+        EARLIER `xadd(` call for the synthetic smoke-probe click (which
+        deliberately does NOT participate in dedup — it's a pipeline-
+        liveness probe, not real traffic), so a whitespace-insensitive
+        "first xadd(" search would false-positive against the smoke
+        path once M1 changed the real XADD's indentation. Searching for
+        the `click_record` JSON-encode instead targets the REAL click's
+        XADD specifically (smoke encodes `smoke_record`, never
+        `click_record`).
+        """
         import inspect
         from app import main
 
@@ -202,11 +214,13 @@ class TestSourcePins:
         assert "_acquire_click_dedup" in src, (
             "/decide MUST call _acquire_click_dedup() in its body."
         )
-        # Position check: the dedup call must precede the xadd.
+        # Position check: the dedup call must precede the REAL click's xadd.
         dedup_pos = src.find("_acquire_click_dedup")
-        xadd_pos = src.find('r.xadd(\n            "stream:clicks"')
-        if xadd_pos < 0:  # fallback for slight whitespace drift
-            xadd_pos = src.find('xadd(')
+        xadd_pos = src.find("json.dumps(click_record")
+        assert xadd_pos > 0, (
+            "Expected to find the real click's XADD payload "
+            "(json.dumps(click_record, ...)) in /decide's source."
+        )
         assert dedup_pos < xadd_pos, (
             "Dedup call must precede the XADD — otherwise a duplicate "
             "is written to the stream before we know it's a duplicate."

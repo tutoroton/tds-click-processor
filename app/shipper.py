@@ -275,13 +275,17 @@ async def _retry_click(
     underlying stream entry gets a new msg_id each time. The old
     msg_id of the rejected attempt MUST be ACKed by the caller AFTER
     this re-XADD succeeds (otherwise PEL grows unbounded).
+
+    M1 (LOSSFIX P1b, 2026-07-07) — no ``maxlen`` here, deliberately, and
+    with NO new gate either: this is a size-neutral swap (the old
+    stream entry is ACKed right after this re-XADD succeeds), and
+    gating a retry would starve transient failures straight into
+    deadletters instead of giving them another shipper cycle.
     """
     payload = json.dumps(click, default=str)
     await redis_pool.xadd(
         STREAM_KEY,
         {"data": payload},
-        maxlen=settings.stream_clicks_maxlen,
-        approximate=True,
     )
 
 
@@ -995,8 +999,15 @@ async def _trim_processed_history(redis_pool) -> int:
     batch after recovery used to trim everything older than the newest
     10k — silently destroying the un-shipped backlog (including
     PEL-referenced entries, which XAUTOCLAIM then drops as deleted).
-    The XADD-side ``MAXLEN ~ stream_clicks_maxlen`` (1M) remains the only
-    capacity ceiling.
+
+    A1 (LOSSFIX P1b, 2026-07-07) — stale-comment fix: the XADD side no
+    longer carries a MAXLEN trim cap at all (M1 repurposed
+    ``stream_clicks_maxlen`` into a whole-request REJECT threshold,
+    checked against a cached length sample in ``main._check_stream_
+    backpressure`` — over-threshold real clicks divert to the disk
+    fallback instead of writing the stream). The capacity ceiling is
+    therefore that reject threshold, not a trim, and it now applies
+    BEFORE entries ever reach the stream rather than after.
 
     Mirror of the proven process-service pattern
     (``app/events/consumer.py`` ``trim_processed``). Safe point:

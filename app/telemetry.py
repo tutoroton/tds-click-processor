@@ -63,12 +63,19 @@ OP_LOOP_ITERATION = "loop_iteration"
 # Hot-path /decide failure modes (Sprint 1.5+)
 OP_DISK_PRESSURE = "disk_pressure"
 
-# LOSSFIX P1b (2026-07-07) — L1: the stream write AND the disk fallback
-# BOTH failed to durably capture the click. Pre-fix this fell through
-# to a silent 302 (click "genuinely lost" per the old comment); now it
-# 503s the Worker instead — this tag marks that terminal,
-# non-recoverable-here moment.
+# LOSSFIX P1b (2026-07-07) — L1: the stream write (real XADD or an M1
+# gate-reject) AND the disk fallback BOTH failed to durably capture the
+# click. Pre-fix this fell through to a silent 302 (click "genuinely
+# lost" per the old comment); now it 503s the Worker instead — this tag
+# marks that terminal, non-recoverable-here moment.
 OP_CLICK_UNCAPTURED = "click_uncaptured"
+
+# LOSSFIX P1b (2026-07-07) — M1: the cached stream:clicks length is
+# at/over the reject threshold. Fired when a real click is diverted to
+# the disk fallback pre-emptively (no XADD attempted) and when the
+# smoke probe rejects outright (503, reject-only, no disk fallback —
+# synthetic click, nothing to preserve).
+OP_STREAM_ENTRY_LIMIT = "stream_entry_limit"
 
 # Returning-user identity resolver fail-open (P2, 2026-06-05). Emitted (throttled
 # per company) when the resolver raises and the click degrades to legacy flags.

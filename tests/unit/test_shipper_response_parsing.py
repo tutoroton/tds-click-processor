@@ -133,8 +133,13 @@ def test_parse_only_queued_key_is_legacy():
 @pytest.mark.asyncio
 async def test_retry_click_xadds_to_stream_with_maxlen_cap():
     """Re-XADDs the click payload to ``stream:clicks`` (NOT the
-    deadletter stream). Uses the same MAXLEN cap as the original
-    ingest path — bounds stream growth under retry storms."""
+    deadletter stream).
+
+    M1 (LOSSFIX P1b, 2026-07-07): NO `maxlen` here anymore, and
+    deliberately no new gate either — this is a size-neutral swap (the
+    old stream entry is ACKed right after this re-XADD succeeds), and
+    gating a retry would starve transient failures into deadletters
+    instead of giving them another shipper cycle."""
     redis_mock = AsyncMock()
     click = {"click_id": "abc", "ip": "1.2.3.4"}
 
@@ -147,9 +152,10 @@ async def test_retry_click_xadds_to_stream_with_maxlen_cap():
     # main.py /decide XADD shape).
     assert "data" in args[1]
     assert json.loads(args[1]["data"])["click_id"] == "abc"
-    # MAXLEN cap enforced — defensive against retry storms.
-    assert kwargs["maxlen"] == 1_000_000
-    assert kwargs["approximate"] is True
+    # No MAXLEN cap — a trim here would silently destroy unconsumed
+    # entries (M-TRIM); retries are size-neutral, no gate needed.
+    assert "maxlen" not in kwargs
+    assert "approximate" not in kwargs
 
 
 # ---------------------------------------------------------------------------

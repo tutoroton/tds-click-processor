@@ -157,25 +157,33 @@ class Settings(BaseSettings):
     sync_interval_seconds: int = 30
     full_sync_interval_seconds: int = 60
 
-    # T2.1 / G-22 — `stream:clicks` inline MAXLEN cap (zero-loss
-    # foundation). This inline cap is the ONLY capacity ceiling: the
-    # shipper's processed-history trim is MINID-based (AUD-B F1) and
-    # never cuts undelivered entries. Without this hard cap
-    # a central-collector outage would let `/decide`'s XADD path
-    # grow the stream unbounded → Redis OOM → routing degradation
-    # + click loss (`noeviction` policy on edge Redis means writes
-    # eventually start failing). The inline `MAXLEN ~ N` on every
-    # XADD enforces a worst-case ceiling that's:
-    #   - large enough to absorb collector outages of hours under
-    #     normal click rates (1M @ ~500 B/click ≈ 500 MB Redis budget,
-    #     well below typical 4 GB node provisioning)
-    #   - small enough that even at saturation the stream stays
-    #     bounded
-    # `~` (approximate) trim is O(1) per XADD vs O(N) exact trim;
-    # at the cost of the cap being honoured to ±10% of the target
-    # rather than exact — fine for a defense-in-depth ceiling.
-    # Tunable per-environment via TDS_STREAM_CLICKS_MAXLEN.
-    stream_clicks_maxlen: int = 1_000_000
+    # T2.1 / G-22, REPURPOSED by M1 (LOSSFIX P1b, 2026-07-07) —
+    # `stream:clicks` entry-count REJECT threshold. Pre-fix this was an
+    # inline `MAXLEN ~ N` on every XADD, which SILENTLY TRIMMED the
+    # oldest UNCONSUMED entries once the stream grew past it during an
+    # extended central-collector outage (the M-TRIM pathology — masked
+    # by the fact that the stream rarely got that large before OTHER
+    # limits bit). No XADD carries MAXLEN anymore: `/decide` instead
+    # checks this threshold against a CACHED XLEN sample
+    # (`app.observability.get_cached_stream_clicks_length`, ~60s
+    # cadence — never a per-click round-trip) BEFORE attempting the
+    # real-click XADD, and diverts to the existing disk-fallback queue
+    # when at/over it — reject, not trim (see `main._check_stream_
+    # backpressure`). The smoke-probe XADD rejects outright (503) at
+    # the same threshold, gating node activation.
+    #
+    # A2 (MUST, LOSSFIX P1b) — default is 300_000, NOT the old 1_000_000.
+    # Edge routing Redis is provisioned at 256 MB (`docker-compose.yml`
+    # `--maxmemory 256mb`); at ~500-600 B/entry, 1,000,000 entries ≈
+    # 500-600 MB — comfortably ABOVE the 256 MB budget, so Redis would
+    # OOM long before XLEN could ever reach that count, making the
+    # reject path dead code. 300,000 ≈ 70% of 256 MB ÷ ~600 B/entry —
+    # large enough to absorb hours of a collector outage at normal
+    # click rates while staying inside the actual memory budget.
+    # Tunable per-environment via TDS_STREAM_CLICKS_MAXLEN (NOT pinned
+    # by `deploy/render-env.sh`, so this new default takes effect
+    # fleet-wide on next deploy).
+    stream_clicks_maxlen: int = 300_000
 
     # H1 fix (2026-05-11): TTL for the per-click idempotency marker
     # `click:seen:<click_id>` set by `acquire_click_dedup` in main.py.

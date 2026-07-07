@@ -56,6 +56,7 @@ from app.telemetry import (
     OP_DISK_PRESSURE,
     OP_IDENTITY_STORE_PRESSURE,
     OP_ROUTE_ERROR,
+    OP_STREAM_ENTRY_LIMIT,
     capture_op_exc,
     capture_op_msg,
     capture_op_msg_throttled,
@@ -66,7 +67,7 @@ from app.disk_queue import (
     get_queue_size,
     run_drainer as run_disk_drainer,
 )
-from app.observability import run_observability_loop
+from app.observability import get_cached_stream_clicks_length, run_observability_loop
 from app.sync_client import apply_snapshot, start_periodic_pull
 
 logger = logging.getLogger("tds.click-processor")
@@ -207,6 +208,24 @@ async def lifespan(app: FastAPI):
     # drainer cadences (60s default vs 30s drain) to keep
     # alert granularity matched to typical Sentry evaluation.
     observability_task = asyncio.create_task(run_observability_loop(r))
+
+    # H6 (LOSSFIX P1b, 2026-07-07) — one-shot boot log: the
+    # stream:clicks MAXLEN cap's semantics changed from SILENT TRIM to
+    # REJECT. Pre-fix, every XADD to stream:clicks (real click, smoke
+    # probe, shipper retry, disk-drainer replay) carried `MAXLEN ~N`,
+    # which silently dropped the OLDEST unconsumed entries once the
+    # stream grew past it (M-TRIM). That cap is gone from all four
+    # XADD sites; the SAME value now gates the real-click + smoke-probe
+    # paths as a whole-request reject threshold (checked against a
+    # CACHED length sample, never a per-click round-trip — see
+    # app/observability.py + main._check_stream_backpressure).
+    logger.warning(
+        "stream:clicks MAXLEN semantics changed (M1, LOSSFIX P1b): no "
+        "longer silently trims at ~%d entries — real clicks divert to "
+        "the disk fallback and the smoke probe 503s at/over that "
+        "entry count instead.",
+        settings.stream_clicks_maxlen,
+    )
 
     # Diagnostic obs-stream drainer. Started unconditionally — when
     # `TDS_DIAG_OBS_STREAM=false` (production default) the queue
@@ -619,6 +638,27 @@ async def _acquire_click_dedup(click_id: str) -> bool | None:
         )
         sentry_sdk.capture_exception(exc)
         return None
+
+
+def _check_stream_backpressure() -> bool:
+    """M1 (edge, LOSSFIX P1b, 2026-07-07) — whole-click entry-count
+    reject decision for the real-click XADD and the smoke-probe XADD.
+
+    Returns True when the CACHED `stream:clicks` length (sampled by
+    ``app.observability.run_observability_loop``, ~60s cadence) is
+    at/over ``settings.stream_clicks_maxlen`` (the repurposed old
+    MAXLEN value, now a reject threshold — see app/config.py).
+
+    A3 (MUST): reads the cache ONLY — no Redis round-trip on this hot
+    path. A3 fail-open: a cache that has never been populated (``None``
+    — fresh boot, or the last sample attempt failed) returns False
+    (proceed normally) so this gate can never itself become a new
+    hot-path failure mode.
+    """
+    cached_length = get_cached_stream_clicks_length()
+    if cached_length is None:
+        return False
+    return cached_length >= settings.stream_clicks_maxlen
 
 
 # F.29 Sprint 3.6 (2026-05-23) — smoke-test click_id prefix.
@@ -1082,6 +1122,37 @@ async def decide(
                 smoke_fp, settings.node_id,
             )
 
+        # M1 (edge, LOSSFIX P1b, 2026-07-07) — A4: the smoke probe gates
+        # node ACTIVATION (admin-api polls the central stream for this
+        # exact click). A node whose stream:clicks is at/over the
+        # reject threshold must FAIL its probe (503) rather than pass
+        # green — activating a node already under entry-count pressure
+        # would immediately route real traffic into the same pressure.
+        # Reject-only: no XADD attempt, no disk fallback (synthetic
+        # click, nothing to preserve).
+        if _check_stream_backpressure():
+            logger.warning(
+                "LOSSFIX P1b M1 — smoke probe REFUSED: stream:clicks "
+                "at/over the reject threshold (%d) click_id_fp=%s "
+                "node_id=%s. Node activation must not pass green while "
+                "already under entry-count pressure.",
+                settings.stream_clicks_maxlen, smoke_fp, settings.node_id,
+            )
+            capture_op_msg(
+                OP_STREAM_ENTRY_LIMIT,
+                f"Smoke probe refused: stream:clicks at/over reject "
+                f"threshold ({settings.stream_clicks_maxlen}) "
+                f"node_id={settings.node_id}",
+                level="error",
+                click_id_fp=smoke_fp,
+                node_id=settings.node_id,
+                threshold=settings.stream_clicks_maxlen,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="stream_entry_limit",
+            )
+
         try:
             r = await get_redis()
             smoke_record = {
@@ -1093,8 +1164,6 @@ async def decide(
             await r.xadd(
                 "stream:clicks",
                 {"data": json.dumps(smoke_record)},
-                maxlen=settings.stream_clicks_maxlen,
-                approximate=True,
             )
             logger.info(
                 "Smoke-test click bypassed routing: click_id_fp=%s node_id=%s",
@@ -1473,34 +1542,56 @@ async def decide(
     history.schedule_capture(click_record)
 
     # Write to local stream.
-    # T2.1 / G-22: inline `MAXLEN ~ N` enforces a hard ceiling on
-    # the stream so a central-collector outage cannot grow it
-    # unbounded → Redis OOM → routing degradation + click loss.
-    # `approximate=True` (the redis-py `~` modifier) makes the trim
-    # O(1) per XADD by trimming whole macro-nodes rather than
-    # exact-counting; the cap is honoured to ±10% of target which
-    # is more than sufficient for a defense-in-depth ceiling. Under
-    # normal operation the shipper.run_shipper loop XTRIMs the
-    # stream to ~10k after every successful batch ship, so this cap
-    # is rarely exercised — it exists for the failure-mode tail.
-    # Cap value is env-configurable (TDS_STREAM_CLICKS_MAXLEN);
-    # default 1M ≈ ~500 MB Redis budget at ~500 B/click.
+    # M1 (LOSSFIX P1b, 2026-07-07) — repurposed from T2.1/G-22's inline
+    # `MAXLEN ~ N` trim cap. The XADD below is now UNBOUNDED (no
+    # maxlen/approximate kwargs): a hard trim silently destroyed
+    # unconsumed entries once the stream grew past the cap during an
+    # extended central-collector outage (M-TRIM). Instead,
+    # `_check_stream_backpressure()` reads a CACHED stream-length
+    # sample (never a per-click round-trip — A3) and, at/over the
+    # reject threshold, diverts the click into the SAME disk-fallback
+    # path used for a genuine XADD failure below — reject, not trim.
+    # Cap value is env-configurable (TDS_STREAM_CLICKS_MAXLEN; default
+    # 300_000 — see app/config.py for the sizing rationale).
     t_stream = time.perf_counter()
-    try:
-        r = await get_redis()
-        await r.xadd(
-            "stream:clicks",
-            {"data": json.dumps(click_record, default=str)},
-            maxlen=settings.stream_clicks_maxlen,
-            approximate=True,
+    stream_write_failed = False
+    stream_failure_reason = ""
+    if _check_stream_backpressure():
+        stream_write_failed = True
+        stream_failure_reason = "entry_count_reject"
+        logger.warning(
+            "LOSSFIX P1b M1 — stream:clicks at/over the reject "
+            "threshold (%d); diverting click %s to the disk fallback "
+            "instead of XADD (no silent trim).",
+            settings.stream_clicks_maxlen, req.click_id,
         )
-        emit_checkpoint("click.stream_xadd", {
-            "click_id": req.click_id,
-            "stream_write_ms": round((time.perf_counter() - t_stream) * 1000, 2),
-        })
-    except Exception as e:
-        logger.error("Failed to write click to stream: %s", e, extra={"click_id": req.click_id})
-        sentry_sdk.capture_exception(e)
+        capture_op_msg(
+            OP_STREAM_ENTRY_LIMIT,
+            f"stream:clicks at/over reject threshold "
+            f"({settings.stream_clicks_maxlen}) — click {req.click_id} "
+            "diverted to disk fallback",
+            level="warning",
+            click_id=req.click_id,
+            threshold=settings.stream_clicks_maxlen,
+        )
+    else:
+        try:
+            r = await get_redis()
+            await r.xadd(
+                "stream:clicks",
+                {"data": json.dumps(click_record, default=str)},
+            )
+            emit_checkpoint("click.stream_xadd", {
+                "click_id": req.click_id,
+                "stream_write_ms": round((time.perf_counter() - t_stream) * 1000, 2),
+            })
+        except Exception as e:
+            logger.error("Failed to write click to stream: %s", e, extra={"click_id": req.click_id})
+            sentry_sdk.capture_exception(e)
+            stream_write_failed = True
+            stream_failure_reason = str(e)[:200]
+
+    if stream_write_failed:
         # F.29 Sprint 1.5 (2026-05-23) — pre-flight disk-pressure check.
         # Plan §3 G4 closes the "disk full → enqueue OSErrors silently"
         # gap. Pre-F.29 the disk-fallback path called enqueue_click
@@ -1558,18 +1649,18 @@ async def decide(
             )
 
         # T2.2 / G-23 — fall back to disk queue when Redis is
-        # unreachable. Without this, every click during a Redis
-        # outage was LOST: the log + Sentry capture above record
-        # the symptom but the click_record itself never made it
-        # to the stream → never to central → never to analytics.
-        # The disk file is replayed by the background drainer
-        # task once Redis recovers; nothing is lost provided
+        # unreachable (or the M1 gate diverted us here). Without this,
+        # every click during a Redis outage was LOST: the log + Sentry
+        # capture above record the symptom but the click_record itself
+        # never made it to the stream → never to central → never to
+        # analytics. The disk file is replayed by the background
+        # drainer task once Redis recovers; nothing is lost provided
         # disk space holds (cap = TDS_DISK_QUEUE_MAX_FILES).
         enqueued = await enqueue_click_to_disk(click_record)
         if enqueued:
             logger.info(
-                "Click %s queued to disk after Redis failure",
-                req.click_id,
+                "Click %s queued to disk (%s)",
+                req.click_id, stream_failure_reason,
             )
         else:
             # L1 FIX (LOSSFIX P1b, 2026-07-07) — pre-fix this fell
@@ -1583,22 +1674,22 @@ async def decide(
             # nowhere durable.
             logger.critical(
                 "Click %s could not be captured by ANY durable path "
-                "(stream XADD failed: %s; disk fallback rejected/failed "
-                "too) — refusing 302, returning 503.",
-                req.click_id, e,
+                "(stream: %s; disk: rejected/failed too) — refusing "
+                "302, returning 503.",
+                req.click_id, stream_failure_reason,
             )
             capture_op_msg(
                 OP_CLICK_UNCAPTURED,
                 f"Click {req.click_id} uncaptured: stream write failed "
-                f"({str(e)[:200]}) AND the disk fallback also failed — "
-                "503 to Worker instead of a silent 302.",
+                f"({stream_failure_reason}) AND the disk fallback also "
+                "failed — 503 to Worker instead of a silent 302.",
                 level="error",
                 click_id=req.click_id,
-                stream_failure_reason=str(e)[:200],
+                stream_failure_reason=stream_failure_reason,
             )
             emit_checkpoint("click.uncaptured_503", {
                 "click_id": req.click_id,
-                "stream_failure_reason": str(e)[:200],
+                "stream_failure_reason": stream_failure_reason,
             })
             raise HTTPException(
                 status_code=503,
@@ -1607,7 +1698,7 @@ async def decide(
         emit_checkpoint("click.disk_queue_fallback", {
             "click_id": req.click_id,
             "enqueued": enqueued,
-            "error": str(e)[:200],
+            "error": stream_failure_reason,
         })
     timing["stream_write_ms"] = round((time.perf_counter() - t_stream) * 1000, 2)
     timing["endpoint_total_ms"] = round((time.perf_counter() - t_endpoint_start) * 1000, 2)

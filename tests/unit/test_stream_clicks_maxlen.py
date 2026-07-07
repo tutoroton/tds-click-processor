@@ -1,27 +1,34 @@
-"""Tests for the stream:clicks inline MAXLEN cap (T2.1 / G-22).
+"""Tests for `stream:clicks` entry-count handling (T2.1 / G-22, REPURPOSED
+by M1 — LOSSFIX P1b, 2026-07-07).
 
-Foundation for Tier 2 zero-loss. Without this cap, a central-
-collector outage lets `/decide`'s XADD grow the local stream
-unbounded — eventually Redis OOM → routing 5xx + click analytics
-loss. The shipper's post-success XTRIM keeps the stream at ~10k
-in steady-state; this cap defends the failure-mode tail.
+Pre-fix: an inline `MAXLEN ~ N` on every XADD to `stream:clicks` SILENTLY
+TRIMMED the oldest UNCONSUMED entries once the stream grew past the cap
+during an extended central-collector outage (the M-TRIM pathology).
 
-Two layers of defense:
+Post-fix: NO XADD to `stream:clicks` carries a MAXLEN cap, at ANY of the
+four call sites:
 
-  1. Source-pin on `app/main.py` `/decide` handler — the XADD call
-     MUST carry `maxlen=` and `approximate=True` keywords. A future
-     refactor that drops them would re-open G-22 silently.
+  1. `/decide`'s real-click XADD (`main.py`) — GATED: before attempting
+     the XADD, a cached stream-length check
+     (`main._check_stream_backpressure`, never a per-click round-trip)
+     diverts an over-threshold click to the EXISTING disk-fallback path
+     instead — reject, not trim.
+  2. `/decide`'s smoke-probe XADD (`main.py`) — GATED, reject-only: an
+     over-threshold smoke probe 503s outright (no XADD attempt, no disk
+     fallback — synthetic click, nothing to preserve). Gates node
+     ACTIVATION.
+  3. `shipper.py` `_retry_click` — NO new gate: a size-neutral swap (the
+     old entry is ACKed right after), gating would starve transient
+     retries into deadletters.
+  4. `disk_queue.py` drainer replay XADD — NO new gate: the existing
+     stop-on-first-failure is this phase's self-limit; watermark-gated
+     drain pacing is P2 (do not half-build it here).
 
-  2. Source-pin on `app/config.py` Settings — the cap MUST be a
-     named, env-configurable field (not a hardcoded literal at the
-     callsite), so operators can tune per-environment without code
-     deploy.
+The reject threshold itself is the OLD `stream_clicks_maxlen` setting,
+repurposed (same name, new meaning + a new default — see A2 below).
 
-  3. Behavioural pin on the redis-py call shape — pass an AsyncMock
-     redis client through the relevant code path and assert the
-     XADD arguments match the contract.
-
-Reference: rule `sync-protocol`, action-items.md T2.1, open-questions.md G-22.
+Reference: rule `sync-protocol`, LOSSFIX-FINAL-PLAN.md M1 (edge),
+BLAST-RADIUS-map.md, action-items.md T2.1, open-questions.md G-22.
 """
 
 from __future__ import annotations
@@ -38,7 +45,7 @@ import pytest
 
 class TestSettingsField:
     def test_stream_clicks_maxlen_named_field(self):
-        """The cap MUST be a named Settings field, not a hardcoded
+        """The threshold MUST be a named Settings field, not a hardcoded
         literal. Lets operators tune via TDS_STREAM_CLICKS_MAXLEN
         without rebuilding the image."""
         from app.config import Settings
@@ -46,19 +53,26 @@ class TestSettingsField:
         assert "stream_clicks_maxlen" in Settings.model_fields, (
             "Settings.stream_clicks_maxlen must be defined so operators "
             "can override via TDS_STREAM_CLICKS_MAXLEN env var "
-            "(T2.1 / G-22)."
+            "(T2.1 / G-22 / M1)."
         )
 
-    def test_default_value_is_one_million(self):
-        """Default 1M ≈ 500 MB Redis budget at ~500 B/click.
-        Pinning the default protects against accidental changes
-        that would either nuke Redis (too high) or trim live
-        outage-recovery clicks (too low)."""
+    def test_default_value_is_300k_not_the_dead_code_1m(self):
+        """A2 (MUST, LOSSFIX P1b) — pin the NEW default explicitly.
+
+        Edge routing Redis is provisioned at 256 MB
+        (`docker-compose.yml` `--maxmemory 256mb`). At ~500-600 B/entry,
+        the OLD default of 1_000_000 entries would be ~500-600 MB —
+        ABOVE the actual memory budget, so Redis would OOM long before
+        XLEN could ever reach that count: the reject path would be dead
+        code and the H6 boot log would announce a gate that never
+        gates. 300_000 (~70% of the 256 MB budget at ~600 B/entry)
+        keeps the threshold inside the real budget."""
         from app.config import settings
 
-        assert settings.stream_clicks_maxlen == 1_000_000, (
-            "Default cap should be 1_000_000 — see T2.1 design "
-            "rationale in `app/config.py` docstring."
+        assert settings.stream_clicks_maxlen == 300_000, (
+            "Default should be 300_000 (A2) — NOT the old 1_000_000, "
+            "which sat above the 256 MB edge-Redis memory budget and "
+            "made the M1 reject path unreachable dead code."
         )
 
     def test_env_prefix_resolves_field(self):
@@ -67,140 +81,166 @@ class TestSettingsField:
         var name (TDS_STREAM_CLICKS_MAXLEN) actually works."""
         from app.config import Settings
 
-        # Pydantic-settings derives `TDS_STREAM_CLICKS_MAXLEN` from
-        # `stream_clicks_maxlen` because env_prefix='TDS_' is set
-        # on the class. A direct test would require setting the env
-        # var and reloading; instead we pin the model_config shape
-        # so a future refactor can't silently drop the prefix.
         assert Settings.model_config.get("env_prefix") == "TDS_"
 
 
 # ---------------------------------------------------------------------------
-# Source-pin: /decide handler XADD shape
+# Source-pin: /decide handler — real-click XADD site (1 of 4)
 # ---------------------------------------------------------------------------
 
 
-class TestDecideHandlerSource:
-    """The `/decide` POST handler is the only place that XADDs to
-    `stream:clicks` in click-processor. Pin its call shape so a
-    future refactor (e.g., extracting to a helper) can't silently
-    drop the cap.
+class TestDecideRealClickXaddSource:
+    """The real-click XADD in `/decide`. Pin its call shape so a future
+    refactor can't silently reintroduce the trimming MAXLEN cap.
     """
 
     def _decide_source(self) -> str:
-        """Source of the `/decide` handler (`decide` is the FastAPI
-        view function — the route is `@app.post("/decide")`)."""
         from app.main import decide
 
         return inspect.getsource(decide)
 
-    def test_xadd_uses_maxlen_kwarg(self):
-        # The redis-py shape we need is
-        #   r.xadd("stream:clicks", {...}, maxlen=N, approximate=True)
-        # Pin both kwargs so neither slips during refactor.
+    def test_real_xadd_still_writes_stream_clicks(self):
         source = self._decide_source()
-
         assert "stream:clicks" in source, (
             "The /decide handler must still XADD to stream:clicks."
         )
-        assert "maxlen=" in source, (
-            "XADD must pass maxlen= to enforce the inline cap "
-            "(T2.1 / G-22). Without it, a central-collector outage "
-            "lets the stream grow unbounded → Redis OOM."
-        )
-        assert "approximate=True" in source, (
-            "XADD must pass approximate=True for O(1) trim "
-            "performance — exact trim is O(N) and would tank "
-            "/decide latency."
-        )
 
-    def test_xadd_reads_cap_from_settings(self):
-        """The cap MUST be read from settings, not hardcoded at the
-        callsite. Otherwise the env-var override pathway is dead."""
+    def test_real_xadd_carries_no_maxlen_kwarg(self):
+        """M1 — the real-click XADD call itself must NOT carry
+        `maxlen=`/`approximate=` anymore. Anchored on the unique
+        `json.dumps(click_record` marker so this doesn't accidentally
+        match the SEPARATE smoke-probe XADD (which serialises
+        `smoke_record`, not `click_record`)."""
         source = self._decide_source()
+        anchor = source.find("json.dumps(click_record")
+        assert anchor > 0, (
+            "Expected to find the real click's XADD payload "
+            "(json.dumps(click_record, ...)) in /decide's source."
+        )
+        # Look at the XADD call surrounding the anchor — the call opens
+        # a few lines above the payload construction and closes a few
+        # lines below it; a window is simpler and more robust than
+        # trying to balance parens across a reformatted call.
+        window = source[max(0, anchor - 200):anchor + 200]
+        assert "maxlen=" not in window, (
+            "The real-click XADD must NOT carry maxlen= — M1 removed "
+            "the silently-trimming cap. Over-threshold clicks are "
+            "diverted to the disk fallback via "
+            "main._check_stream_backpressure() instead."
+        )
+        assert "approximate" not in window
 
-        assert "settings.stream_clicks_maxlen" in source, (
-            "XADD must reference settings.stream_clicks_maxlen so "
-            "operators can tune via TDS_STREAM_CLICKS_MAXLEN env."
+    def test_check_stream_backpressure_helper_exists_and_used(self):
+        """The gate helper must exist and actually be called from
+        /decide — otherwise M1's reject-threshold is unreachable."""
+        from app import main
+
+        assert hasattr(main, "_check_stream_backpressure"), (
+            "main._check_stream_backpressure is the canonical M1 gate "
+            "helper — if renamed, update this pin."
+        )
+        source = self._decide_source()
+        assert "_check_stream_backpressure()" in source, (
+            "/decide MUST call _check_stream_backpressure() before the "
+            "real-click XADD attempt."
         )
 
 
 # ---------------------------------------------------------------------------
-# Behavioural pin: redis-py call signature
+# Source-pin: /decide handler — smoke-probe XADD site (2 of 4)
+# ---------------------------------------------------------------------------
+
+
+class TestDecideSmokeXaddSource:
+    def _decide_source(self) -> str:
+        from app.main import decide
+
+        return inspect.getsource(decide)
+
+    def test_smoke_xadd_carries_no_maxlen_kwarg(self):
+        source = self._decide_source()
+        anchor = source.find("json.dumps(smoke_record")
+        assert anchor > 0, (
+            "Expected to find the smoke probe's XADD payload "
+            "(json.dumps(smoke_record)) in /decide's source."
+        )
+        window = source[max(0, anchor - 200):anchor + 200]
+        assert "maxlen=" not in window
+        assert "approximate" not in window
+
+    def test_smoke_path_gated_before_xadd_attempt(self):
+        """A4 — the smoke probe must check the SAME backpressure gate
+        BEFORE attempting its XADD (reject-only, no disk fallback)."""
+        source = self._decide_source()
+        gate_pos = source.find("_check_stream_backpressure()")
+        smoke_xadd_pos = source.find("json.dumps(smoke_record")
+        assert gate_pos > 0 and smoke_xadd_pos > 0
+        assert gate_pos < smoke_xadd_pos, (
+            "The backpressure gate check must precede the smoke XADD "
+            "attempt — reject-only means we must not even try the "
+            "write once over threshold."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Source-pin: shipper.py `_retry_click` — site 3 of 4
+# ---------------------------------------------------------------------------
+
+
+class TestShipperRetryClickSource:
+    def test_retry_click_carries_no_maxlen_kwarg(self):
+        from app.shipper import _retry_click
+
+        source = inspect.getsource(_retry_click)
+        assert "stream_clicks_maxlen" not in source, (
+            "_retry_click must not read stream_clicks_maxlen at all — "
+            "M1 removed the cap here with NO new gate (retries are "
+            "size-neutral; gating them would starve transient failures "
+            "into deadletters)."
+        )
+        assert "maxlen=" not in source
+        assert "approximate" not in source
+
+
+# ---------------------------------------------------------------------------
+# Source-pin: disk_queue.py drainer replay XADD — site 4 of 4
+# ---------------------------------------------------------------------------
+
+
+class TestDiskQueueDrainerXaddSource:
+    def test_drainer_xadd_carries_no_maxlen_kwarg(self):
+        from app.disk_queue import drain_to_redis
+
+        source = inspect.getsource(drain_to_redis)
+        assert "maxlen=" not in source, (
+            "The drainer replay XADD must not carry maxlen= — M1 "
+            "removed the cap here too (no new gate; the existing "
+            "stop-on-first-XADD-failure is this phase's self-limit — "
+            "watermark-gated drain pacing is P2)."
+        )
+        assert "approximate" not in source
+
+
+# ---------------------------------------------------------------------------
+# Behavioural pin: redis-py call signature (real click, direct simulation)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_xadd_call_shape_via_mock(monkeypatch):
-    """End-to-end: drive `/decide`'s XADD path with an AsyncMock
-    redis client; assert the call shape matches the documented
-    contract.
-
-    We don't go through the full FastAPI handler — only the XADD
-    call. The handler's other concerns (routing, response build,
-    Sentry) are covered by the existing test suite.
-    """
+async def test_xadd_call_shape_via_mock():
+    """End-to-end-ish: the real-click XADD shape has no maxlen/approximate
+    kwargs. We don't go through the full FastAPI handler here — only the
+    XADD call shape; the gated end-to-end behaviour is covered in
+    test_stream_backpressure_edge.py."""
     from unittest.mock import AsyncMock
-
-    from app.config import settings
 
     mock_redis = AsyncMock()
     sentinel_payload = {"data": '{"click_id":"x"}'}
 
-    # Mirror the call shape used in main.py — single source of
-    # truth for what tests expect.
-    await mock_redis.xadd(
-        "stream:clicks",
-        sentinel_payload,
-        maxlen=settings.stream_clicks_maxlen,
-        approximate=True,
-    )
+    # Mirror the (post-M1) call shape used in main.py — no maxlen/approximate.
+    await mock_redis.xadd("stream:clicks", sentinel_payload)
 
     mock_redis.xadd.assert_awaited_once_with(
         "stream:clicks",
         sentinel_payload,
-        maxlen=1_000_000,
-        approximate=True,
-    )
-
-
-@pytest.mark.asyncio
-async def test_settings_override_propagates_to_xadd_kwarg(monkeypatch):
-    """If an operator sets TDS_STREAM_CLICKS_MAXLEN, the override
-    must propagate to the XADD callsite. We can't reload the
-    Settings instance mid-test cleanly (it's a module-level
-    singleton), but we CAN verify the runtime path: monkeypatch
-    `settings.stream_clicks_maxlen` to a probe value, simulate the
-    main.py call shape, and verify the redis client receives the
-    new value.
-
-    This catches the regression where a refactor hardcodes the
-    cap (e.g., `maxlen=1_000_000` literal at the callsite) — the
-    monkeypatch wouldn't change the call value and the test fails
-    loud.
-    """
-    from unittest.mock import AsyncMock
-
-    from app import config as click_config
-
-    probe_value = 250_000
-    monkeypatch.setattr(click_config.settings, "stream_clicks_maxlen", probe_value)
-
-    mock_redis = AsyncMock()
-
-    # Simulate the same call shape as main.py — read fresh from
-    # settings at call-time, NOT from a captured local.
-    await mock_redis.xadd(
-        "stream:clicks",
-        {"data": "{}"},
-        maxlen=click_config.settings.stream_clicks_maxlen,
-        approximate=True,
-    )
-
-    call = mock_redis.xadd.call_args
-    assert call.kwargs["maxlen"] == probe_value, (
-        f"Expected the operator override ({probe_value}) to "
-        f"propagate; got {call.kwargs.get('maxlen')!r}. "
-        "If this fails, the callsite likely hardcoded the cap "
-        "instead of reading from settings at call time."
     )

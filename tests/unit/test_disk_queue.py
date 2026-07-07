@@ -56,9 +56,6 @@ def _reset_disk_queue_state(tmp_path, monkeypatch):
     monkeypatch.setattr(
         disk_queue.settings, "disk_queue_max_files", 10_000,
     )
-    monkeypatch.setattr(
-        disk_queue.settings, "stream_clicks_maxlen", 1_000_000,
-    )
     disk_queue._reset_state_for_tests()
     yield
     disk_queue._reset_state_for_tests()
@@ -299,18 +296,26 @@ async def test_drain_replays_files_to_redis():
 async def test_drain_xadd_call_shape_matches_decide_path():
     """Drainer's XADD shape MUST be identical to /decide's so the
     stream contains uniform records — downstream collectors don't
-    care which path the click took."""
+    care which path the click took.
+
+    M1 (LOSSFIX P1b, 2026-07-07): neither side carries `maxlen`/
+    `approximate` anymore — the drainer replay XADD is unbounded, with
+    NO new gate (the existing stop-on-first-failure is this phase's
+    self-limit; watermark-gated drain pacing is P2)."""
     await disk_queue.enqueue_click({"id": 99, "country": "DE"})
 
     redis = _make_redis_mock()
     await disk_queue.drain_to_redis(redis)
 
-    # One call, with stream:clicks key + maxlen + approximate=True.
+    # One call, with stream:clicks key — no maxlen/approximate kwargs.
     call = redis.xadd.call_args
     assert call.args[0] == "stream:clicks"
     assert "data" in call.args[1]
-    assert call.kwargs["maxlen"] == 1_000_000
-    assert call.kwargs["approximate"] is True
+    assert "maxlen" not in call.kwargs, (
+        "M1 removed the MAXLEN cap from the drainer's replay XADD — a "
+        "trim here would silently destroy unconsumed entries (M-TRIM)."
+    )
+    assert "approximate" not in call.kwargs
 
     # Round-trip the JSON payload — drained record == enqueued record.
     decoded = json.loads(call.args[1]["data"])

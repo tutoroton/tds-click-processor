@@ -1,10 +1,11 @@
 """Periodic metric emission for click-processor's zero-loss layer.
 
 T2.6 partial — gives operators *visibility* into the defenses
-shipped by T2.1 (`stream:clicks` MAXLEN cap) and T2.2 (disk
-fallback queue). Without these emissions, the defenses are
-invisible: a Redis outage that exhausted disk-queue capacity, or a
-collector outage approaching the stream-length cap, would only
+shipped by T2.1 / M1 (`stream:clicks` reject threshold — LOSSFIX P1b,
+2026-07-07, repurposed from the original silently-trimming MAXLEN cap)
+and T2.2 (disk fallback queue). Without these emissions, the defenses
+are invisible: a Redis outage that exhausted disk-queue capacity, or a
+collector outage approaching the stream-length threshold, would only
 surface at the moment routing fails. Now the operator gets a
 warn-level Sentry breadcrumb at 50% of either cap — actionable
 lead time.
@@ -18,18 +19,23 @@ across environments.
 
 Two metrics emitted by ``run_observability_loop``:
 
-  * ``stream.clicks.length`` — XLEN of `stream:clicks`. The
-    shipper's post-success XTRIM keeps the stream at ~10k in
-    steady state, so a sustained value above 10k indicates the
-    central collector is unreachable (shipper failing to ack).
-    50% of MAXLEN cap = "outage has been ongoing for hours,
-    intervene now".
+  * ``stream.clicks.length`` — XLEN of `stream:clicks`, ALSO cached
+    (:func:`get_cached_stream_clicks_length`) for `main._check_stream_
+    backpressure` to read on the hot `/decide` path — never a per-click
+    XLEN round-trip (LOSSFIX P1b A3). The shipper's post-success XTRIM
+    keeps the stream at ~10k in steady state, so a sustained value
+    above 10k indicates the central collector is unreachable (shipper
+    failing to ack). 50% of the reject threshold = "outage has been
+    ongoing for hours, intervene now"; at/over the threshold itself,
+    `/decide` diverts new real clicks to the disk fallback instead of
+    writing the stream (reject, not trim — the M1 fix).
 
   * ``disk_queue.size`` — count of files awaiting drainer replay.
     Steady-state value is 0 (Redis healthy). Any non-zero value
-    means at least one click hit the XADD failure path; growing
-    values mean Redis is sustained unhealthy. 50% of cap = "30+
-    minutes of outage at typical click rates, escalate".
+    means at least one click hit the XADD failure path (or the M1
+    reject threshold); growing values mean Redis is sustained
+    unhealthy or the stream stays pinned above threshold. 50% of cap
+    = "30+ minutes of outage at typical click rates, escalate".
 
 Three metrics from the original T2.6 plan are deferred:
 
@@ -77,20 +83,49 @@ _SHIPPER_GROUP = "shippers"
 # uniform alerting story.
 _WARN_THRESHOLD_RATIO = 0.5
 
+# LOSSFIX P1b (2026-07-07) — M1: the last successfully-sampled XLEN of
+# `stream:clicks`, written ONLY here (once per `run_observability_loop`
+# tick, ~60s cadence) and read by `main._check_stream_backpressure` —
+# the whole point being that the reject-threshold gate on the hot
+# `/decide` path NEVER issues its own per-click XLEN round-trip. `None`
+# means "never sampled yet" (fresh boot) or "the last sample attempt
+# failed" — either way the gate must FAIL OPEN (never gate ingest on
+# missing/stale data; a 60s-stale reading is fine for a secondary,
+# defense-in-depth ceiling — the real-time defense is the existing
+# XADD-exception → disk-fallback path).
+_cached_stream_clicks_length: int | None = None
+
+
+def get_cached_stream_clicks_length() -> int | None:
+    """Last known XLEN(`stream:clicks`) sampled by the observability
+    loop. `None` = never sampled / last sample failed — callers on the
+    hot path must fail OPEN on `None` (see `main._check_stream_backpressure`)."""
+    return _cached_stream_clicks_length
+
+
+def _reset_cached_stream_clicks_length_for_tests() -> None:
+    """Test-only — clear the cache between test cases."""
+    global _cached_stream_clicks_length
+    _cached_stream_clicks_length = None
+
 
 async def emit_stream_clicks_length(redis) -> int:
-    """Sample XLEN of `stream:clicks`; warn at 50% of MAXLEN cap.
+    """Sample XLEN of `stream:clicks`; warn at 50% of the reject
+    threshold; cache the value for `main._check_stream_backpressure`.
 
     Returns the sampled length so callers can log it themselves
     (e.g., a /health endpoint that wants to expose it). On XLEN
-    failure (Redis impaired), returns -1 and emits a warning —
-    same Redis impairment that T2.2's disk fallback handles.
+    failure (Redis impaired), returns -1, emits a warning, and leaves
+    the cache untouched (ages toward staleness — the gate's caller
+    fails open on a value that never updates, same Redis impairment
+    that T2.2's disk fallback handles).
 
     Lower bound on the cap defends against divide-by-zero when an
     operator misconfigures `TDS_STREAM_CLICKS_MAXLEN=0`. The
     setting itself rejects this in its Pydantic constraint, but
     we keep the runtime guard for defense in depth.
     """
+    global _cached_stream_clicks_length
     try:
         length = await redis.xlen(_STREAM_KEY)
     except Exception as exc:  # noqa: BLE001 — Redis impairment is exactly the case we monitor
@@ -100,6 +135,8 @@ async def emit_stream_clicks_length(redis) -> int:
             extra={"area": "observability", "metric": "stream.clicks.length"},
         )
         return -1
+
+    _cached_stream_clicks_length = length
 
     cap = max(1, settings.stream_clicks_maxlen)
     pct = (length * 100) // cap
@@ -113,15 +150,16 @@ async def emit_stream_clicks_length(redis) -> int:
 
     if length >= int(cap * _WARN_THRESHOLD_RATIO):
         logger.warning(
-            "stream.clicks.length=%d at %d%% of cap %d — "
-            "central-collector outage suspected, intervene before "
-            "MAXLEN cap trims oldest clicks.",
+            "stream.clicks.length=%d at %d%% of reject threshold %d — "
+            "central-collector outage suspected; new clicks will start "
+            "diverting to the disk fallback once the threshold is hit "
+            "(LOSSFIX P1b M1 — reject, not trim).",
             length, pct, cap,
             extra=extra,
         )
         sentry_sdk.capture_message(
             f"stream:clicks at {length}/{cap} ({pct}%) — "
-            f"approaching MAXLEN cap",
+            f"approaching the M1 reject threshold",
             level="warning",
         )
     elif length > 0:

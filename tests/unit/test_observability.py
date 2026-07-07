@@ -59,8 +59,10 @@ def _reset_settings(monkeypatch, tmp_path):
         disk_queue.settings, "disk_queue_max_files", 1000,
     )
     disk_queue._reset_state_for_tests()
+    observability._reset_cached_stream_clicks_length_for_tests()
     yield
     disk_queue._reset_state_for_tests()
+    observability._reset_cached_stream_clicks_length_for_tests()
 
 
 # ---------------------------------------------------------------------------
@@ -174,6 +176,55 @@ async def test_stream_length_cap_zero_no_divide_by_zero(monkeypatch, caplog):
     # Should not raise.
     length = await observability.emit_stream_clicks_length(redis)
     assert length == 5
+
+
+# ---------------------------------------------------------------------------
+# LOSSFIX P1b (2026-07-07) — cached stream-length for main._check_stream_
+# backpressure. The whole point is that the hot /decide path NEVER issues
+# its own XLEN — it reads whatever this cache last held.
+# ---------------------------------------------------------------------------
+
+
+class TestCachedStreamClicksLength:
+    def test_never_sampled_returns_none(self):
+        assert observability.get_cached_stream_clicks_length() is None
+
+    @pytest.mark.asyncio
+    async def test_successful_sample_populates_cache(self):
+        redis = AsyncMock()
+        redis.xlen = AsyncMock(return_value=42)
+
+        await observability.emit_stream_clicks_length(redis)
+
+        assert observability.get_cached_stream_clicks_length() == 42
+
+    @pytest.mark.asyncio
+    async def test_failed_sample_leaves_cache_untouched(self):
+        redis_ok = AsyncMock()
+        redis_ok.xlen = AsyncMock(return_value=7)
+        await observability.emit_stream_clicks_length(redis_ok)
+        assert observability.get_cached_stream_clicks_length() == 7
+
+        redis_broken = AsyncMock()
+        redis_broken.xlen = AsyncMock(side_effect=RuntimeError("redis down"))
+        length = await observability.emit_stream_clicks_length(redis_broken)
+
+        assert length == -1
+        # Cache ages toward staleness rather than resetting to an
+        # arbitrary value — the caller's fail-open policy is what
+        # matters, not this module pretending to know a fresh number.
+        assert observability.get_cached_stream_clicks_length() == 7
+
+    @pytest.mark.asyncio
+    async def test_reset_for_tests_clears_cache(self):
+        redis = AsyncMock()
+        redis.xlen = AsyncMock(return_value=99)
+        await observability.emit_stream_clicks_length(redis)
+        assert observability.get_cached_stream_clicks_length() == 99
+
+        observability._reset_cached_stream_clicks_length_for_tests()
+
+        assert observability.get_cached_stream_clicks_length() is None
 
 
 # ---------------------------------------------------------------------------

@@ -261,6 +261,18 @@ class Settings(BaseSettings):
     disk_segment_max_total_bytes: int = 5_000_000_000  # 5 GiB
     disk_queue_stats_scan_interval_seconds: float = 5.0
 
+    # P2 c2 (B1) — orphan-adoption age floor. At worker startup, any
+    # segment prefix `{epoch}-{pid}` that isn't THIS worker's own is a
+    # candidate orphan (its writer died — crash, restart, or a full-node
+    # reboot). Prefixes younger than this floor are assumed to belong to
+    # a SIBLING worker of the SAME boot generation that just hasn't
+    # written its first segment yet (uvicorn's `--workers N` start
+    # within a couple seconds of each other) and are left alone THIS
+    # round — a genuinely dead worker's segments are still there (and
+    # get adopted) on the NEXT restart. 30s is comfortably above any
+    # realistic multi-worker boot stagger.
+    disk_orphan_adopt_min_age_seconds: int = 30
+
     # F.29 Sprint 4.1 (2026-05-23) — shipper-health alert thresholds.
     #
     # The observability loop (`emit_shipper_health`) runs on its OWN task,

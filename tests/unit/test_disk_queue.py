@@ -1,18 +1,16 @@
 """Tests for the click-processor disk-segment fallback queue (T2.2 / G-23),
 REDESIGNED by P2 (LOSSFIX, 2026-07-07) from one-file-per-click into
-append-only NDJSON segments with group-commit fsync and a global
-byte-cap. Per-worker orphan adoption + crash-recovery E2E land in the
-c2 follow-up commit (this file's TestOrphanAdoption / TestCrashRecoveryE2E
-classes) — the naming scheme's per-worker isolation itself IS covered
-here (TestWorkerNaming).
+append-only NDJSON segments with group-commit fsync, per-worker
+ownership, orphan adoption, and a global byte-cap.
 
-Coverage layers (P2 brief's OBSERVABLE DONE items covered by c1: 1, 2,
-4, 5, 6, 7, 8):
+Coverage layers (mirrors the P2 brief's OBSERVABLE DONE items 1-9, 13):
 
   1. Segment lifecycle — rotate at size/time, group-commit fsync,
      replay-then-unlink, dir-fsync on finalize (D2).
   2. WC=8 no-race — per-worker prefix naming, no two workers touch the
      same live segment.
+  3. Orphan adoption (B1) — a dead worker's segments get claimed by
+     exactly one live worker.
   4. Legacy migration (D1) — pre-P2 `*.json` files still drain.
   5. Byte-cap — visible shed (return False), never silent.
   6. Partial-last-line (B2) — a torn `.wip` tail truncates + op-tags,
@@ -21,6 +19,8 @@ Coverage layers (P2 brief's OBSERVABLE DONE items covered by c1: 1, 2,
      most one re-replayed line.
   8. `/health` depth (D3) — segment count / bytes / oldest-age, via
      `get_queue_stats`.
+  9. Crash-recovery E2E — kill mid-write, restart, adopt, replay,
+     nothing lost, nothing double-shipped.
 
 Reference: rule `sync-protocol`, action-items.md T2.2, open-questions.md
 G-23.
@@ -54,6 +54,7 @@ def _reset_disk_queue_state(tmp_path, monkeypatch):
     monkeypatch.setattr(disk_queue.settings, "disk_segment_max_bytes", 2_000_000)
     monkeypatch.setattr(disk_queue.settings, "disk_segment_max_age_seconds", 1_000.0)
     monkeypatch.setattr(disk_queue.settings, "disk_segment_max_total_bytes", 5_000_000_000)
+    monkeypatch.setattr(disk_queue.settings, "disk_orphan_adopt_min_age_seconds", 30)
     disk_queue._reset_state_for_tests()
     yield
     disk_queue._reset_state_for_tests()
@@ -336,6 +337,124 @@ class TestTornTailTruncation:
 
 
 # ---------------------------------------------------------------------------
+# 3 — orphan adoption (B1)
+# ---------------------------------------------------------------------------
+
+
+class TestOrphanAdoption:
+    @pytest.mark.asyncio
+    async def test_aged_orphan_finalized_segment_is_adopted_and_drained(self, monkeypatch):
+        root = _root()
+        root.mkdir(parents=True)
+        old_epoch = int(time.time()) - 3600  # 1h old — well past the age floor
+        orphan = root / f"{old_epoch}-999999-000001.ndjson"
+        orphan.write_bytes(b'{"click_id":"orphan-1"}\n')
+
+        adopted = await disk_queue.adopt_orphan_segments()
+
+        assert adopted == [f"{old_epoch}-999999"]
+        assert not orphan.exists()  # renamed away under my own prefix
+        my_prefix = disk_queue._worker_prefix()
+        renamed = sorted(root.glob(f"{my_prefix}-adopted-*.ndjson"))
+        assert len(renamed) == 1
+
+        redis = _make_redis_mock()
+        stats = await disk_queue.drain_to_redis(redis)
+        assert stats["drained"] == 1
+        assert redis.xadd.await_count == 1
+        assert renamed[0].exists() is False  # drained + deleted
+
+    @pytest.mark.asyncio
+    async def test_young_orphan_is_left_for_a_same_boot_sibling(self):
+        """A prefix younger than `disk_orphan_adopt_min_age_seconds` is
+        assumed to belong to a sibling worker of the SAME boot
+        generation still starting up — must NOT be adopted yet."""
+        root = _root()
+        root.mkdir(parents=True)
+        fresh_epoch = int(time.time())
+        sibling = root / f"{fresh_epoch}-888888-000001.ndjson"
+        sibling.write_bytes(b'{"click_id":"sibling-1"}\n')
+
+        adopted = await disk_queue.adopt_orphan_segments()
+
+        assert adopted == []
+        assert sibling.exists()
+
+    @pytest.mark.asyncio
+    async def test_torn_wip_orphan_is_truncated_then_adopted(self):
+        """A dead worker's segment that was STILL OPEN (`.wip`) at
+        crash time may have a torn tail (B2) — adoption must truncate
+        it BEFORE claiming it, and the result must still replay
+        cleanly."""
+        root = _root()
+        root.mkdir(parents=True)
+        old_epoch = int(time.time()) - 3600
+        wip = root / f"{old_epoch}-777777-000001.ndjson.wip"
+        wip.write_bytes(b'{"click_id":"a"}\n{"click_id":"b"' )  # torn tail
+
+        adopted = await disk_queue.adopt_orphan_segments()
+        assert adopted == [f"{old_epoch}-777777"]
+
+        my_prefix = disk_queue._worker_prefix()
+        finalized = sorted(root.glob(f"{my_prefix}-adopted-*.ndjson"))
+        assert len(finalized) == 1
+        assert disk_queue._read_complete_lines_sync(finalized[0]) == [b'{"click_id":"a"}']
+
+        redis = _make_redis_mock()
+        stats = await disk_queue.drain_to_redis(redis)
+        assert stats["drained"] == 1
+
+    @pytest.mark.asyncio
+    async def test_own_prefix_never_treated_as_orphan(self):
+        await disk_queue.enqueue_click({"click_id": "mine"})
+        adopted = await disk_queue.adopt_orphan_segments()
+        assert adopted == []
+        assert len(_wip_segments()) == 1  # untouched, still mine
+
+    @pytest.mark.asyncio
+    async def test_offset_sidecar_carried_over_on_adoption(self):
+        """An orphan's replay progress (offset sidecar) must survive
+        adoption — otherwise re-adopting the same segment across
+        restarts would re-replay already-confirmed lines."""
+        root = _root()
+        root.mkdir(parents=True)
+        old_epoch = int(time.time()) - 3600
+        orphan = root / f"{old_epoch}-666666-000001.ndjson"
+        orphan.write_bytes(b'{"click_id":"a"}\n{"click_id":"b"}\n')
+        (root / f"{old_epoch}-666666-000001.ndjson.offset").write_text("1")
+
+        await disk_queue.adopt_orphan_segments()
+
+        my_prefix = disk_queue._worker_prefix()
+        finalized = sorted(root.glob(f"{my_prefix}-adopted-*.ndjson"))[0]
+        assert disk_queue._read_offset_sync(finalized) == 1
+
+        redis = _make_redis_mock()
+        stats = await disk_queue.drain_to_redis(redis)
+        # Only the SECOND line (offset already at 1) should replay.
+        assert stats["drained"] == 1
+        assert redis.xadd.await_count == 1
+        assert json.loads(redis.xadd.call_args.args[1]["data"]) == {"click_id": "b"}
+
+    @pytest.mark.asyncio
+    async def test_adoption_op_tagged(self, monkeypatch):
+        root = _root()
+        root.mkdir(parents=True)
+        old_epoch = int(time.time()) - 3600
+        (root / f"{old_epoch}-555555-000001.ndjson").write_bytes(b'{"a":1}\n')
+
+        captured = {}
+
+        def _capture(op_name, message, level="warning", **extras):
+            captured["op"] = op_name
+
+        monkeypatch.setattr(disk_queue, "capture_op_msg", _capture)
+        await disk_queue.adopt_orphan_segments()
+
+        assert captured["op"] == disk_queue.OP_SEGMENT_ORPHAN_ADOPTED
+
+
+# ---------------------------------------------------------------------------
 # 2 — WC=8 no-race: distinct worker prefixes never collide
 # ---------------------------------------------------------------------------
 
@@ -519,3 +638,38 @@ class TestLegacyMigration:
         assert stats["failed"] == 1
         assert len(_segments()) == 1  # untouched — legacy failure short-circuited
 
+
+# ---------------------------------------------------------------------------
+# 9 — crash-recovery E2E: kill mid-write -> restart -> adopt -> replay
+# ---------------------------------------------------------------------------
+
+
+class TestCrashRecoveryE2E:
+    @pytest.mark.asyncio
+    async def test_full_cycle_no_loss_no_double_ship(self):
+        """Simulates: worker A writes 2 clicks + crashes mid-write of a
+        3rd (torn tail left in a `.wip` file) -> worker B (fresh
+        pid/epoch, i.e. THIS test process after a state reset) boots,
+        adopts A's orphaned segment, truncates the torn tail, and
+        drains everything — exactly the 2 fully-written clicks ship,
+        the torn 3rd is dropped loss-free (never acked), nothing ships
+        twice."""
+        root = _root()
+        root.mkdir(parents=True)
+        dead_epoch = int(time.time()) - 3600
+        crashed_segment = root / f"{dead_epoch}-333333-000001.ndjson.wip"
+        crashed_segment.write_bytes(
+            b'{"click_id":"e2e-1"}\n{"click_id":"e2e-2"}\n{"click_id":"e2e-3"'
+        )
+
+        adopted = await disk_queue.adopt_orphan_segments()
+        assert adopted == [f"{dead_epoch}-333333"]
+
+        redis = _make_redis_mock()
+        stats = await disk_queue.drain_to_redis(redis)
+
+        assert stats["drained"] == 2
+        shipped = [json.loads(c.args[1]["data"])["click_id"] for c in redis.xadd.await_args_list]
+        assert shipped == ["e2e-1", "e2e-2"]
+        assert _segments() == []  # fully drained + deleted
+        assert _wip_segments() == []

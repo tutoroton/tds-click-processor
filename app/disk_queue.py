@@ -32,15 +32,22 @@ Segment lifecycle
      whole segment (B3). Once every line replays, the segment + its
      sidecar are deleted together.
 
-Per-worker ownership
+Orphan adoption (B1)
 ---------------------
 
 `WEB_CONCURRENCY` > 1 means N sibling worker PROCESSES, each with its
-own `(boot_epoch, pid)` — the naming scheme above means the drainer's
-`{my_prefix}-*.ndjson` glob only ever matches THIS worker's own
-segments, so no two workers ever race to drain the same live file. A
-worker that crashes/restarts gets a NEW pid, stranding its old segments
-— orphan adoption for that case is a follow-up (c2), not yet wired here.
+own `(boot_epoch, pid)`. A worker that crashes/restarts gets a NEW pid
+-> its old segments belong to nobody -> stranded forever unless someone
+adopts them. `adopt_orphan_segments()` runs ONCE at worker startup
+(before the drainer task starts): any segment prefix that isn't this
+worker's own AND is older than `disk_orphan_adopt_min_age_seconds` (so
+a same-boot sibling still starting up is never mistaken for a corpse)
+is claimed via an atomic `os.rename` per file — POSIX rename requires
+the SOURCE to exist, so if two workers race to adopt the same orphan,
+exactly one wins (the other's rename raises `FileNotFoundError` and it
+moves on). A recovered `.wip` file (the dead worker's segment was still
+open at crash time) gets its torn tail truncated first (B2) before
+being adopted as a finalized segment.
 
 Legacy migration (D1)
 ----------------------
@@ -70,6 +77,7 @@ import sentry_sdk
 from app.config import _LOCAL_ENVIRONMENTS, settings
 from app.telemetry import (
     OP_SEGMENT_BYTE_CAP,
+    OP_SEGMENT_ORPHAN_ADOPTED,
     OP_SEGMENT_TORN_TAIL,
     capture_op_msg,
 )
@@ -457,14 +465,14 @@ async def enqueue_click(record: dict) -> bool:
     incident is visible.
 
     Caller contract: unchanged from pre-P2 — this is the XADD-failure
-    (or M1/watermark pre-emptive-divert) fallback path on `/decide`, not
-    a primary write path.
+    (or M1 pre-emptive-divert) fallback path on `/decide`, not a
+    primary write path.
     """
     return await _get_writer().append(record)
 
 
 # ---------------------------------------------------------------------------
-# Torn-tail truncation (B2)
+# Orphan adoption (B1, c2) — startup-only, atomic per-file rename claim.
 # ---------------------------------------------------------------------------
 
 
@@ -542,8 +550,110 @@ def _truncate_torn_tail_sync(path: Path) -> int:
     return dropped
 
 
+def _adopt_orphan_group_sync(prefix: str, root: Path) -> bool:
+    """Claim every file (segment + `.wip` + offset sidecar) under one
+    orphan `{epoch}-{pid}` prefix via atomic `os.rename`. Returns True
+    if at least one file was successfully claimed (another worker may
+    have already won some/all of them — that's fine, POSIX rename on a
+    vanished source raises FileNotFoundError and we just move on)."""
+    my_prefix = _worker_prefix()
+    claimed_any = False
+
+    for f in sorted(root.glob(f"{prefix}-*.ndjson.wip")):
+        _truncate_torn_tail_sync(f)
+        new_name = f"{my_prefix}-adopted-{f.name[: -len('.wip')]}"
+        try:
+            os.rename(f, f.parent / new_name)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            logger.warning("Orphan adoption rename failed for %s: %s", f, exc)
+            continue
+        claimed_any = True
+        old_offset = f.parent / (f.name[: -len(".wip")] + ".offset")
+        if old_offset.exists():
+            try:
+                os.rename(old_offset, f.parent / (new_name + ".offset"))
+            except OSError:
+                pass
+
+    for f in sorted(root.glob(f"{prefix}-*.ndjson")):
+        new_name = f"{my_prefix}-adopted-{f.name}"
+        try:
+            os.rename(f, f.parent / new_name)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            logger.warning("Orphan adoption rename failed for %s: %s", f, exc)
+            continue
+        claimed_any = True
+        old_offset = f.parent / (f.name + ".offset")
+        if old_offset.exists():
+            try:
+                os.rename(old_offset, f.parent / (new_name + ".offset"))
+            except OSError:
+                pass
+
+    return claimed_any
+
+
+def _adopt_orphan_segments_sync() -> list[str]:
+    root = _queue_root()
+    if not root.exists():
+        return []
+    my_prefix = _worker_prefix()
+    now_epoch = _get_boot_epoch()
+    min_age = settings.disk_orphan_adopt_min_age_seconds
+
+    prefixes: set[str] = set()
+    for pattern in ("*.ndjson", "*.ndjson.wip"):
+        for f in root.glob(pattern):
+            name = f.name
+            if name.endswith(".wip"):
+                name = name[: -len(".wip")]
+            m = _SEGMENT_RE.match(name)
+            if not m:
+                continue
+            prefix = f"{m.group('epoch')}-{m.group('pid')}"
+            if prefix == my_prefix:
+                continue
+            epoch = int(m.group("epoch"))
+            if now_epoch - epoch < min_age:
+                continue  # likely a same-boot sibling still starting up
+            prefixes.add(prefix)
+
+    adopted: list[str] = []
+    for prefix in sorted(prefixes):
+        if _adopt_orphan_group_sync(prefix, root):
+            adopted.append(prefix)
+            epoch = int(prefix.split("-")[0])
+            logger.warning(
+                "Orphan adoption: claimed dead worker's segments "
+                "prefix=%s (age=%ds) — will drain under %s",
+                prefix, now_epoch - epoch, my_prefix,
+            )
+    return adopted
+
+
+async def adopt_orphan_segments() -> list[str]:
+    """Run ONCE at worker startup (from `main.lifespan`, before the
+    drainer task is created) so newly-adopted segments are visible to
+    the very first drain cycle. See module docstring for the full B1
+    rationale."""
+    adopted = await asyncio.to_thread(_adopt_orphan_segments_sync)
+    if adopted:
+        capture_op_msg(
+            OP_SEGMENT_ORPHAN_ADOPTED,
+            f"Orphan adoption claimed {len(adopted)} dead worker prefix(es): "
+            f"{adopted}",
+            level="warning",
+            adopted_prefixes=adopted,
+        )
+    return adopted
+
+
 # ---------------------------------------------------------------------------
-# Replay (drain) — own segments + legacy *.json (D1)
+# Replay (drain) — segments (own + adopted) + legacy *.json (D1)
 # ---------------------------------------------------------------------------
 
 
@@ -593,11 +703,11 @@ def _read_complete_lines_sync(path: Path) -> list[bytes]:
 
 
 async def _replay_segment(redis, path: Path) -> dict:
-    """Replay one finalized segment. Per-LINE offset persistence (B3)
-    bounds a crash mid-replay to at most one re-replayed line — the
-    SETNX click-id dedup below (H1, unchanged from pre-P2) is the
-    backstop for that bounded duplicate, on top of the collector's own
-    central dedup."""
+    """Replay one finalized segment (own or adopted). Per-LINE offset
+    persistence (B3) bounds a crash mid-replay to at most one
+    re-replayed line — the SETNX click-id dedup below (H1, unchanged
+    from pre-P2) is the backstop for that bounded duplicate, on top of
+    the collector's own central dedup."""
     lines = await asyncio.to_thread(_read_complete_lines_sync, path)
     start_offset = await asyncio.to_thread(_read_offset_sync, path)
     drained = skipped = 0
@@ -782,10 +892,11 @@ async def _drain_legacy_json_files(redis) -> dict:
 
 
 async def drain_to_redis(redis) -> dict:
-    """Replay this worker's own finalized segments + legacy `*.json`
-    files, back into `stream:clicks`. Stops at the FIRST Redis failure
-    (self-limit — no point pounding an impaired Redis); remaining
-    segments/files stay on disk for the next drainer iteration.
+    """Replay this worker's own finalized segments + any orphan
+    segments it adopted at startup + legacy `*.json` files, back into
+    `stream:clicks`. Stops at the FIRST Redis failure (self-limit — no
+    point pounding an impaired Redis); remaining segments/files stay on
+    disk for the next drainer iteration.
 
     Returns the SAME stats shape as pre-P2: drained/skipped/failed/
     remaining, summed across every source drained this cycle.
@@ -803,11 +914,11 @@ async def drain_to_redis(redis) -> dict:
         return total
 
     my_prefix = _worker_prefix()
-    # Only THIS worker's own finalized segments match `{my_prefix}-
-    # *.ndjson` — the naming scheme is the per-worker isolation, no
-    # separate ownership bookkeeping needed. `.wip` segments never
-    # match (different suffix) — the active segment is invisible here
-    # by construction, no writer/drainer coordination needed.
+    # Own + adopted segments both match `{my_prefix}-*.ndjson` — adopted
+    # ones carry the extra `-adopted-{orig}` infix but share the SAME
+    # prefix, so one glob covers both. `.wip` segments never match
+    # (different suffix) — the active segment is invisible here by
+    # construction, no writer/drainer coordination needed.
     segment_paths = sorted(root.glob(f"{my_prefix}-*.ndjson"))
 
     for path in segment_paths:

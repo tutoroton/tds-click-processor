@@ -77,18 +77,23 @@ OP_CLICK_UNCAPTURED = "click_uncaptured"
 # synthetic click, nothing to preserve).
 OP_STREAM_ENTRY_LIMIT = "stream_entry_limit"
 
-# LOSSFIX P2 c1 (2026-07-07) — a recovered `.wip` segment had a torn
-# tail: the last line was incomplete or failed to parse. Loss-free by
-# construction (see disk_queue._truncate_torn_tail_sync docstring) —
-# this tag is visibility on the truncation event, not an error signal
-# about lost data.
+# LOSSFIX P2 c1 (2026-07-07) — a recovered `.wip` segment (orphan
+# adoption, B1) had a torn tail: the last line was incomplete or failed
+# to parse. Loss-free by construction (see disk_queue._truncate_torn_
+# tail_sync docstring) — this tag is visibility on the truncation event,
+# not an error signal about lost data.
 OP_SEGMENT_TORN_TAIL = "segment_torn_tail"
 
-# LOSSFIX P2 c1 — the cached total disk-segment byte usage (own +
-# legacy) is at/over `disk_segment_max_total_bytes`. A new click is
-# REJECTED (visible 503 via the existing L1 uncaptured path) rather
-# than silently rotating the oldest segment.
+# LOSSFIX P2 c1/c2 — the cached total disk-segment byte usage (own +
+# adopted + legacy) is at/over `disk_segment_max_total_bytes`. A new
+# click is REJECTED (visible 503 via the existing L1 uncaptured path)
+# rather than silently rotating the oldest segment.
 OP_SEGMENT_BYTE_CAP = "segment_byte_cap"
+
+# LOSSFIX P2 c2 (B1) — startup orphan adoption claimed at least one dead
+# worker's segment prefix. Informational (not an error) — visibility
+# that the WC=8 stranding class did NOT go silent.
+OP_SEGMENT_ORPHAN_ADOPTED = "segment_orphan_adopted"
 
 # Returning-user identity resolver fail-open (P2, 2026-06-05). Emitted (throttled
 # per company) when the resolver raises and the click degrades to legacy flags.

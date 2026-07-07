@@ -62,6 +62,7 @@ from app.telemetry import (
     capture_op_msg_throttled,
 )
 from app.disk_queue import (
+    adopt_orphan_segments,
     check_disk_pressure,
     enqueue_click as enqueue_click_to_disk,
     get_queue_stats,
@@ -195,15 +196,21 @@ async def lifespan(app: FastAPI):
     # Start periodic sync pull from central
     sync_task = asyncio.create_task(start_periodic_pull(r, interval=settings.full_sync_interval_seconds))
 
+    # P2 c2 (B1, LOSSFIX 2026-07-07) — orphan adoption runs ONCE, before
+    # the drainer task starts, so any segments claimed from a dead
+    # worker (crash, restart, or a full-node reboot) are visible to the
+    # very first drain cycle rather than waiting a full interval.
+    await adopt_orphan_segments()
+
     # Start disk-queue drainer (T2.2 / G-23). Periodically replays
     # any clicks that landed on disk during a Redis outage back
     # into the stream. Runs unconditionally — even in standalone
     # mode there's no harm in scanning an empty queue every 30s.
     disk_drainer_task = asyncio.create_task(run_disk_drainer(r))
 
-    # P2 c1 (LOSSFIX 2026-07-07) — cheap periodic scan caching
-    # {segments, bytes, oldest_seconds} across this worker's segments
-    # + legacy files. Feeds both the byte-cap gate
+    # P2 c1/c2 (LOSSFIX 2026-07-07) — cheap periodic scan caching
+    # {segments, bytes, oldest_seconds} across ALL workers' segments
+    # (own + adopted + legacy). Feeds both the byte-cap gate
     # (`disk_queue._check_byte_cap`, hot-path-safe — reads the cache,
     # never scans live) and /health's D3 depth fields.
     queue_stats_task = asyncio.create_task(run_queue_stats_sampler())

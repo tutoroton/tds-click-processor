@@ -1233,7 +1233,7 @@ class TestClickShippedNotClickSeenRegression:
     async def test_pre_planted_click_seen_marker_does_not_block_replay(self):
         """Simulates EXACTLY what happens for every disk-fallback click
         today: its own /decide call already ran `_acquire_click_dedup`
-        (SET click:seen NX EX 86400) BEFORE ever reaching the stream-
+        (SET click:seen NX EX <ttl>) BEFORE ever reaching the stream-
         write decision. The replayed click must still ship exactly
         once — the pre-planted click:seen marker must have zero effect
         on the (correctly click:shipped-gated) replay path."""
@@ -1244,7 +1244,13 @@ class TestClickShippedNotClickSeenRegression:
         click_id = "spilled-click-1"
         # Exactly what main._acquire_click_dedup does at /decide time,
         # for EVERY click, before the stream-vs-disk-fallback decision.
-        await redis.set(f"click:seen:{click_id}", "1", nx=True, ex=86400)
+        # Reads the LIVE setting (not a hardcoded literal, currently
+        # 600s per LOSSFIX P3, 2026-07-07) so this never goes stale
+        # again after a future TTL change.
+        await redis.set(
+            f"click:seen:{click_id}", "1",
+            nx=True, ex=disk_queue.settings.click_dedup_ttl_seconds,
+        )
 
         await disk_queue.enqueue_click({"click_id": click_id})
         disk_queue._get_writer().force_finalize_for_tests()
@@ -1273,7 +1279,10 @@ class TestClickShippedNotClickSeenRegression:
         redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
 
         click_id = "already-shipped-1"
-        await redis.set(f"click:shipped:{click_id}", "1", ex=86400)
+        await redis.set(
+            f"click:shipped:{click_id}", "1",
+            ex=disk_queue.settings.click_dedup_ttl_seconds,
+        )
 
         await disk_queue.enqueue_click({"click_id": click_id})
         disk_queue._get_writer().force_finalize_for_tests()

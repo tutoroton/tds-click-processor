@@ -250,6 +250,24 @@ async def lifespan(app: FastAPI):
         settings.stream_clicks_maxlen,
     )
 
+    # LOSSFIX P3 (2026-07-07) — one-shot boot log: click_dedup_ttl_
+    # seconds' DEFAULT dropped 86400s->600s (see config.py's sizing
+    # comment, A1/A2, for the STRESS-rate keyspace table + the
+    # bounded-dup-never-loss invariant). A node running WITHOUT an
+    # explicit TDS_CLICK_DEDUP_TTL_SECONDS override picks up the new
+    # default silently on this deploy; this line makes it visible in
+    # logs regardless of whether an override is in effect. Guarded on
+    # ttl>0 — the ttl=0 escape hatch already means dedup is off, and an
+    # "in effect" message there would be misleading noise.
+    if settings.click_dedup_ttl_seconds > 0:
+        logger.warning(
+            "click_dedup_ttl_seconds=%ss in effect (LOSSFIX P3 default "
+            "CHANGED 86400s->600s, 2026-07-07 — see config.py sizing "
+            "comment). An explicit TDS_CLICK_DEDUP_TTL_SECONDS override, "
+            "if set, takes precedence over this new default.",
+            settings.click_dedup_ttl_seconds,
+        )
+
     # Diagnostic obs-stream drainer. Started unconditionally — when
     # `TDS_DIAG_OBS_STREAM=false` (production default) the queue
     # stays empty and the drain loop is a no-op every 100ms. Cheap

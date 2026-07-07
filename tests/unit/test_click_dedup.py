@@ -15,8 +15,8 @@ to the stream.
 
 Three layers of defense covered here:
 
-  1. Settings field exists and defaults to a 24-hour TTL (F-4, audit
-     2026-05-25; lowered from 30d — node-local marker only needs to
+  1. Settings field exists and defaults to a 10-minute TTL (LOSSFIX
+     P3, 2026-07-07 — shrunk from 24h; node-local marker only needs to
      cover the same-node retry window of seconds).
   2. The `_acquire_click_dedup` helper returns the documented
      three-state result (True / False / None).
@@ -30,6 +30,8 @@ import asyncio
 from unittest.mock import AsyncMock, patch
 
 import pytest
+
+from app.config import settings
 
 
 # ---------------------------------------------------------------------------
@@ -50,18 +52,19 @@ class TestSettingsField:
             "(H1 escape hatch)."
         )
 
-    def test_default_is_24_hours(self):
-        """Default 24h (F-4, audit 2026-05-25, lowered from 30d). This
-        NODE-LOCAL marker only suppresses a same-node retry — which
-        arrives within SECONDS (the Worker's 2s AbortSignal window), not
-        days. It is also write-only and fully backstopped by the
-        collector's central dedup, so a generous 24h amply covers the
-        real window while bounding Redis memory ~30×."""
-        from app.config import settings
-
-        assert settings.click_dedup_ttl_seconds == 86400, (
-            "Default dedup TTL should be 24 hours (86400 seconds) per "
-            "F-4 (audit 2026-05-25)."
+    def test_default_is_600_seconds(self):
+        """LOSSFIX P3 (2026-07-07): default shrunk 86400s (24h) ->
+        600s (10min) — the M-OOM keyspace relief (see config.py's A1/A2
+        sizing comment). This NODE-LOCAL marker only suppresses a
+        same-node retry — which arrives within SECONDS (the Worker's
+        2s AbortSignal window), not minutes — and 600s still clears
+        the ~95s shipper-reclaim bound (A1) with a wide margin. It is
+        also write-only and fully backstopped by the collector's
+        central dedup, so shrinking it only ever widens a bounded-dup
+        window, never opens a loss path (A2)."""
+        assert settings.click_dedup_ttl_seconds == 600, (
+            "Default dedup TTL should be 600 seconds (10 minutes) per "
+            "LOSSFIX P3 (2026-07-07, was 86400s/24h)."
         )
 
 
@@ -93,7 +96,10 @@ class TestAcquireClickDedup:
             "click:seen:test-click-001",
             "1",
             nx=True,
-            ex=86400,  # default TTL — 24h (F-4, lowered from 30d)
+            # Reads the LIVE setting (not a hardcoded literal) so this
+            # pin never goes stale again after a future TTL change —
+            # currently 600s per LOSSFIX P3 (2026-07-07, was 86400s/24h).
+            ex=settings.click_dedup_ttl_seconds,
         )
 
     @pytest.mark.asyncio
@@ -261,3 +267,47 @@ class TestSourcePins:
                 "Redis-recovery doesn't create stream duplicates "
                 "(H1 fix companion)."
             )
+
+
+# ---------------------------------------------------------------------------
+# LOSSFIX P3 (2026-07-07) — one-shot boot deprecation log (C5 companion).
+# ---------------------------------------------------------------------------
+
+
+class TestOneShotDeprecationLog:
+    """LOSSFIX P3: the TTL default change (86400s->600s) must be
+    visible in boot logs — an operator running without an explicit
+    override picks up the new default silently otherwise. Source-
+    pinned (mirrors the existing `test_observability_loop_started_in_
+    lifespan` style) rather than executing the full lifespan, which
+    needs a live Redis + shipper config."""
+
+    def test_lifespan_logs_the_ttl_default_change(self):
+        import inspect
+        from app import main
+
+        src = inspect.getsource(main.lifespan)
+        assert "click_dedup_ttl_seconds" in src and "86400" in src and "600" in src, (
+            "lifespan() must log the click_dedup_ttl_seconds default "
+            "change (86400s->600s, LOSSFIX P3) once at boot."
+        )
+
+    def test_deprecation_log_guarded_on_ttl_enabled(self):
+        """Skip the 'in effect' log when dedup is disabled (ttl<=0) —
+        that state already has its own meaning and an 'in effect'
+        message there would be misleading noise."""
+        import inspect
+        from app import main
+
+        src = inspect.getsource(main.lifespan)
+        # rfind, not find: the comment ABOVE the log call also mentions
+        # "86400s->600s" (LOSSFIX P3) — the LAST occurrence is the one
+        # inside the actual logger.warning(...) call, which is what
+        # the guard must precede.
+        marker_pos = src.rfind("86400s->600s")
+        assert marker_pos > 0
+        guard_pos = src.rfind("click_dedup_ttl_seconds > 0", 0, marker_pos)
+        assert guard_pos > 0, (
+            "The TTL-change boot log must be guarded on "
+            "`settings.click_dedup_ttl_seconds > 0`."
+        )

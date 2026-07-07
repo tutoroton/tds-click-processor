@@ -192,14 +192,52 @@ class Settings(BaseSettings):
     # this node within its 2s AbortSignal window). A genuine duplicate
     # therefore arrives within SECONDS, not days; the shipper has long
     # deadlettered anything older. The marker is also write-only (a
-    # SETNX flag, never read back). 24h is a generous margin over the
-    # real retry window and bounds Redis memory (audit 2026-05-25 F-4,
-    # lowered from 30d). Cross-node / late duplicates are independently
-    # caught by the COLLECTOR's central dedup, so this expiring early is
-    # fully backstopped. Operator override: env `TDS_CLICK_DEDUP_TTL_SECONDS`;
-    # 0 DISABLES dedup entirely (escape hatch for Redis OOM / extreme
-    # retry-storm during a deploy).
-    click_dedup_ttl_seconds: int = 86400  # 24 hours, 0 = disabled
+    # SETNX flag, never read back). Cross-node / late duplicates are
+    # independently caught by the COLLECTOR's central dedup, so this
+    # expiring early is fully backstopped.
+    #
+    # `click:shipped:<click_id>` (P2, LOSSFIX 2026-07-07 — set ONLY
+    # after a CONFIRMED-successful XADD, see app/disk_queue.py) SHARES
+    # this SAME TTL — both markers shrink together.
+    #
+    # LOSSFIX P3 (2026-07-07) — SHRUNK 86400s (24h) -> 600s (10min), the
+    # edge-side half of the M-OOM keyspace relief (collector's central
+    # `click:central_seen` mirrors this shrink to 1800s — see
+    # services/collector/app/config.py for that side's sizing table).
+    # See ``docs/development/lossfix-p3-2026-07-07/DEPLOY-SEQUENCING.md``
+    # before ever rolling this to a node with an existing disk backlog.
+    #
+    # SIZING (A1, MUST): must EXCEED the max realistic dedup-defeating
+    # window = max(CF-Worker-retry window, the shipper reclaim window
+    # ~95s [F-6: min_idle 60s + interval 30s + one loop pass], cross-
+    # node arrival skew). 600s comfortably clears that ~95s bound.
+    #
+    # Keyspace at STRESS rates (dedup_keyspace ~= rate * TTL * ~150B/
+    # key): @600s, 800rps (the grid soak target) -> 72MB of the edge
+    # routing Redis's 256MB budget (28%) -- volatile-lru MAY evict
+    # markers early under memory pressure, which only shifts a replay
+    # toward the DUP direction (safe by A2 below, never loss).
+    #
+    # spilled=first-arrival insight: a DIVERTED/spilled click does NOT
+    # depend on THIS marker at any TTL for its own correctness -- it is
+    # captured once via segment replay gated on the SEPARATE
+    # `click:shipped` LOCAL check (disk_queue.py), and central dedup
+    # (collector's `click:central_seen`) is the cross-node/CF-retry
+    # backstop. The TTL shrink does NOT weaken spill-path correctness —
+    # don't over-worry the spill path reading this.
+    #
+    # INVARIANT (A2, MUST): the shrink can only ever increase BOUNDED
+    # DUP, never loss. `click:seen`/`click:shipped` only fail toward
+    # "not seen" on expiry (false-negative -> re-ship -> the
+    # collector's central SETNX / CH uniq-by-click_id absorbs it); a
+    # false-positive "already shipped" CANNOT arise from expiry --
+    # `click:shipped` is only SET after a CONFIRMED XADD, never before
+    # one is attempted.
+    #
+    # Operator override: env `TDS_CLICK_DEDUP_TTL_SECONDS`; 0 DISABLES
+    # dedup entirely (escape hatch for Redis OOM / extreme retry-storm
+    # during a deploy).
+    click_dedup_ttl_seconds: int = 600  # 10 minutes, 0 = disabled (LOSSFIX P3, was 86400/24h)
 
     # T2.2 / G-23, REDESIGNED by P2 (LOSSFIX, 2026-07-07) — disk fallback
     # queue for clicks when XADD fails (or the M1/watermark gates divert

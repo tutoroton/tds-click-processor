@@ -199,6 +199,50 @@ class TestSegmentLifecycle:
         # dir fsync both fired.
         assert len(dir_fsync_calls) >= 2
 
+    @pytest.mark.asyncio
+    async def test_commit_error_closes_and_salvages_fd_no_stranding(self, monkeypatch):
+        """MEDIUM fix (gate-E review, 2026-07-07) — on an OSError inside
+        `_commit_batch_sync`, the fd must be closed+nulled (so a LATER
+        successful commit can't silently flush the failed batch's
+        bytes through and un-fail a click already told `ok=False`) AND
+        whatever an EARLIER successful commit on the SAME fd durably
+        wrote must be salvaged (truncated + finalized under this
+        worker's own prefix) — not abandoned forever in a `.wip` file
+        that neither this worker's own drain (globs only `.ndjson`)
+        nor orphan adoption (excludes its own prefix) will ever look
+        at again."""
+        call_count = {"n": 0}
+        original_fsync = os.fsync
+
+        def flaky_fsync(fd):
+            call_count["n"] += 1
+            if call_count["n"] == 2:
+                raise OSError("simulated fsync failure")
+            return original_fsync(fd)
+
+        monkeypatch.setattr(disk_queue.os, "fsync", flaky_fsync)
+
+        assert await disk_queue.enqueue_click({"click_id": "a"}) is True
+        ok = await disk_queue.enqueue_click({"click_id": "b"})  # 2nd commit's fsync fails
+        assert ok is False
+
+        writer = disk_queue._get_writer()
+        assert writer.current_wip_path is None, (
+            "The fd must be abandoned (closed+nulled), not left open "
+            "for the NEXT commit to keep writing/fsyncing through."
+        )
+
+        # Whatever WAS durably written (click "a", from the first,
+        # SUCCESSFUL commit) must have been salvaged — finalized under
+        # THIS worker's own prefix, discoverable by its own drain.
+        segments = _segments()
+        assert len(segments) == 1
+        assert {"click_id": "a"} in _lines_of(segments[0])
+
+        # A later click opens a FRESH segment — not the abandoned fd.
+        assert await disk_queue.enqueue_click({"click_id": "c"}) is True
+        assert len(_wip_segments()) == 1
+
 
 # ---------------------------------------------------------------------------
 # 5 — byte-cap: visible shed, never silent
@@ -459,6 +503,169 @@ class TestOrphanAdoption:
 
         assert captured["op"] == disk_queue.OP_SEGMENT_ORPHAN_ADOPTED
 
+    @pytest.mark.asyncio
+    async def test_young_orphan_deferred_then_adopted_on_retry(self, monkeypatch):
+        """HIGH fix (gate-E review, 2026-07-07) — adoption must RETRY,
+        not run once at boot. A deferred (too-young) orphan must become
+        adoptable on a LATER call once it's genuinely old enough — this
+        is what makes `run_drainer`'s per-cycle retry meaningful rather
+        than a no-op repeat of the same boot-time check."""
+        root = _root()
+        root.mkdir(parents=True)
+        fresh_epoch = int(time.time())
+        sibling = root / f"{fresh_epoch}-888888-000001.ndjson"
+        sibling.write_bytes(b'{"click_id":"sibling-1"}\n')
+
+        adopted = await disk_queue.adopt_orphan_segments()
+        assert adopted == []
+        assert sibling.exists()
+
+        # Simulate enough real time having passed (equivalently: an
+        # operator lowering the grace period) by shrinking the min-age
+        # floor rather than sleeping in a test — what matters is that
+        # CALLING ADOPT AGAIN, once conditions permit, actually adopts
+        # what was previously deferred.
+        monkeypatch.setattr(disk_queue.settings, "disk_orphan_adopt_min_age_seconds", 0)
+        adopted = await disk_queue.adopt_orphan_segments()
+        assert adopted == [f"{fresh_epoch}-888888"]
+        assert not sibling.exists()
+
+    @pytest.mark.asyncio
+    async def test_two_hop_adoption_x_dies_before_draining_y_reclaims_zero_loss(self):
+        """CRITICAL regression (gate-E review, 2026-07-07): the
+        adoption rename used to embed the FULL previous filename as a
+        plain infix (`{new}-adopted-{old_full_name}`), which broke
+        `_SEGMENT_RE` (a non-digit `-adopted-` infix in the middle of
+        an all-digits pattern never matches) — so a segment that got
+        re-orphaned (its adopter died before draining it) became
+        PERMANENTLY invisible to every future orphan scan. This
+        simulates exactly that: worker A died, worker X adopted A's
+        segment but ALSO died before draining it, and worker Y (this
+        test process) must still discover + re-adopt + drain it with
+        zero loss."""
+        root = _root()
+        root.mkdir(parents=True)
+        orig_epoch = int(time.time()) - 7200  # A, the ORIGINAL dead worker
+        x_epoch = int(time.time()) - 3600     # X adopted A's orphan, then X ALSO died
+        x_prefix = f"{x_epoch}-222222"
+        # State AFTER hop 1 (X adopted A's orphan) without ever
+        # draining it — X's own prefix, A's origin preserved.
+        hop1_name = f"{x_prefix}-adopted-{orig_epoch}-111111-000001.ndjson"
+        (root / hop1_name).write_bytes(b'{"click_id":"two-hop-1"}\n')
+
+        adopted = await disk_queue.adopt_orphan_segments()
+        assert adopted == [x_prefix], (
+            "Y must discover X's already-adopted-but-undrained segment "
+            "as an orphan — the -adopted- infix must not defeat "
+            "discovery on a second hop."
+        )
+
+        my_prefix = disk_queue._worker_prefix()
+        hop2 = sorted(root.glob(f"{my_prefix}-adopted-*.ndjson"))
+        assert len(hop2) == 1, (
+            f"Expected exactly one re-adopted segment under Y's "
+            f"prefix, found .ndjson files: "
+            f"{[p.name for p in root.glob('*.ndjson')]}"
+        )
+        # The ORIGIN identity (A, the first dead worker) must be
+        # preserved verbatim across the hop — never X's (also-dead)
+        # prefix, and the filename must not grow with each hop.
+        assert hop2[0].name == (
+            f"{my_prefix}-adopted-{orig_epoch}-111111-000001.ndjson"
+        )
+
+        redis = _make_redis_mock()
+        stats = await disk_queue.drain_to_redis(redis)
+        assert stats["drained"] == 1
+        assert redis.xadd.await_count == 1
+        assert json.loads(redis.xadd.call_args.args[1]["data"]) == {
+            "click_id": "two-hop-1",
+        }
+        assert not hop2[0].exists()  # fully drained + deleted
+
+    def test_canonical_adopted_name_preserves_origin_across_hops(self):
+        """Unit-level pin on the naming primitive itself: re-adopting
+        an ALREADY-adopted name must replace only the leading
+        (current-owner) prefix, keeping the embedded origin and seq
+        untouched — this is what bounds filename length regardless of
+        hop count."""
+        plain = "1000-111-000042.ndjson"
+        assert disk_queue._canonical_adopted_name(plain, "2000-222") == (
+            "2000-222-adopted-1000-111-000042.ndjson"
+        )
+
+        already_adopted = "2000-222-adopted-1000-111-000042.ndjson"
+        assert disk_queue._canonical_adopted_name(already_adopted, "3000-333") == (
+            "3000-333-adopted-1000-111-000042.ndjson"
+        )
+
+        assert disk_queue._canonical_adopted_name("not-a-segment.json", "3000-333") is None
+
+
+# ---------------------------------------------------------------------------
+# run_drainer — periodic orphan-adoption retry (gate-E HIGH fix) + the
+# pre-P2 cancellable/survives-error loop coverage this file had dropped.
+# ---------------------------------------------------------------------------
+
+
+class TestRunDrainerLoop:
+    @pytest.mark.asyncio
+    async def test_cancellable(self):
+        redis = _make_redis_mock()
+        task = asyncio.create_task(disk_queue.run_drainer(redis, interval=10))
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    @pytest.mark.asyncio
+    async def test_survives_iteration_error(self, monkeypatch):
+        call_count = {"n": 0}
+
+        async def flaky_drain(redis):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise RuntimeError("transient")
+            return {"drained": 0, "skipped": 0, "failed": 0, "remaining": 0}
+
+        monkeypatch.setattr(disk_queue, "drain_to_redis", flaky_drain)
+
+        redis = _make_redis_mock()
+        task = asyncio.create_task(disk_queue.run_drainer(redis, interval=0))
+        for _ in range(3):
+            await asyncio.sleep(0.01)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert call_count["n"] >= 2
+
+    @pytest.mark.asyncio
+    async def test_retries_orphan_adoption_every_cycle(self, monkeypatch):
+        """HIGH fix (gate-E review, 2026-07-07) — proves the retry
+        mechanism is actually wired into the loop, not just callable
+        on demand."""
+        call_count = {"n": 0}
+
+        async def counting_adopt():
+            call_count["n"] += 1
+            return []
+
+        monkeypatch.setattr(disk_queue, "adopt_orphan_segments", counting_adopt)
+
+        redis = _make_redis_mock()
+        task = asyncio.create_task(disk_queue.run_drainer(redis, interval=0))
+        for _ in range(3):
+            await asyncio.sleep(0.01)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert call_count["n"] >= 2, (
+            "run_drainer must call adopt_orphan_segments() every "
+            "cycle, not just once at boot."
+        )
+
 
 # ---------------------------------------------------------------------------
 # 2 — WC=8 no-race: distinct worker prefixes never collide
@@ -575,6 +782,61 @@ class TestReplayExactlyOnce:
         assert stats["skipped"] == 1
         redis.xadd.assert_not_awaited()
         assert not seg.exists()  # fully "processed" (skipped counts toward completion)
+
+    @pytest.mark.asyncio
+    async def test_offset_persisted_in_batches_not_per_line(self, monkeypatch):
+        """MEDIUM perf fix (gate-E review, 2026-07-07) — the offset
+        sidecar is persisted every `disk_replay_offset_batch_lines`
+        lines, not every single line (which is correct but expensive —
+        a full open+write+fsync+close+rename per line — under a large
+        backlog)."""
+        monkeypatch.setattr(disk_queue.settings, "disk_replay_offset_batch_lines", 3)
+        for i in range(7):
+            await disk_queue.enqueue_click({"click_id": f"c{i}"})
+        disk_queue._get_writer().force_finalize_for_tests()
+
+        write_calls: list[int] = []
+        original = disk_queue._write_offset_sync
+
+        def counting_write_offset(path, offset):
+            write_calls.append(offset)
+            return original(path, offset)
+
+        monkeypatch.setattr(disk_queue, "_write_offset_sync", counting_write_offset)
+
+        redis = _make_redis_mock()
+        stats = await disk_queue.drain_to_redis(redis)
+
+        assert stats["drained"] == 7
+        # Batched every 3 lines: flushed mid-loop at 3 and 6; the final
+        # line (index 6, offset 7) doesn't need a flush since the
+        # segment is fully drained and deleted outright.
+        assert write_calls == [3, 6], (
+            f"Expected exactly 2 batched offset writes (at 3 and 6), "
+            f"got {write_calls} — per-line would produce 7."
+        )
+
+    @pytest.mark.asyncio
+    async def test_redis_failure_flushes_offset_immediately_not_batched(self, monkeypatch):
+        """A Redis-IMPAIRMENT break (the process stays alive, it just
+        stops) must NOT accept the batching window — only a hard crash
+        does. Confirms batching didn't regress
+        test_redis_failure_persists_offset_up_to_last_success_only's
+        guarantee even with a batch size bigger than the backlog."""
+        monkeypatch.setattr(disk_queue.settings, "disk_replay_offset_batch_lines", 50)
+        for i in range(3):
+            await disk_queue.enqueue_click({"click_id": f"c{i}"})
+        disk_queue._get_writer().force_finalize_for_tests()
+        seg = _segments()[0]
+
+        redis = _make_redis_mock()
+        redis.xadd.side_effect = [None, ConnectionError("down")]
+        stats = await disk_queue.drain_to_redis(redis)
+
+        assert stats["drained"] == 1
+        assert stats["failed"] == 1
+        assert disk_queue._read_offset_sync(seg) == 1
+        assert seg.exists()
 
 
 # ---------------------------------------------------------------------------

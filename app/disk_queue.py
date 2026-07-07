@@ -27,10 +27,14 @@ Segment lifecycle
   4. The drainer (`drain_to_redis`) only ever globs plain `.ndjson`
      files — a `.wip` (still being written) segment is invisible to it
      by construction, no in-memory writer/drainer coordination needed.
-  5. Each segment gets a REPLAY-OFFSET sidecar (`{name}.offset`) so a
-     crash mid-replay re-does at most the single next line, never the
-     whole segment (B3). Once every line replays, the segment + its
-     sidecar are deleted together.
+  5. Each segment gets a REPLAY-OFFSET sidecar (`{name}.offset`),
+     persisted every `disk_replay_offset_batch_lines` lines (gate-E
+     perf fix, 2026-07-07 — was every single line, correct but
+     expensive under a large backlog) so a CRASH mid-replay re-does at
+     most that many lines, never the whole segment (B3) — a Redis-
+     impairment break (process stays alive) still flushes immediately,
+     no batching window there. Once every line replays, the segment +
+     its sidecar are deleted together.
 
 Orphan adoption (B1)
 ---------------------
@@ -38,16 +42,31 @@ Orphan adoption (B1)
 `WEB_CONCURRENCY` > 1 means N sibling worker PROCESSES, each with its
 own `(boot_epoch, pid)`. A worker that crashes/restarts gets a NEW pid
 -> its old segments belong to nobody -> stranded forever unless someone
-adopts them. `adopt_orphan_segments()` runs ONCE at worker startup
-(before the drainer task starts): any segment prefix that isn't this
-worker's own AND is older than `disk_orphan_adopt_min_age_seconds` (so
-a same-boot sibling still starting up is never mistaken for a corpse)
-is claimed via an atomic `os.rename` per file — POSIX rename requires
-the SOURCE to exist, so if two workers race to adopt the same orphan,
-exactly one wins (the other's rename raises `FileNotFoundError` and it
-moves on). A recovered `.wip` file (the dead worker's segment was still
-open at crash time) gets its torn tail truncated first (B2) before
-being adopted as a finalized segment.
+adopts them. `adopt_orphan_segments()` runs at worker startup AND on
+every periodic drainer cycle (gate-E fix, 2026-07-07 — was one-shot-
+at-boot only, which meant a worker that crash-restarted WITHIN the
+min-age grace window, or an ADOPTER that itself died before draining
+what it just claimed, stayed stranded until some unrelated future
+restart — possibly days on a stable node). Any segment prefix that
+isn't this worker's own AND is older than
+`disk_orphan_adopt_min_age_seconds` (so a same-boot sibling still
+starting up is never mistaken for a corpse) is claimed via an atomic
+`os.rename` per file — POSIX rename requires the SOURCE to exist, so if
+two workers race to adopt the same orphan, exactly one wins (the
+other's rename raises `FileNotFoundError` and it moves on). A recovered
+`.wip` file (the dead worker's segment was still open at crash time)
+gets its torn tail truncated first (B2) before being adopted as a
+finalized segment.
+
+RE-ADOPTION (multi-hop) — an adopted segment's new name encodes the
+CURRENT owner's prefix + the segment's ORIGINAL identity, e.g.
+`{owner}-adopted-{origin_epoch}-{origin_pid}-{seq}.ndjson`. If THAT
+owner ALSO dies before draining it, discovery (`_SEGMENT_RE`, extended
+to recognise this shape) still finds it — the ORIGIN is what gets
+carried forward unchanged on every hop; only the leading owner-prefix
+is replaced. This bounds the filename length regardless of how many
+times a segment gets re-orphaned and re-adopted during an extended
+outage — it does NOT grow with hop count.
 
 Legacy migration (D1)
 ----------------------
@@ -87,7 +106,24 @@ logger = logging.getLogger("tds.disk_queue")
 # `{epoch}-{pid}-{seq}.ndjson` — the FINALIZED segment name. The active
 # (still being written) form carries an extra `.wip` suffix and is never
 # matched by this regex or by the drainer's glob.
-_SEGMENT_RE = re.compile(r"^(?P<epoch>\d+)-(?P<pid>\d+)-(?P<seq>\d{6})\.ndjson$")
+#
+# gate-E CRITICAL fix (2026-07-07): the optional `-adopted-{orig_epoch}-
+# {orig_pid}-` infix recognises an ADOPTED segment's name. `epoch`/`pid`
+# always identify the CURRENT owner (whoever most recently
+# adopted it, or the original writer if never adopted); `orig_epoch`/
+# `orig_pid` (present only after at least one adoption hop) identify
+# the segment's ORIGINAL writer and are carried forward UNCHANGED on
+# every re-adoption hop — only the leading owner-prefix ever changes.
+# Without this, an adopted segment's name (which used to embed the
+# FULL previous name as a plain, non-numeric infix) never matched this
+# regex at all, making it permanently invisible to every FUTURE orphan
+# scan the instant its adopter died before draining it — the exact
+# stranding class this subsystem exists to prevent.
+_SEGMENT_RE = re.compile(
+    r"^(?P<epoch>\d+)-(?P<pid>\d+)"
+    r"(?:-adopted-(?P<orig_epoch>\d+)-(?P<orig_pid>\d+))?"
+    r"-(?P<seq>\d{6})\.ndjson$"
+)
 
 
 def _queue_root() -> Path:
@@ -372,6 +408,10 @@ class _SegmentWriter:
                 self._size += len(line)
             os.fsync(self._fd)
         except OSError as exc:
+            # gate-E MEDIUM fix (2026-07-07) — never leave the fd open
+            # for a later commit to keep writing into / eventually
+            # fsync-through (see `_abandon_current_on_error_sync`).
+            self._abandon_current_on_error_sync()
             return False, exc
         self._maybe_rotate_sync()
         return True, None
@@ -429,14 +469,61 @@ class _SegmentWriter:
             os.close(self._fd)
             final_path = self._path.with_suffix("")  # strips ".wip"
             os.rename(self._path, final_path)
-            dir_fd = os.open(final_path.parent, os.O_RDONLY)
-            try:
-                os.fsync(dir_fd)
-            finally:
-                os.close(dir_fd)
+            _fsync_dir_sync(final_path.parent)
         finally:
             self._fd = None
             self._path = None
+
+    def _abandon_current_on_error_sync(self) -> None:
+        """gate-E MEDIUM fix (2026-07-07) — called when `_commit_batch_
+        sync` hits an OSError. Two distinct problems, one fix:
+
+        1. Leaving `self._fd` open would let the NEXT commit keep
+           appending to (and eventually successfully fsync) a fd whose
+           LAST write may have failed partway — silently un-failing a
+           batch whose callers were just told `ok=False` (503'd), i.e.
+           a click reappearing later after being told it was lost.
+        2. Simply closing+nulling the fd WITHOUT salvaging its content
+           would stash whatever an EARLIER, successfully-fsynced commit
+           on this SAME fd had already durably written (real,
+           acknowledged clicks) into a `.wip` file under THIS worker's
+           OWN prefix — which neither this worker's own drain (globs
+           only `.ndjson`) NOR orphan adoption (excludes its own
+           prefix) will EVER touch again. That is exactly the
+           permanently-stranded-acknowledged-click class this whole
+           review round exists to close — reintroducing it via the
+           "just close the fd" fix would defeat the point.
+
+        So: truncate any torn tail (B2 — drops only what was never
+        acknowledged) and FINALIZE the file under THIS worker's own
+        name, exactly like a clean rotation would. Whatever is left
+        after truncation re-enters the normal per-worker drain path
+        with no orphan-adoption round-trip needed (it's still owned by
+        the same worker) — durable data never sits in a `.wip` limbo
+        that nothing will ever look at again."""
+        path = self._path
+        if self._fd is not None:
+            try:
+                os.close(self._fd)
+            except OSError:
+                pass
+        self._fd = None
+        self._path = None
+        if path is None or not path.exists():
+            return
+        try:
+            _truncate_torn_tail_sync(path)
+            final_path = path.with_suffix("")  # strips ".wip"
+            os.rename(path, final_path)
+            _fsync_dir_sync(final_path.parent)
+        except OSError as exc:
+            logger.error(
+                "Failed to salvage segment %s after a write error — any "
+                "already-fsynced content in it may be stranded as a "
+                ".wip file until an operator investigates: %s",
+                path, exc,
+            )
+            sentry_sdk.capture_exception(exc)
 
     def force_finalize_for_tests(self) -> None:
         """Test-only — finalize whatever is open so a short-lived test
@@ -550,18 +637,73 @@ def _truncate_torn_tail_sync(path: Path) -> int:
     return dropped
 
 
+def _fsync_dir_sync(dir_path: Path) -> None:
+    """D2 primitive — fsync a directory so a prior rename's directory-
+    entry change survives a power-loss (a file's own fsync covers its
+    CONTENT only, never the directory entry). Shared by segment
+    finalize and orphan adoption."""
+    dir_fd = os.open(dir_path, os.O_RDONLY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
+def _canonical_adopted_name(source_name: str, new_owner_prefix: str) -> str | None:
+    """gate-E CRITICAL fix (2026-07-07) — the name a segment (or its
+    `.wip` form, WITHOUT the `.wip` suffix — strip it before calling)
+    should have after adoption by `new_owner_prefix`.
+
+    The segment's ORIGIN identity (the worker that FIRST wrote it) is
+    embedded ONCE and carried forward UNCHANGED across any number of
+    re-adoption hops — only the LEADING (current-owner) prefix ever
+    changes. This is what makes multi-hop adoption safe: a segment
+    that gets re-orphaned (its adopter died before draining it) is
+    STILL discoverable by `_SEGMENT_RE` (which recognises this exact
+    shape) on the next scan, and the filename never grows with hop
+    count — unlike embedding the FULL previous name at each hop, which
+    both breaks discovery (a non-numeric `-adopted-` infix in the
+    middle of what SEGMENT_RE expects to be all-digits) and grows
+    without bound.
+
+    Returns None if `source_name` doesn't match the segment naming
+    scheme at all (defensive — callers skip adoption for it).
+    """
+    m = _SEGMENT_RE.match(source_name)
+    if not m:
+        return None
+    if m.group("orig_epoch") is not None:
+        origin = f"{m.group('orig_epoch')}-{m.group('orig_pid')}"
+    else:
+        origin = f"{m.group('epoch')}-{m.group('pid')}"
+    return f"{new_owner_prefix}-adopted-{origin}-{m.group('seq')}.ndjson"
+
+
 def _adopt_orphan_group_sync(prefix: str, root: Path) -> bool:
     """Claim every file (segment + `.wip` + offset sidecar) under one
     orphan `{epoch}-{pid}` prefix via atomic `os.rename`. Returns True
     if at least one file was successfully claimed (another worker may
     have already won some/all of them — that's fine, POSIX rename on a
-    vanished source raises FileNotFoundError and we just move on)."""
+    vanished source raises FileNotFoundError and we just move on).
+
+    D2 fix (gate-E review, 2026-07-07): the parent directory is fsynced
+    once after all renames in this call so the adoption itself (a
+    directory-entry change, same class as segment finalize) survives a
+    power-loss — closes a durability gap that compounded the CRITICAL
+    stranding bug this function's naming scheme fixes."""
     my_prefix = _worker_prefix()
     claimed_any = False
 
     for f in sorted(root.glob(f"{prefix}-*.ndjson.wip")):
         _truncate_torn_tail_sync(f)
-        new_name = f"{my_prefix}-adopted-{f.name[: -len('.wip')]}"
+        base_name = f.name[: -len(".wip")]
+        new_name = _canonical_adopted_name(base_name, my_prefix)
+        if new_name is None:
+            logger.warning(
+                "Orphan adoption: %s doesn't match the segment naming "
+                "scheme — skipping", f,
+            )
+            continue
         try:
             os.rename(f, f.parent / new_name)
         except FileNotFoundError:
@@ -570,7 +712,7 @@ def _adopt_orphan_group_sync(prefix: str, root: Path) -> bool:
             logger.warning("Orphan adoption rename failed for %s: %s", f, exc)
             continue
         claimed_any = True
-        old_offset = f.parent / (f.name[: -len(".wip")] + ".offset")
+        old_offset = f.parent / (base_name + ".offset")
         if old_offset.exists():
             try:
                 os.rename(old_offset, f.parent / (new_name + ".offset"))
@@ -578,7 +720,13 @@ def _adopt_orphan_group_sync(prefix: str, root: Path) -> bool:
                 pass
 
     for f in sorted(root.glob(f"{prefix}-*.ndjson")):
-        new_name = f"{my_prefix}-adopted-{f.name}"
+        new_name = _canonical_adopted_name(f.name, my_prefix)
+        if new_name is None:
+            logger.warning(
+                "Orphan adoption: %s doesn't match the segment naming "
+                "scheme — skipping", f,
+            )
+            continue
         try:
             os.rename(f, f.parent / new_name)
         except FileNotFoundError:
@@ -594,6 +742,15 @@ def _adopt_orphan_group_sync(prefix: str, root: Path) -> bool:
             except OSError:
                 pass
 
+    if claimed_any:
+        try:
+            _fsync_dir_sync(root)
+        except OSError as exc:
+            logger.warning(
+                "Orphan adoption: parent-directory fsync failed after "
+                "claiming prefix=%s: %s", prefix, exc,
+            )
+
     return claimed_any
 
 
@@ -602,7 +759,15 @@ def _adopt_orphan_segments_sync() -> list[str]:
     if not root.exists():
         return []
     my_prefix = _worker_prefix()
-    now_epoch = _get_boot_epoch()
+    # HIGH fix (gate-E review, 2026-07-07) — REAL wall-clock "now", not
+    # `_get_boot_epoch()`. This function now runs repeatedly over a
+    # long-lived process's life (periodic retry, not one-shot-at-boot),
+    # and `_get_boot_epoch()` is MEMOIZED at this process's own boot
+    # moment — reusing it as "now" would freeze every candidate's
+    # computed age at whatever it was on the FIRST call, silently
+    # defeating the retry (a deferred orphan would never age past the
+    # min-age floor no matter how many real seconds pass).
+    now = int(time.time())
     min_age = settings.disk_orphan_adopt_min_age_seconds
 
     prefixes: set[str] = set()
@@ -618,7 +783,7 @@ def _adopt_orphan_segments_sync() -> list[str]:
             if prefix == my_prefix:
                 continue
             epoch = int(m.group("epoch"))
-            if now_epoch - epoch < min_age:
+            if now - epoch < min_age:
                 continue  # likely a same-boot sibling still starting up
             prefixes.add(prefix)
 
@@ -630,16 +795,18 @@ def _adopt_orphan_segments_sync() -> list[str]:
             logger.warning(
                 "Orphan adoption: claimed dead worker's segments "
                 "prefix=%s (age=%ds) — will drain under %s",
-                prefix, now_epoch - epoch, my_prefix,
+                prefix, now - epoch, my_prefix,
             )
     return adopted
 
 
 async def adopt_orphan_segments() -> list[str]:
-    """Run ONCE at worker startup (from `main.lifespan`, before the
-    drainer task is created) so newly-adopted segments are visible to
-    the very first drain cycle. See module docstring for the full B1
-    rationale."""
+    """Run at worker startup AND on every periodic drainer cycle
+    (gate-E fix, 2026-07-07 — was one-shot-at-boot only, see module
+    docstring for why that stranded segments). Idempotent — a prefix
+    already adopted under this worker's own name is excluded from
+    later scans (`prefix == my_prefix`), so calling this repeatedly
+    with nothing new to adopt is just a couple of cheap glob scans."""
     adopted = await asyncio.to_thread(_adopt_orphan_segments_sync)
     if adopted:
         capture_op_msg(
@@ -703,11 +870,15 @@ def _read_complete_lines_sync(path: Path) -> list[bytes]:
 
 
 async def _replay_segment(redis, path: Path) -> dict:
-    """Replay one finalized segment (own or adopted). Per-LINE offset
-    persistence (B3) bounds a crash mid-replay to at most one
-    re-replayed line — the `click:shipped` check below is the backstop
-    for that bounded duplicate, on top of the collector's own central
-    dedup.
+    """Replay one finalized segment (own or adopted). Offset persistence
+    (B3) is BATCHED every `disk_replay_offset_batch_lines` lines (gate-E
+    perf fix, 2026-07-07 — was every single line: correct but expensive
+    under a large backlog) so a CRASH mid-replay re-does at most that
+    many lines, never the whole segment — the `click:shipped` check
+    below is the backstop for that bounded duplicate, on top of the
+    collector's own central dedup. A Redis-IMPAIRMENT break (the
+    process stays alive, it just stops) flushes the offset immediately
+    on the way out — only a hard crash accepts the batching window.
 
     LOSSFIX P2 fix (2026-07-07, GTD routing-audit CRITICAL-disk-
     fallback-silent-loss): this used to gate on `click:seen` — the SAME
@@ -730,6 +901,16 @@ async def _replay_segment(redis, path: Path) -> dict:
     failed = 0
     i = start_offset
     n = len(lines)
+    persisted_offset = start_offset
+    batch_size = max(1, settings.disk_replay_offset_batch_lines)
+
+    async def _maybe_persist_offset() -> None:
+        nonlocal persisted_offset
+        if i - persisted_offset >= batch_size:
+            await asyncio.to_thread(_write_offset_sync, path, i)
+            persisted_offset = i
+
+    completed = False
     while i < n:
         line = lines[i]
         try:
@@ -740,9 +921,9 @@ async def _replay_segment(redis, path: Path) -> dict:
                 path.name, i, exc,
             )
             sentry_sdk.capture_exception(exc)
-            await asyncio.to_thread(_write_offset_sync, path, i + 1)
             skipped += 1
             i += 1
+            await _maybe_persist_offset()
             continue
 
         click_id_for_dedup: str | None = None
@@ -760,9 +941,9 @@ async def _replay_segment(redis, path: Path) -> dict:
                         "shipped — skipping line %d of %s",
                         click_id_for_dedup, i, path.name,
                     )
-                    await asyncio.to_thread(_write_offset_sync, path, i + 1)
                     skipped += 1
                     i += 1
+                    await _maybe_persist_offset()
                     continue
             except Exception as exc:  # noqa: BLE001 — Redis impaired, fail-open to legacy
                 logger.warning(
@@ -800,14 +981,26 @@ async def _replay_segment(redis, path: Path) -> dict:
                     click_id_for_dedup, exc,
                 )
 
-        await asyncio.to_thread(_write_offset_sync, path, i + 1)
         drained += 1
         i += 1
+        await _maybe_persist_offset()
     else:
-        # Loop completed without break — every line from start_offset
-        # onward is now drained or skipped. Safe to delete the whole
-        # segment (atomic per-segment, per the design brief).
+        completed = True
+
+    if completed:
+        # Every line from start_offset onward is now drained or
+        # skipped. Safe to delete the whole segment (atomic per-
+        # segment, per the design brief) — no need to flush the
+        # batched offset first, the file is gone either way.
         await asyncio.to_thread(_delete_segment_and_sidecar_sync, path)
+    elif i > persisted_offset:
+        # Broke out early (Redis impairment — the process is still
+        # alive, it just stopped). Flush whatever progress happened
+        # since the last batched write immediately: a non-crash
+        # interruption must not accept the batching window, only a
+        # hard crash does.
+        await asyncio.to_thread(_write_offset_sync, path, i)
+        persisted_offset = i
 
     remaining = max(0, n - start_offset - drained - skipped)
     return {"drained": drained, "skipped": skipped, "failed": failed, "remaining": remaining}
@@ -977,11 +1170,19 @@ async def drain_to_redis(redis) -> dict:
 
 
 async def run_drainer(redis, interval: int | None = None) -> None:
-    """Background task: periodic drain attempt.
+    """Background task: periodic orphan-adoption retry + drain attempt.
 
     Started in the FastAPI lifespan, cancelled on shutdown. Robust
     to per-iteration errors — a transient failure in one round
     doesn't kill the loop.
+
+    HIGH fix (gate-E review, 2026-07-07): orphan adoption now runs
+    EVERY cycle here, not just once at boot (see `adopt_orphan_
+    segments`'s docstring + the module docstring's "Orphan adoption"
+    section) — a deferred (too-young-at-first-check) or re-orphaned
+    (its adopter died before draining it) segment gets a real retry
+    every `interval` seconds, not "wait for an unrelated future
+    restart".
     """
     if interval is None:
         interval = settings.disk_queue_drain_interval_seconds
@@ -990,6 +1191,7 @@ async def run_drainer(redis, interval: int | None = None) -> None:
     while True:
         try:
             await asyncio.sleep(interval)
+            await adopt_orphan_segments()
             stats = await drain_to_redis(redis)
             if stats["drained"] > 0 or stats["failed"] > 0:
                 logger.info(

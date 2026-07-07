@@ -261,17 +261,34 @@ class Settings(BaseSettings):
     disk_segment_max_total_bytes: int = 5_000_000_000  # 5 GiB
     disk_queue_stats_scan_interval_seconds: float = 5.0
 
-    # P2 c2 (B1) — orphan-adoption age floor. At worker startup, any
-    # segment prefix `{epoch}-{pid}` that isn't THIS worker's own is a
-    # candidate orphan (its writer died — crash, restart, or a full-node
-    # reboot). Prefixes younger than this floor are assumed to belong to
-    # a SIBLING worker of the SAME boot generation that just hasn't
-    # written its first segment yet (uvicorn's `--workers N` start
-    # within a couple seconds of each other) and are left alone THIS
-    # round — a genuinely dead worker's segments are still there (and
-    # get adopted) on the NEXT restart. 30s is comfortably above any
-    # realistic multi-worker boot stagger.
+    # P2 c2 (B1) — orphan-adoption age floor. On EVERY adoption attempt
+    # (boot + each periodic drainer cycle, gate-E fix 2026-07-07 — was
+    # one-shot-at-boot only), any segment prefix `{epoch}-{pid}` that
+    # isn't THIS worker's own is a candidate orphan (its writer died —
+    # crash, restart, or a full-node reboot). Prefixes younger than
+    # this floor are assumed to belong to a SIBLING worker of the SAME
+    # boot generation that just hasn't written its first segment yet
+    # (uvicorn's `--workers N` start within a couple seconds of each
+    # other) and are left alone THIS attempt — a genuinely dead
+    # worker's segments are still there (and get adopted) on the NEXT
+    # periodic retry, at most `disk_queue_drain_interval_seconds`
+    # later. 30s is comfortably above any realistic multi-worker boot
+    # stagger.
     disk_orphan_adopt_min_age_seconds: int = 30
+
+    # P2 c1 (B3, gate-E perf fix 2026-07-07) — replay-offset batching.
+    # Persisting the offset sidecar after EVERY line (one full
+    # open+write+fsync+close+rename per line) is correct but slow under
+    # a large backlog — it can slow the drain enough to push toward the
+    # byte-cap sooner. Batching to every N lines cuts the fsync count
+    # ~Nx while still bounding a CRASH mid-replay to at most N
+    # re-replayed lines (backstopped by the click:shipped dedup check +
+    # the collector's central dedup, same "duplicate over loss"
+    # trade-off already accepted elsewhere in this module). A Redis-
+    # impairment break (the process stays alive, just stops) still
+    # flushes the offset immediately — only a hard crash accepts the
+    # bounded-batch window.
+    disk_replay_offset_batch_lines: int = 50
 
     # P2 c3 (D5, LOSSFIX, 2026-07-07) — edge used_memory% watermark.
     #

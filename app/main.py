@@ -1646,6 +1646,36 @@ async def decide(
                 "click_id": req.click_id,
                 "stream_write_ms": round((time.perf_counter() - t_stream) * 1000, 2),
             })
+            # LOSSFIX P2 fix (2026-07-07, GTD routing-audit
+            # CRITICAL-disk-fallback-silent-loss) — mark `click:shipped`
+            # ONLY after XADD is CONFIRMED successful. This is a
+            # DIFFERENT key from `click:seen` (set at dedup-check time,
+            # BEFORE any write decision — see `_acquire_click_dedup`).
+            # Conflating the two was the bug: the disk-queue drainer's
+            # replay used to gate on `click:seen`, which every
+            # disk-fallback click ALREADY has planted by its own
+            # /decide call, so the replay's "duplicate" check always
+            # false-positived and the file was deleted without ever
+            # being shipped — a 100%-reproducible silent loss for every
+            # M1/watermark-diverted click. `click:shipped` is the
+            # correct signal for "this click_id is confirmed IN the
+            # stream" that `app.disk_queue`'s replay checks instead.
+            # Best-effort: a failure here must never fail the request —
+            # it only defeats a defense-in-depth replay-dedup nicety,
+            # not the click's own delivery.
+            if settings.click_dedup_ttl_seconds > 0:
+                try:
+                    await r.set(
+                        f"click:shipped:{req.click_id}",
+                        "1",
+                        ex=settings.click_dedup_ttl_seconds,
+                    )
+                except Exception as exc:  # noqa: BLE001 — non-fatal, best-effort marker
+                    logger.warning(
+                        "Failed to set click:shipped marker for %s: %s "
+                        "(non-fatal — click already durably in the stream)",
+                        req.click_id, exc,
+                    )
         except Exception as e:
             logger.error("Failed to write click to stream: %s", e, extra={"click_id": req.click_id})
             sentry_sdk.capture_exception(e)

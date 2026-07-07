@@ -705,9 +705,25 @@ def _read_complete_lines_sync(path: Path) -> list[bytes]:
 async def _replay_segment(redis, path: Path) -> dict:
     """Replay one finalized segment (own or adopted). Per-LINE offset
     persistence (B3) bounds a crash mid-replay to at most one
-    re-replayed line — the SETNX click-id dedup below (H1, unchanged
-    from pre-P2) is the backstop for that bounded duplicate, on top of
-    the collector's own central dedup."""
+    re-replayed line — the `click:shipped` check below is the backstop
+    for that bounded duplicate, on top of the collector's own central
+    dedup.
+
+    LOSSFIX P2 fix (2026-07-07, GTD routing-audit CRITICAL-disk-
+    fallback-silent-loss): this used to gate on `click:seen` — the SAME
+    key `main._acquire_click_dedup` SETNX's at /decide time, BEFORE the
+    stream-vs-disk-fallback decision even runs. That meant EVERY click
+    that reached disk (M1 reject, a watermark spill, or a genuine XADD
+    exception) ALREADY had its `click:seen` marker planted by its OWN
+    /decide call — so this check's SETNX always found the key taken,
+    always concluded "duplicate, already in the stream", and deleted
+    the segment line WITHOUT ever shipping it. 100%-reproducible silent
+    loss for every disk-fallback click, live-confirmed 0/40. `click:
+    shipped` is a DIFFERENT key, set ONLY after a CONFIRMED-successful
+    XADD (here, or in main.py's direct-write path) — never before one
+    is attempted — so a click that never got a chance to ship (which is
+    every M1/watermark-diverted click) can NEVER see its own marker
+    already set."""
     lines = await asyncio.to_thread(_read_complete_lines_sync, path)
     start_offset = await asyncio.to_thread(_read_offset_sync, path)
     drained = skipped = 0
@@ -737,16 +753,11 @@ async def _replay_segment(redis, path: Path) -> dict:
 
         if click_id_for_dedup is not None and settings.click_dedup_ttl_seconds > 0:
             try:
-                acquired = await redis.set(
-                    f"click:seen:{click_id_for_dedup}",
-                    "1",
-                    nx=True,
-                    ex=settings.click_dedup_ttl_seconds,
-                )
-                if not acquired:
+                already_shipped = await redis.get(f"click:shipped:{click_id_for_dedup}")
+                if already_shipped:
                     logger.info(
-                        "Segment replay: duplicate click_id %s (already "
-                        "in stream) — skipping line %d of %s",
+                        "Segment replay: click_id %s already confirmed "
+                        "shipped — skipping line %d of %s",
                         click_id_for_dedup, i, path.name,
                     )
                     await asyncio.to_thread(_write_offset_sync, path, i + 1)
@@ -755,8 +766,8 @@ async def _replay_segment(redis, path: Path) -> dict:
                     continue
             except Exception as exc:  # noqa: BLE001 — Redis impaired, fail-open to legacy
                 logger.warning(
-                    "Segment replay: SETNX failed for %s: %s — "
-                    "proceeding without dedup",
+                    "Segment replay: click:shipped GET failed for %s: "
+                    "%s — proceeding without dedup",
                     click_id_for_dedup, exc,
                 )
 
@@ -773,6 +784,21 @@ async def _replay_segment(redis, path: Path) -> dict:
             )
             failed = 1
             break
+
+        if click_id_for_dedup is not None and settings.click_dedup_ttl_seconds > 0:
+            try:
+                await redis.set(
+                    f"click:shipped:{click_id_for_dedup}",
+                    "1",
+                    ex=settings.click_dedup_ttl_seconds,
+                )
+            except Exception as exc:  # noqa: BLE001 — non-fatal, best-effort marker
+                logger.warning(
+                    "Segment replay: click:shipped SET failed for %s: "
+                    "%s (non-fatal — click already durably in the "
+                    "stream)",
+                    click_id_for_dedup, exc,
+                )
 
         await asyncio.to_thread(_write_offset_sync, path, i + 1)
         drained += 1
@@ -830,16 +856,20 @@ async def _drain_legacy_json_files(redis) -> dict:
                     path.name, exc,
                 )
         if click_id_for_dedup is not None:
+            # LOSSFIX P2 fix (2026-07-07, GTD routing-audit CRITICAL-
+            # disk-fallback-silent-loss) — `click:shipped`, NOT
+            # `click:seen`. See `_replay_segment`'s docstring for the
+            # full bug: `click:seen` is planted at /decide dedup-check
+            # time, BEFORE any write decision, so every disk-fallback
+            # click already has it set and the old SETNX-on-click:seen
+            # check always false-positived as "duplicate" — deleting
+            # the file without ever shipping it.
             try:
-                acquired = await redis.set(
-                    f"click:seen:{click_id_for_dedup}",
-                    "1",
-                    nx=True,
-                    ex=settings.click_dedup_ttl_seconds,
-                )
-                if not acquired:
+                already_shipped = await redis.get(f"click:shipped:{click_id_for_dedup}")
+                if already_shipped:
                     logger.info(
-                        "Legacy drain: duplicate click_id %s — dropping %s",
+                        "Legacy drain: click_id %s already confirmed "
+                        "shipped — dropping %s",
                         click_id_for_dedup, path.name,
                     )
                     try:
@@ -855,8 +885,8 @@ async def _drain_legacy_json_files(redis) -> dict:
                     continue
             except Exception as exc:  # noqa: BLE001 — Redis impaired
                 logger.warning(
-                    "Legacy drain: SETNX failed for %s: %s — proceeding "
-                    "without dedup", click_id_for_dedup, exc,
+                    "Legacy drain: click:shipped GET failed for %s: %s "
+                    "— proceeding without dedup", click_id_for_dedup, exc,
                 )
 
         try:
@@ -868,6 +898,20 @@ async def _drain_legacy_json_files(redis) -> dict:
             )
             failed = 1
             break
+
+        if click_id_for_dedup is not None and settings.click_dedup_ttl_seconds > 0:
+            try:
+                await redis.set(
+                    f"click:shipped:{click_id_for_dedup}",
+                    "1",
+                    ex=settings.click_dedup_ttl_seconds,
+                )
+            except Exception as exc:  # noqa: BLE001 — non-fatal, best-effort marker
+                logger.warning(
+                    "Legacy drain: click:shipped SET failed for %s: %s "
+                    "(non-fatal — click already durably in the stream)",
+                    click_id_for_dedup, exc,
+                )
 
         try:
             await asyncio.to_thread(path.unlink)

@@ -80,6 +80,12 @@ def _make_redis_mock(xadd_side_effect=None) -> AsyncMock:
     redis = AsyncMock()
     if xadd_side_effect is not None:
         redis.xadd.side_effect = xadd_side_effect
+    # `click:shipped` is a GET-then-SET check (P2 fix, 2026-07-07) — a
+    # bare AsyncMock's `.get(...)` return_value defaults to a truthy
+    # MagicMock, which would make EVERY replayed line look
+    # "already shipped" and never reach XADD. None = "not shipped yet",
+    # the correct default for a fresh fake-Redis in these tests.
+    redis.get = AsyncMock(return_value=None)
     return redis
 
 
@@ -552,19 +558,92 @@ class TestReplayExactlyOnce:
 
     @pytest.mark.asyncio
     async def test_duplicate_click_id_skipped_via_dedup_still_advances_offset(self, monkeypatch):
+        """P2 fix (2026-07-07): the dedup check keys on `click:shipped`
+        (GET), not `click:seen` (SETNX) — a click already CONFIRMED
+        shipped (by this or another path) is skipped without a
+        re-XADD."""
         monkeypatch.setattr(disk_queue.settings, "click_dedup_ttl_seconds", 300)
         await disk_queue.enqueue_click({"click_id": "dup-1"})
         disk_queue._get_writer().force_finalize_for_tests()
         seg = _segments()[0]
 
         redis = _make_redis_mock()
-        redis.set = AsyncMock(return_value=False)  # SETNX says "already seen"
+        redis.get = AsyncMock(return_value="1")  # click:shipped already set
         stats = await disk_queue.drain_to_redis(redis)
 
         assert stats["drained"] == 0
         assert stats["skipped"] == 1
         redis.xadd.assert_not_awaited()
         assert not seg.exists()  # fully "processed" (skipped counts toward completion)
+
+
+# ---------------------------------------------------------------------------
+# CRITICAL regression (GTD routing-audit CRITICAL-disk-fallback-silent-loss,
+# 2026-07-07) — replay must key on click:shipped, NEVER click:seen. Every
+# disk-fallback click's `click:seen` marker is ALREADY planted by its own
+# /decide call (main._acquire_click_dedup runs BEFORE the stream-vs-disk
+# decision), so gating replay on that key always false-positived as
+# "duplicate" and silently dropped the click — 100%-reproducible, live-
+# confirmed 0/40. This test FAILS against the old (click:seen-gated) logic
+# and PASSES against the fix.
+# ---------------------------------------------------------------------------
+
+
+class TestClickShippedNotClickSeenRegression:
+    @pytest.mark.asyncio
+    async def test_pre_planted_click_seen_marker_does_not_block_replay(self):
+        """Simulates EXACTLY what happens for every disk-fallback click
+        today: its own /decide call already ran `_acquire_click_dedup`
+        (SET click:seen NX EX 86400) BEFORE ever reaching the stream-
+        write decision. The replayed click must still ship exactly
+        once — the pre-planted click:seen marker must have zero effect
+        on the (correctly click:shipped-gated) replay path."""
+        import fakeredis.aioredis
+
+        redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+
+        click_id = "spilled-click-1"
+        # Exactly what main._acquire_click_dedup does at /decide time,
+        # for EVERY click, before the stream-vs-disk-fallback decision.
+        await redis.set(f"click:seen:{click_id}", "1", nx=True, ex=86400)
+
+        await disk_queue.enqueue_click({"click_id": click_id})
+        disk_queue._get_writer().force_finalize_for_tests()
+
+        stats = await disk_queue.drain_to_redis(redis)
+
+        assert stats["drained"] == 1, (
+            "The click MUST ship on replay even though its own /decide "
+            "already planted click:seen — gating replay on that key "
+            "silently drops every disk-fallback click (0 loss is the "
+            "whole point of the disk fallback)."
+        )
+        assert stats["skipped"] == 0
+        assert await redis.xlen("stream:clicks") == 1
+        entries = await redis.xrange("stream:clicks")
+        shipped = json.loads(entries[0][1]["data"])
+        assert shipped["click_id"] == click_id
+
+    @pytest.mark.asyncio
+    async def test_click_shipped_marker_prevents_a_genuine_re_ship(self):
+        """Sanity counterpart — click:shipped (the CORRECT key, set
+        only after a confirmed-successful XADD) DOES suppress a replay
+        that would otherwise duplicate an already-shipped click."""
+        import fakeredis.aioredis
+
+        redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+
+        click_id = "already-shipped-1"
+        await redis.set(f"click:shipped:{click_id}", "1", ex=86400)
+
+        await disk_queue.enqueue_click({"click_id": click_id})
+        disk_queue._get_writer().force_finalize_for_tests()
+
+        stats = await disk_queue.drain_to_redis(redis)
+
+        assert stats["drained"] == 0
+        assert stats["skipped"] == 1
+        assert await redis.xlen("stream:clicks") == 0
 
 
 # ---------------------------------------------------------------------------

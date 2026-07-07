@@ -236,13 +236,27 @@ class TestSourcePins:
         orchestrator over `_replay_segment` (own/adopted segments) and
         `_drain_legacy_json_files` (pre-P2 per-click files, D1
         migration) — the dedup gate now lives in BOTH of those, not in
-        `drain_to_redis` itself."""
+        `drain_to_redis` itself.
+
+        P2 fix (2026-07-07, GTD routing-audit CRITICAL-disk-fallback-
+        silent-loss): the gate MUST key on `click:shipped` (set only
+        after a confirmed-successful XADD), never `click:seen` (set at
+        /decide dedup-check time, BEFORE any write decision — every
+        disk-fallback click already has that one planted, which
+        silently dropped every M1/watermark-diverted click on replay)."""
         import inspect
         from app import disk_queue
 
         for fn in (disk_queue._replay_segment, disk_queue._drain_legacy_json_files):
             src = inspect.getsource(fn)
-            assert "click:seen:" in src or "click_dedup_ttl_seconds" in src, (
+            assert "click:shipped:" in src, (
+                f"{fn.__name__} MUST gate the XADD replay on the "
+                "click:shipped marker (set only after a confirmed "
+                "successful XADD) — NOT click:seen (planted at /decide "
+                "dedup-check time, before any write decision), which "
+                "silently drops every disk-fallback click on replay."
+            )
+            assert "click_dedup_ttl_seconds" in src, (
                 f"{fn.__name__} MUST gate the XADD replay on dedup so "
                 "Redis-recovery doesn't create stream duplicates "
                 "(H1 fix companion)."

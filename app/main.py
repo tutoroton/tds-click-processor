@@ -57,6 +57,7 @@ from app.telemetry import (
     OP_IDENTITY_STORE_PRESSURE,
     OP_ROUTE_ERROR,
     OP_STREAM_ENTRY_LIMIT,
+    OP_WATERMARK_SPILL,
     capture_op_exc,
     capture_op_msg,
     capture_op_msg_throttled,
@@ -71,6 +72,7 @@ from app.disk_queue import (
 )
 from app.observability import get_cached_stream_clicks_length, run_observability_loop
 from app.sync_client import apply_snapshot, start_periodic_pull
+from app.watermark import run_watermark_sampler, watermark_state
 
 logger = logging.getLogger("tds.click-processor")
 
@@ -215,6 +217,12 @@ async def lifespan(app: FastAPI):
     # never scans live) and /health's D3 depth fields.
     queue_stats_task = asyncio.create_task(run_queue_stats_sampler())
 
+    # P2 c3 (D5, LOSSFIX 2026-07-07) — edge used_memory% watermark,
+    # ported from the collector's sampler. `main.py`'s real-click write
+    # path reads only the cached `watermark_state.should_spill()`
+    # decision — never a per-click INFO round-trip.
+    watermark_task = asyncio.create_task(run_watermark_sampler(r))
+
     # Start observability loop (T2.6 partial). Periodically emits
     # `stream.clicks.length` + `disk_queue.size` to Sentry as
     # warn-level breadcrumbs when either approaches its cap. No
@@ -266,6 +274,7 @@ async def lifespan(app: FastAPI):
     sync_task.cancel()
     disk_drainer_task.cancel()
     queue_stats_task.cancel()
+    watermark_task.cancel()
     observability_task.cancel()
     diag_drain_task.cancel()
     try:
@@ -282,6 +291,10 @@ async def lifespan(app: FastAPI):
         pass
     try:
         await queue_stats_task
+    except asyncio.CancelledError:
+        pass
+    try:
+        await watermark_task
     except asyncio.CancelledError:
         pass
     try:
@@ -1594,6 +1607,34 @@ async def decide(
             click_id=req.click_id,
             threshold=settings.stream_clicks_maxlen,
         )
+    elif watermark_state.should_spill():
+        # P2 c3 (D5, LOSSFIX 2026-07-07) — the edge used_memory%
+        # watermark is in SPILL mode: the routing Redis is under memory
+        # pressure (it hosts BOTH the routing cache AND stream:clicks —
+        # confirmed shared instance, docker-compose.node.yml). Divert
+        # into the SAME disk-fallback path used for a genuine XADD
+        # failure, BEFORE attempting the XADD, so new clicks stop
+        # competing with the routing cache for memory. Checked against
+        # the CACHED sampler decision only (never a per-click INFO
+        # round-trip) and fails open on a stale/never-sampled signal —
+        # see app/watermark.py.
+        stream_write_failed = True
+        stream_failure_reason = "watermark_spill"
+        logger.warning(
+            "LOSSFIX P2 c3 — edge watermark in SPILL mode "
+            "(used_memory=%.1f%%); diverting click %s to the disk "
+            "fallback instead of XADD.",
+            watermark_state.used_memory_pct, req.click_id,
+        )
+        capture_op_msg(
+            OP_WATERMARK_SPILL,
+            f"Edge watermark spill (used_memory="
+            f"{watermark_state.used_memory_pct:.1f}%) — click "
+            f"{req.click_id} diverted to disk fallback",
+            level="warning",
+            click_id=req.click_id,
+            used_memory_pct=watermark_state.used_memory_pct,
+        )
     else:
         try:
             r = await get_redis()
@@ -1669,8 +1710,8 @@ async def decide(
             )
 
         # T2.2 / G-23 — fall back to disk queue when Redis is
-        # unreachable (or the M1 gate diverted us here). Without this,
-        # every click during a Redis outage was
+        # unreachable (or the M1 gate / watermark spill diverted us
+        # here). Without this, every click during a Redis outage was
         # LOST: the log + Sentry capture above record the symptom but
         # the click_record itself never made it to the stream → never
         # to central → never to analytics. The disk segment is

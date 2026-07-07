@@ -77,6 +77,19 @@ OP_CLICK_UNCAPTURED = "click_uncaptured"
 # synthetic click, nothing to preserve).
 OP_STREAM_ENTRY_LIMIT = "stream_entry_limit"
 
+# LOSSFIX P2 c3 (2026-07-07) — the edge watermark sampler (app/watermark.py)
+# tripped: cached used_memory% of the routing Redis is at/over the shed
+# threshold. Fired once per click diverted into the disk-segment spill
+# path (NOT a 503 — see app/watermark.py module docstring for why edge
+# spills instead of shedding).
+OP_WATERMARK_SPILL = "watermark_spill"
+
+# LOSSFIX P2 c3 — mirrors the collector's OP_WATERMARK_SIGNAL_STALE: the
+# watermark sampler's cached sample is stale (sampler wedged, dead, or
+# never landed a first reading past the boot grace). Fail-open always
+# wins (accept/XADD proceeds) — this tag is pure visibility.
+OP_WATERMARK_SIGNAL_STALE = "watermark_signal_stale"
+
 # LOSSFIX P2 c1 (2026-07-07) — a recovered `.wip` segment (orphan
 # adoption, B1) had a torn tail: the last line was incomplete or failed
 # to parse. Loss-free by construction (see disk_queue._truncate_torn_

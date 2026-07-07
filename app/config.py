@@ -273,6 +273,28 @@ class Settings(BaseSettings):
     # realistic multi-worker boot stagger.
     disk_orphan_adopt_min_age_seconds: int = 30
 
+    # P2 c3 (D5, LOSSFIX, 2026-07-07) — edge used_memory% watermark.
+    #
+    # Ported from the collector's `app/watermark.py` (LOSSFIX P1a) — same
+    # state machine, same defaults, same fail-open/hysteresis semantics.
+    # The ONE difference: the collector SHEDS (503) on trip; the edge
+    # SPILLS (diverts new real clicks to the disk-segment fallback
+    # instead of XADD-ing) because routing-cache HSETs live on the SAME
+    # Redis instance (`docker-compose.node.yml`'s `redis` service, 256
+    # MB volatile-lru — confirmed shared with `stream:clicks`, not a
+    # separate instance) and must keep succeeding even under click-
+    # traffic memory pressure (empirical: campaign-sync HSET threw
+    # OutOfMemoryError at >=650rps once click XADDs filled the same
+    # instance). A dedicated ~1s sampler (`app/watermark.py`) reads
+    # `used_memory%` of THIS SAME instance; `main.py`'s real-click path
+    # reads only the cached `should_spill()` decision — never a per-click
+    # INFO round-trip.
+    watermark_shed_pct: float = 85.0
+    watermark_resume_pct: float = 70.0
+    watermark_sample_interval_sec: float = 1.0
+    watermark_staleness_sec: float = 10.0
+    watermark_boot_grace_sec: float = 60.0
+
     # F.29 Sprint 4.1 (2026-05-23) — shipper-health alert thresholds.
     #
     # The observability loop (`emit_shipper_health`) runs on its OWN task,

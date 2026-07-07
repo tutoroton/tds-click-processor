@@ -276,6 +276,30 @@ class Settings(BaseSettings):
     # stagger.
     disk_orphan_adopt_min_age_seconds: int = 30
 
+    # gate-E round 2 CRITICAL fix (2026-07-07) — MECHANICAL liveness for
+    # orphan adoption. `disk_orphan_adopt_min_age_seconds` above is a cheap
+    # AGE pre-filter only (guards a same-boot sibling still starting up); it
+    # is NOT proof of death, because the epoch in a segment's name is the
+    # writer's BOOT time, not the file's age — so ANY live sibling older
+    # than that floor (i.e. every sibling past its first ~30s of life)
+    # looked "dead" to age alone. Combined with the periodic-retry HIGH fix
+    # (round 1), that became CONTINUOUS mass live-sibling theft under
+    # sustained WC=8 spill — including OPEN `.wip` theft (silent loss
+    # TWICE: a torn-tail truncate mid-flight on a file the owner is still
+    # actively writing, then the owner's own subsequent appends vanishing
+    # into an unlinked inode once the thief drains+deletes the file).
+    #
+    # Every worker refreshes its own `{prefix}.alive` heartbeat file's mtime
+    # every `run_drainer` cycle AND at the moment it opens its FIRST
+    # segment — a candidate orphan prefix is adopted only once its
+    # heartbeat is missing (a pre-this-fix orphan that already cleared the
+    # age floor — a live current-code worker can never be in that state)
+    # OR older than `THIS multiplier * disk_queue_drain_interval_seconds`.
+    # A multiplier (not an absolute seconds value) so a change to the drain
+    # interval can never accidentally starve a live worker of enough time
+    # to refresh before looking stale.
+    disk_orphan_heartbeat_stale_multiplier: float = 3.0
+
     # P2 c1 (B3, gate-E perf fix 2026-07-07) — replay-offset batching.
     # Persisting the offset sidecar after EVERY line (one full
     # open+write+fsync+close+rename per line) is correct but slow under

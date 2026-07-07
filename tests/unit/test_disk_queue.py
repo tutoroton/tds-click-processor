@@ -21,6 +21,14 @@ Coverage layers (mirrors the P2 brief's OBSERVABLE DONE items 1-9, 13):
      `get_queue_stats`.
   9. Crash-recovery E2E — kill mid-write, restart, adopt, replay,
      nothing lost, nothing double-shipped.
+  10. Mechanical liveness (gate-E round 2 CRITICAL) — orphan adoption
+      NEVER touches a live sibling (heartbeat-gated, not age-inferred),
+      proven both at the unit level and against a REAL killable
+      subprocess.
+  11. Rotation-failure containment + idle-tail finalize (gate-E round 2
+      HIGH) — a rotation OSError never hangs the flush loop nor
+      strands durable bytes; an idle `.wip` with zero new appends
+      still finalizes within one drainer cycle.
 
 Reference: rule `sync-protocol`, action-items.md T2.2, open-questions.md
 G-23.
@@ -31,6 +39,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import subprocess
+import sys
 import time
 from pathlib import Path
 from unittest.mock import AsyncMock
@@ -242,6 +252,181 @@ class TestSegmentLifecycle:
         # A later click opens a FRESH segment — not the abandoned fd.
         assert await disk_queue.enqueue_click({"click_id": "c"}) is True
         assert len(_wip_segments()) == 1
+
+
+# ---------------------------------------------------------------------------
+# 11 — rotation-failure containment + idle-tail finalize (gate-E round 2
+# HIGH §4 + §5).
+# ---------------------------------------------------------------------------
+
+
+class TestRotationFailureContainment:
+    @pytest.mark.asyncio
+    async def test_rotation_rename_failure_reopens_segment_no_stranding_no_hang(
+        self, monkeypatch,
+    ):
+        """HIGH fix (gate-E round 2 §4) — a rename failure DURING
+        rotation (simulated ENOSPC/EIO) must never hang the caller
+        (the write+fsync already succeeded, so ok=True) and must never
+        strand the segment's already-durable bytes under a cleared
+        fd/path — the writer re-opens the SAME `.wip` path so the data
+        stays reachable and rotation retries on the next eligible
+        commit."""
+        # Just over one line's size (~19 bytes for `{"click_id":"a"}\n`)
+        # so the FIRST click alone crosses the threshold and triggers
+        # the (simulated-failing) rotate attempt.
+        monkeypatch.setattr(disk_queue.settings, "disk_segment_max_bytes", 15)
+
+        call_count = {"n": 0}
+        original_rename = os.rename
+
+        def flaky_rename(src, dst):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise OSError("simulated ENOSPC on rename")
+            return original_rename(src, dst)
+
+        monkeypatch.setattr(disk_queue.os, "rename", flaky_rename)
+
+        ok = await disk_queue.enqueue_click({"click_id": "a"})
+        assert ok is True, (
+            "The write+fsync succeeded BEFORE the rotate step ran — "
+            "callers must see ok=True regardless of a LATER rotation "
+            "failure."
+        )
+
+        writer = disk_queue._get_writer()
+        assert writer.current_wip_path is not None, (
+            "After a failed rename, the writer must re-open the SAME "
+            ".wip path rather than losing track of it (which would "
+            "strand its already-durable bytes under this worker's own, "
+            "never-revisited prefix)."
+        )
+
+        # Click "b" lands in the SAME still-open segment (size stays
+        # over threshold, since the writer never reset it) — its own
+        # commit's rotate check retries the finalize, and this time
+        # the rename succeeds (call_count reaches 2), closing the
+        # segment with BOTH "a" and "b" durably inside it. No data
+        # lost across the retry, and the caller never hung.
+        ok2 = await disk_queue.enqueue_click({"click_id": "b"})
+        assert ok2 is True
+        assert _wip_segments() == []
+        segments = _segments()
+        assert len(segments) == 1
+        assert _lines_of(segments[0]) == [{"click_id": "a"}, {"click_id": "b"}]
+
+        # A later click still succeeds — the writer isn't wedged. (With
+        # this tiny max_bytes, even a single fresh line already exceeds
+        # it, so "c" rotates into its own segment immediately too —
+        # what matters is that it's durably recorded, not the exact
+        # segment count.)
+        ok3 = await disk_queue.enqueue_click({"click_id": "c"})
+        assert ok3 is True
+        all_lines = [line for seg in _segments() for line in _lines_of(seg)]
+        assert {"click_id": "c"} in all_lines
+
+    @pytest.mark.asyncio
+    async def test_unexpected_commit_exception_resolves_futures_and_resets_flush_task(
+        self, monkeypatch,
+    ):
+        """Defense-in-depth (gate-E round 2 §4 ask #2) — even an
+        exception this fix didn't specifically anticipate escaping the
+        commit call must resolve the batch's futures (ok=False, never
+        hang forever) AND reset `_flush_task` so the NEXT append()
+        spawns a fresh flush loop rather than queuing into a dead one
+        — the node-wide spill-path hang this whole fix-round closes."""
+        writer = disk_queue._get_writer()
+        original = writer._commit_batch_sync
+        call_count = {"n": 0}
+
+        def exploding_commit(batch):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise RuntimeError("unexpected bug")
+            return original(batch)
+
+        monkeypatch.setattr(writer, "_commit_batch_sync", exploding_commit)
+
+        ok = await asyncio.wait_for(
+            disk_queue.enqueue_click({"click_id": "a"}), timeout=2.0,
+        )
+        assert ok is False
+
+        assert writer._flush_task is None, (
+            "_flush_task must be reset after ANY exit from "
+            "_run_flush_loop, including an unexpected exception — "
+            "otherwise every future append queues into a dead loop "
+            "and never resolves, hanging the entire spill path."
+        )
+
+        ok2 = await asyncio.wait_for(
+            disk_queue.enqueue_click({"click_id": "b"}), timeout=2.0,
+        )
+        assert ok2 is True
+
+
+class TestFinalizeIfStale:
+    @pytest.mark.asyncio
+    async def test_idle_wip_past_max_age_gets_finalized(self, monkeypatch):
+        """HIGH fix (gate-E round 2 §5) — an idle `.wip` with ZERO new
+        appends must still finalize once past `disk_segment_max_age_
+        seconds`, closing the "spill burst then quiet" unbounded-
+        delivery-delay gap (previously rotation only ever ran as a
+        side effect of a LATER commit)."""
+        monkeypatch.setattr(disk_queue.settings, "disk_segment_max_age_seconds", 0.05)
+        await disk_queue.enqueue_click({"click_id": "idle-1"})
+        assert len(_wip_segments()) == 1
+
+        await asyncio.sleep(0.1)
+        await disk_queue._get_writer().finalize_if_stale()
+
+        assert _wip_segments() == []
+        assert len(_segments()) == 1
+        assert _lines_of(_segments()[0]) == [{"click_id": "idle-1"}]
+
+    @pytest.mark.asyncio
+    async def test_fresh_wip_not_yet_stale_is_left_open(self, monkeypatch):
+        monkeypatch.setattr(disk_queue.settings, "disk_segment_max_age_seconds", 1000.0)
+        await disk_queue.enqueue_click({"click_id": "fresh-1"})
+
+        await disk_queue._get_writer().finalize_if_stale()
+
+        assert len(_wip_segments()) == 1
+        assert _segments() == []
+
+    @pytest.mark.asyncio
+    async def test_no_open_segment_is_a_noop(self):
+        await disk_queue._get_writer().finalize_if_stale()  # must not raise
+
+    @pytest.mark.asyncio
+    async def test_wired_into_run_drainer_cycle(self, monkeypatch):
+        """Proves the retrofit is actually wired into `run_drainer`,
+        not just callable on demand — an idle `.wip` with NO new
+        appends still gets drained by the background loop alone."""
+        monkeypatch.setattr(disk_queue.settings, "disk_segment_max_age_seconds", 0.01)
+        await disk_queue.enqueue_click({"click_id": "cycle-1"})
+        assert len(_wip_segments()) == 1
+
+        redis = _make_redis_mock()
+        task = asyncio.create_task(disk_queue.run_drainer(redis, interval=0))
+        # Poll for the TERMINAL state (both empty) rather than the
+        # intermediate "xadd was called" signal — there are further
+        # await points (click:shipped SET, offset persistence, the
+        # delete-to-thread call) between the xadd and the segment
+        # actually disappearing, so breaking on await_count alone
+        # races with those and is flaky.
+        for _ in range(200):
+            await asyncio.sleep(0.01)
+            if not _wip_segments() and not _segments():
+                break
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert redis.xadd.await_count == 1
+        assert _wip_segments() == []
+        assert _segments() == []  # drained + deleted
 
 
 # ---------------------------------------------------------------------------
@@ -600,6 +785,198 @@ class TestOrphanAdoption:
         )
 
         assert disk_queue._canonical_adopted_name("not-a-segment.json", "3000-333") is None
+
+
+# ---------------------------------------------------------------------------
+# 10 — mechanical liveness (gate-E round 2 CRITICAL) — orphan adoption must
+# NEVER touch a live sibling. Fable's independent adversarial pass found the
+# age-inferred check (round 1) treated ANY live sibling older than the
+# min-age floor as "dead" — the epoch in a segment's NAME is the writer's
+# BOOT time, not the file's age. Combined with round 1's own periodic-retry
+# fix, this became CONTINUOUS mass live-sibling theft under sustained WC=8
+# spill, including catastrophic OPEN `.wip` theft (silent loss twice over).
+# ---------------------------------------------------------------------------
+
+
+class TestMechanicalLiveness:
+    """Fast, deterministic coverage of `_worker_is_dead_sync` — the
+    arithmetic the real-process regression below exercises end-to-end."""
+
+    def test_fresh_heartbeat_means_alive_regardless_of_segment_name_age(self):
+        """The core bug this fix closes: a segment-name epoch can be
+        arbitrarily old for a perfectly live, long-running worker — a
+        fresh heartbeat must prove liveness regardless."""
+        root = _root()
+        root.mkdir(parents=True)
+        ancient_prefix = f"{int(time.time()) - 7200}-424242"
+        disk_queue._heartbeat_path(root, ancient_prefix).touch()
+
+        assert disk_queue._worker_is_dead_sync(root, ancient_prefix, time.time()) is False
+
+    def test_stale_heartbeat_means_dead(self, monkeypatch):
+        monkeypatch.setattr(disk_queue.settings, "disk_queue_drain_interval_seconds", 1)
+        monkeypatch.setattr(disk_queue.settings, "disk_orphan_heartbeat_stale_multiplier", 3.0)
+        root = _root()
+        root.mkdir(parents=True)
+        prefix = f"{int(time.time())}-424242"
+        hb = disk_queue._heartbeat_path(root, prefix)
+        hb.touch()
+        stale_mtime = time.time() - 10  # well past 3 * 1s
+        os.utime(hb, (stale_mtime, stale_mtime))
+
+        assert disk_queue._worker_is_dead_sync(root, prefix, time.time()) is True
+
+    def test_missing_heartbeat_means_dead(self):
+        """Legacy fallback — a pre-this-fix orphan (whose segments
+        already cleared the age floor) never had a heartbeat file at
+        all; a live current-code worker can never reach this state
+        (its heartbeat always exists at least as early as its first
+        segment — see `_ensure_open_sync`)."""
+        root = _root()
+        root.mkdir(parents=True)
+        assert disk_queue._worker_is_dead_sync(root, "123-456", time.time()) is True
+
+    @pytest.mark.asyncio
+    async def test_live_prefix_with_fresh_heartbeat_is_never_adopted_even_if_name_is_old(
+        self, monkeypatch,
+    ):
+        """End-to-end via the public `adopt_orphan_segments()` entry
+        point — a segment whose NAME embeds an ancient epoch (would
+        have passed the OLD age-only check) must still be left
+        completely alone, `.wip` included, as long as its heartbeat is
+        fresh."""
+        monkeypatch.setattr(disk_queue.settings, "disk_orphan_adopt_min_age_seconds", 0)
+        root = _root()
+        root.mkdir(parents=True)
+        old_epoch = int(time.time()) - 7200
+        live_prefix = f"{old_epoch}-424242"
+        segment = root / f"{live_prefix}-000001.ndjson"
+        segment.write_bytes(b'{"click_id":"still-live"}\n')
+        wip = root / f"{live_prefix}-000002.ndjson.wip"
+        wip.write_bytes(b'{"click_id":"still-live-2"}\n')
+        disk_queue._heartbeat_path(root, live_prefix).touch()
+
+        adopted = await disk_queue.adopt_orphan_segments()
+
+        assert adopted == [], (
+            "A live sibling (fresh heartbeat) must NEVER be adopted, "
+            "even when its segment-name epoch is old enough that the "
+            "pre-round-2 age-only check would have claimed it."
+        )
+        assert segment.exists()
+        assert wip.exists()
+
+    @pytest.mark.asyncio
+    async def test_opening_a_segment_creates_this_workers_heartbeat(self):
+        """Closes the boot-race window: a segment file for a prefix
+        must never exist on disk before that SAME prefix's heartbeat
+        file does — otherwise a peer's orphan scan could catch a
+        genuinely-live, just-started worker in a 'segment exists, no
+        heartbeat yet' gap."""
+        await disk_queue.enqueue_click({"click_id": "a"})
+        my_prefix = disk_queue._worker_prefix()
+        assert disk_queue._heartbeat_path(_root(), my_prefix).exists()
+
+
+class TestLiveSiblingProcessTheft:
+    """CRITICAL regression (Fable's independent adversarial pass,
+    gate-E round 2, 2026-07-07) — a REAL live process (an actually
+    killable pid), not a simulated dead one, holding an open `.wip`
+    must survive many adoption passes UNTOUCHED; once genuinely
+    killed, everything (including its formerly-open `.wip`) must be
+    adopted and drained with zero loss. The round-1 two-hop regression
+    only ever simulated DEAD owners (fresh synthetic prefixes with no
+    process behind them) — nothing exercised a real live sibling."""
+
+    @pytest.mark.asyncio
+    async def test_live_sibling_survives_many_passes_then_dead_sibling_fully_adopted(
+        self, monkeypatch,
+    ):
+        monkeypatch.setattr(disk_queue.settings, "disk_orphan_adopt_min_age_seconds", 0)
+        monkeypatch.setattr(disk_queue.settings, "disk_queue_drain_interval_seconds", 0.5)
+        monkeypatch.setattr(disk_queue.settings, "disk_orphan_heartbeat_stale_multiplier", 3.0)
+
+        root = _root()
+        root.mkdir(parents=True)
+        service_root = Path(disk_queue.__file__).resolve().parent.parent
+
+        child_script = (
+            "import os\n"
+            f"os.environ['TDS_DISK_QUEUE_ROOT'] = {str(root)!r}\n"
+            "import sys, time\n"
+            "from app import disk_queue as dq\n"
+            "writer = dq._get_writer()\n"
+            "writer._ensure_open_sync()\n"
+            'os.write(writer._fd, b\'{"click_id": "live-finalized"}\\n\')\n'
+            "os.fsync(writer._fd)\n"
+            "writer._size += 200\n"
+            "writer._finalize_current_sync()\n"
+            "writer._ensure_open_sync()\n"
+            'os.write(writer._fd, b\'{"click_id": "live-wip"}\\n\')\n'
+            "os.fsync(writer._fd)\n"
+            "writer._size += 200\n"
+            "sys.stdout.write('READY\\n')\n"
+            "sys.stdout.flush()\n"
+            "while True:\n"
+            "    dq._touch_heartbeat_sync()\n"
+            "    time.sleep(0.1)\n"
+        )
+
+        proc = subprocess.Popen(
+            [sys.executable, "-c", child_script],
+            cwd=str(service_root),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            ready_line = await asyncio.wait_for(
+                asyncio.to_thread(proc.stdout.readline), timeout=10.0,
+            )
+            assert ready_line.strip() == "READY", (
+                f"Child process failed to start: {proc.stderr.read()}"
+            )
+
+            live_prefixes = {p.name.rsplit("-", 1)[0] for p in root.glob("*.ndjson")}
+            assert len(live_prefixes) == 1
+            live_prefix = next(iter(live_prefixes))
+
+            for _ in range(3):
+                adopted = await disk_queue.adopt_orphan_segments()
+                assert adopted == [], (
+                    "A LIVE sibling's segments (including its open "
+                    ".wip) must never be adopted — this would truncate "
+                    "a live writer's in-flight tail and/or cause its "
+                    "subsequent appends to vanish into an unlinked "
+                    "inode once the thief deletes the renamed file."
+                )
+                await asyncio.sleep(0.7)
+
+            proc.kill()
+            proc.wait(timeout=5)
+
+            # Wait past the heartbeat staleness threshold (3 * 0.5s).
+            await asyncio.sleep(2.0)
+
+            adopted = await disk_queue.adopt_orphan_segments()
+            assert adopted == [live_prefix], (
+                f"Expected the now-dead sibling's prefix to be "
+                f"adopted, got {adopted}"
+            )
+
+            redis = _make_redis_mock()
+            stats = await disk_queue.drain_to_redis(redis)
+            assert stats["drained"] == 2
+            assert stats["failed"] == 0
+            shipped = {
+                json.loads(c.args[1]["data"])["click_id"]
+                for c in redis.xadd.await_args_list
+            }
+            assert shipped == {"live-finalized", "live-wip"}
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5)
 
 
 # ---------------------------------------------------------------------------

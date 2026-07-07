@@ -68,6 +68,73 @@ is replaced. This bounds the filename length regardless of how many
 times a segment gets re-orphaned and re-adopted during an extended
 outage — it does NOT grow with hop count.
 
+Mechanical liveness (gate-E round 2 CRITICAL fix, 2026-07-07)
+---------------------------------------------------------------
+
+The age check above (`disk_orphan_adopt_min_age_seconds`) is a cheap
+pre-filter, NOT proof of death: the epoch in a segment's NAME is the
+writer's BOOT time, not the file's age, so ANY live sibling older than
+that floor (i.e. every sibling past its first ~30s of life) looked
+"dead" to age alone. Combined with the periodic-retry HIGH fix (round
+1), this became CONTINUOUS mass live-sibling theft under sustained
+WC=8 spill — including OPEN `.wip` theft, which is silent loss TWICE:
+(i) a torn-tail truncate mid-flight on a file the owner is still
+actively appending to, dropping an already-fsynced, already-
+acknowledged write; (ii) the owner's own subsequent appends (its fd
+still open, O_APPEND follows the inode) vanishing into an unlinked
+inode once the thief drains + deletes the renamed file.
+
+Every worker refreshes its OWN `{prefix}.alive` heartbeat file's mtime
+every `run_drainer` cycle (`_touch_heartbeat_sync`) AND at the moment
+it opens its FIRST segment (`_ensure_open_sync`) — so a segment file
+for a prefix can never exist on disk before that SAME prefix's
+heartbeat file does. `_worker_is_dead_sync` is the sole gate: a
+candidate orphan prefix is adopted ONLY if its heartbeat is MISSING (a
+pre-this-fix orphan whose segments already cleared the age floor — a
+live current-code worker can never be in that state, since its
+heartbeat always exists by the time its first segment does) OR its
+heartbeat is older than `disk_orphan_heartbeat_stale_multiplier *
+disk_queue_drain_interval_seconds`. This survives pid recycling for
+free: an unrelated NEW process reusing a dead worker's old pid writes
+its OWN fresh prefix + heartbeat, never touching the dead one's file.
+The SAME check gates BOTH `.wip` and finalized-segment adoption
+uniformly — a live worker's finalized-but-not-yet-drained segments are
+never touched either, closing a subtler race against that worker's
+OWN concurrent drain cycle.
+
+Idle-tail finalize + rotation-failure containment (gate-E round 2 HIGH
+fixes, 2026-07-07)
+--------------------------------------------------------------------------
+
+A `.wip` segment used to finalize ONLY as a side effect of a LATER
+commit's rotate check (`_maybe_rotate_sync`, called from
+`_commit_batch_sync`) — a spill burst followed by quiet left the FINAL
+segment open INDEFINITELY: its clicks were fsync'd + acknowledged, but
+invisible to the drainer (globs `.ndjson` only) until the next burst
+or a restart. `run_drainer`'s cycle now also calls `_SegmentWriter.
+finalize_if_stale()`, which finalizes an idle-past-
+`disk_segment_max_age_seconds` `.wip` even with zero new appends.
+Because this runs from an INDEPENDENT asyncio task (not the writer's
+own flush-loop task), it serializes with `_commit_batch_sync` via
+`_state_lock` — the "only one `_commit_batch_sync` in flight" note
+above no longer holds unmodified once a second call site touches the
+same fd/path state.
+
+`_finalize_current_sync` itself now NEVER raises: a rename/dir-fsync
+failure during rotation (ENOSPC/EIO) re-opens the SAME `.wip` path in
+append mode (`_reopen_after_failed_finalize_sync`) instead of
+stranding its already-durable bytes under a cleared fd/path. Before
+this, a rotation OSError propagated out of `_commit_batch_sync`,
+through `asyncio.to_thread`, and out of `_run_flush_loop` BEFORE it
+resolved the batch's futures or reset `_flush_task` — hanging every
+pending `/decide` call on the node AND permanently wedging the flush
+loop (no future append ever spawns a new one again, since `append()`
+only spawns when `_flush_task is None`). `_run_flush_loop` also now
+wraps its whole body in try/finally (always resets `_flush_task`) with
+a defensive except around the commit call (resolves the batch
+`ok=False` rather than hanging forever) as a second, independent line
+of defense against any OTHER future exception in this path.
+
 Legacy migration (D1)
 ----------------------
 
@@ -340,6 +407,14 @@ class _SegmentWriter:
         self._seq = 0
         self._pending: list[tuple[bytes, asyncio.Future]] = []
         self._flush_task: asyncio.Task | None = None
+        # gate-E round 2 HIGH fix (2026-07-07) — serializes
+        # `_commit_batch_sync` against `finalize_if_stale()`, which runs
+        # from run_drainer's INDEPENDENT asyncio task, not this writer's
+        # own flush-loop task. Uncontended in the common case (only
+        # `_run_flush_loop` ever holds it during normal operation) — this
+        # is intra-process coordination for one writer instance, not the
+        # forbidden cross-worker lock on the hot append path.
+        self._state_lock = asyncio.Lock()
 
     @property
     def current_wip_path(self) -> Path | None:
@@ -381,24 +456,55 @@ class _SegmentWriter:
     async def _run_flush_loop(self, initial_delay: float) -> None:
         if initial_delay > 0:
             await asyncio.sleep(initial_delay)
-        while True:
-            batch = self._pending
-            self._pending = []
-            ok, exc = await asyncio.to_thread(self._commit_batch_sync, batch)
-            for _, fut in batch:
-                if not fut.done():
-                    fut.set_result(ok)
-            if not ok:
-                logger.error("Segment group-commit failed: %s", exc)
-                sentry_sdk.capture_message(
-                    f"Disk-segment group-commit failed: {exc}", level="error",
-                )
-            if not self._pending:
-                break
-            # More arrived while we were mid-commit — they already
-            # waited through this commit; drain them immediately
-            # rather than making them wait through ANOTHER full linger.
-        self._flush_task = None
+        try:
+            while True:
+                batch = self._pending
+                self._pending = []
+                try:
+                    async with self._state_lock:
+                        ok, exc = await asyncio.to_thread(self._commit_batch_sync, batch)
+                except Exception as loop_exc:  # noqa: BLE001 — gate-E round 2 HIGH
+                    # fix (2026-07-07): defense-in-depth. `_commit_batch_
+                    # sync` (and `_finalize_current_sync` it calls into via
+                    # rotation) is now designed to never raise, but if
+                    # something ELSE ever escapes here, the batch's
+                    # futures must STILL resolve — a caller `await`-ing its
+                    # future must never hang forever just because the
+                    # commit machinery had a bug. ok=False is the honest
+                    # answer: we cannot prove this batch is durable.
+                    logger.exception(
+                        "Segment group-commit loop iteration crashed "
+                        "unexpectedly — resolving this batch as failed "
+                        "rather than leaving its callers hanging forever."
+                    )
+                    sentry_sdk.capture_exception(loop_exc)
+                    ok, exc = False, loop_exc
+                for _, fut in batch:
+                    if not fut.done():
+                        fut.set_result(ok)
+                if not ok:
+                    logger.error("Segment group-commit failed: %s", exc)
+                    sentry_sdk.capture_message(
+                        f"Disk-segment group-commit failed: {exc}", level="error",
+                    )
+                if not self._pending:
+                    break
+                # More arrived while we were mid-commit — they already
+                # waited through this commit; drain them immediately
+                # rather than making them wait through ANOTHER full linger.
+        finally:
+            # gate-E round 2 HIGH fix (2026-07-07): ANY exit from this
+            # loop — the normal break above, or an exception escaping the
+            # try — MUST reset `_flush_task` so the NEXT append() spawns
+            # a fresh flush loop. Before this fix, an exception raised
+            # before reaching the (until-now unconditional) tail
+            # assignment left `_flush_task` permanently non-None —
+            # `append()` only spawns a new loop when `_flush_task is
+            # None`, so every future append on this worker queued into
+            # `self._pending` with nothing left to ever drain it: a
+            # node-wide hang of the entire real-click spill/divert path
+            # until restart.
+            self._flush_task = None
 
     def _commit_batch_sync(self, batch: list[tuple[bytes, asyncio.Future]]):
         try:
@@ -413,6 +519,12 @@ class _SegmentWriter:
             # fsync-through (see `_abandon_current_on_error_sync`).
             self._abandon_current_on_error_sync()
             return False, exc
+        # This batch's writes+fsync above are ALREADY durable — nothing
+        # below can un-succeed it. `_maybe_rotate_sync` -> `_finalize_
+        # current_sync` is designed to NEVER raise (gate-E round 2 HIGH
+        # fix — see that function's docstring), so no try/except is
+        # needed here; a rotation hiccup self-heals on the writer's own
+        # state without ever risking this batch's callers.
         self._maybe_rotate_sync()
         return True, None
 
@@ -436,6 +548,16 @@ class _SegmentWriter:
             sentry_sdk.capture_message(
                 f"Disk-queue chmod failed on {root}: {exc}", level="warning",
             )
+        # gate-E round 2 CRITICAL fix (2026-07-07) — establish this
+        # worker's proof-of-life BEFORE (same call, so effectively
+        # atomically-enough with) its FIRST segment file appears on disk.
+        # This closes the boot-race window: a segment file for a prefix
+        # can never exist without that SAME prefix's heartbeat file also
+        # existing, so a peer's orphan scan can never mistake a brand-new,
+        # genuinely-alive worker for a dead one (see `_worker_is_dead_sync`
+        # docstring). `run_drainer`'s own periodic touch keeps it fresh
+        # afterwards even during a quiet (no-new-segment) stretch.
+        _touch_heartbeat_sync()
         self._seq += 1
         name = f"{_worker_prefix()}-{self._seq:06d}.ndjson.wip"
         path = root / name
@@ -462,17 +584,111 @@ class _SegmentWriter:
         durable; it does NOT guarantee the directory entry (this
         filename existing at all) is durable without ALSO fsyncing the
         directory — this bounds the unsafe window to one group-commit,
-        matching the design brief's stated invariant."""
+        matching the design brief's stated invariant.
+
+        gate-E round 2 HIGH fix (2026-07-07): this method NEVER raises.
+        The ORIGINAL shape unconditionally nulled `self._fd`/`self._path`
+        in a `finally` regardless of whether the rename/dir-fsync
+        succeeded, THEN let the exception propagate — which had two
+        compounding problems: (1) the exception escaped `_commit_batch_
+        sync` -> `asyncio.to_thread` -> `_run_flush_loop` BEFORE it could
+        resolve the in-flight batch's futures or reset `_flush_task`,
+        hanging every pending caller and permanently wedging the flush
+        loop (see `_run_flush_loop`'s own gate-E round 2 fix); (2) even
+        with that contained, nulling `_fd`/`_path` on a FAILED rename
+        abandons the segment's already-fsynced, already-acknowledged
+        bytes under THIS worker's own (now live-protected, post-round-2
+        CRITICAL fix) prefix — neither this worker's own drain (globs
+        `.ndjson` only) nor orphan adoption (never touches a live prefix)
+        would ever look at it again until this worker eventually
+        restarts. Now: a rename/dir-fsync failure re-opens the SAME
+        `.wip` path in append mode (`_reopen_after_failed_finalize_sync`)
+        so the very next commit keeps writing there and the next
+        rotation-eligible commit retries the finalize."""
         if self._fd is None:
             return
+        fd = self._fd
+        path = self._path
+        self._fd = None
+        self._path = None
         try:
-            os.close(self._fd)
-            final_path = self._path.with_suffix("")  # strips ".wip"
-            os.rename(self._path, final_path)
+            os.close(fd)
+        except OSError as exc:
+            logger.warning(
+                "Failed to close fd for %s during finalize (continuing "
+                "with the rename attempt regardless): %s", path, exc,
+            )
+
+        final_path = path.with_suffix("")  # strips ".wip"
+        try:
+            os.rename(path, final_path)
             _fsync_dir_sync(final_path.parent)
-        finally:
-            self._fd = None
-            self._path = None
+        except OSError as exc:
+            logger.error(
+                "Segment rotation/finalize failed for %s — its bytes "
+                "are already fsync'd-durable at the .wip path; "
+                "re-opening it so this worker keeps appending and "
+                "retries rotation on the next eligible commit: %s",
+                path, exc,
+            )
+            sentry_sdk.capture_exception(exc)
+            self._reopen_after_failed_finalize_sync(path)
+
+    def _reopen_after_failed_finalize_sync(self, path: Path) -> None:
+        """A finalize attempt's rename (or the D2 dir-fsync) failed
+        AFTER the fd was already closed. The file's CONTENT is
+        untouched and still fully durable at `path` (still named
+        `.wip` — `os.rename` is atomic, it either fully succeeds or
+        leaves the source exactly as it was); re-opening it in append
+        mode restores this worker's ownership so the next `append()`
+        resumes writing here and the next rotation-eligible commit
+        retries the finalize. `_size`/`_opened_monotonic` are left
+        as-is (unchanged since they still describe this exact segment)
+        — that also means the very next commit's rotate check sees it
+        as already over-age/over-size and retries almost immediately,
+        which is the desired behaviour."""
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        except OSError as exc:
+            logger.error(
+                "Failed to re-open %s after a failed finalize — this "
+                "worker will open a FRESH segment on the next append; "
+                "the old .wip (already-durable data) needs operator "
+                "attention if this worker doesn't restart soon: %s",
+                path, exc,
+            )
+            sentry_sdk.capture_exception(exc)
+            return
+        self._fd = fd
+        self._path = path
+
+    async def finalize_if_stale(self) -> None:
+        """gate-E round 2 HIGH fix (2026-07-07) — an idle `.wip`
+        segment previously finalized ONLY as a side effect of a LATER
+        commit's rotate check (`_maybe_rotate_sync`, called from
+        `_commit_batch_sync`). A spill burst followed by quiet left
+        the FINAL segment open INDEFINITELY: its clicks were fsync'd +
+        302-acknowledged, but invisible to the drainer (globs
+        `.ndjson` only) until the next burst (hours/days) or a
+        restart — an unbounded delivery delay for already-
+        acknowledged clicks. Called once per `run_drainer` cycle so an
+        idle tail gets flushed within one drain interval.
+
+        Runs from run_drainer's INDEPENDENT asyncio task, not this
+        writer's own flush-loop task — MUST serialize with
+        `_commit_batch_sync` via `_state_lock` (the "only one
+        `_commit_batch_sync` in flight" invariant no longer protects
+        against a concurrent commit once a second call site touches
+        the same fd/path state)."""
+        if self._path is None:
+            return
+        async with self._state_lock:
+            if self._path is None:
+                return
+            idle_for = time.monotonic() - self._opened_monotonic
+            if idle_for < settings.disk_segment_max_age_seconds:
+                return
+            await asyncio.to_thread(self._finalize_current_sync)
 
     def _abandon_current_on_error_sync(self) -> None:
         """gate-E MEDIUM fix (2026-07-07) — called when `_commit_batch_
@@ -649,6 +865,80 @@ def _fsync_dir_sync(dir_path: Path) -> None:
         os.close(dir_fd)
 
 
+_HEARTBEAT_SUFFIX = ".alive"
+
+
+def _heartbeat_path(root: Path, prefix: str) -> Path:
+    return root / f"{prefix}{_HEARTBEAT_SUFFIX}"
+
+
+def _touch_heartbeat_sync() -> None:
+    """gate-E round 2 CRITICAL fix (2026-07-07) — mechanical proof-of-
+    life for orphan-adoption gating. Called every `run_drainer` cycle
+    AND at the moment THIS worker's `_SegmentWriter` opens its FIRST
+    segment (`_ensure_open_sync`) — so a segment file for a prefix can
+    never exist on disk before that SAME prefix's heartbeat file does.
+    A sibling scanning for orphans (`_worker_is_dead_sync`) treats a
+    heartbeat mtime younger than `disk_orphan_heartbeat_stale_
+    multiplier * disk_queue_drain_interval_seconds` as PROOF this
+    worker is alive — the file itself, not the boot-epoch encoded in
+    segment names (the writer's START time, not a measure of current
+    aliveness), is the source of truth. Survives pid recycling for
+    free: an unrelated NEW process reusing an old dead worker's pid
+    writes its OWN fresh prefix + heartbeat, never touching the dead
+    one's file."""
+    root = _queue_root()
+    try:
+        root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    except OSError:
+        return
+    path = _heartbeat_path(root, _worker_prefix())
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o600)
+        os.close(fd)
+        os.utime(path, None)  # bump mtime to "now" even if it already existed
+    except OSError as exc:
+        logger.warning("Failed to refresh worker heartbeat %s: %s", path, exc)
+
+
+def _worker_is_dead_sync(root: Path, prefix: str, now: float) -> bool:
+    """gate-E round 2 CRITICAL fix (2026-07-07) — MECHANICAL liveness
+    proof, replacing the age-inferred check that treated ANY live
+    sibling older than `disk_orphan_adopt_min_age_seconds` (i.e. every
+    sibling past its first ~30s of life) as "dead": the epoch in a
+    segment NAME is the writer's BOOT time, not the file's age.
+    Combined with the periodic-retry HIGH fix (round 1), age-alone
+    turned into CONTINUOUS mass live-sibling theft under sustained
+    WC=8 spill — including OPEN `.wip` theft, which is silent loss
+    TWICE over (a torn-tail truncate on a file the owner is still
+    actively appending to, then the owner's own subsequent appends
+    vanishing into an unlinked inode once the thief drains + deletes
+    the renamed file).
+
+    A prefix is dead only if:
+      * its heartbeat file is MISSING — this can only be a pre-this-
+        fix orphan (a live current-code worker's heartbeat always
+        exists at least as early as its first segment, so it can never
+        reach this branch while genuinely alive), OR
+      * its heartbeat is older than `disk_orphan_heartbeat_stale_
+        multiplier * disk_queue_drain_interval_seconds`.
+
+    Gates BOTH `.wip` and finalized-segment adoption uniformly — a
+    live worker's finalized-but-not-yet-drained segments are never
+    touched either, closing a subtler race against that worker's OWN
+    concurrent drain cycle."""
+    hb = _heartbeat_path(root, prefix)
+    try:
+        mtime = hb.stat().st_mtime
+    except OSError:
+        return True
+    stale_after = (
+        settings.disk_orphan_heartbeat_stale_multiplier
+        * settings.disk_queue_drain_interval_seconds
+    )
+    return (now - mtime) >= stale_after
+
+
 def _canonical_adopted_name(source_name: str, new_owner_prefix: str) -> str | None:
     """gate-E CRITICAL fix (2026-07-07) — the name a segment (or its
     `.wip` form, WITHOUT the `.wip` suffix — strip it before calling)
@@ -750,6 +1040,14 @@ def _adopt_orphan_group_sync(prefix: str, root: Path) -> bool:
                 "Orphan adoption: parent-directory fsync failed after "
                 "claiming prefix=%s: %s", prefix, exc,
             )
+        # Best-effort tidy-up — a stale `.alive` file left behind for a
+        # fully-claimed dead prefix is harmless (never matched by
+        # `_SEGMENT_RE`, never re-considered since its segments are
+        # gone), but removing it keeps the directory listing honest.
+        try:
+            _heartbeat_path(root, prefix).unlink()
+        except OSError:
+            pass
 
     return claimed_any
 
@@ -789,6 +1087,14 @@ def _adopt_orphan_segments_sync() -> list[str]:
 
     adopted: list[str] = []
     for prefix in sorted(prefixes):
+        # gate-E round 2 CRITICAL fix (2026-07-07) — the age check above
+        # is only a cheap pre-filter (same-boot-sibling-still-starting-up
+        # guard); the REAL liveness gate is mechanical (heartbeat-based),
+        # never age-inferred. See `_worker_is_dead_sync`'s docstring for
+        # why age alone made every live sibling past ~30s of life look
+        # "dead".
+        if not _worker_is_dead_sync(root, prefix, time.time()):
+            continue
         if _adopt_orphan_group_sync(prefix, root):
             adopted.append(prefix)
             epoch = int(prefix.split("-")[0])
@@ -806,7 +1112,14 @@ async def adopt_orphan_segments() -> list[str]:
     docstring for why that stranded segments). Idempotent — a prefix
     already adopted under this worker's own name is excluded from
     later scans (`prefix == my_prefix`), so calling this repeatedly
-    with nothing new to adopt is just a couple of cheap glob scans."""
+    with nothing new to adopt is just a couple of cheap glob scans.
+
+    gate-E round 2 CRITICAL fix (2026-07-07): a candidate prefix is
+    only ever claimed once `_worker_is_dead_sync` proves it via its
+    heartbeat file — see that function's docstring. `run_drainer`
+    refreshes THIS worker's own heartbeat every cycle before calling
+    here, so a live worker is never at risk of its own segments
+    looking "dead" to a peer."""
     adopted = await asyncio.to_thread(_adopt_orphan_segments_sync)
     if adopted:
         capture_op_msg(
@@ -1183,6 +1496,15 @@ async def run_drainer(redis, interval: int | None = None) -> None:
     (its adopter died before draining it) segment gets a real retry
     every `interval` seconds, not "wait for an unrelated future
     restart".
+
+    gate-E round 2 fixes (2026-07-07): each cycle also (1) refreshes
+    THIS worker's own heartbeat file BEFORE scanning for orphans — the
+    mechanical proof-of-life every peer's `adopt_orphan_segments` call
+    relies on to never mistake this worker for dead (CRITICAL fix, see
+    `_worker_is_dead_sync`); (2) calls the writer's `finalize_if_stale()`
+    so an idle `.wip` tail (a spill burst followed by quiet) surfaces to
+    the drainer within one interval instead of sitting open indefinitely
+    (HIGH fix, see that method's docstring).
     """
     if interval is None:
         interval = settings.disk_queue_drain_interval_seconds
@@ -1191,7 +1513,9 @@ async def run_drainer(redis, interval: int | None = None) -> None:
     while True:
         try:
             await asyncio.sleep(interval)
+            await asyncio.to_thread(_touch_heartbeat_sync)
             await adopt_orphan_segments()
+            await _get_writer().finalize_if_stale()
             stats = await drain_to_redis(redis)
             if stats["drained"] > 0 or stats["failed"] > 0:
                 logger.info(

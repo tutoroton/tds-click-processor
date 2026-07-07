@@ -100,30 +100,38 @@ class TestChmodLoudFailure:
     log + Sentry message on failure, not silently pass. Operators
     need to see directory-perm drift."""
 
-    def test_chmod_failure_logs_warning(self, tmp_path, caplog):
-        """Run the real `_write_file_sync` against a path whose
-        parent we make un-chmod-able by mocking `os.chmod` to
-        raise OSError. Assert that a WARN log was emitted."""
+    @pytest.mark.asyncio
+    async def test_chmod_failure_logs_warning(self, tmp_path, caplog, monkeypatch):
+        """Run the real segment writer against a queue root whose
+        directory we make un-chmod-able by mocking `os.chmod` to raise
+        OSError. Assert that a WARN log was emitted.
+
+        P2 (LOSSFIX, 2026-07-07) moved the chmod block from the old
+        per-click `_write_file_sync` into `_SegmentWriter._ensure_open_
+        sync` (called from `enqueue_click` -> `append` -> the
+        group-commit flush loop)."""
         import logging
         from app import disk_queue
 
-        target = tmp_path / "out" / "x.json"
+        monkeypatch.setattr(
+            disk_queue.settings, "disk_queue_root", str(tmp_path / "queue"),
+        )
+        monkeypatch.setattr(disk_queue.settings, "disk_segment_group_commit_ms", 0.0)
+        disk_queue._reset_state_for_tests()
 
         def fail_chmod(*args, **kwargs):
             raise OSError("Operation not permitted")
 
-        caplog.set_level(logging.WARNING, logger="app.disk_queue")
-        with patch("app.disk_queue.os.chmod", side_effect=fail_chmod), \
-             patch("app.disk_queue.sentry_sdk.capture_message") as mock_capture:
-            # `_write_file_sync` is the internal that contains the
-            # chmod block. Calling through the public API requires
-            # async setup; the unit-level test below targets the
-            # function directly.
-            disk_queue._write_file_sync(target, b'{"click_id":"x"}')
+        try:
+            caplog.set_level(logging.WARNING, logger="app.disk_queue")
+            with patch("app.disk_queue.os.chmod", side_effect=fail_chmod), \
+                 patch("app.disk_queue.sentry_sdk.capture_message") as mock_capture:
+                ok = await disk_queue.enqueue_click({"click_id": "x"})
+        finally:
+            disk_queue._reset_state_for_tests()
 
-        # File still written despite chmod failure.
-        assert target.exists()
-        assert target.read_bytes() == b'{"click_id":"x"}'
+        # Click still durably written despite the chmod failure.
+        assert ok is True
 
         # Warning was logged (not silent).
         assert any(

@@ -64,8 +64,9 @@ from app.telemetry import (
 from app.disk_queue import (
     check_disk_pressure,
     enqueue_click as enqueue_click_to_disk,
-    get_queue_size,
+    get_queue_stats,
     run_drainer as run_disk_drainer,
+    run_queue_stats_sampler,
 )
 from app.observability import get_cached_stream_clicks_length, run_observability_loop
 from app.sync_client import apply_snapshot, start_periodic_pull
@@ -200,6 +201,13 @@ async def lifespan(app: FastAPI):
     # mode there's no harm in scanning an empty queue every 30s.
     disk_drainer_task = asyncio.create_task(run_disk_drainer(r))
 
+    # P2 c1 (LOSSFIX 2026-07-07) — cheap periodic scan caching
+    # {segments, bytes, oldest_seconds} across this worker's segments
+    # + legacy files. Feeds both the byte-cap gate
+    # (`disk_queue._check_byte_cap`, hot-path-safe — reads the cache,
+    # never scans live) and /health's D3 depth fields.
+    queue_stats_task = asyncio.create_task(run_queue_stats_sampler())
+
     # Start observability loop (T2.6 partial). Periodically emits
     # `stream.clicks.length` + `disk_queue.size` to Sentry as
     # warn-level breadcrumbs when either approaches its cap. No
@@ -250,6 +258,7 @@ async def lifespan(app: FastAPI):
     shipper_task.cancel()
     sync_task.cancel()
     disk_drainer_task.cancel()
+    queue_stats_task.cancel()
     observability_task.cancel()
     diag_drain_task.cancel()
     try:
@@ -262,6 +271,10 @@ async def lifespan(app: FastAPI):
         pass
     try:
         await disk_drainer_task
+    except asyncio.CancelledError:
+        pass
+    try:
+        await queue_stats_task
     except asyncio.CancelledError:
         pass
     try:
@@ -1650,12 +1663,13 @@ async def decide(
 
         # T2.2 / G-23 — fall back to disk queue when Redis is
         # unreachable (or the M1 gate diverted us here). Without this,
-        # every click during a Redis outage was LOST: the log + Sentry
-        # capture above record the symptom but the click_record itself
-        # never made it to the stream → never to central → never to
-        # analytics. The disk file is replayed by the background
-        # drainer task once Redis recovers; nothing is lost provided
-        # disk space holds (cap = TDS_DISK_QUEUE_MAX_FILES).
+        # every click during a Redis outage was
+        # LOST: the log + Sentry capture above record the symptom but
+        # the click_record itself never made it to the stream → never
+        # to central → never to analytics. The disk segment is
+        # replayed by the background drainer task once Redis recovers;
+        # nothing is lost provided disk space holds (cap =
+        # TDS_DISK_SEGMENT_MAX_TOTAL_BYTES).
         enqueued = await enqueue_click_to_disk(click_record)
         if enqueued:
             logger.info(
@@ -1743,7 +1757,9 @@ async def health():
         last_ship_status / last_batch_size — live from
         ``app.shipper_metrics`` (the shipper task updates it).
       * stream_clicks_length — current XLEN of stream:clicks.
-      * disk_queue_size — count of files awaiting drainer replay.
+      * disk_queue_size / disk_queue_bytes / disk_queue_oldest_seconds —
+        segment-queue depth (P2, D3): segment count, total bytes, and
+        the age of the oldest file still awaiting drainer replay.
       * disk_free_bytes — free bytes on the disk-queue mountpoint
         (None when the path does not exist).
 
@@ -1770,16 +1786,21 @@ async def health():
     except Exception:
         stream_length = 0
 
-    # F.29 Sprint 1.4 — disk-queue file count. Reads the in-memory
-    # counter (no FS scan) — see app.disk_queue. ``get_queue_size`` is
-    # imported at module top (Sprint 1.6 — removed the redundant
-    # in-function import). Wrapped independently so an early-lifecycle
-    # call (before first /decide initialises the counter) returns 0
-    # rather than 500'ing the probe.
+    # P2 (D3, LOSSFIX 2026-07-07) — segment-queue depth. Reads the
+    # CACHED periodic scan (see app.disk_queue.run_queue_stats_sampler)
+    # — never a live scan on /health's hot polling path. Wrapped
+    # independently so an early-lifecycle call (before the sampler's
+    # first tick) still returns a coherent zeroed shape rather than
+    # 500'ing the probe.
     try:
-        disk_queue_size = await get_queue_size()
+        _queue_stats = await get_queue_stats()
+        disk_queue_size = _queue_stats["segments"]
+        disk_queue_bytes = _queue_stats["bytes"]
+        disk_queue_oldest_seconds = _queue_stats["oldest_seconds"]
     except Exception:
         disk_queue_size = 0
+        disk_queue_bytes = 0
+        disk_queue_oldest_seconds = None
 
     # F.29 Sprint 1.4 — free bytes on the disk-queue mountpoint.
     # Used by Sprint 4.1 alert "disk_free_bytes < 1GB → warn". Returns
@@ -1865,6 +1886,8 @@ async def health():
         **shipper_metrics.to_health_dict(),
         stream_clicks_length=stream_length,
         disk_queue_size=disk_queue_size,
+        disk_queue_bytes=disk_queue_bytes,
+        disk_queue_oldest_seconds=disk_queue_oldest_seconds,
         disk_free_bytes=disk_free_bytes,
         identity_store_used_bytes=identity_used_bytes,
         identity_store_max_bytes=identity_max_bytes,

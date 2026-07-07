@@ -44,19 +44,21 @@ from app import disk_queue, observability
 
 @pytest.fixture(autouse=True)
 def _reset_settings(monkeypatch, tmp_path):
-    """Per-test isolation. Disk-queue size counter must be reset
-    too — observability calls `get_queue_size()`."""
+    """Per-test isolation. Disk-queue stats cache must be reset too —
+    observability calls `get_queue_stats()` (P2, LOSSFIX 2026-07-07 —
+    repurposed from the old per-click file-count `get_queue_size`)."""
     monkeypatch.setattr(
         observability.settings, "stream_clicks_maxlen", 1000,
     )
     monkeypatch.setattr(
-        observability.settings, "disk_queue_max_files", 1000,
+        observability.settings, "disk_segment_max_total_bytes", 1000,
     )
     monkeypatch.setattr(
         disk_queue.settings, "disk_queue_root", str(tmp_path / "click-queue"),
     )
+    monkeypatch.setattr(disk_queue.settings, "disk_segment_group_commit_ms", 0.0)
     monkeypatch.setattr(
-        disk_queue.settings, "disk_queue_max_files", 1000,
+        disk_queue.settings, "disk_segment_max_total_bytes", 1000,
     )
     disk_queue._reset_state_for_tests()
     observability._reset_cached_stream_clicks_length_for_tests()
@@ -232,6 +234,17 @@ class TestCachedStreamClicksLength:
 # ---------------------------------------------------------------------------
 
 
+def _seed_cached_stats(bytes_: int) -> None:
+    """P2 (LOSSFIX, 2026-07-07) — `emit_disk_queue_size` now reads
+    `get_queue_stats()`, which prefers the CACHED sampler result. Seed
+    it directly for deterministic, byte-exact test assertions instead
+    of enqueuing N clicks and hoping their serialized size lands on a
+    round number."""
+    disk_queue._cached_queue_stats = {
+        "segments": 1, "bytes": bytes_, "oldest_seconds": 1.0,
+    }
+
+
 @pytest.mark.asyncio
 async def test_disk_queue_empty_no_log(caplog):
     """Steady state — disk queue is empty when Redis healthy. No
@@ -250,9 +263,8 @@ async def test_disk_queue_empty_no_log(caplog):
 async def test_disk_queue_below_threshold_info_only(caplog, monkeypatch):
     """Outage just started — non-zero but well under 50%. INFO
     log so the operator sees the trend, no Sentry breadcrumb yet."""
-    # Pre-seed 100 files in the queue — 10% of cap (1000).
-    for i in range(100):
-        await disk_queue.enqueue_click({"i": i})
+    # cap=1000 (fixture default); 100 bytes = 10% of cap.
+    _seed_cached_stats(100)
 
     with patch("sentry_sdk.capture_message") as mock_capture:
         with caplog.at_level(logging.INFO, logger="tds.observability"):
@@ -271,11 +283,9 @@ async def test_disk_queue_below_threshold_info_only(caplog, monkeypatch):
 async def test_disk_queue_at_threshold_warns(caplog, monkeypatch):
     """50% of cap → WARN + Sentry. Lead time before cap-rejection
     cuts in (which would start dropping clicks)."""
-    monkeypatch.setattr(disk_queue.settings, "disk_queue_max_files", 10)
-    monkeypatch.setattr(observability.settings, "disk_queue_max_files", 10)
-
-    for i in range(5):
-        await disk_queue.enqueue_click({"i": i})
+    monkeypatch.setattr(disk_queue.settings, "disk_segment_max_total_bytes", 10)
+    monkeypatch.setattr(observability.settings, "disk_segment_max_total_bytes", 10)
+    _seed_cached_stats(5)
 
     with patch("sentry_sdk.capture_message") as mock_capture:
         with caplog.at_level(logging.WARNING, logger="tds.observability"):
@@ -292,14 +302,12 @@ async def test_disk_queue_at_threshold_warns(caplog, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_disk_queue_unbounded_mode_no_threshold(caplog, monkeypatch):
-    """Operator opted into unbounded mode (cap=0). Skip threshold
+    """Operator opted into unbounded mode (cap<=0). Skip threshold
     check entirely — there's no "50% of unbounded". Still log
     INFO when non-zero so the trend is visible."""
-    monkeypatch.setattr(disk_queue.settings, "disk_queue_max_files", 0)
-    monkeypatch.setattr(observability.settings, "disk_queue_max_files", 0)
-
-    for i in range(50):
-        await disk_queue.enqueue_click({"i": i})
+    monkeypatch.setattr(disk_queue.settings, "disk_segment_max_total_bytes", 0)
+    monkeypatch.setattr(observability.settings, "disk_segment_max_total_bytes", 0)
+    _seed_cached_stats(50)
 
     with patch("sentry_sdk.capture_message") as mock_capture:
         with caplog.at_level(logging.INFO, logger="tds.observability"):

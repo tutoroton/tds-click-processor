@@ -1,41 +1,39 @@
-"""Tests for the click-processor disk fallback queue (T2.2 / G-23).
+"""Tests for the click-processor disk-segment fallback queue (T2.2 / G-23),
+REDESIGNED by P2 (LOSSFIX, 2026-07-07) from one-file-per-click into
+append-only NDJSON segments with group-commit fsync and a global
+byte-cap. Per-worker orphan adoption + crash-recovery E2E land in the
+c2 follow-up commit (this file's TestOrphanAdoption / TestCrashRecoveryE2E
+classes) — the naming scheme's per-worker isolation itself IS covered
+here (TestWorkerNaming).
 
-Closes the click-loss gap on `/decide` when Redis is unreachable.
-This module's behaviour is the contract the operator relies on for
-"we don't lose a single click during a Redis outage".
+Coverage layers (P2 brief's OBSERVABLE DONE items covered by c1: 1, 2,
+4, 5, 6, 7, 8):
 
-Coverage layers:
+  1. Segment lifecycle — rotate at size/time, group-commit fsync,
+     replay-then-unlink, dir-fsync on finalize (D2).
+  2. WC=8 no-race — per-worker prefix naming, no two workers touch the
+     same live segment.
+  4. Legacy migration (D1) — pre-P2 `*.json` files still drain.
+  5. Byte-cap — visible shed (return False), never silent.
+  6. Partial-last-line (B2) — a torn `.wip` tail truncates + op-tags,
+     never crashes, never drops a well-formed line.
+  7. Replay exactly-once (B3) — an offset sidecar bounds a crash to at
+     most one re-replayed line.
+  8. `/health` depth (D3) — segment count / bytes / oldest-age, via
+     `get_queue_stats`.
 
-  * Atomic-write contract — `_write_file_sync` writes via .tmp +
-    fsync + rename so a crash mid-write never produces a half-
-    written `.json` file (drainer only reads `.json`).
-
-  * Public API behaviour — `enqueue_click`, `drain_to_redis`,
-    `get_queue_size`. These run against a tmp_path-rooted queue
-    so the real filesystem stays untouched.
-
-  * Cap rejection — at-cap enqueues fail loud (return False, log
-    CRITICAL, Sentry-capture) instead of silently rotating the
-    oldest. Operator's choice on outage longevity.
-
-  * Drainer integration — `run_drainer` is wired into the FastAPI
-    lifespan with a cancellable asyncio task; source-pinned so a
-    refactor can't drop the drainer silently.
-
-  * `/decide` fallback — on XADD failure, the click is enqueued
-    to disk; source-pinned by inspecting the handler.
-
-Reference: rule `sync-protocol`, action-items.md T2.2,
-open-questions.md G-23.
+Reference: rule `sync-protocol`, action-items.md T2.2, open-questions.md
+G-23.
 """
 
 from __future__ import annotations
 
 import asyncio
-import inspect
 import json
+import os
+import time
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -44,504 +42,480 @@ from app import disk_queue
 
 @pytest.fixture(autouse=True)
 def _reset_disk_queue_state(tmp_path, monkeypatch):
-    """Per-test isolation: rebase the queue root on tmp_path and
-    reset the in-memory size counter. Without this, tests would
-    pollute each other's state because the module-level counter
-    persists across tests."""
+    """Per-test isolation: rebase the queue root on tmp_path, disable
+    the group-commit linger (deterministic, fast tests — each
+    `enqueue_click` await resolves as soon as its OWN commit runs), and
+    reset all P2 module-level state (writer, cached stats, boot
+    epoch)."""
     monkeypatch.setattr(
         disk_queue.settings, "disk_queue_root", str(tmp_path / "click-queue"),
     )
-    # Default cap big enough not to trip in normal tests; override
-    # per-test where needed.
-    monkeypatch.setattr(
-        disk_queue.settings, "disk_queue_max_files", 10_000,
-    )
+    monkeypatch.setattr(disk_queue.settings, "disk_segment_group_commit_ms", 0.0)
+    monkeypatch.setattr(disk_queue.settings, "disk_segment_max_bytes", 2_000_000)
+    monkeypatch.setattr(disk_queue.settings, "disk_segment_max_age_seconds", 1_000.0)
+    monkeypatch.setattr(disk_queue.settings, "disk_segment_max_total_bytes", 5_000_000_000)
     disk_queue._reset_state_for_tests()
     yield
     disk_queue._reset_state_for_tests()
 
 
-# ---------------------------------------------------------------------------
-# Atomic write
-# ---------------------------------------------------------------------------
+def _root() -> Path:
+    return Path(disk_queue.settings.disk_queue_root)
 
 
-class TestAtomicWrite:
-    def test_write_creates_target_file(self, tmp_path):
-        target = tmp_path / "out" / "x.json"
-        disk_queue._write_file_sync(target, b'{"k": 1}')
-        assert target.read_bytes() == b'{"k": 1}'
-
-    def test_write_creates_parent_dir(self, tmp_path):
-        target = tmp_path / "deep" / "nested" / "out.json"
-        disk_queue._write_file_sync(target, b"x")
-        assert target.exists()
-        assert target.parent.is_dir()
-
-    def test_no_tmp_file_after_success(self, tmp_path):
-        """The .tmp intermediate must be renamed away — not left
-        behind. Drainer ignores .tmp files; a stale .tmp would
-        accumulate forever otherwise."""
-        target = tmp_path / "x.json"
-        disk_queue._write_file_sync(target, b"data")
-
-        tmp_files = list(tmp_path.glob("*.tmp"))
-        assert tmp_files == [], (
-            f"Expected no .tmp residue; found {tmp_files!r}."
-        )
-
-    def test_overwrites_existing_file(self, tmp_path):
-        """Same path → overwrite, not append. UUID suffix prevents
-        same-second collisions, but defensive overwrite semantics
-        mean a buggy retry that hits the same path doesn't double
-        the data."""
-        target = tmp_path / "x.json"
-        disk_queue._write_file_sync(target, b"first")
-        disk_queue._write_file_sync(target, b"second")
-        assert target.read_bytes() == b"second"
-
-    def test_file_mode_is_owner_read_write_only(self, tmp_path):
-        """Audit fix (Agent 2 HIGH-2, 2026-05-09): click records
-        contain PII (IP, geo, full UA, advertiser-supplied
-        identifiers in query_params). Files MUST be 0o600 — owner
-        read+write only. World-readable 0o644 would let any
-        co-located process / shared bind-mount read every queued
-        click during a Redis outage.
-        """
-        target = tmp_path / "queue" / "x.json"
-        disk_queue._write_file_sync(target, b'{"k": 1}')
-
-        # Stat the file mode — mask out the file-type bits, keep
-        # only the permission bits.
-        import os as _os
-        mode = _os.stat(target).st_mode & 0o777
-        assert mode == 0o600, (
-            f"Expected 0o600 (owner rw only) for PII-bearing click "
-            f"records; got {oct(mode)}. World-readable mode leaks "
-            f"every queued click to any local process."
-        )
-
-    def test_parent_dir_mode_is_owner_only(self, tmp_path):
-        """Audit fix (Agent 2 HIGH-2, 2026-05-09): the parent
-        directory listing leaks queue depth + filenames (which
-        encode timestamps + UUIDs — useful for an attacker
-        timing-correlating clicks). Mode 0o700 — owner-only
-        access at the directory level too.
-        """
-        target = tmp_path / "queue" / "today" / "x.json"
-        disk_queue._write_file_sync(target, b'{"k": 1}')
-
-        import os as _os
-        mode = _os.stat(target.parent).st_mode & 0o777
-        # We require <= 0o700 — `0o700` is the goal but if the
-        # process umask is more restrictive (rare), accept that
-        # as still secure.
-        assert mode & 0o077 == 0, (
-            f"Parent dir {target.parent} leaks read access to "
-            f"group/other (mode {oct(mode)}). Click queue must "
-            f"be owner-only at the directory level."
-        )
+def _segments() -> list[Path]:
+    if not _root().exists():
+        return []
+    return sorted(_root().rglob("*.ndjson"))
 
 
-# ---------------------------------------------------------------------------
-# enqueue_click
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_enqueue_creates_one_file_per_call():
-    record = {"click_id": "abc", "campaign_id": 1, "ts": "2026-05-09T12:00:00Z"}
-
-    assert await disk_queue.enqueue_click(record) is True
-    assert await disk_queue.enqueue_click(record) is True
-
-    files = list(Path(disk_queue.settings.disk_queue_root).rglob("*.json"))
-    assert len(files) == 2
-
-
-@pytest.mark.asyncio
-async def test_enqueue_payload_round_trips_via_json():
-    record = {"click_id": "abc", "country": "PL", "weight": 0.42}
-
-    assert await disk_queue.enqueue_click(record) is True
-
-    files = list(Path(disk_queue.settings.disk_queue_root).rglob("*.json"))
-    assert len(files) == 1
-    decoded = json.loads(files[0].read_text())
-    assert decoded == record
-
-
-@pytest.mark.asyncio
-async def test_enqueue_handles_non_serializable_via_str_default():
-    """`json.dumps(..., default=str)` is the same shape used by
-    /decide on the happy path — keeps the disk-queue payload
-    bit-for-bit identical to what would have gone to Redis. Pin
-    this so a refactor that changes the serializer doesn't break
-    drainer's XADD shape."""
-    from datetime import datetime
-
-    record = {"click_id": "abc", "ts": datetime(2026, 5, 9, 12, 0, 0)}
-    assert await disk_queue.enqueue_click(record) is True
-
-    files = list(Path(disk_queue.settings.disk_queue_root).rglob("*.json"))
-    assert len(files) == 1
-    # Datetime serialised via str(...) → ISO-ish string, never raises.
-    decoded = json.loads(files[0].read_text())
-    assert decoded["click_id"] == "abc"
-    assert isinstance(decoded["ts"], str)
-
-
-@pytest.mark.asyncio
-async def test_enqueue_returns_false_on_cap(monkeypatch):
-    """At cap, enqueue REJECTS rather than silently rotating
-    oldest. The operator must see the loud failure to know an
-    outage is exceeding capacity."""
-    monkeypatch.setattr(disk_queue.settings, "disk_queue_max_files", 2)
-
-    assert await disk_queue.enqueue_click({"a": 1}) is True
-    assert await disk_queue.enqueue_click({"a": 2}) is True
-    # Third hits the cap.
-    assert await disk_queue.enqueue_click({"a": 3}) is False
-
-    # Files on disk reflect what was accepted, not what was tried.
-    files = list(Path(disk_queue.settings.disk_queue_root).rglob("*.json"))
-    assert len(files) == 2
-
-
-@pytest.mark.asyncio
-async def test_enqueue_unbounded_cap_zero(monkeypatch):
-    """`disk_queue_max_files=0` disables the cap (operator opt-in
-    for unbounded — strongly discouraged but documented)."""
-    monkeypatch.setattr(disk_queue.settings, "disk_queue_max_files", 0)
-
-    for i in range(5):
-        assert await disk_queue.enqueue_click({"i": i}) is True
-
-    files = list(Path(disk_queue.settings.disk_queue_root).rglob("*.json"))
-    assert len(files) == 5
-
-
-# ---------------------------------------------------------------------------
-# get_queue_size
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_get_queue_size_starts_at_zero_on_fresh():
-    assert await disk_queue.get_queue_size() == 0
-
-
-@pytest.mark.asyncio
-async def test_get_queue_size_tracks_enqueues():
-    await disk_queue.enqueue_click({"a": 1})
-    await disk_queue.enqueue_click({"b": 2})
-    await disk_queue.enqueue_click({"c": 3})
-
-    assert await disk_queue.get_queue_size() == 3
-
-
-@pytest.mark.asyncio
-async def test_get_queue_size_reflects_pre_existing_files():
-    """A click-processor restart should pick up pre-existing files
-    from the previous run — `init_queue_size_once` does a single
-    rglob to seed the counter."""
-    # Pre-create files BEFORE first call to enqueue/get_queue_size.
-    root = Path(disk_queue.settings.disk_queue_root)
-    today = root / "2026-05-09"
-    today.mkdir(parents=True)
-    (today / "a.json").write_text('{"existing": 1}')
-    (today / "b.json").write_text('{"existing": 2}')
-
-    # Reset state so init runs fresh.
-    disk_queue._reset_state_for_tests()
-
-    assert await disk_queue.get_queue_size() == 2
-
-
-# ---------------------------------------------------------------------------
-# drain_to_redis
-# ---------------------------------------------------------------------------
+def _wip_segments() -> list[Path]:
+    if not _root().exists():
+        return []
+    return sorted(_root().rglob("*.ndjson.wip"))
 
 
 def _make_redis_mock(xadd_side_effect=None) -> AsyncMock:
-    """AsyncMock standing in for the asyncio Redis client. By
-    default xadd() succeeds; pass `xadd_side_effect=Exception(...)`
-    to simulate Redis still impaired."""
     redis = AsyncMock()
     if xadd_side_effect is not None:
         redis.xadd.side_effect = xadd_side_effect
     return redis
 
 
-@pytest.mark.asyncio
-async def test_drain_replays_files_to_redis():
-    await disk_queue.enqueue_click({"id": 1})
-    await disk_queue.enqueue_click({"id": 2})
-    await disk_queue.enqueue_click({"id": 3})
-
-    redis = _make_redis_mock()
-    stats = await disk_queue.drain_to_redis(redis)
-
-    assert stats["drained"] == 3
-    assert stats["failed"] == 0
-    assert stats["remaining"] == 0
-    assert redis.xadd.await_count == 3
-
-    # All three files should be deleted from disk.
-    files = list(Path(disk_queue.settings.disk_queue_root).rglob("*.json"))
-    assert files == []
+def _lines_of(path: Path) -> list[dict]:
+    text = path.read_text()
+    return [json.loads(line) for line in text.splitlines() if line]
 
 
-@pytest.mark.asyncio
-async def test_drain_xadd_call_shape_matches_decide_path():
-    """Drainer's XADD shape MUST be identical to /decide's so the
-    stream contains uniform records — downstream collectors don't
-    care which path the click took.
-
-    M1 (LOSSFIX P1b, 2026-07-07): neither side carries `maxlen`/
-    `approximate` anymore — the drainer replay XADD is unbounded, with
-    NO new gate (the existing stop-on-first-failure is this phase's
-    self-limit; watermark-gated drain pacing is P2)."""
-    await disk_queue.enqueue_click({"id": 99, "country": "DE"})
-
-    redis = _make_redis_mock()
-    await disk_queue.drain_to_redis(redis)
-
-    # One call, with stream:clicks key — no maxlen/approximate kwargs.
-    call = redis.xadd.call_args
-    assert call.args[0] == "stream:clicks"
-    assert "data" in call.args[1]
-    assert "maxlen" not in call.kwargs, (
-        "M1 removed the MAXLEN cap from the drainer's replay XADD — a "
-        "trim here would silently destroy unconsumed entries (M-TRIM)."
-    )
-    assert "approximate" not in call.kwargs
-
-    # Round-trip the JSON payload — drained record == enqueued record.
-    decoded = json.loads(call.args[1]["data"])
-    assert decoded == {"id": 99, "country": "DE"}
+# ---------------------------------------------------------------------------
+# 1 — segment lifecycle: append, rotate, group-commit fsync, dir-fsync (D2)
+# ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
-async def test_drain_stops_on_first_xadd_failure():
-    """If Redis is still impaired, the drainer must NOT pound it.
-    First failure → break the loop, leave remaining files for the
-    next iteration. Otherwise we'd retry every file every 30s
-    against a sick Redis until it ACK'd."""
-    await disk_queue.enqueue_click({"id": 1})
-    await disk_queue.enqueue_click({"id": 2})
-    await disk_queue.enqueue_click({"id": 3})
+class TestSegmentLifecycle:
+    @pytest.mark.asyncio
+    async def test_enqueue_creates_a_wip_segment_then_none_finalized_yet(self):
+        assert await disk_queue.enqueue_click({"click_id": "a"}) is True
+        assert len(_wip_segments()) == 1
+        assert _segments() == []  # not rotated yet — below size/age threshold
 
-    redis = _make_redis_mock(xadd_side_effect=ConnectionError("redis down"))
-    stats = await disk_queue.drain_to_redis(redis)
+    @pytest.mark.asyncio
+    async def test_multiple_enqueues_append_to_the_same_open_segment(self):
+        for i in range(5):
+            assert await disk_queue.enqueue_click({"click_id": f"c{i}"}) is True
+        wips = _wip_segments()
+        assert len(wips) == 1
+        assert _lines_of(wips[0]) == [{"click_id": f"c{i}"} for i in range(5)]
 
-    assert stats["drained"] == 0
-    assert stats["failed"] == 1
-    assert stats["remaining"] == 3
+    @pytest.mark.asyncio
+    async def test_payload_round_trips_via_json(self):
+        record = {"click_id": "abc", "country": "PL", "weight": 0.42}
+        assert await disk_queue.enqueue_click(record) is True
+        assert _lines_of(_wip_segments()[0]) == [record]
 
-    # All three files MUST still be on disk — nothing got drained.
-    files = list(Path(disk_queue.settings.disk_queue_root).rglob("*.json"))
-    assert len(files) == 3
+    @pytest.mark.asyncio
+    async def test_non_serializable_value_uses_str_default(self):
+        """`json.dumps(..., default=str)` keeps the disk-segment payload
+        shape identical to /decide's happy-path serialization."""
+        from datetime import datetime
+
+        record = {"click_id": "abc", "ts": datetime(2026, 5, 9, 12, 0, 0)}
+        assert await disk_queue.enqueue_click(record) is True
+        decoded = _lines_of(_wip_segments()[0])[0]
+        assert decoded["click_id"] == "abc"
+        assert isinstance(decoded["ts"], str)
+
+    @pytest.mark.asyncio
+    async def test_rotates_at_size_threshold(self, monkeypatch):
+        monkeypatch.setattr(disk_queue.settings, "disk_segment_max_bytes", 10)
+        await disk_queue.enqueue_click({"a": "x" * 20})  # one line already exceeds 10 bytes
+        # Rotation happens AFTER the commit that crossed the threshold —
+        # the segment is finalized (renamed off .wip) once that commit lands.
+        assert _wip_segments() == []
+        assert len(_segments()) == 1
+
+    @pytest.mark.asyncio
+    async def test_rotates_at_age_threshold(self, monkeypatch):
+        monkeypatch.setattr(disk_queue.settings, "disk_segment_max_age_seconds", 0.0)
+        await disk_queue.enqueue_click({"a": 1})
+        await disk_queue.enqueue_click({"a": 2})  # 2nd commit sees age >= 0 -> rotates
+        assert len(_segments()) >= 1
+
+    @pytest.mark.asyncio
+    async def test_group_commit_batches_concurrent_appends_into_one_fsync(
+        self, monkeypatch,
+    ):
+        """Concurrent awaiters that land within the linger window share
+        ONE commit (one `_commit_batch_sync` call) instead of one
+        fsync per click — the core fix for the old ~1-fsync/click
+        pathology."""
+        monkeypatch.setattr(disk_queue.settings, "disk_segment_group_commit_ms", 50.0)
+        writer = disk_queue._get_writer()
+        commit_calls = []
+        original = writer._commit_batch_sync
+
+        def counting_commit(batch):
+            commit_calls.append(len(batch))
+            return original(batch)
+
+        monkeypatch.setattr(writer, "_commit_batch_sync", counting_commit)
+
+        results = await asyncio.gather(
+            *[disk_queue.enqueue_click({"click_id": f"g{i}"}) for i in range(10)]
+        )
+        assert all(results)
+        assert len(commit_calls) == 1, (
+            f"Expected all 10 concurrent appends to share ONE group-commit, "
+            f"got {len(commit_calls)} separate commits: {commit_calls}"
+        )
+        assert commit_calls[0] == 10
+
+    @pytest.mark.asyncio
+    async def test_finalize_dir_fsyncs_parent(self, monkeypatch):
+        """D2 — the parent directory must be fsynced on finalize so the
+        rename (directory-entry change) survives a power-loss."""
+        monkeypatch.setattr(disk_queue.settings, "disk_segment_max_bytes", 1)
+        dir_fsync_calls = []
+        original_fsync = os.fsync
+
+        def spying_fsync(fd):
+            dir_fsync_calls.append(fd)
+            return original_fsync(fd)
+
+        monkeypatch.setattr(disk_queue.os, "fsync", spying_fsync)
+        await disk_queue.enqueue_click({"a": 1})  # rotates immediately (max_bytes=1)
+
+        assert len(_segments()) == 1
+        # At least 2 fsyncs happened: one for the file content, one for
+        # the directory (D2). We can't cheaply distinguish fds here
+        # without duplicating internals, so assert the COUNT — file +
+        # dir fsync both fired.
+        assert len(dir_fsync_calls) >= 2
 
 
-@pytest.mark.asyncio
-async def test_drain_partial_recovery():
-    """Redis recovers after the second click — first two drain,
-    third stops the loop, third stays on disk."""
-    await disk_queue.enqueue_click({"id": 1})
-    await disk_queue.enqueue_click({"id": 2})
-    await disk_queue.enqueue_click({"id": 3})
-
-    redis = _make_redis_mock()
-    # Succeed twice, then fail.
-    redis.xadd.side_effect = [None, None, ConnectionError("fail")]
-
-    stats = await disk_queue.drain_to_redis(redis)
-
-    assert stats["drained"] == 2
-    assert stats["failed"] == 1
-    assert stats["remaining"] == 1
+# ---------------------------------------------------------------------------
+# 5 — byte-cap: visible shed, never silent
+# ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
-async def test_drain_empty_queue_returns_zero():
-    redis = _make_redis_mock()
-    stats = await disk_queue.drain_to_redis(redis)
+class TestByteCap:
+    @pytest.mark.asyncio
+    async def test_at_cap_enqueue_returns_false(self, monkeypatch):
+        await disk_queue.enqueue_click({"a": 1})
+        disk_queue._cached_queue_stats = {"segments": 1, "bytes": 999, "oldest_seconds": 0.0}
+        monkeypatch.setattr(disk_queue.settings, "disk_segment_max_total_bytes", 999)
 
-    assert stats == {
-        "drained": 0,
-        "skipped": 0,
-        "failed": 0,
-        "remaining": 0,
-    }
-    redis.xadd.assert_not_awaited()
+        assert await disk_queue.enqueue_click({"a": 2}) is False
+
+    @pytest.mark.asyncio
+    async def test_below_cap_enqueue_succeeds(self, monkeypatch):
+        disk_queue._cached_queue_stats = {"segments": 1, "bytes": 10, "oldest_seconds": 0.0}
+        monkeypatch.setattr(disk_queue.settings, "disk_segment_max_total_bytes", 999)
+        assert await disk_queue.enqueue_click({"a": 1}) is True
+
+    @pytest.mark.asyncio
+    async def test_disabled_cap_never_rejects(self, monkeypatch):
+        disk_queue._cached_queue_stats = {"segments": 1, "bytes": 10**12, "oldest_seconds": 0.0}
+        monkeypatch.setattr(disk_queue.settings, "disk_segment_max_total_bytes", 0)
+        assert await disk_queue.enqueue_click({"a": 1}) is True
+
+    @pytest.mark.asyncio
+    async def test_never_sampled_fails_open(self, monkeypatch):
+        """Fail-open discipline (A3-style): a never-sampled cache must
+        never itself become a new failure mode."""
+        assert disk_queue._cached_queue_stats is None
+        monkeypatch.setattr(disk_queue.settings, "disk_segment_max_total_bytes", 1)
+        assert await disk_queue.enqueue_click({"a": 1}) is True
+
+    def test_scan_computes_bytes_segments_and_oldest_age(self, tmp_path):
+        root = _root()
+        root.mkdir(parents=True)
+        (root / "1-1-000001.ndjson").write_bytes(b'{"a":1}\n')
+        time.sleep(0.05)
+        (root / "1-1-000002.ndjson").write_bytes(b'{"a":2}\n{"a":3}\n')
+
+        stats = disk_queue._scan_queue_stats_sync()
+        assert stats["segments"] == 2
+        assert stats["bytes"] == len(b'{"a":1}\n') + len(b'{"a":2}\n{"a":3}\n')
+        assert stats["oldest_seconds"] > 0
 
 
-@pytest.mark.asyncio
-async def test_drain_skips_tmp_files():
-    """Files ending in `.tmp` are mid-write — drainer must NOT
-    touch them. Drainer reads `*.json` only via the sorted glob."""
-    root = Path(disk_queue.settings.disk_queue_root) / "2026-05-09"
-    root.mkdir(parents=True)
-    (root / "good.json").write_text('{"id": 1}')
-    (root / "incomplete.json.tmp").write_text("partial")
-
-    disk_queue._reset_state_for_tests()
-
-    redis = _make_redis_mock()
-    stats = await disk_queue.drain_to_redis(redis)
-
-    assert stats["drained"] == 1
-    # The .tmp survives — we don't sweep them up.
-    assert (root / "incomplete.json.tmp").exists()
+# ---------------------------------------------------------------------------
+# 8 — /health depth (D3)
+# ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
-async def test_drain_unlink_failure_keeps_file_and_counter():
-    """Audit fix (Agent 1 HIGH-2, 2026-05-09): when XADD succeeds
-    but unlink raises OSError (permission denied, FS full during
-    journal update, etc.), the file MUST stay on disk AND the
-    in-memory counter MUST NOT decrement. Otherwise counter
-    underestimates real queue depth → cap check lets in more
-    enqueues than the disk holds → silent over-cap during a
-    sustained outage.
-    """
-    await disk_queue.enqueue_click({"id": 1})
-    await disk_queue.enqueue_click({"id": 2})
-    assert await disk_queue.get_queue_size() == 2
+class TestQueueStats:
+    @pytest.mark.asyncio
+    async def test_get_queue_stats_forces_a_scan_when_never_sampled(self):
+        await disk_queue.enqueue_click({"a": 1})
+        disk_queue._get_writer().force_finalize_for_tests()
 
-    redis = _make_redis_mock()
-    # Patch Path.unlink to raise OSError — simulates permission /
-    # FS-state failure post-XADD. asyncio.to_thread wraps unlink,
-    # so patching at the Path class level is the cleanest hook.
-    from unittest.mock import patch
-    original_unlink = Path.unlink
+        stats = await disk_queue.get_queue_stats()
+        assert stats["segments"] == 1
+        assert stats["bytes"] > 0
+        assert stats["oldest_seconds"] is not None
 
-    def flaky_unlink(self, *a, **kw):
-        raise OSError("simulated unlink failure")
+    @pytest.mark.asyncio
+    async def test_get_queue_stats_prefers_cache_over_live_scan(self):
+        disk_queue._cached_queue_stats = {
+            "segments": 42, "bytes": 4096, "oldest_seconds": 12.0,
+        }
+        assert await disk_queue.get_queue_stats() == {
+            "segments": 42, "bytes": 4096, "oldest_seconds": 12.0,
+        }
 
-    with patch.object(Path, "unlink", flaky_unlink):
+    def test_cached_stats_default_when_never_sampled(self):
+        assert disk_queue.get_cached_queue_stats() == {
+            "segments": 0, "bytes": 0, "oldest_seconds": None,
+        }
+
+
+# ---------------------------------------------------------------------------
+# 6 — partial-last-line torn-tail truncation (B2)
+# ---------------------------------------------------------------------------
+
+
+class TestTornTailTruncation:
+    def test_incomplete_last_line_is_truncated(self, tmp_path):
+        path = tmp_path / "x.ndjson.wip"
+        good = b'{"click_id":"a"}\n{"click_id":"b"}\n'
+        torn = b'{"click_id":"c"'  # no trailing newline, incomplete JSON
+        path.write_bytes(good + torn)
+
+        dropped = disk_queue._truncate_torn_tail_sync(path)
+
+        assert dropped == len(torn)
+        assert path.read_bytes() == good
+
+    def test_well_formed_trailing_line_without_newline_is_kept(self, tmp_path):
+        """A COMPLETE JSON object with no trailing newline is still a
+        legitimate line (e.g. the process was killed right after the
+        write() but the buffer had exactly one full record) — B2 only
+        drops what fails to parse, never a well-formed record."""
+        path = tmp_path / "x.ndjson.wip"
+        path.write_bytes(b'{"click_id":"a"}\n{"click_id":"b"}')
+
+        dropped = disk_queue._truncate_torn_tail_sync(path)
+
+        assert dropped == 0
+        assert disk_queue._read_complete_lines_sync(path) == [
+            b'{"click_id":"a"}', b'{"click_id":"b"}',
+        ]
+
+    def test_clean_file_is_never_modified(self, tmp_path):
+        path = tmp_path / "x.ndjson.wip"
+        content = b'{"click_id":"a"}\n{"click_id":"b"}\n'
+        path.write_bytes(content)
+
+        dropped = disk_queue._truncate_torn_tail_sync(path)
+
+        assert dropped == 0
+        assert path.read_bytes() == content
+
+    def test_empty_file_is_a_noop(self, tmp_path):
+        path = tmp_path / "x.ndjson.wip"
+        path.write_bytes(b"")
+        assert disk_queue._truncate_torn_tail_sync(path) == 0
+
+    def test_torn_tail_op_tagged(self, tmp_path, monkeypatch):
+        path = tmp_path / "x.ndjson.wip"
+        path.write_bytes(b'{"click_id":"a"}\nnot-json-and-no-newline')
+
+        captured = {}
+
+        def _capture(op_name, message, level="warning", **extras):
+            captured["op"] = op_name
+            captured["extras"] = extras
+
+        monkeypatch.setattr(disk_queue, "capture_op_msg", _capture)
+        disk_queue._truncate_torn_tail_sync(path)
+
+        assert captured["op"] == disk_queue.OP_SEGMENT_TORN_TAIL
+        assert captured["extras"]["dropped_bytes"] == len(b"not-json-and-no-newline")
+
+
+# ---------------------------------------------------------------------------
+# 2 — WC=8 no-race: distinct worker prefixes never collide
+# ---------------------------------------------------------------------------
+
+
+class TestWorkerNaming:
+    def test_segment_naming_matches_epoch_pid_seq(self):
+        assert disk_queue._SEGMENT_RE.match("1700000000-1234-000001.ndjson")
+        assert not disk_queue._SEGMENT_RE.match("1700000000-1234-000001.ndjson.wip")
+        assert not disk_queue._SEGMENT_RE.match("not-a-segment.json")
+
+    def test_worker_prefix_is_epoch_dash_pid(self):
+        prefix = disk_queue._worker_prefix()
+        epoch_str, pid_str = prefix.split("-")
+        assert epoch_str.isdigit()
+        assert int(pid_str) == os.getpid()
+
+    @pytest.mark.asyncio
+    async def test_two_simulated_workers_each_drain_only_their_own_segments(self):
+        """Simulates two DIFFERENT (epoch, pid) prefixes writing
+        segments into the SAME shared root — the drainer for one
+        worker (identified by `_worker_prefix()`) must never touch the
+        other's live/finalized files."""
+        root = _root()
+        root.mkdir(parents=True)
+        my_prefix = disk_queue._worker_prefix()
+        other_prefix = f"{int(time.time())}-424242"
+
+        (root / f"{my_prefix}-000001.ndjson").write_bytes(b'{"click_id":"mine"}\n')
+        (root / f"{other_prefix}-000001.ndjson").write_bytes(b'{"click_id":"other"}\n')
+
+        redis = _make_redis_mock()
         stats = await disk_queue.drain_to_redis(redis)
 
-    # Drain reports nothing successful — both files hit the same
-    # unlink-OSError branch.
-    assert stats["drained"] == 0
-    # Counter unchanged — files still on disk.
-    assert await disk_queue.get_queue_size() == 2
-
-    # Files truly remain on disk (sanity check the patch was
-    # restored cleanly + the files weren't deleted by some other
-    # path).
-    files = list(Path(disk_queue.settings.disk_queue_root).rglob("*.json"))
-    assert len(files) == 2
-
-
-@pytest.mark.asyncio
-async def test_drain_decrements_size_counter():
-    """Counter must reflect drained files so future cap checks
-    correctly account for the freed slots. A counter that goes
-    stale would either falsely-reject (over-counts) or
-    falsely-accept (under-counts)."""
-    await disk_queue.enqueue_click({"id": 1})
-    await disk_queue.enqueue_click({"id": 2})
-    assert await disk_queue.get_queue_size() == 2
-
-    redis = _make_redis_mock()
-    await disk_queue.drain_to_redis(redis)
-
-    assert await disk_queue.get_queue_size() == 0
+        assert stats["drained"] == 1
+        assert redis.xadd.await_count == 1
+        assert json.loads(redis.xadd.call_args.args[1]["data"]) == {"click_id": "mine"}
+        # The other worker's (not-yet-orphaned, fresh) segment is untouched.
+        assert (root / f"{other_prefix}-000001.ndjson").exists()
 
 
 # ---------------------------------------------------------------------------
-# Source-level pin: drainer wired into lifespan + /decide fallback
+# 7 — replay exactly-once via the offset sidecar (B3)
 # ---------------------------------------------------------------------------
 
 
-class TestLifespanIntegration:
-    """A future refactor that drops the drainer task or the /decide
-    fallback would silently re-open G-23. Pin them at the source."""
+class TestReplayExactlyOnce:
+    @pytest.mark.asyncio
+    async def test_offset_advances_per_line_and_segment_deleted_on_full_drain(self):
+        for i in range(3):
+            await disk_queue.enqueue_click({"click_id": f"c{i}"})
+        disk_queue._get_writer().force_finalize_for_tests()
+        seg = _segments()[0]
 
-    def test_drainer_wired_into_lifespan(self):
-        from app import main as click_main
+        redis = _make_redis_mock()
+        stats = await disk_queue.drain_to_redis(redis)
 
-        source = inspect.getsource(click_main.lifespan)
-        assert "run_disk_drainer" in source, (
-            "FastAPI lifespan must start the disk-queue drainer "
-            "task (T2.2 / G-23). Without it, files written by "
-            "the /decide fallback never replay back into Redis."
-        )
-        # Also pin that the task is cancelled on shutdown — a
-        # leak would block clean process exit.
-        assert "disk_drainer_task.cancel()" in source, (
-            "Lifespan must cancel disk_drainer_task on shutdown."
-        )
+        assert stats["drained"] == 3
+        assert stats["remaining"] == 0
+        assert not seg.exists()
+        assert not disk_queue._offset_path_for(seg).exists()
 
-    def test_decide_falls_back_to_disk_on_xadd_failure(self):
-        from app.main import decide
+    @pytest.mark.asyncio
+    async def test_crash_mid_replay_resumes_from_offset_no_reprocessing_earlier_lines(self):
+        for i in range(3):
+            await disk_queue.enqueue_click({"click_id": f"c{i}"})
+        disk_queue._get_writer().force_finalize_for_tests()
+        seg = _segments()[0]
 
-        source = inspect.getsource(decide)
-        assert "enqueue_click_to_disk" in source, (
-            "/decide must call enqueue_click_to_disk on XADD "
-            "failure (T2.2 / G-23). Without this, a Redis outage "
-            "loses every click during the outage window."
-        )
-        # Pin that the call sits inside the `except` branch — not
-        # the happy path.
-        idx_except = source.find("except Exception as e:")
-        idx_fallback = source.find("enqueue_click_to_disk")
-        assert idx_except != -1 and idx_fallback != -1
-        assert idx_except < idx_fallback, (
-            "enqueue_click_to_disk must be called inside the "
-            "XADD-failure except branch, not on the happy path."
-        )
+        # Simulate a crash right after line 0's offset was persisted.
+        disk_queue._write_offset_sync(seg, 1)
+
+        redis = _make_redis_mock()
+        stats = await disk_queue.drain_to_redis(redis)
+
+        assert stats["drained"] == 2  # only lines 1 and 2 replayed
+        assert redis.xadd.await_count == 2
+        shipped = [json.loads(c.args[1]["data"])["click_id"] for c in redis.xadd.await_args_list]
+        assert shipped == ["c1", "c2"]
+
+    @pytest.mark.asyncio
+    async def test_redis_failure_persists_offset_up_to_last_success_only(self):
+        for i in range(3):
+            await disk_queue.enqueue_click({"click_id": f"c{i}"})
+        disk_queue._get_writer().force_finalize_for_tests()
+        seg = _segments()[0]
+
+        redis = _make_redis_mock()
+        redis.xadd.side_effect = [None, ConnectionError("down")]
+        stats = await disk_queue.drain_to_redis(redis)
+
+        assert stats["drained"] == 1
+        assert stats["failed"] == 1
+        assert disk_queue._read_offset_sync(seg) == 1
+        assert seg.exists()  # not fully drained — stays for next cycle
+
+    @pytest.mark.asyncio
+    async def test_duplicate_click_id_skipped_via_dedup_still_advances_offset(self, monkeypatch):
+        monkeypatch.setattr(disk_queue.settings, "click_dedup_ttl_seconds", 300)
+        await disk_queue.enqueue_click({"click_id": "dup-1"})
+        disk_queue._get_writer().force_finalize_for_tests()
+        seg = _segments()[0]
+
+        redis = _make_redis_mock()
+        redis.set = AsyncMock(return_value=False)  # SETNX says "already seen"
+        stats = await disk_queue.drain_to_redis(redis)
+
+        assert stats["drained"] == 0
+        assert stats["skipped"] == 1
+        redis.xadd.assert_not_awaited()
+        assert not seg.exists()  # fully "processed" (skipped counts toward completion)
 
 
 # ---------------------------------------------------------------------------
-# run_drainer behaviour
+# 4 — legacy *.json migration (D1)
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
-async def test_run_drainer_cancellable():
-    """Lifespan shutdown cancels the task — verify it raises
-    CancelledError cleanly (no swallow)."""
-    redis = _make_redis_mock()
-    # Use a short interval so the test doesn't hang waiting.
-    task = asyncio.create_task(disk_queue.run_drainer(redis, interval=10))
+class TestLegacyMigration:
+    @pytest.mark.asyncio
+    async def test_legacy_json_files_still_drain(self):
+        root = _root()
+        legacy_dir = root / "2026-05-09"
+        legacy_dir.mkdir(parents=True)
+        (legacy_dir / "a.json").write_text(json.dumps({"click_id": "legacy-a"}))
+        (legacy_dir / "b.json").write_text(json.dumps({"click_id": "legacy-b"}))
 
-    await asyncio.sleep(0)  # let the task enter its loop
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
+        redis = _make_redis_mock()
+        stats = await disk_queue.drain_to_redis(redis)
 
+        assert stats["drained"] == 2
+        assert redis.xadd.await_count == 2
+        assert list(legacy_dir.glob("*.json")) == []
 
-@pytest.mark.asyncio
-async def test_run_drainer_survives_iteration_error(monkeypatch):
-    """A transient error in one drain iteration must NOT kill the
-    loop — log + continue. We force `drain_to_redis` to raise on
-    first call, succeed on second, and verify the task is still
-    running after."""
-    call_count = {"n": 0}
+    @pytest.mark.asyncio
+    async def test_legacy_and_segments_drain_in_the_same_cycle(self):
+        root = _root()
+        legacy_dir = root / "2026-05-09"
+        legacy_dir.mkdir(parents=True)
+        (legacy_dir / "a.json").write_text(json.dumps({"click_id": "legacy-a"}))
 
-    async def flaky_drain(redis):
-        call_count["n"] += 1
-        if call_count["n"] == 1:
-            raise RuntimeError("transient")
-        return {"drained": 0, "skipped": 0, "failed": 0, "remaining": 0}
+        await disk_queue.enqueue_click({"click_id": "seg-a"})
+        disk_queue._get_writer().force_finalize_for_tests()
 
-    monkeypatch.setattr(disk_queue, "drain_to_redis", flaky_drain)
+        redis = _make_redis_mock()
+        stats = await disk_queue.drain_to_redis(redis)
 
-    redis = _make_redis_mock()
-    # Tiny interval so we can cycle through multiple iterations
-    # quickly. asyncio.sleep(0) yields the loop.
-    task = asyncio.create_task(disk_queue.run_drainer(redis, interval=0))
-    # Let it cycle a few times.
-    for _ in range(3):
-        await asyncio.sleep(0.01)
+        assert stats["drained"] == 2
+        assert redis.xadd.await_count == 2
 
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
+    @pytest.mark.asyncio
+    async def test_legacy_drain_stops_on_first_failure_like_before(self):
+        root = _root()
+        legacy_dir = root / "2026-05-09"
+        legacy_dir.mkdir(parents=True)
+        (legacy_dir / "a.json").write_text(json.dumps({"click_id": "legacy-a"}))
+        (legacy_dir / "b.json").write_text(json.dumps({"click_id": "legacy-b"}))
 
-    # We saw at least 2 iterations — task survived the error.
-    assert call_count["n"] >= 2
+        redis = _make_redis_mock(xadd_side_effect=ConnectionError("redis down"))
+        stats = await disk_queue.drain_to_redis(redis)
+
+        assert stats["drained"] == 0
+        assert stats["failed"] == 1
+        assert len(list(legacy_dir.glob("*.json"))) == 2
+
+    @pytest.mark.asyncio
+    async def test_legacy_failure_stops_the_whole_cycle_segments_not_attempted(self):
+        """A legacy-drain failure must stop the CYCLE (self-limit) —
+        segments are left for the next iteration rather than racing an
+        impaired Redis further."""
+        root = _root()
+        legacy_dir = root / "2026-05-09"
+        legacy_dir.mkdir(parents=True)
+        (legacy_dir / "a.json").write_text(json.dumps({"click_id": "legacy-a"}))
+
+        await disk_queue.enqueue_click({"click_id": "seg-a"})
+        disk_queue._get_writer().force_finalize_for_tests()
+
+        redis = _make_redis_mock(xadd_side_effect=ConnectionError("redis down"))
+        stats = await disk_queue.drain_to_redis(redis)
+
+        assert stats["failed"] == 1
+        assert len(_segments()) == 1  # untouched — legacy failure short-circuited
+

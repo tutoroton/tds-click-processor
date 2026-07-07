@@ -30,12 +30,14 @@ Two metrics emitted by ``run_observability_loop``:
     `/decide` diverts new real clicks to the disk fallback instead of
     writing the stream (reject, not trim — the M1 fix).
 
-  * ``disk_queue.size`` — count of files awaiting drainer replay.
+  * ``disk_queue.size`` — total BYTES across every segment (own +
+    adopted + not-yet-migrated legacy) awaiting drainer replay (P2,
+    LOSSFIX 2026-07-07 — repurposed from a per-click file count).
     Steady-state value is 0 (Redis healthy). Any non-zero value
-    means at least one click hit the XADD failure path (or the M1
-    reject threshold); growing values mean Redis is sustained
-    unhealthy or the stream stays pinned above threshold. 50% of cap
-    = "30+ minutes of outage at typical click rates, escalate".
+    means at least one click hit the XADD failure path (M1 reject,
+    a watermark spill, or a genuine XADD exception); growing values
+    mean Redis is sustained unhealthy or under memory pressure. 50%
+    of the byte-cap = "escalate".
 
 Three metrics from the original T2.6 plan are deferred:
 
@@ -61,7 +63,7 @@ import logging
 import sentry_sdk
 
 from app.config import _LOCAL_ENVIRONMENTS, settings
-from app.disk_queue import get_queue_size
+from app.disk_queue import get_queue_stats
 from app.shipper_metrics import metrics as shipper_metrics
 
 logger = logging.getLogger("tds.observability")
@@ -176,20 +178,31 @@ async def emit_stream_clicks_length(redis) -> int:
 
 
 async def emit_disk_queue_size() -> int:
-    """Sample disk-queue file count; warn at 50% of cap.
+    """Sample disk-queue BYTE usage (own + adopted + legacy segments);
+    warn at 50% of the P2 byte-cap.
 
-    Steady-state value is 0 — disk queue fires only on XADD
-    failure, and the drainer pulls everything back into Redis on
-    recovery. Any sustained non-zero value is a signal that
-    Redis is unhealthy AND the disk fallback is doing its job.
+    Steady-state value is 0 — disk queue fires only on XADD failure,
+    the M1 entry-count reject, or a watermark spill, and the drainer
+    pulls everything back into Redis on recovery. Any sustained
+    non-zero value is a signal that Redis is unhealthy (or under
+    memory pressure) AND the disk fallback is doing its job.
 
-    `disk_queue_max_files=0` (operator opt-in for unbounded queue)
-    skips the threshold check — there's no "50% of unbounded".
+    P2 (LOSSFIX, 2026-07-07) REPURPOSED this from a per-click FILE
+    COUNT vs `disk_queue_max_files` (meaningless once clicks batch
+    into segments) to total BYTES vs `disk_segment_max_total_bytes` —
+    the actual operative capacity ceiling now
+    (`app.disk_queue._check_byte_cap`). `disk_segment_max_total_bytes
+    <= 0` (operator opt-in for unbounded queue) skips the threshold
+    check — there's no "50% of unbounded".
+
+    Returns the sampled byte count so callers can log it themselves
+    (e.g., a /health endpoint that wants to expose it).
     """
-    size = await get_queue_size()
-    cap = settings.disk_queue_max_files
+    stats = await get_queue_stats()
+    size = stats["bytes"]
+    cap = settings.disk_segment_max_total_bytes
 
-    if cap == 0:
+    if cap <= 0:
         # Unbounded — operator chose this. Just log the size when
         # non-zero so the trend is visible.
         if size > 0:
@@ -218,8 +231,8 @@ async def emit_disk_queue_size() -> int:
         logger.warning(
             "disk_queue.size=%d at %d%% of cap %d — Redis outage "
             "ongoing, T2.2 fallback engaged. Investigate redis-server "
-            "health and consider raising TDS_DISK_QUEUE_MAX_FILES "
-            "if outage will persist.",
+            "health and consider raising "
+            "TDS_DISK_SEGMENT_MAX_TOTAL_BYTES if outage will persist.",
             size, pct, cap,
             extra=extra,
         )

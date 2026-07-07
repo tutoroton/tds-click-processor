@@ -201,30 +201,17 @@ class Settings(BaseSettings):
     # retry-storm during a deploy).
     click_dedup_ttl_seconds: int = 86400  # 24 hours, 0 = disabled
 
-    # T2.2 / G-23 — disk fallback queue for clicks when XADD fails.
-    # The MAXLEN cap above defends against unbounded growth, but
-    # cannot help when Redis itself is unreachable (container OOM,
-    # restart, brief network partition). Without this fallback,
-    # every click during a Redis outage is LOST — log + Sentry
-    # capture, but the click never lands in stream:clicks, never
-    # ships to central, never appears in analytics. Revenue blind
-    # spot.
+    # T2.2 / G-23, REDESIGNED by P2 (LOSSFIX, 2026-07-07) — disk fallback
+    # queue for clicks when XADD fails (or the M1/watermark gates divert
+    # here pre-emptively). Every worker appends NDJSON lines to its OWN
+    # `{boot_epoch}-{pid}-{seq}.ndjson` segment (group-commit fsync, see
+    # `app/disk_queue.py`) instead of one file per click — the old
+    # per-click-file design meant an outage produced one `rglob` entry
+    # per click (inode exhaustion risk) and ~1 fsync per click. A
+    # background drainer replays each finalized segment, deleting it
+    # (and its replay-offset sidecar) once fully drained.
     #
-    # On XADD failure, /decide writes the click record to a JSON
-    # file under `disk_queue_root` (atomic write — .tmp + rename).
-    # A background drainer task scans the queue every
-    # `disk_queue_drain_interval_seconds` and replays files back
-    # into Redis once it recovers. Drained files are unlinked.
-    #
-    # Cap (`disk_queue_max_files`) bounds the disk usage during
-    # prolonged outages — at 100k files * ~500 B = ~50 MB budget.
-    # Exceeding the cap CRITICAL-logs and rejects the enqueue
-    # (loud failure) rather than silently rotating oldest. If your
-    # incident response can't recover Redis within the cap window,
-    # the operator's options are: scale Redis, raise the cap,
-    # accept loss for new clicks. We never silently drop the
-    # OLDEST click — that's revenue we already earned.
-    # M7 fix (2026-05-11): absolute-path requirement.
+    # M7 fix (2026-05-11), unchanged by P2: absolute-path requirement.
     #
     # Was: `var/click-queue` — RELATIVE to process CWD at runtime.
     # If uvicorn was launched with `cwd=/` (some container configs,
@@ -242,8 +229,37 @@ class Settings(BaseSettings):
     # non-absolute value. Loud failure at startup > silent data
     # loss at runtime.
     disk_queue_root: str = "/var/tds/click-queue"
-    disk_queue_max_files: int = 100_000
     disk_queue_drain_interval_seconds: int = 30
+
+    # P2 c1 — segment rotation. A segment finalizes (closes, renames off
+    # its `.wip` suffix, dir-fsynced — D2) once EITHER threshold is hit,
+    # whichever first. 1-5 MB / ~1s per the design brief; defaults sit at
+    # the low end so a drainer cycle never waits long to see fresh data.
+    disk_segment_max_bytes: int = 2_000_000
+    disk_segment_max_age_seconds: float = 1.0
+
+    # P2 c1 — group-commit linger window. Concurrent `enqueue_click`
+    # awaiters that land within this window share ONE fsync (batches
+    # writes under load instead of ~1 fsync/click); bounds the added
+    # latency on the (already-degraded, spill/fallback-only) path to
+    # this value plus a few ms of fsync time — comfortably under the
+    # brief's <=100ms target and far under the CF Worker's 2000ms
+    # AbortSignal race deadline.
+    disk_segment_group_commit_ms: float = 20.0
+
+    # P2 c1/c2 — global byte-cap across ALL workers' segments (own +
+    # adopted orphans + any not-yet-migrated legacy `*.json` files),
+    # replacing the old per-click-file-count cap (`disk_queue_max_files`,
+    # removed — meaningless once clicks are batched into segments). A
+    # CHEAP periodic scan (`disk_queue_stats_scan_interval_seconds`)
+    # caches {segments, bytes, oldest_seconds} for both this gate and
+    # `/health`; `enqueue_click` reads ONLY the cache (A3-style hot-path
+    # discipline — never a live scan on `/decide`). At/over the cap, new
+    # clicks are REJECTED (visible 503 via the existing L1 uncaptured
+    # path) rather than silently rotating the oldest segment. 0/negative
+    # disables the cap (unbounded, operator opt-in).
+    disk_segment_max_total_bytes: int = 5_000_000_000  # 5 GiB
+    disk_queue_stats_scan_interval_seconds: float = 5.0
 
     # F.29 Sprint 4.1 (2026-05-23) — shipper-health alert thresholds.
     #

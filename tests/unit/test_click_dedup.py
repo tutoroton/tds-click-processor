@@ -227,16 +227,23 @@ class TestSourcePins:
         )
 
     def test_drainer_path_has_dedup_branch(self):
-        """The disk drainer at `disk_queue.drain_to_redis` must also
-        gate on dedup — otherwise a Redis-outage recovery replay
-        creates duplicate stream entries for any click that ALSO
-        succeeded on a sibling node during the outage window."""
+        """The disk drainer's replay paths must also gate on dedup —
+        otherwise a Redis-outage recovery replay creates duplicate
+        stream entries for any click that ALSO succeeded on a sibling
+        node during the outage window.
+
+        P2 (LOSSFIX, 2026-07-07) split `drain_to_redis` into a thin
+        orchestrator over `_replay_segment` (own/adopted segments) and
+        `_drain_legacy_json_files` (pre-P2 per-click files, D1
+        migration) — the dedup gate now lives in BOTH of those, not in
+        `drain_to_redis` itself."""
         import inspect
         from app import disk_queue
 
-        src = inspect.getsource(disk_queue.drain_to_redis)
-        assert "click:seen:" in src or "click_dedup_ttl_seconds" in src, (
-            "drain_to_redis MUST gate the XADD replay on dedup so "
-            "Redis-recovery doesn't create stream duplicates "
-            "(H1 fix companion)."
-        )
+        for fn in (disk_queue._replay_segment, disk_queue._drain_legacy_json_files):
+            src = inspect.getsource(fn)
+            assert "click:seen:" in src or "click_dedup_ttl_seconds" in src, (
+                f"{fn.__name__} MUST gate the XADD replay on dedup so "
+                "Redis-recovery doesn't create stream duplicates "
+                "(H1 fix companion)."
+            )

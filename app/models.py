@@ -219,7 +219,7 @@ class HealthResponse(BaseModel):
         return a coherent shape.
 
     Field semantics — see ``app.shipper_metrics.ShipperMetrics`` +
-    ``app.disk_queue.get_queue_size`` for the canonical definitions.
+    ``app.disk_queue.get_queue_stats`` for the canonical definitions.
     """
 
     # F.32 Track 1 — running code version (git short SHA from the node .env via
@@ -281,9 +281,20 @@ class HealthResponse(BaseModel):
     # XLEN of stream:clicks. Steady-state ~0-10k (shipper XTRIMs to 10k
     # after success). Sustained > 50k = shipper failing.
     stream_clicks_length: int = 0
-    # Count of files in /var/tds/click-queue/ awaiting drainer replay.
-    # Steady-state = 0 (disk fallback fires only on Redis outage).
+    # P2 (D3, LOSSFIX 2026-07-07) segment-queue depth — REPURPOSED from
+    # a per-click file count (pre-P2) to a SEGMENT count (own + adopted
+    # + not-yet-migrated legacy `*.json`). Steady-state = 0 (disk
+    # fallback fires only on Redis outage / M1 reject / watermark
+    # spill). See ``app.disk_queue.get_queue_stats``.
     disk_queue_size: int = 0
+    # P2 (D3) — total bytes across every segment/legacy file awaiting
+    # drainer replay. Compared against
+    # ``settings.disk_segment_max_total_bytes`` for the byte-cap gate.
+    disk_queue_bytes: int = 0
+    # P2 (D3) — age in seconds of the OLDEST file still awaiting replay.
+    # None when the queue is empty. A growing value under a healthy
+    # Redis means the drainer itself is stuck, not just an outage.
+    disk_queue_oldest_seconds: float | None = None
     # Free bytes on the disk-queue mountpoint. None when the path does
     # not exist (local dev without TDS_DISK_QUEUE_ROOT). Sprint 1.5
     # pre-flight check uses this against

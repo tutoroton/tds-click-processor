@@ -1,61 +1,57 @@
-"""Disk fallback queue for click writes (T2.2 / G-23).
+"""Disk fallback queue for click writes (T2.2 / G-23), REDESIGNED by P2
+(LOSSFIX, 2026-07-07) into a segment engine.
 
-Closes the click-loss gap on the `/decide` hot path. The MAXLEN
-cap (T2.1) defends Redis from unbounded growth, but cannot help
-when Redis itself is unreachable — XADD raises, the click
-record vanishes. This module catches that case: the record is
-serialised to a local JSON file; a background drainer replays it
-into Redis once the outage clears. Drained files are unlinked.
+The original design (one atomically-written `.json` file per click) was
+fine at a trickle but pathological under a sustained outage: an hour at
+even modest click volume produced tens of thousands of files in one
+directory (inode exhaustion risk, `rglob` cost climbing with file
+count) and ~1 `fsync` per click. This module replaces it with append-
+only NDJSON SEGMENTS shared by many clicks, group-commit fsync, and a
+per-worker ownership model so `WEB_CONCURRENCY` > 1 workers never race
+the same file.
 
-Storage layout:
+Segment lifecycle
+------------------
 
-    var/click-queue/
-        <YYYY-MM-DD>/
-            <YYYYMMDDTHHMMSS>-<uuid8>.json
-            ...
+  1. A worker opens `{boot_epoch}-{pid}-{seq:06d}.ndjson.wip` and
+     APPENDS one JSON line per click (`_SegmentWriter.append`).
+  2. Concurrent `append()` awaiters within `disk_segment_group_commit_ms`
+     share ONE `fsync` (group commit) — the await only resolves once
+     that shared fsync lands, so redirect-latency stays bounded even
+     though multiple clicks' writes are batched.
+  3. On a size/age threshold the segment FINALIZES: fd closed, renamed
+     `.wip` -> plain `.ndjson` (this rename is the durability boundary —
+     a plain `.ndjson` name is used by NOTHING until it is safe to
+     read), then the PARENT DIRECTORY is fsynced (D2) so the rename
+     itself survives a power-loss.
+  4. The drainer (`drain_to_redis`) only ever globs plain `.ndjson`
+     files — a `.wip` (still being written) segment is invisible to it
+     by construction, no in-memory writer/drainer coordination needed.
+  5. Each segment gets a REPLAY-OFFSET sidecar (`{name}.offset`) so a
+     crash mid-replay re-does at most the single next line, never the
+     whole segment (B3). Once every line replays, the segment + its
+     sidecar are deleted together.
 
-Date-bucketed for human inspection + log-rotation parity. ISO-8601
-timestamp prefix gives time-sorted listing (drainer drains oldest
-first — first-in-first-out semantics, matching Redis Streams'
-natural order). UUID suffix avoids collision when the same second
-sees multiple enqueues.
+Per-worker ownership
+---------------------
 
-Atomic write contract:
+`WEB_CONCURRENCY` > 1 means N sibling worker PROCESSES, each with its
+own `(boot_epoch, pid)` — the naming scheme above means the drainer's
+`{my_prefix}-*.ndjson` glob only ever matches THIS worker's own
+segments, so no two workers ever race to drain the same live file. A
+worker that crashes/restarts gets a NEW pid, stranding its old segments
+— orphan adoption for that case is a follow-up (c2), not yet wired here.
 
-    1. Write to <name>.tmp
-    2. fsync the file descriptor
-    3. Rename .tmp → <name> (atomic on POSIX)
+Legacy migration (D1)
+----------------------
 
-A crash mid-write leaves a `.tmp` file. The drainer scans only
-`*.json` files, so half-written records are never replayed — they
-sit on disk until manually inspected (operator may want to
-post-mortem). The fsync before rename ensures durable write
-ordering: even if power dies between rename and the next loop
-iteration, the file is recoverable.
+Any pre-P2 `*.json` per-click file still on disk at upgrade time is
+drained by the SAME per-cycle sweep (`_drain_legacy_json_files`) so an
+upgrade never strands them — this path naturally self-obsoletes once a
+node's legacy backlog empties.
 
-Hot-path performance:
-
-    enqueue_click() runs OFF the asyncio event loop via
-    asyncio.to_thread() — file I/O happens in the default thread
-    pool, the loop stays free for other requests. Typical write
-    latency is sub-millisecond for our payload size; even under
-    heavy outage load the budget is dominated by Redis-recovery
-    time, not by disk write.
-
-In-memory size counter:
-
-    A naive cap check (rglob + count on every enqueue) would scan
-    100k files on every click during a sustained outage —
-    pathological. Instead we maintain an in-memory counter,
-    initialised once at first call by a single filesystem scan.
-    Increment on successful write, decrement on successful drain.
-    Exact in single-process click-processor (the only deployment
-    today); if the service ever runs multi-worker, the counter
-    becomes a per-worker estimate — still acceptable for a cap
-    check (worst case: ~N workers go ~N% over cap).
-
-Reference: rule `sync-protocol`, action-items.md T2.2,
-open-questions.md G-23.
+Reference: rule `sync-protocol`, action-items.md T2.2, open-questions.md
+G-23; collector's `app/watermark.py` for the sibling P2 c3 pattern.
 """
 
 from __future__ import annotations
@@ -64,175 +60,63 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shutil
 import time
-import uuid
 from pathlib import Path
 
 import sentry_sdk
 
 from app.config import _LOCAL_ENVIRONMENTS, settings
+from app.telemetry import (
+    OP_SEGMENT_BYTE_CAP,
+    OP_SEGMENT_TORN_TAIL,
+    capture_op_msg,
+)
 
 logger = logging.getLogger("tds.disk_queue")
 
-
-# In-memory count of files currently in the queue. Initialised
-# lazily on first enqueue from a filesystem scan; mutated on
-# every enqueue (+1) and successful drain (-1). Accuracy is
-# guaranteed in single-process deployment; multi-worker would
-# need a shared counter (per-worker estimate is good enough for
-# a cap check, see module docstring).
-_queue_size: int = 0
-_queue_size_initialized: bool = False
-_init_lock: asyncio.Lock | None = None
-
-
-def _get_init_lock() -> asyncio.Lock:
-    """Lazy lock construction — `asyncio.Lock()` requires a running
-    event loop, so we defer instantiation to first call. Safe in
-    single-loop context (only one event loop ever exists in
-    click-processor's lifespan)."""
-    global _init_lock
-    if _init_lock is None:
-        _init_lock = asyncio.Lock()
-    return _init_lock
+# `{epoch}-{pid}-{seq}.ndjson` — the FINALIZED segment name. The active
+# (still being written) form carries an extra `.wip` suffix and is never
+# matched by this regex or by the drainer's glob.
+_SEGMENT_RE = re.compile(r"^(?P<epoch>\d+)-(?P<pid>\d+)-(?P<seq>\d{6})\.ndjson$")
 
 
 def _queue_root() -> Path:
-    """Resolve the queue root path. Resolution is per-call so a
-    test that monkeypatches settings.disk_queue_root sees the new
-    value without restart."""
+    """Resolve the queue root path. Resolution is per-call so a test
+    that monkeypatches settings.disk_queue_root sees the new value
+    without restart."""
     return Path(settings.disk_queue_root)
 
 
-def _today_dir() -> Path:
-    """Today's UTC bucket — keeps a long-running queue from piling
-    100k files in a single directory (some filesystems degrade
-    badly past ~10k entries per directory)."""
-    return _queue_root() / time.strftime("%Y-%m-%d", time.gmtime())
+# ---------------------------------------------------------------------------
+# Worker identity — `{boot_epoch}-{pid}` naming (B1)
+# ---------------------------------------------------------------------------
+
+_boot_epoch: int | None = None
 
 
-def _new_filename() -> str:
-    """Time-sorted, collision-resistant filename. ``YYYYMMDDTHHMMSS``
-    prefix sorts lexicographically by time; 8-char UUID4 suffix
-    avoids same-second collisions across concurrent enqueues."""
-    ts = time.strftime("%Y%m%dT%H%M%S", time.gmtime())
-    suffix = uuid.uuid4().hex[:8]
-    return f"{ts}-{suffix}.json"
+def _get_boot_epoch() -> int:
+    """Lazily memoized once per process. Combined with `os.getpid()`
+    this disambiguates PID RECYCLING across restarts: a bare pid alone
+    collides once the OS reuses it for an unrelated later process; the
+    epoch (this process's own start time) makes the pair unique-enough
+    without requiring any cross-worker coordination at boot."""
+    global _boot_epoch
+    if _boot_epoch is None:
+        _boot_epoch = int(time.time())
+    return _boot_epoch
 
 
-def _count_queue_files_sync() -> int:
-    """One-shot filesystem scan — used at first-init to seed the
-    in-memory counter. Counts only `*.json` (excludes `.tmp` and
-    other ad-hoc files an operator might place there)."""
-    root = _queue_root()
-    if not root.exists():
-        return 0
-    return sum(1 for _ in root.rglob("*.json"))
+def _worker_prefix() -> str:
+    return f"{_get_boot_epoch()}-{os.getpid()}"
 
 
-def _list_queue_files_sync() -> list[Path]:
-    """Sorted listing of queueable files. Sort is critical — gives
-    the drainer FIFO semantics (oldest clicks ship first), matching
-    Redis Stream natural order."""
-    root = _queue_root()
-    if not root.exists():
-        return []
-    return sorted(root.rglob("*.json"))
-
-
-def _write_file_sync(path: Path, data: bytes) -> None:
-    """Atomic write via `tmp + fsync + rename`.
-
-    POSIX rename is atomic on the same filesystem. Creating the
-    parent directory is idempotent (mkdir parents=True,
-    exist_ok=True). The file descriptor is closed in `finally` so
-    a write error doesn't leak the FD even before the rename
-    happens.
-
-    File mode `0o600` (owner read+write only) — the queue contains
-    click records with PII (IP, geo, full UA, query_params that
-    may carry advertiser-supplied identifiers). World-readable
-    `0o644` would let any co-located process / sidecar / shared
-    bind-mount read every queued click during a Redis outage.
-    Parent directory `0o700` mirrors the same boundary at the dir
-    level (a user-listable parent leaks filenames, which encode
-    timestamps + UUIDs). Closes Agent 2 HIGH-2 audit finding
-    (security review 2026-05-09).
-    """
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    # `mkdir(mode=...)` only honours mode on FIRST creation —
-    # subsequent calls with exist_ok=True don't tighten an
-    # already-loose dir. Defensive chmod ensures the boundary
-    # holds even when the directory pre-existed (e.g., previous
-    # process ran with a more permissive umask).
-    try:
-        os.chmod(path.parent, 0o700)
-    except OSError as exc:
-        # M7 fix (2026-05-11): WAS silent `pass`. The earlier
-        # rationale (file itself written at 0o600 still protects
-        # the click bytes) holds, BUT operators had no signal when
-        # the directory perms drifted — e.g., a hostile co-tenant
-        # owning the path. Log + Sentry-capture so the operator
-        # sees the misconfig. Still non-fatal: the file write is
-        # the load-bearing protection; the dir chmod is hygiene.
-        logger.warning(
-            "Disk queue: chmod 0o700 failed on %s — directory may be "
-            "world-readable. The queued click file is still written at "
-            "0o600 so PII bytes stay protected, but verify directory "
-            "ownership: %s",
-            path.parent, exc,
-        )
-        sentry_sdk.capture_message(
-            f"Disk-queue chmod failed on {path.parent}: {exc}",
-            level="warning",
-        )
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    try:
-        os.write(fd, data)
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-    os.rename(tmp_path, path)
-
-
-async def _ensure_initialized() -> None:
-    """Lazy first-time initialization of the in-memory size counter.
-
-    Single FS scan, guarded by an asyncio.Lock so concurrent
-    enqueues during the first outage don't all trigger their own
-    rglob (which would defeat the optimization that motivated this
-    counter in the first place).
-    """
-    global _queue_size, _queue_size_initialized
-    if _queue_size_initialized:
-        return
-    async with _get_init_lock():
-        if _queue_size_initialized:
-            return
-        _queue_size = await asyncio.to_thread(_count_queue_files_sync)
-        _queue_size_initialized = True
-        logger.info(
-            "Disk queue initialized — %d existing file(s) at %s",
-            _queue_size, _queue_root(),
-        )
-
-
-def _decrement_size() -> None:
-    """Decrement counter, never below zero. Counter underflow
-    would only happen if drain saw a file that enqueue didn't
-    count (e.g., file placed externally) — we don't want to track
-    a negative value, so we clamp."""
-    global _queue_size
-    _queue_size = max(0, _queue_size - 1)
-
-
-async def get_queue_size() -> int:
-    """Return current queue size — safe to call from /health or
-    metrics emitters. Triggers lazy init on first call."""
-    await _ensure_initialized()
-    return _queue_size
+# ---------------------------------------------------------------------------
+# Disk-pressure preflight — UNCHANGED by P2 (orthogonal to the segment
+# format; still a free-bytes floor check called from main.py before
+# `enqueue_click`).
+# ---------------------------------------------------------------------------
 
 
 def check_disk_pressure() -> tuple[bool, int | None]:
@@ -277,10 +161,10 @@ def check_disk_pressure() -> tuple[bool, int | None]:
         usage = shutil.disk_usage(settings.disk_queue_root)
     except (OSError, FileNotFoundError) as exc:
         # Root path doesn't exist yet on first boot (the parent dir
-        # gets created lazily by ``_write_file_sync.mkdir``). The
-        # absence itself isn't pressure — it just means we cannot
-        # measure. Log at DEBUG only (not WARNING) because this is
-        # the expected state on a brand-new node before the first
+        # gets created lazily by the segment writer). The absence
+        # itself isn't pressure — it just means we cannot measure.
+        # Log at DEBUG only (not WARNING) because this is the
+        # expected state on a brand-new node before the first
         # disk-fallback fires.
         logger.debug(
             "Disk-queue pressure check: %s unreadable (%s) — "
@@ -303,100 +187,525 @@ def check_disk_pressure() -> tuple[bool, int | None]:
     return is_pressured, free_bytes
 
 
+# ---------------------------------------------------------------------------
+# Cached queue stats (byte-cap gate + /health, D3) — a CHEAP periodic scan,
+# never a per-append live scan. Affordable because a healthy node holds
+# hundreds of segments, not the old design's potential millions of files.
+# ---------------------------------------------------------------------------
+
+_cached_queue_stats: dict | None = None
+
+
+def _scan_queue_stats_sync() -> dict:
+    root = _queue_root()
+    segments = 0
+    total_bytes = 0
+    oldest_mtime: float | None = None
+    if root.exists():
+        for pattern in ("*.ndjson", "*.json"):
+            for f in root.rglob(pattern):
+                try:
+                    st = f.stat()
+                except OSError:
+                    continue
+                segments += 1
+                total_bytes += st.st_size
+                if oldest_mtime is None or st.st_mtime < oldest_mtime:
+                    oldest_mtime = st.st_mtime
+    oldest_seconds = (time.time() - oldest_mtime) if oldest_mtime is not None else None
+    return {"segments": segments, "bytes": total_bytes, "oldest_seconds": oldest_seconds}
+
+
+def get_cached_queue_stats() -> dict:
+    """Cached `{segments, bytes, oldest_seconds}` for /health (D3) and
+    the byte-cap gate. Never-sampled returns a zeroed dict — safe
+    default for a fresh boot before the sampler's first tick."""
+    if _cached_queue_stats is None:
+        return {"segments": 0, "bytes": 0, "oldest_seconds": None}
+    return _cached_queue_stats
+
+
+def _check_byte_cap() -> bool:
+    """True = at/over the global byte-cap, new appends must be rejected.
+
+    Fail-open on a never-sampled cache (same discipline as the M1
+    stream-length gate — a missing signal must never itself become a
+    new failure mode) and when the cap is disabled (<=0)."""
+    cap = settings.disk_segment_max_total_bytes
+    if cap <= 0:
+        return False
+    if _cached_queue_stats is None:
+        return False
+    return _cached_queue_stats["bytes"] >= cap
+
+
+async def run_queue_stats_sampler(interval: float | None = None) -> None:
+    """Periodic full scan of the queue root, caching `{segments, bytes,
+    oldest_seconds}`. Started in the FastAPI lifespan, cancelled on
+    shutdown — mirrors `run_observability_loop` / the collector's
+    `run_watermark_sampler`. A transient scan failure just leaves the
+    cache aging (fails open on the byte-cap gate); it never kills the
+    loop."""
+    interval = interval or settings.disk_queue_stats_scan_interval_seconds
+    logger.info("Disk-queue stats sampler started (interval=%ss)", interval)
+    global _cached_queue_stats
+    while True:
+        try:
+            await asyncio.sleep(interval)
+            _cached_queue_stats = await asyncio.to_thread(_scan_queue_stats_sync)
+        except asyncio.CancelledError:
+            logger.info("Disk-queue stats sampler cancelled — shutting down")
+            raise
+        except Exception:  # noqa: BLE001
+            logger.exception("Disk-queue stats sampler iteration failed")
+
+
+async def get_queue_stats() -> dict:
+    """Async accessor for /health — returns the cached stats, forcing a
+    one-shot scan first if the sampler hasn't ticked yet (so /health
+    right after boot isn't stuck reporting zeros for a full interval)."""
+    global _cached_queue_stats
+    if _cached_queue_stats is None:
+        _cached_queue_stats = await asyncio.to_thread(_scan_queue_stats_sync)
+    return _cached_queue_stats
+
+
+# ---------------------------------------------------------------------------
+# Segment writer — group-commit append (c1)
+# ---------------------------------------------------------------------------
+
+
+class _SegmentWriter:
+    """Owns ONE actively-open NDJSON segment for THIS worker process.
+
+    `append()` is the group-commit entrypoint: concurrent awaiters that
+    land while a flush loop is already running share the SAME batch (or
+    the next one, if their arrival lost the race) — bounding the number
+    of `fsync` calls under load while keeping added latency close to
+    `disk_segment_group_commit_ms`. Only ONE `_commit_batch_sync` ever
+    runs at a time (the flush loop below never spawns a second
+    concurrent thread call), so the file-handle/size/rotation state
+    below needs no lock beyond that invariant.
+    """
+
+    def __init__(self) -> None:
+        self._fd: int | None = None
+        self._path: Path | None = None
+        self._size = 0
+        self._opened_monotonic = 0.0
+        self._seq = 0
+        self._pending: list[tuple[bytes, asyncio.Future]] = []
+        self._flush_task: asyncio.Task | None = None
+
+    @property
+    def current_wip_path(self) -> Path | None:
+        return self._path
+
+    async def append(self, record: dict) -> bool:
+        if _check_byte_cap():
+            logger.error(
+                "Disk-segment byte-cap reached (>=%d bytes) — DROPPING "
+                "click. Resolve the outage or raise "
+                "TDS_DISK_SEGMENT_MAX_TOTAL_BYTES.",
+                settings.disk_segment_max_total_bytes,
+            )
+            capture_op_msg(
+                OP_SEGMENT_BYTE_CAP,
+                f"Disk-segment byte-cap reached "
+                f"(>={settings.disk_segment_max_total_bytes} bytes); "
+                "click rejected.",
+                level="error",
+            )
+            return False
+
+        try:
+            line = json.dumps(record, default=str).encode("utf-8") + b"\n"
+        except (TypeError, ValueError) as exc:
+            logger.error("Failed to serialize click for disk segment: %s", exc)
+            sentry_sdk.capture_exception(exc)
+            return False
+
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
+        self._pending.append((line, fut))
+        if self._flush_task is None:
+            self._flush_task = asyncio.create_task(
+                self._run_flush_loop(settings.disk_segment_group_commit_ms / 1000.0)
+            )
+        return await fut
+
+    async def _run_flush_loop(self, initial_delay: float) -> None:
+        if initial_delay > 0:
+            await asyncio.sleep(initial_delay)
+        while True:
+            batch = self._pending
+            self._pending = []
+            ok, exc = await asyncio.to_thread(self._commit_batch_sync, batch)
+            for _, fut in batch:
+                if not fut.done():
+                    fut.set_result(ok)
+            if not ok:
+                logger.error("Segment group-commit failed: %s", exc)
+                sentry_sdk.capture_message(
+                    f"Disk-segment group-commit failed: {exc}", level="error",
+                )
+            if not self._pending:
+                break
+            # More arrived while we were mid-commit — they already
+            # waited through this commit; drain them immediately
+            # rather than making them wait through ANOTHER full linger.
+        self._flush_task = None
+
+    def _commit_batch_sync(self, batch: list[tuple[bytes, asyncio.Future]]):
+        try:
+            self._ensure_open_sync()
+            for line, _ in batch:
+                os.write(self._fd, line)
+                self._size += len(line)
+            os.fsync(self._fd)
+        except OSError as exc:
+            return False, exc
+        self._maybe_rotate_sync()
+        return True, None
+
+    def _ensure_open_sync(self) -> None:
+        if self._fd is not None:
+            return
+        root = _queue_root()
+        root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        try:
+            os.chmod(root, 0o700)
+        except OSError as exc:
+            # M7-style defensive chmod (2026-05-11 fix, carried over):
+            # non-fatal — the file itself is still opened at 0o600
+            # below — but a drifted directory permission must not be
+            # silently swallowed.
+            logger.warning(
+                "Disk queue: chmod 0o700 failed on %s — directory may be "
+                "world-readable. Segment files are still written at "
+                "0o600: %s", root, exc,
+            )
+            sentry_sdk.capture_message(
+                f"Disk-queue chmod failed on {root}: {exc}", level="warning",
+            )
+        self._seq += 1
+        name = f"{_worker_prefix()}-{self._seq:06d}.ndjson.wip"
+        path = root / name
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        self._fd = fd
+        self._path = path
+        self._size = 0
+        self._opened_monotonic = time.monotonic()
+
+    def _maybe_rotate_sync(self) -> None:
+        due = (
+            self._size >= settings.disk_segment_max_bytes
+            or (time.monotonic() - self._opened_monotonic)
+            >= settings.disk_segment_max_age_seconds
+        )
+        if due:
+            self._finalize_current_sync()
+
+    def _finalize_current_sync(self) -> None:
+        """Close the active `.wip` fd, rename it to the plain `.ndjson`
+        name (the durability boundary the drainer relies on), then
+        fsync the PARENT DIRECTORY (D2) so that rename survives a
+        power-loss. A file's own fsync guarantees its CONTENT is
+        durable; it does NOT guarantee the directory entry (this
+        filename existing at all) is durable without ALSO fsyncing the
+        directory — this bounds the unsafe window to one group-commit,
+        matching the design brief's stated invariant."""
+        if self._fd is None:
+            return
+        try:
+            os.close(self._fd)
+            final_path = self._path.with_suffix("")  # strips ".wip"
+            os.rename(self._path, final_path)
+            dir_fd = os.open(final_path.parent, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        finally:
+            self._fd = None
+            self._path = None
+
+    def force_finalize_for_tests(self) -> None:
+        """Test-only — finalize whatever is open so a short-lived test
+        doesn't leave a `.wip` segment sitting below the rotation
+        threshold (and therefore invisible to the drainer) forever."""
+        self._finalize_current_sync()
+
+
+_writer: _SegmentWriter | None = None
+
+
+def _get_writer() -> _SegmentWriter:
+    global _writer
+    if _writer is None:
+        _writer = _SegmentWriter()
+    return _writer
+
+
 async def enqueue_click(record: dict) -> bool:
-    """Persist a click record to the disk queue.
+    """Persist a click record to the disk-segment queue.
 
-    Returns True on success (file written, atomic, durable).
-    Returns False on cap rejection or write failure (the click is
-    LOST in this case — the caller is expected to log CRITICAL +
-    Sentry capture so the incident is visible).
+    Returns True on success (durably group-committed to the active
+    segment). Returns False on byte-cap rejection or a write failure —
+    the caller (main.py) is expected to log CRITICAL + Sentry capture
+    (or, on this ALSO failing, the L1 uncaptured-click 503) so the
+    incident is visible.
 
-    Caller contract: this function is intended for the XADD-failure
-    fallback path on `/decide`. It is NOT a primary write path —
-    the steady state writes directly to Redis. So the cap is sized
-    for outage duration, not click volume × seconds.
+    Caller contract: unchanged from pre-P2 — this is the XADD-failure
+    (or M1/watermark pre-emptive-divert) fallback path on `/decide`, not
+    a primary write path.
     """
-    global _queue_size
-    await _ensure_initialized()
-
-    cap = settings.disk_queue_max_files
-    if cap > 0 and _queue_size >= cap:
-        logger.error(
-            "Disk queue at cap (%d ≥ %d) — DROPPING click. "
-            "Resolve Redis outage or raise TDS_DISK_QUEUE_MAX_FILES.",
-            _queue_size, cap,
-        )
-        sentry_sdk.capture_message(
-            f"Disk-queue cap reached ({_queue_size} ≥ {cap}); "
-            "click rejected.",
-            level="error",
-        )
-        return False
-
-    try:
-        payload = json.dumps(record, default=str).encode("utf-8")
-    except (TypeError, ValueError) as exc:
-        logger.error("Failed to serialize click for disk queue: %s", exc)
-        sentry_sdk.capture_exception(exc)
-        return False
-
-    path = _today_dir() / _new_filename()
-    try:
-        await asyncio.to_thread(_write_file_sync, path, payload)
-    except OSError as exc:
-        logger.error("Failed to enqueue click to disk: %s", exc)
-        sentry_sdk.capture_exception(exc)
-        return False
-
-    _queue_size += 1
-    return True
+    return await _get_writer().append(record)
 
 
-async def drain_to_redis(redis) -> dict:
-    """Replay queued clicks back into the Redis stream.
+# ---------------------------------------------------------------------------
+# Torn-tail truncation (B2)
+# ---------------------------------------------------------------------------
 
-    Stops at the FIRST XADD failure — no point pounding a Redis
-    that's still impaired. The remaining files stay on disk and
-    will be retried by the next drainer iteration. Successful
-    drains delete the file and decrement the in-memory counter.
 
-    Returns stats dict for caller logging:
-      - drained: number of files successfully replayed + deleted
-      - skipped: files that vanished mid-drain (race with another
-        drainer or manual cleanup)
-      - failed: 1 if the loop broke on Redis error, else 0
-      - remaining: best-effort count of files still on disk
+def _truncate_torn_tail_sync(path: Path) -> int:
+    """B2 — a recovered `.wip` segment may end in a TORN (incomplete or
+    corrupt) last line: the write for it either never completed or was
+    never fsynced before the crash/power-loss. Loss-free by
+    construction: NOTHING that was ever acknowledged to a caller is
+    discarded here — a group-commit only resolves its awaiters'
+    futures AFTER its fsync lands, so if that fsync never happened, the
+    `/decide` call for every click in that batch never returned
+    success. Any WELL-FORMED (JSON-parseable, newline-terminated) line
+    is left untouched and replayed normally — we don't need to (and
+    can't) reconstruct group-commit batch boundaries at recovery time,
+    only the true tail matters.
+
+    Returns the number of bytes truncated (0 if the file was already
+    clean).
     """
-    await _ensure_initialized()
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return 0
+    if not data:
+        return 0
 
-    files = await asyncio.to_thread(_list_queue_files_sync)
-    drained = 0
-    skipped = 0
+    lines = data.split(b"\n")
+    if data.endswith(b"\n"):
+        lines = lines[:-1]  # trailing split artifact from the final \n
+
+    # Walk back from the end, dropping any line that isn't valid JSON —
+    # in practice this is at most the single last line (a mid-batch
+    # crash can only corrupt the tail; everything before a completed
+    # group-commit was already fsynced by an EARLIER commit).
+    keep = len(lines)
+    while keep > 0:
+        try:
+            json.loads(lines[keep - 1])
+        except (json.JSONDecodeError, ValueError):
+            keep -= 1
+            continue
+        break
+
+    if keep == len(lines):
+        return 0  # already clean
+
+    truncated = b"\n".join(lines[:keep])
+    if truncated:
+        truncated += b"\n"
+    dropped = len(data) - len(truncated)
+
+    with open(path, "r+b") as f:
+        f.truncate(len(truncated))
+        f.seek(0)
+        if truncated:
+            f.write(truncated)
+        f.flush()
+        os.fsync(f.fileno())
+
+    logger.warning(
+        "B2: truncated a torn tail on recovered segment %s — dropped %d "
+        "byte(s) from an unacknowledged (never-fsynced) write; loss-free "
+        "by construction (the click(s) it represented never received a "
+        "response).",
+        path.name, dropped,
+    )
+    capture_op_msg(
+        OP_SEGMENT_TORN_TAIL,
+        f"Truncated torn tail on {path.name}: {dropped} byte(s) dropped "
+        "(unacknowledged write, loss-free)",
+        level="warning",
+        segment=path.name,
+        dropped_bytes=dropped,
+    )
+    return dropped
+
+
+# ---------------------------------------------------------------------------
+# Replay (drain) — own segments + legacy *.json (D1)
+# ---------------------------------------------------------------------------
+
+
+def _offset_path_for(segment_path: Path) -> Path:
+    return segment_path.with_name(segment_path.name + ".offset")
+
+
+def _read_offset_sync(segment_path: Path) -> int:
+    p = _offset_path_for(segment_path)
+    try:
+        return int(p.read_text().strip())
+    except (FileNotFoundError, ValueError, OSError):
+        return 0
+
+
+def _write_offset_sync(segment_path: Path, offset: int) -> None:
+    p = _offset_path_for(segment_path)
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, str(offset).encode())
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.rename(tmp, p)
+
+
+def _delete_segment_and_sidecar_sync(segment_path: Path) -> None:
+    for p in (segment_path, _offset_path_for(segment_path)):
+        try:
+            p.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _read_complete_lines_sync(path: Path) -> list[bytes]:
+    try:
+        data = path.read_bytes()
+    except FileNotFoundError:
+        return []
+    if not data:
+        return []
+    lines = data.split(b"\n")
+    if lines and lines[-1] == b"":
+        lines = lines[:-1]
+    return lines
+
+
+async def _replay_segment(redis, path: Path) -> dict:
+    """Replay one finalized segment. Per-LINE offset persistence (B3)
+    bounds a crash mid-replay to at most one re-replayed line — the
+    SETNX click-id dedup below (H1, unchanged from pre-P2) is the
+    backstop for that bounded duplicate, on top of the collector's own
+    central dedup."""
+    lines = await asyncio.to_thread(_read_complete_lines_sync, path)
+    start_offset = await asyncio.to_thread(_read_offset_sync, path)
+    drained = skipped = 0
+    failed = 0
+    i = start_offset
+    n = len(lines)
+    while i < n:
+        line = lines[i]
+        try:
+            parsed = json.loads(line)
+        except (json.JSONDecodeError, ValueError) as exc:
+            logger.warning(
+                "Segment %s line %d unparseable, skipping: %s",
+                path.name, i, exc,
+            )
+            sentry_sdk.capture_exception(exc)
+            await asyncio.to_thread(_write_offset_sync, path, i + 1)
+            skipped += 1
+            i += 1
+            continue
+
+        click_id_for_dedup: str | None = None
+        if isinstance(parsed, dict):
+            cid = parsed.get("click_id")
+            if isinstance(cid, str) and cid:
+                click_id_for_dedup = cid
+
+        if click_id_for_dedup is not None and settings.click_dedup_ttl_seconds > 0:
+            try:
+                acquired = await redis.set(
+                    f"click:seen:{click_id_for_dedup}",
+                    "1",
+                    nx=True,
+                    ex=settings.click_dedup_ttl_seconds,
+                )
+                if not acquired:
+                    logger.info(
+                        "Segment replay: duplicate click_id %s (already "
+                        "in stream) — skipping line %d of %s",
+                        click_id_for_dedup, i, path.name,
+                    )
+                    await asyncio.to_thread(_write_offset_sync, path, i + 1)
+                    skipped += 1
+                    i += 1
+                    continue
+            except Exception as exc:  # noqa: BLE001 — Redis impaired, fail-open to legacy
+                logger.warning(
+                    "Segment replay: SETNX failed for %s: %s — "
+                    "proceeding without dedup",
+                    click_id_for_dedup, exc,
+                )
+
+        try:
+            await redis.xadd(
+                "stream:clicks",
+                {"data": line.decode("utf-8")},
+            )
+        except Exception as exc:  # noqa: BLE001 — broad on purpose
+            logger.warning(
+                "Segment replay stopped at %s line %d — Redis still "
+                "impaired: %s",
+                path.name, i, exc,
+            )
+            failed = 1
+            break
+
+        await asyncio.to_thread(_write_offset_sync, path, i + 1)
+        drained += 1
+        i += 1
+    else:
+        # Loop completed without break — every line from start_offset
+        # onward is now drained or skipped. Safe to delete the whole
+        # segment (atomic per-segment, per the design brief).
+        await asyncio.to_thread(_delete_segment_and_sidecar_sync, path)
+
+    remaining = max(0, n - start_offset - drained - skipped)
+    return {"drained": drained, "skipped": skipped, "failed": failed, "remaining": remaining}
+
+
+async def _drain_legacy_json_files(redis) -> dict:
+    """D1 — pre-P2 per-click `*.json` files (from the OLD design) are
+    drained by the SAME cycle so an upgrade never strands them. Shared
+    (race-tolerant) across all workers — unlike segments, legacy files
+    are not per-worker-owned, but the read-then-XADD-then-unlink
+    sequence already tolerates a race (another worker/cleanup grabbing
+    the file first surfaces as FileNotFoundError, handled below exactly
+    like the pre-P2 code did). This path self-obsoletes: once a node's
+    legacy backlog empties, the glob below finds nothing every cycle."""
+    root = _queue_root()
+    if not root.exists():
+        return {"drained": 0, "skipped": 0, "failed": 0, "remaining": 0}
+
+    files = await asyncio.to_thread(lambda: sorted(root.rglob("*.json")))
+    drained = skipped = 0
     failed = 0
 
     for path in files:
         try:
             data = await asyncio.to_thread(path.read_bytes)
         except FileNotFoundError:
-            # Race — another drainer or manual cleanup grabbed it.
             skipped += 1
             continue
         except OSError as exc:
-            logger.warning("Failed to read queued click %s: %s", path.name, exc)
+            logger.warning("Legacy drain: failed to read %s: %s", path.name, exc)
             sentry_sdk.capture_exception(exc)
             skipped += 1
             continue
 
-        # H1 fix (2026-05-11): apply the same idempotency gate on the
-        # replay path. Without this, a Redis outage followed by recovery
-        # would produce a stream entry for every queued file — but if
-        # the original /decide also succeeded on a different node (the
-        # race that motivated H1 in the first place), the replay
-        # introduces a duplicate. The TTL is the same operator-tuned
-        # `click_dedup_ttl_seconds`. Failure to extract click_id from
-        # the payload (corrupt file) is unlikely (we wrote it ourselves
-        # atomically) but we fail-open in that case — better to replay
-        # a possibly-duplicate than lose a click in a Redis-outage tail.
         click_id_for_dedup: str | None = None
         if settings.click_dedup_ttl_seconds > 0:
             try:
@@ -406,8 +715,8 @@ async def drain_to_redis(redis) -> dict:
                     click_id_for_dedup = cid
             except (json.JSONDecodeError, AttributeError) as exc:
                 logger.warning(
-                    "Drain: failed to parse click_id from %s for dedup: %s — "
-                    "proceeding without dedup",
+                    "Legacy drain: failed to parse click_id from %s: %s "
+                    "— proceeding without dedup",
                     path.name, exc,
                 )
         if click_id_for_dedup is not None:
@@ -419,25 +728,8 @@ async def drain_to_redis(redis) -> dict:
                     ex=settings.click_dedup_ttl_seconds,
                 )
                 if not acquired:
-                    # Duplicate — original /decide already wrote to
-                    # stream. Unlink the queued file and skip XADD;
-                    # counter still decrements (file is gone, no
-                    # accounting drift).
-                    #
-                    # VF1 fix (2026-05-11 code-review cycle):
-                    # increment `skipped`, NOT `drained`. The
-                    # docstring of `drain_to_redis` says drained =
-                    # "files successfully replayed + deleted" — but
-                    # a duplicate is NOT replayed (we INTENTIONALLY
-                    # skip the XADD). Bucketing it under `drained`
-                    # inflated the success-rate metric and made the
-                    # `skipped` counter misrepresent reality during
-                    # any post-Redis-outage replay where the
-                    # original /decide had also succeeded on a
-                    # sibling node.
                     logger.info(
-                        "Drain: duplicate click_id %s (already in stream) — "
-                        "dropping queued file %s",
+                        "Legacy drain: duplicate click_id %s — dropping %s",
                         click_id_for_dedup, path.name,
                     )
                     try:
@@ -446,71 +738,39 @@ async def drain_to_redis(redis) -> dict:
                         pass
                     except OSError as exc:
                         logger.warning(
-                            "Drain: unlink failed after duplicate-skip on %s: %s",
-                            path.name, exc,
+                            "Legacy drain: unlink failed after "
+                            "duplicate-skip on %s: %s", path.name, exc,
                         )
-                    _decrement_size()
                     skipped += 1
                     continue
             except Exception as exc:  # noqa: BLE001 — Redis impaired
-                # Dedup failed → fail-open to legacy behaviour. The XADD
-                # below may still raise (Redis impaired); the existing
-                # error handling at line ~324 stops the drain loop.
                 logger.warning(
-                    "Drain: SETNX failed for %s: %s — proceeding without dedup",
-                    click_id_for_dedup, exc,
+                    "Legacy drain: SETNX failed for %s: %s — proceeding "
+                    "without dedup", click_id_for_dedup, exc,
                 )
 
         try:
-            # M1 (LOSSFIX P1b, 2026-07-07) — no `maxlen` here, and NO new
-            # gate: the existing stop-on-first-failure below is this
-            # phase's self-limit for the drain path (watermark-gated
-            # drain pacing is P2 / L4 — do not half-build it here).
-            await redis.xadd(
-                "stream:clicks",
-                {"data": data.decode("utf-8")},
-            )
-        except Exception as exc:  # noqa: BLE001 — broad on purpose
-            # XADD raised → Redis still impaired. Stop the drain
-            # loop. Don't unlink the file — next iteration retries.
+            await redis.xadd("stream:clicks", {"data": data.decode("utf-8")})
+        except Exception as exc:  # noqa: BLE001
             logger.warning(
-                "Drain stopped at %s — Redis still impaired: %s",
+                "Legacy drain stopped at %s — Redis still impaired: %s",
                 path.name, exc,
             )
             failed = 1
             break
 
-        # XADD succeeded — file is safe to remove. The unlink
-        # outcome determines counter accounting:
-        #   FileNotFoundError → another drainer/cleanup got there
-        #     first; treat as drained (data in Redis, file gone).
-        #   OSError (e.g. permission denied, ENOSPC during journal
-        #     update on full disk) → the file STAYS on disk; counter
-        #     MUST NOT decrement, otherwise it underestimates real
-        #     queue depth and the cap check lets through more
-        #     enqueues than the disk holds. Skip increment of
-        #     `drained` too — the next drain cycle re-attempts
-        #     XADD (idempotent if click_id-deduped downstream) and
-        #     unlink. Closes Agent 1 HIGH-2 audit finding
-        #     (code review 2026-05-09).
         try:
             await asyncio.to_thread(path.unlink)
         except FileNotFoundError:
-            _decrement_size()
             drained += 1
         except OSError as exc:
             logger.warning(
-                "XADD-OK but unlink failed for %s: %s — file kept "
-                "on disk, will be retried by next drainer iteration",
-                path.name, exc,
+                "Legacy drain: XADD-OK but unlink failed for %s: %s — "
+                "file kept, retried next cycle", path.name, exc,
             )
             sentry_sdk.capture_exception(exc)
-            # Counter NOT decremented; `drained` NOT incremented.
-            # Move on to the next file — don't break the loop, this
-            # is a per-file unlink issue, not a Redis impairment.
             continue
         else:
-            _decrement_size()
             drained += 1
 
     return {
@@ -519,6 +779,46 @@ async def drain_to_redis(redis) -> dict:
         "failed": failed,
         "remaining": max(0, len(files) - drained - skipped),
     }
+
+
+async def drain_to_redis(redis) -> dict:
+    """Replay this worker's own finalized segments + legacy `*.json`
+    files, back into `stream:clicks`. Stops at the FIRST Redis failure
+    (self-limit — no point pounding an impaired Redis); remaining
+    segments/files stay on disk for the next drainer iteration.
+
+    Returns the SAME stats shape as pre-P2: drained/skipped/failed/
+    remaining, summed across every source drained this cycle.
+    """
+    total = {"drained": 0, "skipped": 0, "failed": 0, "remaining": 0}
+
+    legacy_stats = await _drain_legacy_json_files(redis)
+    for k in total:
+        total[k] += legacy_stats[k]
+    if legacy_stats["failed"]:
+        return total
+
+    root = _queue_root()
+    if not root.exists():
+        return total
+
+    my_prefix = _worker_prefix()
+    # Only THIS worker's own finalized segments match `{my_prefix}-
+    # *.ndjson` — the naming scheme is the per-worker isolation, no
+    # separate ownership bookkeeping needed. `.wip` segments never
+    # match (different suffix) — the active segment is invisible here
+    # by construction, no writer/drainer coordination needed.
+    segment_paths = sorted(root.glob(f"{my_prefix}-*.ndjson"))
+
+    for path in segment_paths:
+        if total["failed"]:
+            break
+        stats = await _replay_segment(redis, path)
+        for k in ("drained", "skipped", "failed"):
+            total[k] += stats[k]
+        total["remaining"] += stats["remaining"]
+
+    return total
 
 
 async def run_drainer(redis, interval: int | None = None) -> None:
@@ -560,7 +860,12 @@ def _reset_state_for_tests() -> None:
     NOT for production use. Production lifecycle is single-init,
     no reset.
     """
-    global _queue_size, _queue_size_initialized, _init_lock
-    _queue_size = 0
-    _queue_size_initialized = False
-    _init_lock = None
+    global _writer, _cached_queue_stats, _boot_epoch
+    if _writer is not None:
+        try:
+            _writer.force_finalize_for_tests()
+        except Exception:  # noqa: BLE001 — best-effort cleanup between tests
+            pass
+    _writer = None
+    _cached_queue_stats = None
+    _boot_epoch = None

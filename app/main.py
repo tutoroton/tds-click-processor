@@ -52,6 +52,7 @@ from app.ua_parser import warmup as warmup_ua_parser
 from app.shipper import assert_shipper_ready, run_shipper
 from app.shipper_metrics import metrics as shipper_metrics
 from app.telemetry import (
+    OP_CLICK_UNCAPTURED,
     OP_DISK_PRESSURE,
     OP_IDENTITY_STORE_PRESSURE,
     OP_ROUTE_ERROR,
@@ -1080,6 +1081,7 @@ async def decide(
                 "to close the TD-13 forge vector + let fresh nodes pass smoke",
                 smoke_fp, settings.node_id,
             )
+
         try:
             r = await get_redis()
             smoke_record = {
@@ -1569,16 +1571,44 @@ async def decide(
                 "Click %s queued to disk after Redis failure",
                 req.click_id,
             )
+        else:
+            # L1 FIX (LOSSFIX P1b, 2026-07-07) — pre-fix this fell
+            # through to the unconditional 302 below regardless of
+            # `enqueued`, per the old comment "the click is genuinely
+            # lost in that path" — with NO HTTP signal to the Worker.
+            # STOP: 503, mirroring the disk-pressure block above. The
+            # Worker's AbortSignal fallback (or sibling-race recovery
+            # from another racing node) takes over instead of silently
+            # telling the user "success" for a click that landed
+            # nowhere durable.
+            logger.critical(
+                "Click %s could not be captured by ANY durable path "
+                "(stream XADD failed: %s; disk fallback rejected/failed "
+                "too) — refusing 302, returning 503.",
+                req.click_id, e,
+            )
+            capture_op_msg(
+                OP_CLICK_UNCAPTURED,
+                f"Click {req.click_id} uncaptured: stream write failed "
+                f"({str(e)[:200]}) AND the disk fallback also failed — "
+                "503 to Worker instead of a silent 302.",
+                level="error",
+                click_id=req.click_id,
+                stream_failure_reason=str(e)[:200],
+            )
+            emit_checkpoint("click.uncaptured_503", {
+                "click_id": req.click_id,
+                "stream_failure_reason": str(e)[:200],
+            })
+            raise HTTPException(
+                status_code=503,
+                detail="click_uncaptured",
+            )
         emit_checkpoint("click.disk_queue_fallback", {
             "click_id": req.click_id,
             "enqueued": enqueued,
             "error": str(e)[:200],
         })
-        # If `enqueued is False`, enqueue_click_to_disk has
-        # already logged + Sentry-captured the cap rejection or
-        # write failure. The click is genuinely lost in that
-        # path — operator's signal to scale Redis or raise the
-        # cap.
     timing["stream_write_ms"] = round((time.perf_counter() - t_stream) * 1000, 2)
     timing["endpoint_total_ms"] = round((time.perf_counter() - t_endpoint_start) * 1000, 2)
 

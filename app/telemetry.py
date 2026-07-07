@@ -63,6 +63,13 @@ OP_LOOP_ITERATION = "loop_iteration"
 # Hot-path /decide failure modes (Sprint 1.5+)
 OP_DISK_PRESSURE = "disk_pressure"
 
+# LOSSFIX P1b (2026-07-07) — L1: the stream write AND the disk fallback
+# BOTH failed to durably capture the click. Pre-fix this fell through
+# to a silent 302 (click "genuinely lost" per the old comment); now it
+# 503s the Worker instead — this tag marks that terminal,
+# non-recoverable-here moment.
+OP_CLICK_UNCAPTURED = "click_uncaptured"
+
 # Returning-user identity resolver fail-open (P2, 2026-06-05). Emitted (throttled
 # per company) when the resolver raises and the click degrades to legacy flags.
 OP_IDENTITY = "identity_resolve"

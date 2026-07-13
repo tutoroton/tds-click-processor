@@ -259,6 +259,26 @@ async def resolve_flow(
     # per click into thousands. Truncate deterministically (first-
     # seen order — campaign-bound flows always come first) so the
     # behaviour is stable, and emit Sentry so ops see the misconfig.
+    #
+    # KNOWN LIMITATION (GTD-R129 / ADR-0102, 2026-07-14): truncation is by
+    # Redis LIST insertion order, not `seq_id`. Because `campaign:{id}:flows`
+    # is fetched (and concatenated) whole, before any org-scope list, a
+    # single campaign with >200 bound flows can consume the entire cap and
+    # silently drop EVERY global candidate at every scope level for that
+    # click — not just risk one within-list tie-flip. Confirmed low current
+    # risk (staging: max 6 flows on any one campaign, 33x margin below the
+    # cap; 0 global flows exist yet) but reachable via ordinary flow-count
+    # growth, not an adversarial input. The correct fix is per-source-list
+    # caps (each org-scope list is already scope-homogeneous, so bounding it
+    # independently prevents one campaign's growth from crowding out a
+    # different scope level) and/or migrating these Redis LISTs to ZSETs
+    # scored by `seq_id` — both DEFERRED pending their own design/benchmark
+    # + critic pass. Do NOT "fix" this by sorting `candidate_ids` by
+    # `seq_id` before truncating — proven wrong (FINDINGS-G3-CRITIC.md): a
+    # global `seq_id` ascending sort always favors old flows over new ones,
+    # so a fresh admin-created override (necessarily the highest `seq_id`)
+    # is the ONE candidate guaranteed to be dropped — the opposite of what
+    # this cap is supposed to protect.
     if len(deduped) > _MAX_FLOWS_PER_CLICK:
         logger.warning(
             "cascade: candidate count %d > cap %d for campaign %s — truncating",
@@ -272,6 +292,8 @@ async def resolve_flow(
             )
         except ImportError:  # pragma: no cover — sentry installed in prod
             pass
+        if trace is not None:
+            trace["candidates_truncated"] = True
         deduped = deduped[:_MAX_FLOWS_PER_CLICK]
 
     flows = await _load_flow_records(r, deduped)

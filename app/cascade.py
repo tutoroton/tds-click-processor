@@ -829,10 +829,10 @@ def _filter_by_criteria(
 ) -> list[dict[str, Any]]:
     """Per `SCOPE-CASCADE.md` step 2 — criteria match.
 
-    Each flow carries `criteria` JSON (resolved from inline filters or
-    linked traffic_target at sync time). Empty list = match-all.
-    Malformed JSON = skip (don't treat as match-all — same defensive
-    rule as `resolve_target` in `router.py`).
+    Each flow carries `criteria` JSON (resolved from inline filters at
+    sync time). Empty list = match-all. Malformed JSON = skip (don't
+    treat as match-all — same defensive rule as `resolve_target` in
+    `router.py`).
 
     v2 LD-F2: when `rejected_sink` is provided, every flow dropped by the
     criteria filter is appended as `{flow_id, failed}` (the one failing

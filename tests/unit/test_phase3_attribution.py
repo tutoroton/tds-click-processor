@@ -60,7 +60,7 @@ class TestPhase3AttributionFields:
                 "buyer_id": 7, "team_id": 3, "department_id": 2,
                 "custom_group_id": 9, "company_id": 42,
                 "source_id": 5, "flow_id": 11, "flow_version_id": 33,
-                "offer_target_id": 4, "traffic_target_id": 8,
+                "offer_target_id": 4,
                 "slots": {
                     "source": "fb", "ad_id": "a1", "app_id": "com.x",
                     "sub9": "x9", "sub20": "x20", "buyer_id": "7",
@@ -82,7 +82,6 @@ class TestPhase3AttributionFields:
         assert f["flow_id"] == 11
         assert f["flow_version_id"] == 33    # S1 — flow's current version
         assert f["offer_target_id"] == 4
-        assert f["traffic_target_id"] == 8
         assert f["routing_result"] == "matched"
 
     def test_company_id_is_campaign_anchor_never_buyer(self):

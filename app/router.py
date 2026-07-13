@@ -1406,13 +1406,12 @@ async def _try_flow_cascade(
         return None
 
     # Phase 3/4 — record routing-decision attribution from the winning
-    # flow. `traffic_target_id` + `current_version_id` are carried on the
-    # flow HASH (sync builder flows.py). Stage 3 / Phase 4 (S1): the flow's
-    # CURRENT version is now joined by the builder and stamped here into
+    # flow. `current_version_id` is carried on the flow HASH (sync
+    # builder flows.py). Stage 3 / Phase 4 (S1): the flow's CURRENT
+    # version is now joined by the builder and stamped here into
     # `flow_version_id` — the CH split-attribution column (previously
     # DEFERRED for lack of a current-version pointer). "0" sentinel → 0.
     attribution["flow_id"] = _to_int(flow.get("_id"))
-    attribution["traffic_target_id"] = _to_int(flow.get("traffic_target_id"))
     attribution["flow_version_id"] = _to_int(flow.get("current_version_id"))
     # v2 Phase A2 — base provenance from the winning flow.
     attribution["action_type"] = flow.get("action_type") or ""

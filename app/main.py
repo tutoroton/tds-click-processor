@@ -932,7 +932,6 @@ def _phase3_attribution_fields(
         # resolved by the router from the flow HASH (no longer DEFERRED).
         "flow_version_id": attr.get("flow_version_id"),
         "offer_target_id": attr.get("offer_target_id"),
-        "traffic_target_id": attr.get("traffic_target_id"),
         # routing_result is already on `timing`; promote to a column so
         # it is queryable without unpacking the timing JSON.
         "routing_result": timing.get("result", ""),

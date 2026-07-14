@@ -910,6 +910,18 @@ def _first_failing_criterion(
                 normalize_hour(v) if isinstance(v, str) else v for v in values
             )
 
+        # G1 (GTD-R135, 2026-07-14) — language: `parse_accept_language` correctly
+        # emits the FULL BCP47 tag including region ("en-US"), but the picker
+        # only ever offers bare codes ("en") — a saved bare criterion never
+        # matched a region-tagged click. Normalize BOTH sides to the bare
+        # primary tag so "en" matches "en-US". Scoped to language ONLY → every
+        # other dim byte-identical. Kept in lockstep with `router.resolve_target`.
+        if dim == "language":
+            click_val = normalize_language(click_val)
+            values = frozenset(
+                normalize_language(v) if isinstance(v, str) else v for v in values
+            )
+
         if op == "in":
             if click_val not in values:
                 return c
@@ -1051,6 +1063,19 @@ def normalize_hour(value: str) -> str:
     `_first_failing_criterion` + router `resolve_target`) so they stay in
     lockstep — router already imports cascade, so no circular import."""
     return str(int(value)) if value.isdigit() else value
+
+
+def normalize_language(value: str) -> str:
+    """G1 (GTD-R135, 2026-07-14) — canonicalize a `language` value to its bare
+    BCP47 PRIMARY tag, stripping any region suffix: "en-US"→"en", "en"→"en"
+    (idempotent). `parse_accept_language` (router.py) correctly parses the
+    FULL tag including region for other future consumers — the bug was
+    comparing the two byte-for-byte while the picker only ever offers bare
+    codes (F.18c). Empty ("" — unparseable/absent Accept-Language) passes
+    THROUGH unchanged, preserving the absent-value fail-closed on `in`.
+    Shared by BOTH matchers (cascade `_first_failing_criterion` + router
+    `resolve_target_with_id`) so they stay in lockstep."""
+    return value.split("-", 1)[0] if "-" in value else value
 
 
 def _criteria_match(

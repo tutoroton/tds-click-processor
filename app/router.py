@@ -2094,6 +2094,17 @@ async def resolve_target_with_id(
                     for v in values
                 ]
 
+            # G1 (GTD-R135) — kept in lockstep with
+            # `cascade._first_failing_criterion`: normalize language to its
+            # bare BCP47 primary tag on BOTH sides so a saved "en" matches a
+            # region-tagged "en-US" click. Scoped to language ONLY.
+            if dim == "language":
+                click_val = cascade.normalize_language(click_val)
+                values = [
+                    cascade.normalize_language(v) if isinstance(v, str) else v
+                    for v in values
+                ]
+
             if op == "in" and click_val not in values:
                 match = False
                 break

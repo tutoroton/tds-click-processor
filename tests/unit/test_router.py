@@ -14,6 +14,7 @@ from app.router import (
     parse_device_type,
     parse_os,
     parse_browser,
+    parse_accept_language,
     build_url,
     coerce_cost,
     resolve_target,
@@ -656,5 +657,48 @@ class TestResolveTargetLegacy:
             legacy_match = (await resolve_target(r, offer, req)) == "https://hit"
             assert cascade_match == legacy_match == expect_match, (
                 f"matcher disagreement at {arrival_ts} {op} {values}: "
+                f"cascade={cascade_match} legacy={legacy_match}"
+            )
+
+    @pytest.mark.asyncio
+    async def test_g1_language_matcher_parity_cascade_vs_legacy(self):
+        """G1 (GTD-R135, 2026-07-14) cross-matcher parity — the exact repro
+        from the discovery: a criterion saved `language in ["en"]` MUST match
+        a click with `Accept-Language: en-US,en;q=0.9` (a real Chrome/en-US
+        browser header). Pre-fix this never matched (byte-for-byte "en" !=
+        "en-US") on EITHER matcher — this test is RED on unpatched code and
+        GREEN after `cascade.normalize_language` is wired into both
+        `_first_failing_criterion` and this legacy `resolve_target` loop."""
+        # (accept_language, op, values, expect_match)
+        matrix = [
+            ("en-US,en;q=0.9", "in", ["en"], True),        # THE FIX — was False
+            ("en-US,en;q=0.9", "not_in", ["en"], False),   # excluded (was a no-op)
+            ("ru-RU,en;q=0.9,uk;q=0.7", "in", ["en"], False),  # primary is ru, genuine no-match
+            ("pt-BR", "in", ["pt"], True),                 # a 2nd region-tagged primary
+            ("uk", "in", ["uk"], True),                    # bare code unaffected (regression)
+        ]
+        for accept_language, op, values, expect_match in matrix:
+            req = ClickRequest(
+                click_id="g1-parity", country="US",
+                user_agent="Mozilla/5.0 (iPhone)", accept_language=accept_language,
+                query_params={},
+            )
+            crit = {"type": "language", "op": op, "values": values}
+            # Cascade matcher verdict (None == match), fed the SAME derived dims.
+            cascade_match = _first_failing_criterion(
+                [crit],
+                _extra_click_dims(req) | {"language": parse_accept_language(accept_language)},
+            ) is None
+            # Legacy resolve_target verdict (matching url returned == match).
+            offer = {"_id": "5", "has_targets": "1"}
+            r = _ot_redis(
+                {"offer:5:targets": {"7"}},
+                {"offer_target:7": {
+                    "url": "https://hit", "priority": "10", "is_default": "0",
+                    "criteria": json.dumps([crit])}},
+            )
+            legacy_match = (await resolve_target(r, offer, req)) == "https://hit"
+            assert cascade_match == legacy_match == expect_match, (
+                f"matcher disagreement at {accept_language!r} {op} {values}: "
                 f"cascade={cascade_match} legacy={legacy_match}"
             )

@@ -12,14 +12,25 @@ time_of_day / day_of_week — "dead criteria"):
      (the CF-3 fail-OPEN direction).
   3. POPULATION — the 3 newly-wired dims are derived correctly from data already
      on the click (req.asn / req.arrival_ts, UTC) and evaluate end-to-end.
+
+GTD-R135 Phase 0 (2026-07-14) adds the filter-system-extension build's 3 pinned
+invariants (Unknown 7) BEFORE any new dim lands:
+
+  A. dashboard picker parity — see `services/dashboard/src/lib/
+     criteria-dictionaries.test.ts` (separate service, separate test file).
+  B. per-field {dropdown values} == {normalizer codomain} — device_type here.
+  C. both matchers' dim-sets in lockstep (legacy frozen at base-10; cascade a
+     superset, never narrower).
 """
 
 from __future__ import annotations
 
 from app.cascade import (
+    KNOWN_EVALUATED_DIMS,
     _EVALUATED_BASE_DIMS,
     _first_failing_criterion,
     normalize_hour,
+    normalize_language,
 )
 from app.models import ClickRequest
 from app.router import _extra_click_dims
@@ -243,3 +254,148 @@ def test_normalize_hour_unit():
     assert normalize_hour("13") == "13"
     assert normalize_hour("") == ""        # absent arrival → stays "" (fail-closed)
     assert normalize_hour("9am") == "9am"  # junk passes through (never a real hour)
+
+
+# ---- G1 (GTD-R135, 2026-07-14): language region-stripping normalization ----
+# The edge (`parse_accept_language`) correctly parses the FULL BCP47 primary
+# tag INCLUDING region ("en-US"); the picker only ever offers bare codes
+# ("en"). Pre-fix a saved "en" criterion never matched a region-tagged click
+# (byte-for-byte `in`/`not_in` comparison) — a live, unguarded bug affecting
+# the majority of real en/pt/zh/es/ar clicks (they carry a region tag).
+# `normalize_language` canonicalizes BOTH sides at compare time, language
+# ONLY. Kept in lockstep with `router.resolve_target_with_id` (test_router.py
+# `test_g1_language_matcher_parity_cascade_vs_legacy`).
+
+def test_language_region_tagged_criterion_matches_bare_click():
+    """THE FIX — a saved "en" matches a region-tagged "en-US" click. Was: no
+    match (this assertion is RED on unpatched code, GREEN after the fix)."""
+    attrs = {"language": "en-US"}
+    assert _first_failing_criterion(
+        [{"type": "language", "op": "in", "values": ["en"]}], attrs) is None
+
+
+def test_language_not_in_excludes_region_tagged_click():
+    """`not_in ["en"]` now correctly EXCLUDES an "en-US" click (was a silent
+    fail-open no-op — the exclusion never matched any saved bare code)."""
+    attrs = {"language": "en-US"}
+    assert _first_failing_criterion(
+        [{"type": "language", "op": "not_in", "values": ["en"]}], attrs) is not None
+
+
+def test_language_genuine_mismatch_still_fails_closed():
+    """Regression — a genuinely different primary language still fails to
+    match after normalization (proves this isn't an accidental match-all)."""
+    attrs = {"language": "ru-RU"}
+    assert _first_failing_criterion(
+        [{"type": "language", "op": "in", "values": ["en"]}], attrs) is not None
+
+
+def test_language_bare_code_unaffected():
+    """Regression — a bare-code click against a bare-code criterion still
+    matches exactly as before (byte-identical for the already-working case)."""
+    attrs = {"language": "uk"}
+    assert _first_failing_criterion(
+        [{"type": "language", "op": "in", "values": ["uk"]}], attrs) is None
+
+
+def test_language_absent_click_fails_closed_preserved():
+    """Absent/unparseable Accept-Language ⇒ click_val "" passes through
+    normalize unchanged → fail-closed on `in`, fail-open on `not_in`
+    (documented legacy semantics, unchanged by G1)."""
+    attrs = {"language": ""}
+    assert _first_failing_criterion(
+        [{"type": "language", "op": "in", "values": ["en"]}], attrs) is not None
+    assert _first_failing_criterion(
+        [{"type": "language", "op": "not_in", "values": ["en"]}], attrs) is None
+
+
+def test_normalize_language_scope_guard_other_case_preserve_dims_untouched():
+    """SCOPE GUARD — a hyphenated value in a NON-language _CASE_PRESERVE dim
+    (region) is NOT normalized: proves the special-case is keyed
+    `dim == "language"` only."""
+    attrs = {"region": "en-US"}
+    assert _first_failing_criterion(
+        [{"type": "region", "op": "in", "values": ["en"]}], attrs) is not None
+
+
+def test_normalize_language_unit():
+    """The shared helper: strips a trailing "-XX" region suffix; a bare code
+    and "" pass through unchanged (idempotent)."""
+    assert normalize_language("en-US") == "en"
+    assert normalize_language("pt-BR") == "pt"
+    assert normalize_language("en") == "en"        # already bare — idempotent
+    assert normalize_language("") == ""             # absent → stays "" (fail-closed)
+    assert normalize_language("uk") == "uk"
+
+
+# ---- GTD-R135 Phase 0/2 — Invariant B: device_type codomain ----------------
+# "per-field {dropdown values} == {normalizer codomain}" (Unknown 7). This is
+# the exact check that would have caught the 3-dead-values bug (tv/console/
+# other) on day one. Verified by direct read of `ua_parser.py:52-61`: every
+# branch of the collapse `if/elif/else` resolves to one of exactly THREE
+# strings — there is no code path that returns "tv"/"console"/"other" from
+# `parse_ua()["device_type"]` (that raw library value is captured separately
+# as `device_type_raw`, never surfaced to the matcher). Both matchers read
+# `parse_device_type()` → `parse_ua()["device_type"]`, so this codomain is
+# shared by cascade AND the legacy matcher.
+_UA_PARSER_DEVICE_TYPE_CODOMAIN = frozenset({"mobile", "tablet", "desktop"})
+
+# Mirror of admin-api `app/common/parameters.py`
+# `CRITERION_VALUE_VALIDATORS["device_type"]["enum"]`. The click-processor
+# cannot import the admin-api module (separate service) — this literal is the
+# cross-service contract anchor, kept in lockstep with the admin registry.
+#
+# Phase 2 (G2, 2026-07-14) shrunk the admin enum + dashboard
+# `DEVICE_TYPE_VALUES` to match this codomain EXACTLY (tv/console/other
+# deleted — structurally unreachable). Assertion below flips from subset
+# (`<=`, Phase 0's honest-baseline check) to equality (`==`) — this flip
+# IS Phase 2's done-criterion.
+_ADMIN_DEVICE_TYPE_ENUM = frozenset({"mobile", "desktop", "tablet"})
+
+
+def test_device_type_codomain_equals_admin_enum():
+    """Invariant B — every value the click-processor can ever emit for
+    device_type is a legal admin-enum value, AND the admin enum carries
+    nothing dead: {dropdown values} == {normalizer codomain} EXACTLY (G2).
+    A future accidental re-widening of the admin enum (or a narrowing of
+    the codomain) fails this immediately instead of shipping an
+    unreachable dropdown option."""
+    assert _UA_PARSER_DEVICE_TYPE_CODOMAIN == _ADMIN_DEVICE_TYPE_ENUM
+
+
+# ---- GTD-R135 Phase 0 — Invariant C: both matchers' dim-sets in lockstep ---
+# Per Unknown 1's resolution (cascade-only via schema-type-gating): the
+# legacy offer-target matcher's inline `click_attrs` dict (`router.py`
+# `resolve_target_with_id`, ~line 2021-2033) must stay FROZEN at exactly the
+# base 10 dims — new structural/identifier dims are gated to FLOW-only
+# criteria (`FLOW_CRITERION_TYPES`) at the admin-api schema layer, so an
+# offer_target criterion using one of them is rejected at write time and the
+# legacy matcher never needs to evaluate it. Cascade's evaluated-dims set
+# (`KNOWN_EVALUATED_DIMS`) is a SUPERSET — never narrower — because it also
+# carries the returning dims (and will carry structural/identifier dims from
+# Phase 3/4 onward). This test locks the architecture in as CI, not a
+# comment: a future accidental widening of the legacy matcher's dim set (or
+# accidental narrowing of cascade's) fails immediately instead of rotting
+# silently.
+
+
+def test_legacy_matcher_dims_frozen_at_base_10():
+    """The legacy matcher's inline click_attrs keys = EXACTLY the base 10
+    dims (7 static UA/geo keys + the 3 CF-3 extra dims). Built the same way
+    `resolve_target_with_id` builds it (static keys ∪ `_extra_click_dims`)
+    so a future edit to either side is caught here."""
+    static_keys = {"geo", "os", "device_type", "browser", "region", "city", "language"}
+    extra_keys = set(_extra_click_dims(_req(arrival_ts=None)))
+    legacy_dims = static_keys | extra_keys
+    assert legacy_dims == _EVALUATED_BASE_DIMS
+    assert len(legacy_dims) == 10
+
+
+def test_cascade_dims_are_superset_of_legacy_matcher_dims():
+    """Cascade's KNOWN_EVALUATED_DIMS must never be a narrower set than the
+    legacy matcher's — cascade may only ever GROW relative to it (structural/
+    identifier dims land here in later phases, never in the legacy matcher)."""
+    static_keys = {"geo", "os", "device_type", "browser", "region", "city", "language"}
+    extra_keys = set(_extra_click_dims(_req(arrival_ts=None)))
+    legacy_dims = static_keys | extra_keys
+    assert legacy_dims <= KNOWN_EVALUATED_DIMS

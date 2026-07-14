@@ -425,17 +425,26 @@ class TestCasePreserveDims:
         ) is True
 
     def test_language_bcp47_strict_casing(self):
-        # `en-US` matches; `en-us` would be a save-time validator
-        # rejection at admin-api so we don't test the lowercase path
-        # here (it can't be stored).
+        # G1 (GTD-R135): both sides now pass through `normalize_language`
+        # (strip region) before comparison, so a saved "uk-UA" still matches
+        # a "uk-UA" click via its bare "uk" form. `en-us` (lowercase region)
+        # would ALSO be a save-time validator rejection at admin-api post-G1
+        # (region-tagged values are tightened out entirely — see
+        # `test_parameters.py`), so we don't test that path here.
         assert _criteria_match(
             [{"type": "language", "op": "in", "values": ["en-US", "uk-UA"]}],
             {"language": "uk-UA"},
         ) is True
 
     def test_language_short_form_match(self):
-        # Operator may save just `"en"` — matcher should accept the
-        # exact string, not "en-US" / "en-GB" prefix-extend.
+        # G1 (GTD-R135, 2026-07-14) — owner decision: "ONE clean English,
+        # any English → en". A saved bare "en" now MATCHES a region-tagged
+        # "en-US" click (region stripped at compare time by
+        # `normalize_language`) — this is THE FIX, not a prefix-extend
+        # accident; it flips this assertion from the pre-G1 pinned
+        # non-match (see `test_criteria_contract.py`
+        # `test_language_region_tagged_criterion_matches_bare_click` for the
+        # dedicated red-then-green regression proof).
         assert _criteria_match(
             [{"type": "language", "op": "in", "values": ["en"]}],
             {"language": "en"},
@@ -443,7 +452,7 @@ class TestCasePreserveDims:
         assert _criteria_match(
             [{"type": "language", "op": "in", "values": ["en"]}],
             {"language": "en-US"},
-        ) is False
+        ) is True
 
     def test_city_lowercases_both_sides(self):
         # `city` is NOT in CASE_PRESERVE — operator-saved "London" is

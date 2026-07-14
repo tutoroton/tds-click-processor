@@ -376,6 +376,160 @@ class TestCriteriaMatch:
 
 
 # ============================================================
+# GTD-R135 Phase 6 — contains / empty / not_empty (identifier dims)
+# ============================================================
+
+
+class TestPhase6IdentifierOperators:
+    """`contains`/`empty`/`not_empty` dispatch — admin-api's R8 only ever
+    WRITES these on a `param:<slot>` identifier dim, but the matcher
+    itself doesn't re-check that (same trust boundary as every other op
+    here); these tests exercise the dispatch directly."""
+
+    def test_contains_matches_substring(self):
+        assert _criteria_match(
+            [{"type": "param:creative_id", "op": "contains", "values": ["promo"]}],
+            {"param:creative_id": "summer-promo-2026"},
+        ) is True
+
+    def test_contains_rejects_non_substring(self):
+        assert _criteria_match(
+            [{"type": "param:creative_id", "op": "contains", "values": ["promo"]}],
+            {"param:creative_id": "summer-sale-2026"},
+        ) is False
+
+    def test_contains_is_case_sensitive(self):
+        # Identifier dims are byte-exact/case-preserving (the sacred
+        # rule) — `contains` inherits that, no `.lower()` anywhere.
+        assert _criteria_match(
+            [{"type": "param:creative_id", "op": "contains", "values": ["Promo"]}],
+            {"param:creative_id": "summer-promo-2026"},
+        ) is False
+
+    def test_contains_ors_across_multiple_values(self):
+        # Mirrors `in`'s OR-membership semantics — matches if ANY listed
+        # substring is found.
+        assert _criteria_match(
+            [{
+                "type": "param:creative_id", "op": "contains",
+                "values": ["banner", "promo"],
+            }],
+            {"param:creative_id": "summer-promo-2026"},
+        ) is True
+
+    def test_empty_matches_absent_click_value(self):
+        # `resolve_slots` yields "" (never None) for an absent/unresolved
+        # identifier slot — this is the ONLY shape `empty` needs to match.
+        assert _criteria_match(
+            [{"type": "param:sub3", "op": "empty", "values": []}],
+            {"param:sub3": ""},
+        ) is True
+
+    def test_empty_rejects_populated_click_value(self):
+        assert _criteria_match(
+            [{"type": "param:sub3", "op": "empty", "values": []}],
+            {"param:sub3": "affiliate42"},
+        ) is False
+
+    def test_not_empty_matches_populated_click_value(self):
+        assert _criteria_match(
+            [{"type": "param:sub3", "op": "not_empty", "values": []}],
+            {"param:sub3": "affiliate42"},
+        ) is True
+
+    def test_not_empty_rejects_absent_click_value(self):
+        assert _criteria_match(
+            [{"type": "param:sub3", "op": "not_empty", "values": []}],
+            {"param:sub3": ""},
+        ) is False
+
+    def test_not_empty_rejects_missing_click_attrs_key_entirely(self):
+        # `click_attrs.get(dim, "")` — a key that's simply ABSENT (not
+        # just empty-string) must behave identically to an explicit "".
+        assert _criteria_match(
+            [{"type": "param:sub3", "op": "not_empty", "values": []}],
+            {},
+        ) is False
+
+    def test_full_pipeline_via_filter_by_criteria(self):
+        # End-to-end through `_filter_by_criteria` (the real call path),
+        # not just the bool wrapper.
+        flows = [_make_flow(fid="1", criteria=[
+            {"type": "param:creative_id", "op": "contains", "values": ["promo"]},
+        ])]
+        ok = _filter_by_criteria(flows, {"param:creative_id": "summer-promo-2026"})
+        assert len(ok) == 1
+        no = _filter_by_criteria(flows, {"param:creative_id": "summer-sale-2026"})
+        assert len(no) == 0
+
+    def test_unknown_op_still_fails_closed_after_the_new_branches(self):
+        # Regression pin — adding elif branches for contains/empty/
+        # not_empty must not accidentally widen the final `else` catch.
+        assert _criteria_match(
+            [{"type": "param:creative_id", "op": "matches", "values": ["promo"]}],
+            {"param:creative_id": "summer-promo-2026"},
+        ) is False
+
+
+class TestPhase6NoneClickValGuard:
+    """Adversarial-review hardening (2026-07-15) — the evaluator must
+    self-defend the valueless-op fail-closed guarantee, not lean on
+    `router.py`'s `slots.get(slot) or ""` never regressing to a bare
+    `.get(slot, "")`. Simulates that hypothetical producer regression by
+    constructing `click_attrs[dim] = None` directly (never happens via the
+    real router today — every producer already coalesces to "" / a set) and
+    proves the matcher still behaves correctly rather than fail-open."""
+
+    def test_not_empty_excludes_a_none_click_val(self):
+        # The exact fail-open this hardening closes: without the None→""
+        # coalesce, `None == ""` is False, so `not_empty` would treat an
+        # absent slot as "present" and INCORRECTLY match.
+        assert _criteria_match(
+            [{"type": "param:sub3", "op": "not_empty", "values": []}],
+            {"param:sub3": None},
+        ) is False
+
+    def test_empty_still_matches_a_none_click_val(self):
+        assert _criteria_match(
+            [{"type": "param:sub3", "op": "empty", "values": []}],
+            {"param:sub3": None},
+        ) is True
+
+    def test_contains_does_not_crash_on_a_none_click_val(self):
+        # `v in None` raises TypeError without the coalesce.
+        assert _criteria_match(
+            [{"type": "param:creative_id", "op": "contains", "values": ["promo"]}],
+            {"param:creative_id": None},
+        ) is False
+
+    def test_in_and_not_in_unaffected_by_a_none_click_val(self):
+        # Byte-identical to pre-hardening behavior — None already never
+        # equalled a configured value, so coalescing it to "" changes
+        # nothing here unless "" is itself a configured value.
+        assert _criteria_match(
+            [{"type": "geo", "op": "in", "values": ["US"]}],
+            {"geo": None},
+        ) is False
+        assert _criteria_match(
+            [{"type": "geo", "op": "not_in", "values": ["US"]}],
+            {"geo": None},
+        ) is True
+
+    def test_set_valued_dim_unaffected_by_the_none_guard(self):
+        # The None-coalesce sits AFTER the set-valued branch's `continue` —
+        # a genuine empty set() must keep failing `in` (no regression from
+        # the guard being read as "falsy → coalesce").
+        assert _criteria_match(
+            [{"type": "prev_offer", "op": "in", "values": ["55"]}],
+            {"prev_offer": frozenset()},
+        ) is False
+        assert _criteria_match(
+            [{"type": "prev_offer", "op": "not_in", "values": ["55"]}],
+            {"prev_offer": frozenset()},
+        ) is True
+
+
+# ============================================================
 # F.17 — Per-type case strategy + new criterion dimensions
 # ============================================================
 #

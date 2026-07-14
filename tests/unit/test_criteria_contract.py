@@ -462,3 +462,59 @@ def test_structural_and_identifier_dims_are_evaluated_by_cascade():
         "admin-accepted structural/identifier dim never evaluated by cascade "
         f"(CF-3-class, not_in fail-open): {sorted(missing)}"
     )
+
+
+# ============================================================
+# GTD-R135 Phase 6 — contains / empty / not_empty operator lockstep
+# ============================================================
+#
+# `cascade._first_failing_criterion`'s op dispatch is a procedural
+# if/elif chain, not a data structure — so there's no literal frozenset
+# to mirror the SHAPE of `test_structural_criterion_dims_in_lockstep_
+# with_admin` above. What CAN be pinned: the exact op-token vocabulary
+# admin-api defines, and that cascade recognizes (doesn't fail-closed
+# on) every one of them.
+
+# Mirror of admin-api `app/common/parameters.py` OPERATORS (the full
+# 5-token union: BASE_OPERATORS ∪ IDENTIFIER_ONLY_OPERATORS).
+_ADMIN_OPERATORS = frozenset({"in", "not_in", "contains", "empty", "not_empty"})
+
+
+def test_cascade_recognizes_every_admin_operator_token():
+    """A future admin-api op addition without a matching cascade dispatch
+    branch would silently fail-closed on 100% of traffic for that op — the
+    CF-3 fail-open/fail-closed class, applied to operators instead of
+    dims. Proves each token is DISPATCHED (not routed to the final
+    `else: return c` catch-all) by constructing a criterion that WOULD
+    match if the op were handled, on an identifier dim (the only family
+    the 3 new ops are legal on)."""
+    for op in _ADMIN_OPERATORS:
+        if op == "empty":
+            criteria = [{"type": "param:creative_id", "op": op, "values": []}]
+            click_attrs = {"param:creative_id": ""}
+        elif op == "not_empty":
+            criteria = [{"type": "param:creative_id", "op": op, "values": []}]
+            click_attrs = {"param:creative_id": "x"}
+        elif op == "not_in":
+            # not_in matches when click_val is ABSENT from values.
+            criteria = [{"type": "param:creative_id", "op": op, "values": ["y"]}]
+            click_attrs = {"param:creative_id": "x"}
+        else:
+            criteria = [{"type": "param:creative_id", "op": op, "values": ["x"]}]
+            click_attrs = {"param:creative_id": "x"}
+        failing = _first_failing_criterion(criteria, click_attrs)
+        assert failing is None, (
+            f"op '{op}' did not match a criterion constructed to match it — "
+            "either dispatch is missing or it fell through to the unknown-op "
+            "fail-closed branch"
+        )
+
+
+def test_cascade_still_fails_closed_on_a_token_outside_the_admin_vocabulary():
+    # The inverse of the test above — an op admin-api does NOT define
+    # must still drop the flow (the pre-existing unknown-op guard).
+    failing = _first_failing_criterion(
+        [{"type": "param:creative_id", "op": "regex", "values": ["x"]}],
+        {"param:creative_id": "x"},
+    )
+    assert failing is not None

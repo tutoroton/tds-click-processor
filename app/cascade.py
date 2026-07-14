@@ -853,6 +853,16 @@ def _first_failing_criterion(
     Supports `op='in'` / `op='not_in'`; per-type casing per `_CASE_PRESERVE`;
     set-valued history dims (prev_offer / prev_offer_target / prev_sub) use
     intersection. Identical decision logic to the pre-LD-F2 `_criteria_match`.
+
+    GTD-R135 Phase 6 adds `op='contains'` (substring — any listed value found
+    IN `click_val`, case-preserving like every identifier-dim match) and
+    `op='empty'`/`op='not_empty'` (presence-only — `click_val == ""` /
+    `!= ""`; identifier dims never resolve to `None`, only `""` on absence,
+    per `router.resolve_slots`). Admin-api's `criteria_consistency.py` R8
+    only ever WRITES these three ops on a `param:<slot>` identifier dim, but
+    this function does not re-check that — it trusts the write-time gate and
+    just evaluates whatever op+dim combination it's handed, same as every
+    other op here.
     """
     for c in criteria:
         if not isinstance(c, dict):
@@ -892,6 +902,20 @@ def _first_failing_criterion(
             else:
                 return c
             continue
+
+        # GTD-R135 Phase 6 hardening (adversarial review) — self-defend the
+        # valueless-op (contains/empty/not_empty) fail-closed guarantee
+        # instead of relying on the producer's `slots.get(slot) or ""`
+        # (router.py) never regressing to a bare `.get(slot, "")`. Past the
+        # set-valued branch above (already `continue`d), `click_val` is only
+        # ever a `str` or (hypothetically, on a producer regression) `None`
+        # — coalesce a stray `None` to `""` so `not_empty` can't be tricked
+        # into treating an absent slot as "present" (fail-OPEN) and
+        # `contains` can't crash on `v in None`. A no-op today (every real
+        # producer already guarantees non-None) — this is a second,
+        # independent line of defense, not a behavior change.
+        if click_val is None:
+            click_val = ""
 
         # GTD-R135 Phase 4 (G5) — identifier (`param:<slot>`) dims are
         # case-preserve TOO (byte-exact wire match — "the sacred rule": the
@@ -935,6 +959,22 @@ def _first_failing_criterion(
                 return c
         elif op == "not_in":
             if click_val in values:
+                return c
+        elif op == "contains":
+            # GTD-R135 Phase 6 — substring, OR across the listed values
+            # (mirrors `in`'s OR-membership semantics). `values` is already
+            # case-preserving for identifier dims (built above) — no
+            # separate casing needed. Bounded: `click_val` is a single
+            # click-derived string (≤ a few hundred chars in practice, per
+            # `SLOT_VALIDATORS` max_length caps), `values` ≤ 500 entries
+            # (schema cap) — no regex, no unbounded work, <10ms-safe.
+            if not any(v in click_val for v in values):
+                return c
+        elif op == "empty":
+            if click_val != "":
+                return c
+        elif op == "not_empty":
+            if click_val == "":
                 return c
         else:
             # Unknown operator — fail safe. Matches admin-api's CRITERION

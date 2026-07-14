@@ -2141,6 +2141,19 @@ async def resolve_target_with_id(
             elif op == "not_in" and click_val in values:
                 match = False
                 break
+            elif op not in ("in", "not_in"):
+                # GTD-R135 Phase 6 defense-in-depth — this legacy matcher only
+                # ever evaluates offer_target criteria, which can NEVER
+                # legally carry `contains`/`empty`/`not_empty` (admin-api's
+                # `criteria_consistency.py` R8 gates those to `param:<slot>`
+                # identifier dims, a flow-only dim family the offer_target
+                # schema structurally cannot accept). Still fail CLOSED on
+                # any op this matcher doesn't recognize — mirrors
+                # `cascade._first_failing_criterion`'s unknown-op guard, so
+                # this matcher's fail-closed posture doesn't depend on admin
+                # gating staying correct forever (CF-3 doctrine).
+                match = False
+                break
 
         if match:
             return t.get("url", ""), t["_id"]

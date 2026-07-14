@@ -2399,3 +2399,186 @@ class TestIdentifierFilters:
         result2 = _route_with(redis, _click({"source": "facebookads"}))
         assert result2 is not None
         assert "catchall" in result2["url"]
+
+
+# ============================================================
+# GTD-R135 Phase 6 — contains / empty / not_empty, full route() pipeline
+# ============================================================
+
+
+class TestPhase6OperatorsFullPipeline:
+    def test_contains_matches_via_full_route(self):
+        campaign_id = "10"
+        hit_flow = "100"
+        default_flow = "101"
+        redis = FakeRedis(
+            sets={
+                "geo:US": {campaign_id},
+                "device:mobile": {campaign_id},
+                "os:ios": {campaign_id},
+                "campaigns:active": {campaign_id},
+            },
+            hashes={
+                f"campaign:{campaign_id}": {"company_id": "1", "priority": "0"},
+                f"flow:{hit_flow}": {
+                    "campaign_id": campaign_id,
+                    "scope_type": "company",
+                    "scope_id": "1",
+                    "seq_id": "1",
+                    "is_default": "0",
+                    "criteria": json.dumps([
+                        {"type": "param:creative_id", "op": "contains", "values": ["promo"]},
+                    ]),
+                    "action_type": "redirect",
+                    "action_config": json.dumps({"url": "https://contains-hit"}),
+                },
+                f"flow:{default_flow}": {
+                    "campaign_id": campaign_id,
+                    "scope_type": "company",
+                    "scope_id": "1",
+                    "seq_id": "5",
+                    "is_default": "1",
+                    "criteria": "[]",
+                    "action_type": "redirect",
+                    "action_config": json.dumps({"url": "https://catchall"}),
+                },
+            },
+            lists={f"campaign:{campaign_id}:flows": [hit_flow, default_flow]},
+        )
+        # Matches — substring present.
+        result = _route_with(redis, _click({"creative_id": "summer-promo-2026"}))
+        assert result is not None
+        assert "contains-hit" in result["url"]
+
+        # Rejects — substring absent, falls through to the catch-all.
+        result2 = _route_with(redis, _click({"creative_id": "summer-sale-2026"}))
+        assert result2 is not None
+        assert "catchall" in result2["url"]
+
+    def test_not_empty_matches_via_full_route(self):
+        campaign_id = "20"
+        hit_flow = "200"
+        default_flow = "201"
+        redis = FakeRedis(
+            sets={
+                "geo:US": {campaign_id},
+                "device:mobile": {campaign_id},
+                "os:ios": {campaign_id},
+                "campaigns:active": {campaign_id},
+            },
+            hashes={
+                f"campaign:{campaign_id}": {"company_id": "1", "priority": "0"},
+                f"flow:{hit_flow}": {
+                    "campaign_id": campaign_id,
+                    "scope_type": "company",
+                    "scope_id": "1",
+                    "seq_id": "1",
+                    "is_default": "0",
+                    "criteria": json.dumps([
+                        {"type": "param:sub3", "op": "not_empty", "values": []},
+                    ]),
+                    "action_type": "redirect",
+                    "action_config": json.dumps({"url": "https://not-empty-hit"}),
+                },
+                f"flow:{default_flow}": {
+                    "campaign_id": campaign_id,
+                    "scope_type": "company",
+                    "scope_id": "1",
+                    "seq_id": "5",
+                    "is_default": "1",
+                    "criteria": "[]",
+                    "action_type": "redirect",
+                    "action_config": json.dumps({"url": "https://catchall"}),
+                },
+            },
+            lists={f"campaign:{campaign_id}:flows": [hit_flow, default_flow]},
+        )
+        # sub3 populated on the click -> not_empty holds -> hit.
+        result = _route_with(redis, _click({"sub3": "affiliate42"}))
+        assert result is not None
+        assert "not-empty-hit" in result["url"]
+
+        # sub3 absent from the click -> resolves to "" -> not_empty fails
+        # -> falls through to the catch-all.
+        result2 = _route_with(redis, _click({}))
+        assert result2 is not None
+        assert "catchall" in result2["url"]
+
+    def test_base_dim_with_new_op_never_reaches_routing(self):
+        """A base/structural dim carrying `contains`/`empty`/`not_empty` can
+        never be SAVED (admin-api R8 write-time reject) — this is not
+        something `route()` needs to defend against by construction. This
+        test documents that boundary rather than exercising it (there is
+        no write path to call from click-processor's test suite); the
+        write-time proof lives in admin-api's `test_criterion_operators.py`
+        `TestWritePathRejectsIdentifierOnlyOpOnWrongDim`. If such a
+        criterion DID somehow reach cascade's evaluator (e.g. a hand-
+        crafted Redis hash bypassing admin-api entirely), it would still
+        fail closed — proven directly at the matcher level by
+        `test_cascade.py::TestPhase6IdentifierOperators` and the legacy
+        matcher's `TestPhase6LegacyMatcherUnknownOpFailsClosed` below."""
+
+
+class TestPhase6LegacyMatcherUnknownOpFailsClosed:
+    """Defense-in-depth (GTD-R135 Phase 6) — before this phase,
+    `resolve_target_with_id`'s op dispatch had NO `else` branch: an
+    op that was neither `in` nor `not_in` left `match=True` unchanged,
+    i.e. the criterion silently PASSED (fail-OPEN — the mirror-image bug
+    of the dim guard right above it, which already failed closed). Red-
+    then-green verified by hand: reverting the `elif op not in ("in",
+    "not_in"): match = False; break` guard makes this test fail (the
+    target incorrectly serves); restoring it passes."""
+
+    @pytest.mark.parametrize("op", ["contains", "empty", "not_empty", "regex", "matches"])
+    def test_unrecognized_op_drops_the_target(self, op):
+        offer = {"_id": "1", "has_targets": "1"}
+        redis = FakeRedis(
+            hashes={
+                "offer_target:10": {
+                    "url": "https://should-never-fire",
+                    "is_default": "0",
+                    "criteria": json.dumps([
+                        {"type": "geo", "op": op, "values": ["US"]},
+                    ]),
+                    "availability": "active",
+                    "priority": "0",
+                },
+            },
+            sets={"offer:1:targets": {"10"}},
+        )
+        import asyncio
+        url, tid = asyncio.run(
+            router.resolve_target_with_id(
+                redis, offer, _click(), frozenset({"active"}),
+            )
+        )
+        # No `is_default` target exists either — a dropped target with no
+        # fallback resolves to (None, None), never the "should-never-fire" url.
+        assert url is None
+        assert tid is None
+
+    def test_known_ops_still_work_after_the_guard(self):
+        # Regression pin — the guard must not swallow the two real ops.
+        offer = {"_id": "1", "has_targets": "1"}
+        redis = FakeRedis(
+            hashes={
+                "offer_target:10": {
+                    "url": "https://in-still-works",
+                    "is_default": "0",
+                    "criteria": json.dumps([
+                        {"type": "geo", "op": "in", "values": ["US"]},
+                    ]),
+                    "availability": "active",
+                    "priority": "0",
+                },
+            },
+            sets={"offer:1:targets": {"10"}},
+        )
+        import asyncio
+        url, tid = asyncio.run(
+            router.resolve_target_with_id(
+                redis, offer, _click(), frozenset({"active"}),
+            )
+        )
+        assert url == "https://in-still-works"
+        assert tid == "10"

@@ -510,15 +510,40 @@ class TestGap5CrossScopeTruncationCounterExample:
 class TestCandidatesTruncatedMarker:
     """The safe, purely-additive `routing_trace.candidates_truncated`
     marker (GTD-R129) — stamped whenever ANY of the ≤6 independent
-    per-bucket LRANGEs in `_collect_candidate_ids` returns exactly `cap`
-    items (at/over its own cap, tail-bounded), absent otherwise. Observes
+    per-bucket LRANGEs in `_collect_candidate_ids` GENUINELY had more
+    than `cap` members (truly tail-bounded), absent otherwise. Observes
     without changing the winner-selection outcome; closes the 'silent'
-    half of the pre-fix silent-misroute risk."""
+    half of the pre-fix silent-misroute risk.
+
+    LOW #5 security-review fix (adversarial review round 1, 2026-07-14):
+    the marker used to fire whenever a bucket's LRANGE returned exactly
+    `cap` items — but a bucket at EXACTLY the cap, with nothing actually
+    dropped, ALSO returns exactly `cap` items from a bare `-cap, -1`
+    range. That false positive is exactly what
+    `test_marker_absent_when_bucket_is_exactly_at_cap` below pins."""
 
     async def test_marker_absent_when_under_cap(self):
         flows = {
             str(n): _flow(str(n), scope_type="company", scope_id=1, campaign_id="1", seq_id=n)
             for n in range(1, 6)
+        }
+        r = await _seed(flows, campaign_lists={"1": list(flows.keys())})
+        trace: dict = {}
+        winner = await _resolve(r, campaign_id="1", company_id=1, trace=trace)
+        assert winner is not None
+        assert "candidates_truncated" not in trace
+
+    async def test_marker_absent_when_bucket_is_exactly_at_cap(self):
+        """LOW #5 — a bucket at EXACTLY `_MAX_FLOWS_PER_CLICK` members,
+        with nothing genuinely dropped, must NOT be marked truncated.
+        Pre-fix, `LRANGE key -cap -1` on a list of exactly `cap` items
+        also returns exactly `cap` items — indistinguishable from a
+        genuinely over-cap bucket under the old `len(items) == cap`
+        check, a false positive. Exactly `_MAX_FLOWS_PER_CLICK` items
+        (not one more, not one less) isolates this boundary."""
+        flows = {
+            str(n): _flow(str(n), scope_type="company", scope_id=1, campaign_id="1", seq_id=n)
+            for n in range(1, _MAX_FLOWS_PER_CLICK + 1)
         }
         r = await _seed(flows, campaign_lists={"1": list(flows.keys())})
         trace: dict = {}

@@ -674,14 +674,24 @@ async def _collect_candidate_ids(
     buyer / custom_group / team / department / company. Caller de-dupes.
 
     GTD-R129 — each list is independently TAIL-bounded to `cap` (the
-    company's `max_flows_per_bucket` setting): `LRANGE key -cap -1`
-    returns the newest `cap` members of an ascending-ordered list (every
-    list is rebuilt full-snapshot every sync cycle, ordered
-    `created_at`/`seq_id` ASC). This is the exact fix for the
+    company's `max_flows_per_bucket` setting). Every list is rebuilt
+    full-snapshot every sync cycle, ordered `created_at`/`seq_id` ASC, so
+    the tail is always the newest members — this is the exact fix for the
     fresh-admin-override-gets-dropped bug (a fresh override is the
     HIGHEST `seq_id`, so it's the LAST thing a tail-bound ever drops) and
     closes the pre-existing uncapped-`LRANGE 0 -1` gap the old post-concat
     truncate never bounded.
+
+    LOW #5 security-review fix (adversarial review round 1, 2026-07-14):
+    each LRANGE asks for `cap + 1` items (`-(cap+1), -1`), one MORE than
+    the bound we actually use. `LRANGE key -cap -1` alone can never
+    distinguish "list has EXACTLY `cap` members, nothing dropped" from
+    "list has MORE than `cap` members, tail-bounded" — both return
+    exactly `cap` items. Asking for one extra makes the two cases
+    observably different: a list at-or-under `cap` returns `<= cap`
+    items (nothing trimmed); a list genuinely over `cap` returns exactly
+    `cap + 1` (the probe element proves there was more), and we trim it
+    back down to the newest `cap` before using it.
     """
     fetch_log: list[str] = []  # bucket label per pipeline slot, in order
 
@@ -694,7 +704,8 @@ async def _collect_candidate_ids(
         # drives the truncated-bucket naming below, not just debug logging.
         fetch_log.clear()
         pipe = r.pipeline()
-        pipe.lrange(f"campaign:{campaign_id}:flows", -cap, -1)
+        # LOW #5: fetch cap+1 (not cap) — see the docstring above for why.
+        pipe.lrange(f"campaign:{campaign_id}:flows", -(cap + 1), -1)
         fetch_log.append(f"campaign:{campaign_id}")
 
         if company_id is not None:
@@ -711,7 +722,7 @@ async def _collect_candidate_ids(
                 if scope_id is not None:
                     pipe.lrange(
                         f"flows:scope:{company_id}:{scope_type}:{scope_id}",
-                        -cap, -1,
+                        -(cap + 1), -1,
                     )
                     fetch_log.append(f"scope:{scope_type}:{scope_id}")
         return pipe
@@ -728,14 +739,19 @@ async def _collect_candidate_ids(
     truncated_buckets: list[str] = []
     for label, items in zip(fetch_log, results):
         if items:
-            out.extend(items)
-            # A list returning EXACTLY `cap` items means it was at or over
-            # the cap and got tail-bounded — same observability intent as
-            # the retired post-concat marker, now precise about WHICH
-            # bucket (a global-scope overflow used to be indistinguishable
-            # from a campaign overflow in the old message).
-            if len(items) == cap:
+            # LOW #5: each LRANGE asked for cap+1 items, so `len(items) >
+            # cap` is the ONLY signal that genuinely means "this bucket
+            # had more than cap members" — a bucket at-or-under cap can
+            # never return more than cap items from a cap+1-wide probe.
+            # Trim the probe's extra (oldest-of-the-fetched) element back
+            # down to the newest `cap` before use — same tail-bound
+            # outcome as before, just correctly distinguishing "at cap,
+            # nothing dropped" from "over cap, tail-bounded" for the
+            # marker below.
+            if len(items) > cap:
                 truncated_buckets.append(label)
+                items = items[-cap:]
+            out.extend(items)
 
     if truncated_buckets:
         logger.warning(

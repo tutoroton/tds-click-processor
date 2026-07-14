@@ -1186,8 +1186,10 @@ class TestCascadeTailBoundCallShape:
     """Pins the LRANGE call SHAPE directly (the behavioral fakeredis-based
     proof lives in `test_global_flow_matrix.py`/
     `test_global_flow_completeness_gaps.py`) — every list read in
-    `_collect_candidate_ids` must ask Redis for the TAIL (`-cap, -1`),
-    never the head (`0, -1`, the removed pre-fix shape)."""
+    `_collect_candidate_ids` must ask Redis for the TAIL (`-(cap+1), -1`
+    since the LOW #5 fix — one MORE than the cap, so a genuinely
+    over-cap bucket is distinguishable from an at-cap one), never the
+    head (`0, -1`, the removed pre-fix shape)."""
 
     @pytest.mark.asyncio
     async def test_lrange_calls_use_tail_bound_args_for_every_present_scope(self):
@@ -1238,9 +1240,11 @@ class TestCascadeTailBoundCallShape:
         # every hierarchy level was given an id, so all 6 are fetched.
         assert len(recorded) == 6
         for key, start, end in recorded:
-            assert (start, end) == (-42, -1), (
+            assert (start, end) == (-43, -1), (
                 f"{key} used LRANGE({start}, {end}), want the TAIL-bound "
-                f"(-42, -1) — a head-bound (0, -1) is the retired pre-fix shape"
+                f"probe (-43, -1) — cap+1 (LOW #5), never a bare -cap "
+                f"(can't distinguish at-cap from over-cap) or the retired "
+                f"head-bound (0, -1)"
             )
 
     @pytest.mark.asyncio
@@ -1284,8 +1288,10 @@ class TestCascadeTailBoundCallShape:
             click_attrs={"geo": "US", "os": "ios", "device_type": "mobile"},
         )
         # Only the campaign list + company scope are fetched (no buyer/
-        # team/dept/group id supplied) — both at the default cap.
-        assert recorded == [(-_MAX_FLOWS_PER_CLICK, -1), (-_MAX_FLOWS_PER_CLICK, -1)]
+        # team/dept/group id supplied) — both at the default cap+1 probe
+        # (LOW #5).
+        probe = -(_MAX_FLOWS_PER_CLICK + 1)
+        assert recorded == [(probe, -1), (probe, -1)]
 
 
 # ============================================================
@@ -1413,3 +1419,40 @@ class TestCrossPartitionPrecedence:
             click_attrs={"geo": "US", "os": "ios", "device_type": "mobile"},
         )
         assert winner["_id"] == "1"  # buyer beats company — pure specificity, unaffected
+
+    @pytest.mark.asyncio
+    async def test_nonempty_campaign_bound_survivors_matching_no_scope_level_falls_through(self):
+        """RV2 LOW (adversarial review round 1) — closes the literal edge
+        of the fallthrough contract that
+        `test_zero_eligible_campaign_bound_survivors_falls_through_regression_guard`
+        above only covers via an EMPTY campaign-bound candidate list.
+        Here the campaign-bound pool is NON-EMPTY and its one flow
+        SURVIVES criteria (`_eligible` never drops it), but its own
+        `scope_type`/`scope_id` matches NONE of the click's hierarchy
+        levels — `_pick_winner`'s walk-loop genuinely iterates a non-
+        empty `survivors` list at each scope level and finds zero
+        matches (as opposed to trivially iterating an empty list), the
+        untested edge of the same code path. The walk must still fall
+        through to the global partition, same as the empty-list case."""
+        # Campaign-bound flow scoped to a DIFFERENT buyer (999) than the
+        # click's own (5) — an eligible survivor (no criteria = match-all)
+        # that nonetheless matches zero scope levels for THIS click.
+        campaign_bound_wrong_scope = _make_flow(
+            fid="1", scope_type="buyer", scope_id=999, campaign_id="1", seq_id=1,
+        )
+        global_flow = _make_flow(
+            fid="2", scope_type="buyer", scope_id=5, campaign_id="0", seq_id=99,
+        )
+        flows = {"flow:1": campaign_bound_wrong_scope, "flow:2": global_flow}
+        lists = {
+            "campaign:1:flows": ["1"],
+            "flows:scope:1:buyer:5": ["2"],
+        }
+        r = _redis_with_lists_and_hashes(lists, flows)
+        winner = await resolve_flow(
+            r, campaign_id="1", company_id=1, buyer_id=5,
+            team_id=None, department_id=None, custom_group_id=None,
+            click_attrs={"geo": "US", "os": "ios", "device_type": "mobile"},
+        )
+        assert winner["_id"] == "2"
+        assert winner["campaign_id"] == "0"

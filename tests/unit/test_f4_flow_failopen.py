@@ -267,6 +267,7 @@ async def test_i_candidate_exhaustion_raises_not_empty():
         await cascade._collect_candidate_ids(
             r, campaign_id=_CID, company_id=1, buyer_id=None,
             team_id=None, department_id=None, custom_group_id=None,
+            cap=200,
         )
     assert ei.value.stage == "candidate"
     assert r.execute_calls == 2  # first attempt + one retry, then raise
@@ -283,6 +284,7 @@ async def test_i_concurrent_exhaustion_none_return_empty():
             await cascade._collect_candidate_ids(
                 r, campaign_id=_CID, company_id=1, buyer_id=None,
                 team_id=None, department_id=None, custom_group_id=None,
+                cap=200,
             )
         return True
 
@@ -512,6 +514,7 @@ async def test_v_timeouterror_raises_flowreaderror():
         await cascade._collect_candidate_ids(
             r, campaign_id=_CID, company_id=1, buyer_id=None,
             team_id=None, department_id=None, custom_group_id=None,
+            cap=200,
         )
     # retry-once still applied to a RedisError subclass.
     assert r.execute_calls == 2
@@ -527,6 +530,7 @@ async def test_v_non_redis_error_propagates_not_swallowed():
         await cascade._collect_candidate_ids(
             r, campaign_id=_CID, company_id=1, buyer_id=None,
             team_id=None, department_id=None, custom_group_id=None,
+            cap=200,
         )
     assert r.execute_calls == 1  # NOT retried (only RedisError is retried)
 

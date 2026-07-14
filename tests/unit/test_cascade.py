@@ -1173,3 +1173,114 @@ class TestLDF2AvailabilityTrace:
         )
         assert "availability" not in trace
         assert trace["availability_excluded"] == 0
+
+
+# ============================================================
+# GTD-R129 — per-bucket tail-bound LRANGE call shape
+# ============================================================
+
+
+class TestCascadeTailBoundCallShape:
+    """Pins the LRANGE call SHAPE directly (the behavioral fakeredis-based
+    proof lives in `test_global_flow_matrix.py`/
+    `test_global_flow_completeness_gaps.py`) — every list read in
+    `_collect_candidate_ids` must ask Redis for the TAIL (`-cap, -1`),
+    never the head (`0, -1`, the removed pre-fix shape)."""
+
+    @pytest.mark.asyncio
+    async def test_lrange_calls_use_tail_bound_args_for_every_present_scope(self):
+        recorded: list[tuple] = []
+
+        class SpyPipeline:
+            def __init__(self):
+                self._ops: list[tuple] = []
+
+            def lrange(self, key, start, end):
+                self._ops.append(("lrange", key))
+                recorded.append((key, start, end))
+
+            def hgetall(self, key):
+                self._ops.append(("hgetall", key))
+
+            def hget(self, key, field):
+                self._ops.append(("hget", key))
+
+            def exists(self, key):
+                self._ops.append(("exists", key))
+
+            async def execute(self):
+                out = []
+                for op, key in self._ops:
+                    if op == "lrange":
+                        out.append([])  # shape-only — no candidates needed
+                    elif op == "hgetall":
+                        out.append({})
+                    elif op == "hget":
+                        out.append(None)
+                    elif op == "exists":
+                        out.append(0)
+                return out
+
+        redis = MagicMock()
+        redis.pipeline = lambda: SpyPipeline()
+
+        winner = await resolve_flow(
+            redis, campaign_id="1", company_id=1, buyer_id=5,
+            team_id=3, department_id=2, custom_group_id=10,
+            click_attrs={"geo": "US", "os": "ios", "device_type": "mobile"},
+            max_flows_per_bucket=42,
+        )
+        assert winner is None  # no candidates seeded — shape-only test
+
+        # 6 lists: campaign + buyer/custom_group/team/department/company —
+        # every hierarchy level was given an id, so all 6 are fetched.
+        assert len(recorded) == 6
+        for key, start, end in recorded:
+            assert (start, end) == (-42, -1), (
+                f"{key} used LRANGE({start}, {end}), want the TAIL-bound "
+                f"(-42, -1) — a head-bound (0, -1) is the retired pre-fix shape"
+            )
+
+    @pytest.mark.asyncio
+    async def test_default_cap_used_when_max_flows_per_bucket_omitted(self):
+        """Unit-test call sites that omit `max_flows_per_bucket` (all of
+        `TestSpecificity`/`TestTieBreak`/etc. in this file) must keep
+        working — the param defaults to `_MAX_FLOWS_PER_CLICK` (200)."""
+        from app.cascade import _MAX_FLOWS_PER_CLICK
+
+        recorded: list[tuple] = []
+
+        class SpyPipeline:
+            def __init__(self):
+                self._ops: list[tuple] = []
+
+            def lrange(self, key, start, end):
+                self._ops.append(("lrange", key))
+                recorded.append((start, end))
+
+            def hgetall(self, key):
+                self._ops.append(("hgetall", key))
+
+            def hget(self, key, field):
+                self._ops.append(("hget", key))
+
+            def exists(self, key):
+                self._ops.append(("exists", key))
+
+            async def execute(self):
+                out = []
+                for op, key in self._ops:
+                    out.append([] if op == "lrange" else ({} if op == "hgetall" else None))
+                return out
+
+        redis = MagicMock()
+        redis.pipeline = lambda: SpyPipeline()
+
+        await resolve_flow(
+            redis, campaign_id="1", company_id=1, buyer_id=None,
+            team_id=None, department_id=None, custom_group_id=None,
+            click_attrs={"geo": "US", "os": "ios", "device_type": "mobile"},
+        )
+        # Only the campaign list + company scope are fetched (no buyer/
+        # team/dept/group id supplied) — both at the default cap.
+        assert recorded == [(-_MAX_FLOWS_PER_CLICK, -1), (-_MAX_FLOWS_PER_CLICK, -1)]

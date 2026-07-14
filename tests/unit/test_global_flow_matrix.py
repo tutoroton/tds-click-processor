@@ -630,17 +630,19 @@ class TestAdditionalGapsTruncationAndTies:
         winner = await _resolve(r)
         assert _wid(winner) == "WIN"
 
-    async def test_max_flows_truncation_can_silently_drop_the_true_winner(self):
-        """`_MAX_FLOWS_PER_CLICK=200` truncation was completely untested
-        (G1 §5.3). This demonstrates the ACTUAL (current) risk rather than
-        assuming safety: truncation is deterministic FIRST-SEEN-ORDER
-        (candidate-collection order == campaign-list position order here),
-        NOT seq_id order. Seed exactly `_MAX_FLOWS_PER_CLICK` flows BEFORE
-        the true lowest-seq_id winner in the campaign's flow list → the
-        true winner falls at position 201 → gets truncated → a WORSE
-        (higher-seq_id) flow wins instead. A legally configured campaign
-        with >200 flows can silently misroute — a candidate real-defect,
-        not a hypothetical."""
+    async def test_max_flows_tail_bound_preserves_the_fresh_winner(self):
+        """GTD-R129 fix (2026-07-14) — INVERTS the pre-fix pinned-bug test
+        (was `test_max_flows_truncation_can_silently_drop_the_true_winner`).
+        `_collect_candidate_ids` now tail-bounds each list independently
+        (`LRANGE key -cap -1`) instead of the old head-truncate-after-concat,
+        so the LAST `_MAX_FLOWS_PER_CLICK` items of an over-cap list survive
+        — matching the real invariant that Redis lists are rebuilt
+        append-order (oldest-first), so the tail is always the NEWEST
+        flows. Same 201-item fixture as before (one over the cap): the
+        item at the HEAD (`DECOY_MATCH`) is now the one dropped, and the
+        item at the TAIL (`TRUE_WIN`) survives and wins — the opposite of
+        the pre-fix result, and exactly the "never drop a fresh override"
+        guarantee this fix exists to provide."""
         decoy_match = _flow(
             "DECOY_MATCH", scope_type="company", scope_id=1, campaign_id="1",
             seq_id=1, criteria=[],
@@ -663,8 +665,8 @@ class TestAdditionalGapsTruncationAndTies:
         assert len(campaign_order) == _MAX_FLOWS_PER_CLICK + 1
         r = await _seed(flows, campaign_lists={"1": campaign_order})
         winner = await _resolve(r)
-        assert _wid(winner) == "DECOY_MATCH"
-        assert _wid(winner) != "TRUE_WIN"
+        assert _wid(winner) == "TRUE_WIN"
+        assert _wid(winner) != "DECOY_MATCH"
 
     async def test_n_way_tie_identical_bound_seqid_default_pins_actual_order(self):
         """No true N-way tie test exists — two flows identical on ALL

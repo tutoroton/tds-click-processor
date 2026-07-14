@@ -133,16 +133,24 @@ SCOPE_PRIORITY: tuple[str, ...] = (
 )
 
 
-# Defensive cap on per-click flow enumeration. Realistic campaigns have
-# 1-10 flows + small org-hierarchy fan-out; a cascade that fetches
-# thousands of flow HASHes in one pipeline blows the 10ms hot-path
-# budget. The cap closes a DoS surface where an insider with admin
-# role creates ~10k buyer-scoped flows targeting their own user_id —
-# every click for that buyer would otherwise issue 10k HGETALLs.
-# Truncate + Sentry warning per security audit 2026-04-28 (HIGH-003).
-# Mirror of `router._MAX_SOURCES_PER_CAMPAIGN_AT_CLICK` and
-# `action_executor._MAX_TARGETS_PER_OFFER_AT_CLICK` patterns.
-_MAX_FLOWS_PER_CLICK = 200
+# GTD-R129 (2026-07-14) — this constant is NO LONGER the enforcement
+# mechanism (that closed a DoS surface per security audit 2026-04-28,
+# HIGH-003, where an insider with admin role could create ~10k buyer-
+# scoped flows targeting their own user_id). It is now only the SAFETY
+# DEFAULT `resolve_flow`'s `max_flows_per_bucket` param falls back to
+# when a caller omits it (unit-test call sites; a defensive default if
+# `router.py` somehow calls without the kwarg). The real enforcement is
+# the per-company `companies.settings.routing_capacity.max_flows_per_bucket`
+# setting (`companies/schemas.py` `RoutingCapacityConfig`), write-time
+# gated (`FlowService.create`/`restore`) and read-time tail-bounded per
+# bucket in `_collect_candidate_ids` — see that function + resolve_flow's
+# docstring for the mechanism this constant used to gate directly.
+# Value 50 (was 200) — BENCH's local-pipeline benchmark proved 6×200=1200
+# HGETALLs measures 13.5ms, over the 10ms hot-path budget; 50 keeps the
+# worst case (6×50=300) inside the proven-safe `SAFE_PER_CLICK_TOTAL=400`
+# ceiling (`companies/schemas.py`). PROVISIONAL — owner reviewing the
+# exact default.
+_MAX_FLOWS_PER_CLICK = 50
 
 
 # v2 LD-F2 — `routing_trace.criteria.rejected` bounds (D22 / §05 Tier-3).
@@ -175,6 +183,7 @@ async def resolve_flow(
     department_id: int | None,
     custom_group_id: int | None,
     click_attrs: dict[str, Any],
+    max_flows_per_bucket: int = _MAX_FLOWS_PER_CLICK,
     seen_before: bool = False,
     audience_routing: bool = False,
     returning_visitor: bool = False,
@@ -218,6 +227,14 @@ async def resolve_flow(
             normalized for criteria matching. Caller is responsible for
             casing (geo upper, os/device lower) so this module stays
             transport-agnostic.
+        max_flows_per_bucket: GTD-R129 — per-company ceiling on active
+            flows within ONE routing bucket (a campaign's own flow-list,
+            or one (scope_type, scope_id) tuple's global flow-list),
+            projected from `companies.settings.routing_capacity` onto the
+            campaign HASH. Tail-bounds each of the ≤6 per-bucket LRANGEs
+            in `_collect_candidate_ids` — a bucket at-or-under this cap
+            is NEVER truncated. Defaults to `_MAX_FLOWS_PER_CLICK` so
+            unit-test call sites that omit it keep the historical value.
 
     Returns:
         Winning flow HASH with `_id` field, or `None` if no flow matches
@@ -238,6 +255,8 @@ async def resolve_flow(
         team_id=team_id,
         department_id=department_id,
         custom_group_id=custom_group_id,
+        cap=max_flows_per_bucket,
+        trace=trace,
     )
     if not candidate_ids:
         return None
@@ -246,55 +265,26 @@ async def resolve_flow(
     # if a campaign-bound flow also got accidentally tagged with a
     # scope_id). HSET-based reads are idempotent so we keep the order
     # of first appearance for deterministic logging.
+    #
+    # GTD-R129 (2026-07-14) — the prior post-concat "bound the pipeline
+    # length" truncate step (a SECOND, coarser cap applied here, atop the
+    # per-list bound above) is GONE. It was ALSO the mechanism that caused
+    # the bug this fix closes: because `campaign:{id}:flows` is fetched
+    # (and concatenated) whole before any org-scope list, a single
+    # over-cap campaign could consume the entire aggregate budget and
+    # silently drop every global candidate at every scope level. Per-bucket
+    # tail-bounding in `_collect_candidate_ids` already keeps each of the
+    # ≤6 lists within a benchmark-proven-safe total (`SAFE_PER_CLICK_TOTAL`,
+    # `companies/schemas.py`) — a second aggregate backstop below that total
+    # would only re-truncate an already within-limit bucket, reintroducing
+    # the exact bug one level up (see ADR-0102/GTD-R129 for the retired
+    # "KNOWN LIMITATION" this replaces).
     seen: set[str] = set()
     deduped: list[str] = []
     for fid in candidate_ids:
         if fid not in seen:
             seen.add(fid)
             deduped.append(fid)
-
-    # Bound the pipeline length on the hot path. With cascade lists
-    # potentially union'ing 6 scopes worth of flow IDs, an insider-
-    # authored flood could push deduped past the realistic ~10 flows
-    # per click into thousands. Truncate deterministically (first-
-    # seen order — campaign-bound flows always come first) so the
-    # behaviour is stable, and emit Sentry so ops see the misconfig.
-    #
-    # KNOWN LIMITATION (GTD-R129 / ADR-0102, 2026-07-14): truncation is by
-    # Redis LIST insertion order, not `seq_id`. Because `campaign:{id}:flows`
-    # is fetched (and concatenated) whole, before any org-scope list, a
-    # single campaign with >200 bound flows can consume the entire cap and
-    # silently drop EVERY global candidate at every scope level for that
-    # click — not just risk one within-list tie-flip. Confirmed low current
-    # risk (staging: max 6 flows on any one campaign, 33x margin below the
-    # cap; 0 global flows exist yet) but reachable via ordinary flow-count
-    # growth, not an adversarial input. The correct fix is per-source-list
-    # caps (each org-scope list is already scope-homogeneous, so bounding it
-    # independently prevents one campaign's growth from crowding out a
-    # different scope level) and/or migrating these Redis LISTs to ZSETs
-    # scored by `seq_id` — both DEFERRED pending their own design/benchmark
-    # + critic pass. Do NOT "fix" this by sorting `candidate_ids` by
-    # `seq_id` before truncating — proven wrong (FINDINGS-G3-CRITIC.md): a
-    # global `seq_id` ascending sort always favors old flows over new ones,
-    # so a fresh admin-created override (necessarily the highest `seq_id`)
-    # is the ONE candidate guaranteed to be dropped — the opposite of what
-    # this cap is supposed to protect.
-    if len(deduped) > _MAX_FLOWS_PER_CLICK:
-        logger.warning(
-            "cascade: candidate count %d > cap %d for campaign %s — truncating",
-            len(deduped), _MAX_FLOWS_PER_CLICK, campaign_id,
-        )
-        try:
-            import sentry_sdk
-            sentry_sdk.capture_message(
-                f"cascade flow count exceeds cap for campaign {campaign_id}",
-                level="warning",
-            )
-        except ImportError:  # pragma: no cover — sentry installed in prod
-            pass
-        if trace is not None:
-            trace["candidates_truncated"] = True
-        deduped = deduped[:_MAX_FLOWS_PER_CLICK]
 
     flows = await _load_flow_records(r, deduped)
     if not flows:
@@ -619,21 +609,37 @@ async def _collect_candidate_ids(
     team_id: int | None,
     department_id: int | None,
     custom_group_id: int | None,
+    cap: int,
+    trace: dict[str, Any] | None = None,
 ) -> list[str]:
     """Single pipeline batch — fetch all relevant flow ID lists.
 
     Returns concatenated flow IDs from campaign-bound + each present
     scope level. Order follows fetch order: campaign first, then
     buyer / custom_group / team / department / company. Caller de-dupes.
+
+    GTD-R129 — each list is independently TAIL-bounded to `cap` (the
+    company's `max_flows_per_bucket` setting): `LRANGE key -cap -1`
+    returns the newest `cap` members of an ascending-ordered list (every
+    list is rebuilt full-snapshot every sync cycle, ordered
+    `created_at`/`seq_id` ASC). This is the exact fix for the
+    fresh-admin-override-gets-dropped bug (a fresh override is the
+    HIGHEST `seq_id`, so it's the LAST thing a tail-bound ever drops) and
+    closes the pre-existing uncapped-`LRANGE 0 -1` gap the old post-concat
+    truncate never bounded.
     """
-    fetch_log: list[str] = []  # for debug logging only
+    fetch_log: list[str] = []  # bucket label per pipeline slot, in order
 
     def _build_pipe():
-        # Rebuilt per attempt — a pipeline is single-use (resets after execute),
-        # so the retry re-issues the same idempotent LRANGEs. `fetch_log` is
-        # debug-only; a duplicate append on the rare retry is inert.
+        # Rebuilt per attempt — a pipeline is single-use (resets after
+        # execute), so the retry re-issues the same idempotent LRANGEs.
+        # `fetch_log` is rebuilt fresh each call (not accumulated across
+        # attempts) so it always lines up 1:1 with whichever attempt's
+        # `results` the caller ultimately gets — needed now that it also
+        # drives the truncated-bucket naming below, not just debug logging.
+        fetch_log.clear()
         pipe = r.pipeline()
-        pipe.lrange(f"campaign:{campaign_id}:flows", 0, -1)
+        pipe.lrange(f"campaign:{campaign_id}:flows", -cap, -1)
         fetch_log.append(f"campaign:{campaign_id}")
 
         if company_id is not None:
@@ -650,7 +656,7 @@ async def _collect_candidate_ids(
                 if scope_id is not None:
                     pipe.lrange(
                         f"flows:scope:{company_id}:{scope_type}:{scope_id}",
-                        0, -1,
+                        -cap, -1,
                     )
                     fetch_log.append(f"scope:{scope_type}:{scope_id}")
         return pipe
@@ -664,9 +670,35 @@ async def _collect_candidate_ids(
     )
 
     out: list[str] = []
-    for items in results:
+    truncated_buckets: list[str] = []
+    for label, items in zip(fetch_log, results):
         if items:
             out.extend(items)
+            # A list returning EXACTLY `cap` items means it was at or over
+            # the cap and got tail-bounded — same observability intent as
+            # the retired post-concat marker, now precise about WHICH
+            # bucket (a global-scope overflow used to be indistinguishable
+            # from a campaign overflow in the old message).
+            if len(items) == cap:
+                truncated_buckets.append(label)
+
+    if truncated_buckets:
+        logger.warning(
+            "cascade: bucket(s) %s at/over cap %d for campaign %s — tail-bounded",
+            truncated_buckets, cap, campaign_id,
+        )
+        try:
+            import sentry_sdk
+            sentry_sdk.capture_message(
+                f"cascade bucket(s) {truncated_buckets} at/over cap {cap} "
+                f"for campaign {campaign_id}",
+                level="warning",
+            )
+        except ImportError:  # pragma: no cover — sentry installed in prod
+            pass
+        if trace is not None:
+            trace["candidates_truncated"] = True
+
     return out
 
 

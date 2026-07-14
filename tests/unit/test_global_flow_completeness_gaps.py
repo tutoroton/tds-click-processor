@@ -1,7 +1,7 @@
 """Global-flow completeness gaps — FOCUS 1 (GTD-R127), closes
-`FINDINGS-G3-CRITIC.md` §(c) gaps 1-5, plus a regression pin for the new
-`routing_trace.candidates_truncated` marker (GTD-R129 / ADR-0102) stamped by
-`cascade.py`'s `_MAX_FLOWS_PER_CLICK` truncation branch.
+`FINDINGS-G3-CRITIC.md` §(c) gaps 1-5, plus a regression pin for the
+`routing_trace.candidates_truncated` marker (GTD-R129) stamped by
+`cascade.py`'s per-bucket tail-bound branch in `_collect_candidate_ids`.
 
 Kept in its own file rather than appended to `test_global_flow_matrix.py`
 (already 738 lines, over the 600-line test-file cap per
@@ -14,12 +14,18 @@ mirror `test_global_flow_matrix.py`'s, per this codebase's established
 per-test-file fixture convention (see that file's own docstring, which
 mirrors `test_cascade.py`/`test_returning_routing.py` in turn).
 
-IMPORTANT: gap 5 (`TestGap5CrossScopeTruncationCounterExample`) PINS the
-CURRENT, documented-defective truncation behaviour (GTD-R129) — it does
-NOT assert correctness. The ordering fix is explicitly DEFERRED per
-ADR-0102 (see `cascade.py`'s comment near `_MAX_FLOWS_PER_CLICK`); do not
-read a passing test here as "the truncation bug is fixed."
-"""
+UPDATED (2026-07-14, GTD-R129 fix): gap 5
+(`TestGap5CrossScopeTruncationCounterExample`) originally PINNED the
+cross-scope truncation defect (a single over-cap campaign-bound list
+could blank out a global override at every scope level, because the
+post-concat truncate consumed the whole cap on the campaign list before
+any scope list was ever appended). That post-concat truncate is GONE —
+each list (campaign + each present scope level) is now independently
+tail-bounded, so the buyer-scope override below is NEVER crowded out by
+an unrelated campaign-bound backlog. This test now asserts the FIX, not
+the defect — see `app/cascade.py::_collect_candidate_ids` for the
+mechanism (GTD-R129 design doc; the historical "KNOWN LIMITATION" this
+replaced is retired, one-line pointer left in the code)."""
 
 from __future__ import annotations
 
@@ -412,24 +418,29 @@ class TestGap4TwentyCriteriaCapRuntime:
 class TestGap5CrossScopeTruncationCounterExample:
     """FINDINGS-G3-CRITIC.md §(c) gap 5 (== §(b) Reason 1's counter-example,
     restated as a coverage gap) — G2's own truncation test
-    (`test_global_flow_matrix.py::test_max_flows_truncation_can_silently_drop_the_true_winner`)
+    (`test_global_flow_matrix.py::test_max_flows_tail_bound_preserves_the_fresh_winner`)
     is SAME-SCOPE-ONLY (every candidate `scope_type="company"`); it cannot
     exercise the worse, cross-scope shape the G3 critic independently
-    traced: `campaign:{id}:flows` is fetched WHOLE and placed FIRST in the
-    concatenated candidate list (`cascade.py::_collect_candidate_ids`), so
-    a single campaign with >200 bound flows can consume the ENTIRE cap
-    before a single global candidate at ANY org-scope level is ever
-    appended — not just risk one tied flow's outcome, but a WHOLE-WALK
-    BLACKOUT for every global flow visible to that click.
+    traced: the pre-fix post-concat truncate consumed the ENTIRE cap on
+    `campaign:{id}:flows` (fetched WHOLE and placed FIRST in the
+    concatenated candidate list) before a single global candidate at ANY
+    org-scope level was ever appended — a WHOLE-WALK BLACKOUT for every
+    global flow visible to that click, not just one tied flow's outcome.
 
-    This PINS the CURRENT (defective, documented — GTD-R129 / ADR-0102)
-    behaviour and asserts the new `routing_trace.candidates_truncated`
-    marker (this same phase's prod-code change) fires. It does NOT assert
-    correctness — the ordering fix is explicitly DEFERRED per ADR-0102."""
+    GTD-R129 fix (2026-07-14) — INVERTED. Each list (campaign + each
+    present scope level) is now an INDEPENDENT pipeline read, tail-bounded
+    to its OWN cap (`cascade.py::_collect_candidate_ids`) — a bloated
+    campaign-bound backlog can no longer crowd out a buyer-scope override;
+    the two lists never compete for the same budget. This test now asserts
+    the buyer-scope override SURVIVES and wins, while the
+    `routing_trace.candidates_truncated` marker still fires (the
+    campaign's own 205-flow list is still over cap and still gets
+    tail-bounded — that per-bucket truncation is expected + safe, only the
+    cross-bucket blackout is fixed)."""
 
-    async def test_overgrown_campaign_blanks_out_a_buyer_scope_global_override(self):
+    async def test_buyer_scope_global_override_survives_an_overgrown_campaign(self):
         # 205 old campaign-bound, company-scope flows — comfortably over the
-        # 200 cap so truncation fires regardless of exact boundary count.
+        # 200 cap so the campaign's OWN list still gets tail-bounded.
         old_campaign_flows = {
             f"OLD{n}": _flow(
                 f"OLD{n}", scope_type="company", scope_id=1, campaign_id="1",
@@ -445,9 +456,6 @@ class TestGap5CrossScopeTruncationCounterExample:
             seq_id=9000, criteria=[],
         )
         flows = {**old_campaign_flows, "BUYER_OVERRIDE": buyer_override}
-        # Concatenation order mirrors `_collect_candidate_ids`'s real fixed
-        # pipe-issue order (campaign list FIRST, buyer scope list appended
-        # after) — the buyer override lands past position 200.
         r = await _seed(
             flows,
             campaign_lists={"1": list(old_campaign_flows.keys())},
@@ -457,13 +465,14 @@ class TestGap5CrossScopeTruncationCounterExample:
         winner = await _resolve(
             r, campaign_id="1", company_id=1, buyer_id=5, trace=trace,
         )
-        # Defect confirmed: the buyer-scope override never became a
-        # candidate — the walk falls through to a company-scope,
-        # campaign-bound flow instead.
-        assert _wid(winner) != "BUYER_OVERRIDE"
-        assert winner["scope_type"] == "company"
-        # The safe observability marker (this phase's prod-code change)
-        # fires — the silent half of "silently misroute" is closed.
+        # Fixed: the buyer-scope override IS a candidate (its own 1-item
+        # list is nowhere near its cap) and wins — buyer is more specific
+        # than company, so `_pick_winner` never even reaches the
+        # campaign-bound company-scope survivors.
+        assert _wid(winner) == "BUYER_OVERRIDE"
+        assert winner["scope_type"] == "buyer"
+        # The campaign's own list (205 > 200) is still tail-bounded —
+        # the marker still fires for THAT bucket, observability intact.
         assert trace["candidates_truncated"] is True
 
 
@@ -474,9 +483,11 @@ class TestGap5CrossScopeTruncationCounterExample:
 
 class TestCandidatesTruncatedMarker:
     """The safe, purely-additive `routing_trace.candidates_truncated`
-    marker (ADR-0102) — stamped ONLY inside the `_MAX_FLOWS_PER_CLICK`
-    truncation branch, absent otherwise. Zero behaviour change; closes the
-    'silent' half of GTD-R129's silent-misroute risk."""
+    marker (GTD-R129) — stamped whenever ANY of the ≤6 independent
+    per-bucket LRANGEs in `_collect_candidate_ids` returns exactly `cap`
+    items (at/over its own cap, tail-bounded), absent otherwise. Observes
+    without changing the winner-selection outcome; closes the 'silent'
+    half of the pre-fix silent-misroute risk."""
 
     async def test_marker_absent_when_under_cap(self):
         flows = {
@@ -510,3 +521,66 @@ class TestCandidatesTruncatedMarker:
         r = await _seed(flows, campaign_lists={"1": list(flows.keys())})
         winner = await _resolve(r, campaign_id="1", company_id=1, trace=None)
         assert winner is not None  # no exception raised
+
+    async def test_marker_fires_for_a_scope_bucket_not_just_the_campaign_bucket(self):
+        """GTD-R129 — each of the ≤6 lists is now independently bounded, so
+        an over-cap SCOPE-level bucket (not the campaign list) must ALSO
+        trip the marker. A campaign with a small, well-under-cap flow list
+        proves the campaign bucket itself is NOT what fires it here."""
+        small_campaign_flows = {
+            f"C{n}": _flow(f"C{n}", scope_type="company", scope_id=1, campaign_id="1", seq_id=n)
+            for n in range(1, 4)
+        }
+        overgrown_buyer_flows = {
+            f"B{n}": _flow(
+                f"B{n}", scope_type="buyer", scope_id=5, campaign_id="0",
+                seq_id=1000 + n, criteria=[],
+            )
+            for n in range(1, _MAX_FLOWS_PER_CLICK + 11)
+        }
+        flows = {**small_campaign_flows, **overgrown_buyer_flows}
+        r = await _seed(
+            flows,
+            campaign_lists={"1": list(small_campaign_flows.keys())},
+            scope_lists={_scope_key(1, "buyer", 5): list(overgrown_buyer_flows.keys())},
+        )
+        trace: dict = {}
+        winner = await _resolve(
+            r, campaign_id="1", company_id=1, buyer_id=5, trace=trace,
+        )
+        assert winner is not None
+        assert trace["candidates_truncated"] is True
+
+    async def test_tail_bound_keeps_the_newest_scope_bucket_members(self):
+        """Direct proof of the tail-bound DIRECTION on a scope-level list
+        (mirrors the campaign-list proof in `test_global_flow_matrix.py`):
+        seed a buyer-scope list one over cap where the OLDEST (lowest
+        seq_id, head-of-list) member is the only criteria-match — the
+        newest (tail) members all fail criteria — so if the tail-bound
+        dropped the HEAD (wrong direction) the sole matching flow would
+        vanish and the click would fall through to `None`."""
+        matching_head = _flow(
+            "HEAD_MATCH", scope_type="buyer", scope_id=5, campaign_id="0",
+            seq_id=1, criteria=[],
+        )
+        non_matching_tail = {
+            f"TAIL{n}": _flow(
+                f"TAIL{n}", scope_type="buyer", scope_id=5, campaign_id="0",
+                seq_id=n + 1,
+                criteria=[{"type": "geo", "op": "in", "values": ["RU"]}],
+            )
+            for n in range(1, _MAX_FLOWS_PER_CLICK + 1)
+        }
+        flows = {"HEAD_MATCH": matching_head, **non_matching_tail}
+        bucket_order = ["HEAD_MATCH"] + list(non_matching_tail.keys())
+        assert len(bucket_order) == _MAX_FLOWS_PER_CLICK + 1
+        r = await _seed(
+            flows, scope_lists={_scope_key(1, "buyer", 5): bucket_order},
+        )
+        winner = await _resolve(r, campaign_id="1", company_id=1, buyer_id=5)
+        # Tail-bound keeps the LAST cap items — HEAD_MATCH (position 0) is
+        # the one dropped here, so nothing survives criteria matching and
+        # the click falls through to no winner at all (no company/campaign
+        # fallback was seeded). This pins the direction: it is the HEAD,
+        # never the TAIL, that a genuinely over-cap bucket sacrifices.
+        assert winner is None

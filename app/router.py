@@ -1380,6 +1380,11 @@ async def _try_flow_cascade(
     # invariant). The raw header is NEVER read here — only the validated,
     # context-bound value (no SEC-L1 regression).
     diagnostic = bool(get_test_id())
+    # GTD-R129 — per-company routing-capacity ceiling, flattened onto the
+    # campaign HASH by the sync builder (`sync/builders/campaigns.py`).
+    # Missing/malformed → 50 (BENCH-confirmed safe default), matching
+    # `FlowRepository.fetch_routing_capacity`'s write-side default.
+    max_flows_per_bucket = _to_int(campaign.get("max_flows_per_bucket")) or 50
     flow = await cascade.resolve_flow(
         r,
         campaign_id=campaign_id,
@@ -1388,6 +1393,7 @@ async def _try_flow_cascade(
         team_id=buyer_chain["team_id"],
         department_id=buyer_chain["department_id"],
         custom_group_id=buyer_chain["custom_group_id"],
+        max_flows_per_bucket=max_flows_per_bucket,
         click_attrs=click_attrs,
         seen_before=seen_before if audience_routing else False,
         audience_routing=audience_routing,

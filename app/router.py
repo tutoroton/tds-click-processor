@@ -1319,6 +1319,36 @@ async def _try_flow_cascade(
         **_extra_click_dims(req),
     }
 
+    # GTD-R135 Phase 3 (G4, ADR-0106) — structural filter dims. `buyer_chain`
+    # is ALREADY resolved unconditionally by the caller (zero new Redis I/O —
+    # confirmed by the call-graph trace: `_build_campaign_attribution` →
+    # `resolve_slots` → `_resolve_buyer_chain`, both complete before this
+    # function runs). MANDATORY str()/None→"" cast (Unknown 5a) — a Python
+    # `int` is never `==` a `str` of the same digits; skipping this cast
+    # reproduces the CF-3 fail-open bug class inside the very fix meant to
+    # prevent it. Cascade-only (`cascade.STRUCTURAL_CRITERION_DIMS`) — the
+    # legacy offer-target matcher never reaches these (schema-gated at
+    # admin-api to FLOW_CRITERION_TYPES only).
+    for _struct_dim in cascade.STRUCTURAL_CRITERION_DIMS:
+        _v = buyer_chain.get(_struct_dim)
+        click_attrs[_struct_dim] = str(_v) if _v is not None else ""
+
+    # GTD-R135 Phase 4 (G5) — identifier filter dims via the owner-named
+    # `param:<slot>` subset. `attribution["slots"]` is ALREADY resolved
+    # unconditionally by the caller (`_build_campaign_attribution` →
+    # `resolve_slots`, zero new Redis I/O) — only the declared subset is
+    # threaded (bounds click_attrs growth to the MVP-working > perfect bar).
+    # `slots.get(slot) or ""` — NOT `.get(slot, "")` — is the load-bearing
+    # fix for the None-when-explicitly-mapped-but-unresolved case (Unknown
+    # 6): `resolve_slots` returns `dict[str, str | None]`, and a bare
+    # `.get(slot, "")` only substitutes the default for an ABSENT key, not
+    # an existing `None` value — it would leave `click_attrs["param:X"] =
+    # None`, breaking the string-only comparison contract every other dim
+    # relies on.
+    _slots = attribution.get("slots") or {}
+    for _id_slot in cascade.IDENTIFIER_SLOTS:
+        click_attrs[f"param:{_id_slot}"] = _slots.get(_id_slot) or ""
+
     # P4 — returning-user segmented routing. `seen_before` = the uid existed
     # BEFORE this click (= B∪C; NOT the is_returning flag, which is B-only —
     # conflating them silently drops segment C, R4 G1). Only meaningful when the

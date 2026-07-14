@@ -22,7 +22,7 @@ from unittest.mock import patch
 
 import pytest
 
-from app import router
+from app import cascade, router
 from app.models import ClickRequest
 
 
@@ -1907,3 +1907,495 @@ class TestF9DisabledDomainFailClosed:
         )
         result = _route_with(redis, req)
         assert not (result or {}).get("blocked")
+
+
+# ============================================================
+# GTD-R135 Phase 3 (G4) + Phase 4 (G5) — structural + identifier filters
+# ============================================================
+#
+# End-to-end through `route()` — the only way to catch a wiring bug between
+# `_resolve_buyer_chain` (int chain) / `resolve_slots` (str|None slots) and
+# the matcher's string-only comparison contract; a pure `_first_failing_
+# criterion` unit test would miss the router.py cast/merge step entirely.
+
+
+class TestStructuralFilters:
+    def test_str_cast_regression_buyer_id_filter_matches_int_chain(self):
+        """Unknown 5a — `_resolve_buyer_chain` returns `buyer_id` as a Python
+        `int`; the matcher compares strings. Without `str(v)` at the
+        click_attrs merge point, `42 in frozenset({"42"})` is FALSE (int
+        never `==` a same-digit str) — the exact CF-3 bug class reproduced
+        inside the fix meant to prevent it. This is RED without the cast in
+        router.py (revert the `str(_v) if _v is not None else ""` line to
+        prove it), GREEN with it."""
+        campaign_id = "10"
+        filter_flow = "100"
+        redis = FakeRedis(
+            sets={
+                "geo:US": {campaign_id},
+                "device:mobile": {campaign_id},
+                "os:ios": {campaign_id},
+                "campaigns:active": {campaign_id},
+            },
+            hashes={
+                f"campaign:{campaign_id}": {"company_id": "1", "priority": "0"},
+                "source:99": {
+                    "slug": "fb",
+                    "param_mappings": json.dumps([
+                        {"slot": "buyer_id", "alias": "buyer_id"},
+                    ]),
+                },
+                "user:42": {
+                    "id": "42", "team_id": "7", "department_id": "3",
+                    "custom_group_id": "", "company_id": "1", "status": "active",
+                },
+                f"flow:{filter_flow}": {
+                    "campaign_id": campaign_id,
+                    "scope_type": "company",
+                    "scope_id": "1",
+                    "seq_id": "1",
+                    "is_default": "0",
+                    "criteria": json.dumps([
+                        {"type": "buyer_id", "op": "in", "values": ["42"]},
+                    ]),
+                    "action_type": "redirect",
+                    "action_config": json.dumps({"url": "https://buyer-filter-hit"}),
+                },
+            },
+            lists={f"campaign:{campaign_id}:flows": [filter_flow]},
+        )
+        redis.sets[f"campaign:{campaign_id}:sources"] = {"99"}
+        result = _route_with(redis, _click({"buyer_id": "42", "source": "fb"}))
+        assert result is not None
+        assert "buyer-filter-hit" in result["url"]
+
+    def test_non_matching_buyer_falls_through_to_default(self):
+        """The dual of the str-cast test — a DIFFERENT buyer (99) must NOT
+        match the `buyer_id in [42]` filter; the click falls through to the
+        company catch-all. Proves the filter genuinely discriminates, not a
+        vacuous always-match."""
+        campaign_id = "10"
+        filter_flow = "100"
+        default_flow = "101"
+        redis = FakeRedis(
+            sets={
+                "geo:US": {campaign_id},
+                "device:mobile": {campaign_id},
+                "os:ios": {campaign_id},
+                "campaigns:active": {campaign_id},
+            },
+            hashes={
+                f"campaign:{campaign_id}": {"company_id": "1", "priority": "0"},
+                "source:99": {
+                    "slug": "fb",
+                    "param_mappings": json.dumps([
+                        {"slot": "buyer_id", "alias": "buyer_id"},
+                    ]),
+                },
+                "user:99": {
+                    "id": "99", "team_id": "7", "department_id": "3",
+                    "custom_group_id": "", "company_id": "1", "status": "active",
+                },
+                f"flow:{filter_flow}": {
+                    "campaign_id": campaign_id,
+                    "scope_type": "company",
+                    "scope_id": "1",
+                    "seq_id": "1",
+                    "is_default": "0",
+                    "criteria": json.dumps([
+                        {"type": "buyer_id", "op": "in", "values": ["42"]},
+                    ]),
+                    "action_type": "redirect",
+                    "action_config": json.dumps({"url": "https://buyer-filter-hit"}),
+                },
+                f"flow:{default_flow}": {
+                    "campaign_id": campaign_id,
+                    "scope_type": "company",
+                    "scope_id": "1",
+                    "seq_id": "5",
+                    "is_default": "1",
+                    "criteria": "[]",
+                    "action_type": "redirect",
+                    "action_config": json.dumps({"url": "https://catchall"}),
+                },
+            },
+            lists={f"campaign:{campaign_id}:flows": [filter_flow, default_flow]},
+        )
+        redis.sets[f"campaign:{campaign_id}:sources"] = {"99"}
+        result = _route_with(redis, _click({"buyer_id": "99", "source": "fb"}))
+        assert result is not None
+        assert "catchall" in result["url"]
+
+    def test_unresolved_buyer_chain_fails_closed_not_crashes(self):
+        """No `buyer_id` in the click at all → `_resolve_buyer_chain` returns
+        an empty chain (`buyer_id=None`) → the router's `str(_v) if _v is not
+        None else ""` cast maps it to `""`, which never matches any saved
+        (non-empty) criterion value — fails closed, falls through, does NOT
+        crash on a None→str comparison."""
+        campaign_id = "10"
+        filter_flow = "100"
+        default_flow = "101"
+        redis = FakeRedis(
+            sets={
+                "geo:US": {campaign_id},
+                "device:mobile": {campaign_id},
+                "os:ios": {campaign_id},
+                "campaigns:active": {campaign_id},
+            },
+            hashes={
+                f"campaign:{campaign_id}": {"company_id": "1", "priority": "0"},
+                f"flow:{filter_flow}": {
+                    "campaign_id": campaign_id,
+                    "scope_type": "company",
+                    "scope_id": "1",
+                    "seq_id": "1",
+                    "is_default": "0",
+                    "criteria": json.dumps([
+                        {"type": "buyer_id", "op": "in", "values": ["42"]},
+                    ]),
+                    "action_type": "redirect",
+                    "action_config": json.dumps({"url": "https://buyer-filter-hit"}),
+                },
+                f"flow:{default_flow}": {
+                    "campaign_id": campaign_id,
+                    "scope_type": "company",
+                    "scope_id": "1",
+                    "seq_id": "5",
+                    "is_default": "1",
+                    "criteria": "[]",
+                    "action_type": "redirect",
+                    "action_config": json.dumps({"url": "https://catchall"}),
+                },
+            },
+            lists={f"campaign:{campaign_id}:flows": [filter_flow, default_flow]},
+        )
+        result = _route_with(redis, _click())  # no buyer_id/source at all
+        assert result is not None
+        assert "catchall" in result["url"]
+
+
+class TestIdentifierFilters:
+    def test_byte_exact_identifier_filter_matches(self):
+        """`creative_id` is a canonical RESERVED slot — it auto-binds from a
+        same-named GET key with NO mapping needed. A `param:creative_id`
+        criterion matches a click carrying the exact wire value."""
+        campaign_id = "10"
+        filter_flow = "100"
+        redis = FakeRedis(
+            sets={
+                "geo:US": {campaign_id},
+                "device:mobile": {campaign_id},
+                "os:ios": {campaign_id},
+                "campaigns:active": {campaign_id},
+            },
+            hashes={
+                f"campaign:{campaign_id}": {"company_id": "1", "priority": "0"},
+                f"flow:{filter_flow}": {
+                    "campaign_id": campaign_id,
+                    "scope_type": "company",
+                    "scope_id": "1",
+                    "seq_id": "1",
+                    "is_default": "0",
+                    "criteria": json.dumps([
+                        {"type": "param:creative_id", "op": "in", "values": ["AdVariant_A"]},
+                    ]),
+                    "action_type": "redirect",
+                    "action_config": json.dumps({"url": "https://creative-hit"}),
+                },
+            },
+            lists={f"campaign:{campaign_id}:flows": [filter_flow]},
+        )
+        result = _route_with(redis, _click({"creative_id": "AdVariant_A"}))
+        assert result is not None
+        assert "creative-hit" in result["url"]
+
+    def test_byte_exact_identifier_filter_rejects_case_mismatch(self):
+        """The sacred rule — wire-format byte-exact. A saved 'AdVariant_A'
+        must NOT match a differently-cased click value; identifier dims are
+        case-preserve (like geo/region/browser/language), NOT lowercased."""
+        campaign_id = "10"
+        filter_flow = "100"
+        default_flow = "101"
+        redis = FakeRedis(
+            sets={
+                "geo:US": {campaign_id},
+                "device:mobile": {campaign_id},
+                "os:ios": {campaign_id},
+                "campaigns:active": {campaign_id},
+            },
+            hashes={
+                f"campaign:{campaign_id}": {"company_id": "1", "priority": "0"},
+                f"flow:{filter_flow}": {
+                    "campaign_id": campaign_id,
+                    "scope_type": "company",
+                    "scope_id": "1",
+                    "seq_id": "1",
+                    "is_default": "0",
+                    "criteria": json.dumps([
+                        {"type": "param:creative_id", "op": "in", "values": ["AdVariant_A"]},
+                    ]),
+                    "action_type": "redirect",
+                    "action_config": json.dumps({"url": "https://creative-hit"}),
+                },
+                f"flow:{default_flow}": {
+                    "campaign_id": campaign_id,
+                    "scope_type": "company",
+                    "scope_id": "1",
+                    "seq_id": "5",
+                    "is_default": "1",
+                    "criteria": "[]",
+                    "action_type": "redirect",
+                    "action_config": json.dumps({"url": "https://catchall"}),
+                },
+            },
+            lists={f"campaign:{campaign_id}:flows": [filter_flow, default_flow]},
+        )
+        result = _route_with(redis, _click({"creative_id": "advariant_a"}))
+        assert result is not None
+        assert "catchall" in result["url"]
+
+    def test_none_slot_regression_explicitly_mapped_unresolved_fails_closed(self):
+        """Unknown 6 — `resolve_slots` returns `dict[str, str | None]`. When a
+        slot is EXPLICITLY mapped (source `param_mappings` entry) but the
+        click carries no value for it AND no default_value is configured,
+        `slots["creative_id"]` is `None` (present, not absent). The router's
+        `.get(slot) or ""` (NOT `.get(slot, "")`) must map this to `""` —
+        proven here by a full route() call that must NOT crash and must
+        fail closed (falls through to the catch-all), never silently
+        matching an `in` criterion on a stray `None`."""
+        campaign_id = "10"
+        filter_flow = "100"
+        default_flow = "101"
+        redis = FakeRedis(
+            sets={
+                "geo:US": {campaign_id},
+                "device:mobile": {campaign_id},
+                "os:ios": {campaign_id},
+                "campaigns:active": {campaign_id},
+            },
+            hashes={
+                f"campaign:{campaign_id}": {"company_id": "1", "priority": "0"},
+                # Explicitly maps creative_id from a NON-canonical alias, with
+                # no default_value — the click below never supplies "cr", so
+                # `slots["creative_id"]` resolves to None (explicitly-mapped,
+                # unresolved), NOT omitted from the dict.
+                "source:99": {
+                    "slug": "fb",
+                    "param_mappings": json.dumps([
+                        {"slot": "creative_id", "alias": "cr"},
+                    ]),
+                },
+                f"flow:{filter_flow}": {
+                    "campaign_id": campaign_id,
+                    "scope_type": "company",
+                    "scope_id": "1",
+                    "seq_id": "1",
+                    "is_default": "0",
+                    "criteria": json.dumps([
+                        {"type": "param:creative_id", "op": "in", "values": ["AdVariant_A"]},
+                    ]),
+                    "action_type": "redirect",
+                    "action_config": json.dumps({"url": "https://creative-hit"}),
+                },
+                f"flow:{default_flow}": {
+                    "campaign_id": campaign_id,
+                    "scope_type": "company",
+                    "scope_id": "1",
+                    "seq_id": "5",
+                    "is_default": "1",
+                    "criteria": "[]",
+                    "action_type": "redirect",
+                    "action_config": json.dumps({"url": "https://catchall"}),
+                },
+            },
+            lists={f"campaign:{campaign_id}:flows": [filter_flow, default_flow]},
+        )
+        redis.sets[f"campaign:{campaign_id}:sources"] = {"99"}
+        # source=fb selects the mapping; NO "cr" param → creative_id
+        # explicitly-mapped-but-unresolved (None).
+        result = _route_with(redis, _click({"source": "fb"}))
+        assert result is not None
+        assert "catchall" in result["url"]
+
+    def test_none_slot_cast_produces_string_not_none_in_click_attrs(self):
+        """Honest companion to the test above — in THIS matcher, a stray
+        `None` and `""` happen to produce the SAME match verdict (`None in
+        frozenset({...})` is False, same as `"" in frozenset({...})`), so
+        the previous test's route()-level assertion can't actually
+        DISCRIMINATE the fixed cast from the naive `.get(slot, "")` bug (both
+        pass). This test closes that gap by spying on the exact
+        `cascade.resolve_flow` call and asserting the click_attrs VALUE TYPE
+        directly — `.get(slot) or ""` must produce a `str`, never a `None`,
+        regardless of whether today's evaluator happens to tolerate it. This
+        is the real regression guard: a future evaluator change (e.g. a
+        dim-specific `.lower()`/`.split()` applied unconditionally) would
+        crash on a `None` that slipped through — this test fails FIRST,
+        at the type boundary, before that can ever happen."""
+        campaign_id = "10"
+        filter_flow = "100"
+        redis = FakeRedis(
+            sets={
+                "geo:US": {campaign_id},
+                "device:mobile": {campaign_id},
+                "os:ios": {campaign_id},
+                "campaigns:active": {campaign_id},
+            },
+            hashes={
+                f"campaign:{campaign_id}": {"company_id": "1", "priority": "0"},
+                "source:99": {
+                    "slug": "fb",
+                    "param_mappings": json.dumps([
+                        {"slot": "creative_id", "alias": "cr"},
+                    ]),
+                },
+                f"flow:{filter_flow}": {
+                    "campaign_id": campaign_id,
+                    "scope_type": "company",
+                    "scope_id": "1",
+                    "seq_id": "1",
+                    "is_default": "0",
+                    "criteria": "[]",
+                    "action_type": "redirect",
+                    "action_config": json.dumps({"url": "https://hit"}),
+                },
+            },
+            lists={f"campaign:{campaign_id}:flows": [filter_flow]},
+        )
+        redis.sets[f"campaign:{campaign_id}:sources"] = {"99"}
+
+        captured: dict = {}
+        real_resolve_flow = cascade.resolve_flow
+
+        async def _spy(*args, **kwargs):
+            captured["click_attrs"] = kwargs.get("click_attrs")
+            return await real_resolve_flow(*args, **kwargs)
+
+        with patch.object(cascade, "resolve_flow", _spy):
+            result = _route_with(redis, _click({"source": "fb"}))
+
+        assert result is not None
+        assert "click_attrs" in captured
+        assert captured["click_attrs"]["param:creative_id"] == ""
+        assert isinstance(captured["click_attrs"]["param:creative_id"], str)
+        # Every identifier + structural dim must be a str — never None —
+        # regardless of whether the underlying source resolved a value.
+        for slot in cascade.IDENTIFIER_SLOTS:
+            assert isinstance(captured["click_attrs"][f"param:{slot}"], str)
+        for dim in cascade.STRUCTURAL_CRITERION_DIMS:
+            assert isinstance(captured["click_attrs"][dim], str)
+
+    def test_structural_and_identifier_combined_in_one_flow(self):
+        """Both new dim families on ONE flow, both must hold (AND semantics)
+        — proves they compose correctly through the same click_attrs dict."""
+        campaign_id = "10"
+        filter_flow = "100"
+        redis = FakeRedis(
+            sets={
+                "geo:US": {campaign_id},
+                "device:mobile": {campaign_id},
+                "os:ios": {campaign_id},
+                "campaigns:active": {campaign_id},
+            },
+            hashes={
+                f"campaign:{campaign_id}": {"company_id": "1", "priority": "0"},
+                "source:99": {
+                    "slug": "fb",
+                    "param_mappings": json.dumps([
+                        {"slot": "buyer_id", "alias": "buyer_id"},
+                    ]),
+                },
+                "user:42": {
+                    "id": "42", "team_id": "7", "department_id": "3",
+                    "custom_group_id": "", "company_id": "1", "status": "active",
+                },
+                f"flow:{filter_flow}": {
+                    "campaign_id": campaign_id,
+                    "scope_type": "company",
+                    "scope_id": "1",
+                    "seq_id": "1",
+                    "is_default": "0",
+                    "criteria": json.dumps([
+                        {"type": "buyer_id", "op": "in", "values": ["42"]},
+                        {"type": "param:creative_id", "op": "in", "values": ["AdVariant_A"]},
+                    ]),
+                    "action_type": "redirect",
+                    "action_config": json.dumps({"url": "https://combo-hit"}),
+                },
+            },
+            lists={f"campaign:{campaign_id}:flows": [filter_flow]},
+        )
+        redis.sets[f"campaign:{campaign_id}:sources"] = {"99"}
+        result = _route_with(
+            redis,
+            _click({"buyer_id": "42", "source": "fb", "creative_id": "AdVariant_A"}),
+        )
+        assert result is not None
+        assert "combo-hit" in result["url"]
+
+    def test_param_source_mixed_case_wire_value_matches_byte_exact(self):
+        """FIX (post-merge adversarial review) — `param:source` is a
+        canonical RESERVED slot: `resolve_slots` auto-binds it from the
+        raw `?source=` query param VERBATIM (no `.lower()` on that path),
+        even though the SEPARATE source-MATCHING lookup (which selects
+        WHICH `source:{id}` record applies) lowers its own local copy for
+        slug comparison only — that lowering never touches `slots`. A
+        mixed-case wire value ("FacebookAds") must byte-match a
+        criterion saved with the SAME casing (case-preserve, like geo/
+        region/browser/language), and must NOT match a differently-cased
+        one — proving both the source-matching lookup (case-insensitive,
+        unaffected) and the `param:source` filter (case-sensitive) work
+        correctly side-by-side on the same click."""
+        campaign_id = "10"
+        hit_flow = "100"
+        default_flow = "101"
+        redis = FakeRedis(
+            sets={
+                "geo:US": {campaign_id},
+                "device:mobile": {campaign_id},
+                "os:ios": {campaign_id},
+                "campaigns:active": {campaign_id},
+            },
+            hashes={
+                f"campaign:{campaign_id}": {"company_id": "1", "priority": "0"},
+                # Source slug is lowercase ("facebookads") — source-MATCHING
+                # is case-insensitive, so `?source=FacebookAds` still finds
+                # this source record. `param:source` filtering is separate.
+                "source:99": {"slug": "facebookads"},
+                f"flow:{hit_flow}": {
+                    "campaign_id": campaign_id,
+                    "scope_type": "company",
+                    "scope_id": "1",
+                    "seq_id": "1",
+                    "is_default": "0",
+                    "criteria": json.dumps([
+                        {"type": "param:source", "op": "in", "values": ["FacebookAds"]},
+                    ]),
+                    "action_type": "redirect",
+                    "action_config": json.dumps({"url": "https://source-hit"}),
+                },
+                f"flow:{default_flow}": {
+                    "campaign_id": campaign_id,
+                    "scope_type": "company",
+                    "scope_id": "1",
+                    "seq_id": "5",
+                    "is_default": "1",
+                    "criteria": "[]",
+                    "action_type": "redirect",
+                    "action_config": json.dumps({"url": "https://catchall"}),
+                },
+            },
+            lists={f"campaign:{campaign_id}:flows": [hit_flow, default_flow]},
+        )
+        redis.sets[f"campaign:{campaign_id}:sources"] = {"99"}
+
+        # Wire value matches the saved criterion's casing exactly -> hit.
+        result = _route_with(redis, _click({"source": "FacebookAds"}))
+        assert result is not None
+        assert "source-hit" in result["url"]
+
+        # Source-MATCHING still resolves this source case-insensitively
+        # (lowercase wire value), but `param:source`'s saved value is
+        # "FacebookAds" -> byte-exact mismatch -> falls through.
+        result2 = _route_with(redis, _click({"source": "facebookads"}))
+        assert result2 is not None
+        assert "catchall" in result2["url"]

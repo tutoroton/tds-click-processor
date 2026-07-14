@@ -893,7 +893,15 @@ def _first_failing_criterion(
                 return c
             continue
 
-        if dim in _CASE_PRESERVE:
+        # GTD-R135 Phase 4 (G5) — identifier (`param:<slot>`) dims are
+        # case-preserve TOO (byte-exact wire match — "the sacred rule": the
+        # configured value must byte-match the /decide wire value for that
+        # slot; a sub-id/creative-id/source token is often case-sensitive).
+        # Checked via `_EVALUATED_IDENTIFIER_DIMS` membership rather than
+        # enumerating all 25 dim names into `_CASE_PRESERVE` literally — ONE
+        # source of truth for the identifier dim-name list, no drift risk
+        # between two separate enumerations of the same names.
+        if dim in _CASE_PRESERVE or dim in _EVALUATED_IDENTIFIER_DIMS:
             values = frozenset(v for v in raw_values if isinstance(v, str))
         else:
             values = frozenset(
@@ -1048,8 +1056,38 @@ _EVALUATED_BASE_DIMS: Final[frozenset[str]] = frozenset({
 _EVALUATED_RETURNING_DIMS: Final[frozenset[str]] = frozenset({
     "is_returning", "is_roaming", "prev_offer", "prev_offer_target", "prev_sub",
 })
+
+# GTD-R135 Phase 3 (G4, ADR-0106) — org-hierarchy structural filter dims.
+# Mirror of admin-api `parameters.py` STRUCTURAL_CRITERION_TYPES (separate
+# service, no shared import — cross-service contract anchor, pinned by
+# `test_criteria_contract.py`). Unconditionally populated in `_try_flow_cascade`
+# from the already-resolved `buyer_chain` (zero new Redis I/O). NEVER reachable
+# by the legacy offer-target matcher — schema-gated to FLOW_CRITERION_TYPES
+# only at admin-api (Unknown 1), so this dim-set exists ONLY on the cascade
+# side of `KNOWN_EVALUATED_DIMS`.
+STRUCTURAL_CRITERION_DIMS: Final[frozenset[str]] = frozenset({
+    "buyer_id", "team_id", "department_id", "custom_group_id",
+})
+
+# GTD-R135 Phase 4 (G5) — identifier filter dims via the `param:<slot>`
+# convention. `IDENTIFIER_SLOTS` is PUBLIC (router.py iterates the raw slot
+# names to populate click_attrs); `_EVALUATED_IDENTIFIER_DIMS` carries the
+# "param:"-prefixed click_attrs KEYS. Mirror of admin-api `parameters.py`
+# IDENTIFIER_SLOTS / IDENTIFIER_CRITERION_DIMS — same owner-named subset.
+IDENTIFIER_SLOTS: Final[frozenset[str]] = frozenset(
+    f"sub{i}" for i in range(1, 21)
+) | frozenset({
+    "creative_id", "ad_campaign_id", "source", "source_click_id", "keyword",
+})
+_EVALUATED_IDENTIFIER_DIMS: Final[frozenset[str]] = frozenset(
+    f"param:{s}" for s in IDENTIFIER_SLOTS
+)
+
 KNOWN_EVALUATED_DIMS: Final[frozenset[str]] = (
-    _EVALUATED_BASE_DIMS | _EVALUATED_RETURNING_DIMS
+    _EVALUATED_BASE_DIMS
+    | _EVALUATED_RETURNING_DIMS
+    | STRUCTURAL_CRITERION_DIMS
+    | _EVALUATED_IDENTIFIER_DIMS
 )
 
 

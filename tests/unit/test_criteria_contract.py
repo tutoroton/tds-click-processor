@@ -27,6 +27,8 @@ from __future__ import annotations
 
 from app.cascade import (
     KNOWN_EVALUATED_DIMS,
+    STRUCTURAL_CRITERION_DIMS,
+    IDENTIFIER_SLOTS,
     _EVALUATED_BASE_DIMS,
     _first_failing_criterion,
     normalize_hour,
@@ -399,3 +401,64 @@ def test_cascade_dims_are_superset_of_legacy_matcher_dims():
     extra_keys = set(_extra_click_dims(_req(arrival_ts=None)))
     legacy_dims = static_keys | extra_keys
     assert legacy_dims <= KNOWN_EVALUATED_DIMS
+
+
+# ---- GTD-R135 Phase 3/4 — Invariant C extended to structural + identifier ---
+# (FIX 3, post-merge adversarial review, 2026-07-14): Phase 0's harness pinned
+# the base-10 CF-3 contract + Invariant B (device_type codomain) + Invariant C
+# (legacy-vs-cascade dim-set lockstep) BEFORE Phase 3/4 existed. Those two
+# phases added STRUCTURAL_CRITERION_DIMS + IDENTIFIER_SLOTS to cascade.py with
+# comments claiming they're "pinned by test_criteria_contract.py" — but no
+# such pin was ever added here. This closes that gap: a future one-sided edit
+# (e.g. a 5th structural dim added to admin-api's parameters.py without
+# wiring cascade.py, or the reverse) now fails CI instead of rotting silently
+# — exactly the CF-3 failure class Invariant 1 above already guards for the
+# base-10 dims.
+
+# Mirror of admin-api `app/common/parameters.py` STRUCTURAL_CRITERION_TYPES.
+# Separate service, no shared import — cross-service contract anchor, same
+# pattern as ADMIN_ACCEPTED_BASE_DIMS / _ADMIN_DEVICE_TYPE_ENUM above.
+_ADMIN_STRUCTURAL_CRITERION_TYPES = frozenset({
+    "buyer_id", "team_id", "department_id", "custom_group_id",
+})
+
+# Mirror of admin-api `app/common/parameters.py` IDENTIFIER_SLOTS — the
+# owner's deliberate 25-slot subset (all 20 sub-slots + 5 named reserved
+# slots), not all 39 canonical slots.
+_ADMIN_IDENTIFIER_SLOTS = frozenset(f"sub{i}" for i in range(1, 21)) | frozenset({
+    "creative_id", "ad_campaign_id", "source", "source_click_id", "keyword",
+})
+
+
+def test_structural_criterion_dims_in_lockstep_with_admin():
+    """Exact equality (not subset) — admin-api's STRUCTURAL_CRITERION_TYPES is
+    an MVP-locked set of exactly 4 org-hierarchy dims (ADR-0106); cascade's
+    STRUCTURAL_CRITERION_DIMS must mirror it byte-for-byte. A one-sided
+    add/remove on either side fails here instead of shipping a dead admin dim
+    (CF-3-class) or an unreachable matcher branch."""
+    assert STRUCTURAL_CRITERION_DIMS == _ADMIN_STRUCTURAL_CRITERION_TYPES
+
+
+def test_identifier_slots_in_lockstep_with_admin():
+    """Exact equality — admin-api's IDENTIFIER_SLOTS is the owner's
+    deliberately-curated subset; cascade's mirror must match exactly so the
+    derived `param:`-prefixed evaluated-dims set (built by the identical
+    transform on both sides) never silently drifts out of sync."""
+    assert IDENTIFIER_SLOTS == _ADMIN_IDENTIFIER_SLOTS
+
+
+def test_structural_and_identifier_dims_are_evaluated_by_cascade():
+    """CF-3 contract, extended to Phase 3/4 (FIX 3) — every structural +
+    identifier dim admin-api accepts on a flow MUST be a member of cascade's
+    KNOWN_EVALUATED_DIMS, exactly like the base-10 contract (Invariant 1)
+    above. A dim accepted at write time but absent from the evaluator's
+    known-dims set is the CF-3 fail-open shape: a stored `not_in` criterion
+    on it would be a silent no-op for 100% of traffic."""
+    admin_dims = _ADMIN_STRUCTURAL_CRITERION_TYPES | {
+        f"param:{slot}" for slot in _ADMIN_IDENTIFIER_SLOTS
+    }
+    missing = admin_dims - KNOWN_EVALUATED_DIMS
+    assert not missing, (
+        "admin-accepted structural/identifier dim never evaluated by cascade "
+        f"(CF-3-class, not_in fail-open): {sorted(missing)}"
+    )

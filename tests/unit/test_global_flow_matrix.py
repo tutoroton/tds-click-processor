@@ -135,14 +135,27 @@ def _wid(flow):
 
 
 class TestGap1AnchorGlobalPreemptsCampaignBound:
-    """FINDINGS-G1 §3.2 anchor: a GLOBAL flow at buyer scope pre-empts a
-    CAMPAIGN-BOUND flow at company scope, for the SAME campaign's click.
-    `_pick_winner` walks `SCOPE_PRIORITY` (most-specific first); binding is
-    only a same-LEVEL tie-break, so scope specificity dominates regardless
-    of binding. No prior test combined a different scope level with a
-    different binding in one `resolve_flow` call (G1 gap #1)."""
+    """FINDINGS-G1 §3.2 anchor (2026-07-14 status: FLIPPED by GTD-R132).
 
-    async def test_global_buyer_flow_beats_campaign_bound_company_flow(self):
+    ORIGINAL finding: a GLOBAL flow at buyer scope pre-empted a
+    CAMPAIGN-BOUND flow at company scope, for the SAME campaign's click —
+    `_pick_winner` walked `SCOPE_PRIORITY` (most-specific first) with
+    binding only a same-LEVEL tie-break, so scope specificity dominated
+    regardless of binding. This was flagged as an UNEXAMINED emergent
+    side-effect (never a deliberate design decision — SCOPE-CASCADE.md's
+    own worked examples never covered a campaign-bound vs. global
+    cross-scope collision).
+
+    GTD-R132 (2026-07-14, Option a, criteria-gated) intentionally
+    OVERTURNS this: campaign-bound survivors are now tried FIRST across
+    every scope level, so the campaign-bound company flow WINS here — a
+    campaign's own explicit routing rule now always outranks a global
+    override at ANY scope, as long as its criteria match the click. The
+    class name is kept (same fixture, same historical significance) but
+    the test below now pins the FLIPPED outcome; see
+    `TestCrossPartitionPrecedence` for the dedicated GTD-R132 coverage."""
+
+    async def test_campaign_bound_company_flow_now_wins_over_global_buyer_flow(self):
         company_bound = _flow(
             "CB", scope_type="company", scope_id=1, campaign_id="1", seq_id=1,
         )
@@ -156,15 +169,15 @@ class TestGap1AnchorGlobalPreemptsCampaignBound:
             scope_lists={_scope_key(1, "buyer", 5): ["BG"]},
         )
         winner = await _resolve(r, buyer_id=5)
-        assert _wid(winner) == "BG"
-        assert winner["campaign_id"] == "0"  # confirms the winner is the GLOBAL one
+        assert _wid(winner) == "CB"
+        assert winner["campaign_id"] == "1"  # confirms the winner is the CAMPAIGN-BOUND one
 
     async def test_reverse_no_buyer_context_campaign_bound_wins(self):
         """Same config, but the click has NO buyer id (walked past buyer
         level entirely) — the buyer-scoped global flow is never even a
         candidate (its scope list is never fetched), so the campaign-bound
-        company flow wins normally. Confirms the anchor is buyer-CONTEXT
-        gated, not a blanket override."""
+        company flow wins regardless. Byte-identical outcome pre/post
+        GTD-R132 (campaign-bound already won here either way)."""
         company_bound = _flow(
             "CB", scope_type="company", scope_id=1, campaign_id="1", seq_id=1,
         )
@@ -528,12 +541,27 @@ class TestGap5CampaignBoundNonCompanyScopeWins:
 class TestGap6FiveLevelMixedBindingEndToEnd:
     """No test populates all 5 scope levels with DISTINCT winning
     candidates (mixed binding) and asserts the ONE correct winner
-    threading the whole chain (G1 gap #6)."""
+    threading the whole chain (G1 gap #6).
 
-    async def test_buyer_wins_over_all_four_less_specific_levels(self):
+    GTD-R132 (2026-07-14) update: with binding now an axis ABOVE scope
+    specificity (campaign-bound tried first, across every scope level),
+    "mixed binding, 5 distinct levels" no longer collapses to a single
+    scope-priority walk — the FIRST test below now demonstrates that a
+    campaign-bound survivor at ANY level beats every global survivor,
+    regardless of specificity (the direct GTD-R132 behavior); the SECOND
+    (new) test restores the original "5-level chain" intent by keeping
+    binding UNIFORM, so it isolates the scope-priority walk WITHIN one
+    partition — proving `_pick_winner`'s own logic is genuinely
+    unchanged. The THIRD test (unaffected, unchanged) proves the
+    criteria-gated fallthrough to global when no campaign-bound survivor
+    is eligible."""
+
+    async def test_campaign_bound_custom_group_wins_over_more_specific_global_buyer(self):
         """Buyer (global) present alongside custom_group/department
-        (campaign-bound) and team/company (global) — buyer must win; none
-        of the other 4 even reach tie-break."""
+        (campaign-bound) and team/company (global) — the campaign-bound
+        custom_group flow now wins, even though the global buyer flow sits
+        at a MORE specific scope. This is the direct GTD-R132 behavior:
+        campaign-bound survivors are tried first, across every level."""
         buyer = _flow("BUY", scope_type="buyer", scope_id=5, campaign_id="0", seq_id=1)
         group = _flow(
             "GRP", scope_type="custom_group", scope_id=10, campaign_id="1", seq_id=1,
@@ -552,6 +580,32 @@ class TestGap6FiveLevelMixedBindingEndToEnd:
                 _scope_key(1, "team", 3): ["TEA"],
                 _scope_key(1, "company", 1): ["COM"],
             },
+        )
+        winner = await _resolve(
+            r, buyer_id=5, custom_group_id=10, team_id=3, department_id=2,
+        )
+        assert _wid(winner) == "GRP"
+        assert winner["campaign_id"] == "1"
+
+    async def test_buyer_wins_over_all_four_less_specific_levels_within_one_partition(self):
+        """Restores the pre-GTD-R132 "5-level chain, most specific wins"
+        intent, correctly scoped: ALL 5 flows are campaign-bound to the
+        SAME campaign, so binding never varies and the scope-priority walk
+        is the only axis in play — proving `_pick_winner`'s own
+        specificity-ordering logic is genuinely unchanged by this fix."""
+        buyer = _flow("BUY", scope_type="buyer", scope_id=5, campaign_id="1", seq_id=1)
+        group = _flow(
+            "GRP", scope_type="custom_group", scope_id=10, campaign_id="1", seq_id=1,
+        )
+        team = _flow("TEA", scope_type="team", scope_id=3, campaign_id="1", seq_id=1)
+        dept = _flow(
+            "DEP", scope_type="department", scope_id=2, campaign_id="1", seq_id=1,
+        )
+        comp = _flow("COM", scope_type="company", scope_id=1, campaign_id="1", seq_id=1)
+        flows = {"BUY": buyer, "GRP": group, "TEA": team, "DEP": dept, "COM": comp}
+        r = await _seed(
+            flows,
+            campaign_lists={"1": ["BUY", "GRP", "TEA", "DEP", "COM"]},
         )
         winner = await _resolve(
             r, buyer_id=5, custom_group_id=10, team_id=3, department_id=2,

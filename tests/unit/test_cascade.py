@@ -53,6 +53,7 @@ def _make_flow(
     is_default: bool = False,
     criteria: list | None = None,
     action_type: str = "redirect",
+    audience: str = "first",
 ) -> dict:
     """Build a flow HASH the way the sync builder emits it."""
     return {
@@ -65,6 +66,7 @@ def _make_flow(
         "criteria": json.dumps(criteria if criteria is not None else []),
         "action_type": action_type,
         "action_config": "{}",
+        "audience": audience,
         "name": f"flow-{fid}",
     }
 
@@ -1284,3 +1286,130 @@ class TestCascadeTailBoundCallShape:
         # Only the campaign list + company scope are fetched (no buyer/
         # team/dept/group id supplied) — both at the default cap.
         assert recorded == [(-_MAX_FLOWS_PER_CLICK, -1), (-_MAX_FLOWS_PER_CLICK, -1)]
+
+
+# ============================================================
+# GTD-R132 — campaign-first partition, criteria-gated (Option a)
+# ============================================================
+
+
+class TestCrossPartitionPrecedence:
+    """Zero existing coverage pre-fix (D3/CX1 confirmed: all 8
+    TestSpecificity/TestTieBreak fixtures are single-partition by
+    construction — every flow in one test shares the same `campaign_id`
+    binding). This class is the FIRST to combine a campaign-bound flow at
+    one scope level with a global flow at a MORE-specific scope level in
+    one `resolve_flow` call, and pins the new axis order: binding
+    (campaign-bound vs global) now sits ABOVE scope specificity.
+
+    0 live behavior change on staging: 0/159 flows have ever had
+    `campaign_id IS NULL` (confirmed FINDINGS-G1/D3), so this collision
+    shape has never been reachable in production data — these tests
+    exercise a cold path made newly correct, not a live regression risk.
+    """
+
+    @pytest.mark.asyncio
+    async def test_campaign_bound_wins_at_less_specific_scope_when_criteria_match(self):
+        """Campaign-bound flow at COMPANY scope vs. global flow at BUYER
+        scope (strictly more specific under the old model) — both match
+        criteria. Campaign-bound wins (was: global, pre-GTD-R132)."""
+        campaign_bound = _make_flow(
+            fid="1", scope_type="company", scope_id=1, campaign_id="1", seq_id=1,
+        )
+        global_flow = _make_flow(
+            fid="2", scope_type="buyer", scope_id=5, campaign_id="0", seq_id=99,
+        )
+        flows = {"flow:1": campaign_bound, "flow:2": global_flow}
+        lists = {
+            "campaign:1:flows": ["1"],
+            "flows:scope:1:buyer:5": ["2"],
+        }
+        r = _redis_with_lists_and_hashes(lists, flows)
+        winner = await resolve_flow(
+            r, campaign_id="1", company_id=1, buyer_id=5,
+            team_id=None, department_id=None, custom_group_id=None,
+            click_attrs={"geo": "US", "os": "ios", "device_type": "mobile"},
+        )
+        assert winner["_id"] == "1"
+        assert winner["campaign_id"] == "1"
+
+    @pytest.mark.asyncio
+    async def test_falls_through_to_global_when_campaign_bound_criteria_fail(self):
+        """Same shape, but the campaign-bound flow's criteria don't match
+        the click — criteria-gated: it was never a survivor, so the walk
+        falls through to the global (more-specific-scope) flow."""
+        campaign_bound = _make_flow(
+            fid="1", scope_type="company", scope_id=1, campaign_id="1", seq_id=1,
+            criteria=[{"type": "geo", "op": "in", "values": ["RU"]}],
+        )
+        global_flow = _make_flow(
+            fid="2", scope_type="buyer", scope_id=5, campaign_id="0", seq_id=99,
+        )
+        flows = {"flow:1": campaign_bound, "flow:2": global_flow}
+        lists = {
+            "campaign:1:flows": ["1"],
+            "flows:scope:1:buyer:5": ["2"],
+        }
+        r = _redis_with_lists_and_hashes(lists, flows)
+        winner = await resolve_flow(
+            r, campaign_id="1", company_id=1, buyer_id=5,
+            team_id=None, department_id=None, custom_group_id=None,
+            click_attrs={"geo": "US", "os": "ios", "device_type": "mobile"},
+        )
+        assert winner["_id"] == "2"
+        assert winner["campaign_id"] == "0"
+
+    @pytest.mark.asyncio
+    async def test_campaign_bound_wins_in_the_returning_pool_too(self):
+        """The mission's exact scenario (CX2 §3) — the binding axis applies
+        symmetrically to the RETURNING pool, not just first-time. A
+        campaign-bound returning flow at company scope wins over a
+        narrower-scoped GLOBAL returning flow for a seen_before visitor."""
+        campaign_bound_returning = _make_flow(
+            fid="1", scope_type="company", scope_id=1, campaign_id="1",
+            seq_id=1, audience="returning",
+        )
+        global_returning = _make_flow(
+            fid="2", scope_type="buyer", scope_id=5, campaign_id="0",
+            seq_id=99, audience="returning",
+        )
+        flows = {"flow:1": campaign_bound_returning, "flow:2": global_returning}
+        lists = {
+            "campaign:1:flows": ["1"],
+            "flows:scope:1:buyer:5": ["2"],
+        }
+        r = _redis_with_lists_and_hashes(lists, flows)
+        winner = await resolve_flow(
+            r, campaign_id="1", company_id=1, buyer_id=5,
+            team_id=None, department_id=None, custom_group_id=None,
+            click_attrs={"geo": "US", "os": "ios", "device_type": "mobile"},
+            seen_before=True, audience_routing=True,
+        )
+        assert winner["_id"] == "1"
+        assert winner["audience"] == "returning"
+
+    @pytest.mark.asyncio
+    async def test_zero_eligible_campaign_bound_survivors_falls_through_regression_guard(self):
+        """Regression guard — when a campaign has NO campaign-bound flows
+        at all (today's live shape: 0/159 flows are global, but every
+        campaign that HAS flows has them campaign-bound in practice too),
+        the walk behaves exactly as before: pure global scope-priority."""
+        global_buyer = _make_flow(
+            fid="1", scope_type="buyer", scope_id=5, campaign_id="0", seq_id=1,
+        )
+        global_company = _make_flow(
+            fid="2", scope_type="company", scope_id=1, campaign_id="0", seq_id=1,
+        )
+        flows = {"flow:1": global_buyer, "flow:2": global_company}
+        lists = {
+            "campaign:1:flows": [],
+            "flows:scope:1:buyer:5": ["1"],
+            "flows:scope:1:company:1": ["2"],
+        }
+        r = _redis_with_lists_and_hashes(lists, flows)
+        winner = await resolve_flow(
+            r, campaign_id="1", company_id=1, buyer_id=5,
+            team_id=None, department_id=None, custom_group_id=None,
+            click_attrs={"geo": "US", "os": "ios", "device_type": "mobile"},
+        )
+        assert winner["_id"] == "1"  # buyer beats company — pure specificity, unaffected

@@ -25,14 +25,25 @@ Algorithm summary (full spec: `docs/design/SCOPE-CASCADE.md`):
            department < company).
   Step 2 — criteria match: each flow's effective criteria must satisfy
            the click attrs (geo, os, device_type). Survivors keep going.
-  Step 3 — specificity: the most-specific scope among survivors wins.
-  Step 4 — tie-break (within same scope level):
-              4a. campaign-bound beats global,
-              4b. lower seq_id wins,
+  Step 3 — binding partition (GTD-R132, campaign-first, CRITERIA-GATED):
+           survivors are split into campaign-bound (this click's own
+           campaign) vs global. Campaign-bound survivors are tried FIRST,
+           walking the FULL specificity order below; only when zero
+           eligible campaign-bound survivors exist at ANY scope level does
+           the walk fall through to global survivors, across every scope
+           level. "Criteria-gated" falls out automatically — a
+           campaign-bound flow whose criteria don't match the click was
+           never a survivor, so a general campaign flow catches all its
+           traffic, a geo-specific one only that geo, and non-matching
+           traffic falls through to global.
+  Step 4 — specificity + tie-break WITHIN one binding partition:
+              4a. the most-specific scope among survivors wins,
+              4b. lower seq_id wins at the same scope level,
               4c. is_default flows are always last.
   Step 5 — fallback: if no flow matches at the deepest level, walk OUT
            one scope level and re-evaluate. Walk continues until a flow
-           is found or all levels are exhausted.
+           is found or all levels are exhausted (within the current
+           binding partition, before falling through per Step 3).
 
 The function returns the winning flow HASH (with `_id` field added) or
 `None` when nothing matches at any level. Caller decides what to do:
@@ -356,6 +367,27 @@ async def resolve_flow(
     # winner expression — the audience partition + first-pool fallthrough is
     # preserved (returning pool first for a seen_before visitor, else first
     # pool).
+    #
+    # GTD-R132 (2026-07-14) — campaign-first partition, CRITERIA-GATED
+    # (Option a). Axis nesting is audience (outer, existing) → campaign-
+    # binding (middle, NEW) → scope-specificity (inner, `_pick_winner`
+    # unchanged). `_pick` calls `_eligible()` ONCE per audience pool, then
+    # splits the SURVIVORS by `campaign_id` — never re-filters per binding
+    # sub-pool (that would double the trace-accounting `_eligible` already
+    # does). Campaign-bound survivors are tried FIRST across every scope
+    # level; only on zero eligible campaign-bound survivors does the walk
+    # fall through to global survivors, also across every scope level.
+    # "Criteria-gated" falls out automatically: a campaign-bound flow whose
+    # criteria don't match the click was never a survivor, so it can't
+    # shadow global flows it wouldn't actually serve.
+    def _pick(pool: list[dict[str, Any]]) -> dict[str, Any] | None:
+        eligible = _eligible(pool)  # ONE call — GTD-R132 guardrail
+        campaign_bound, global_ = _split_by_binding(eligible)
+        return (
+            _pick_winner(campaign_bound, click_levels)
+            or _pick_winner(global_, click_levels)
+        )
+
     winner: dict[str, Any] | None
     returning_flows, first_flows = _partition_audience(flows)
     if not audience_routing:
@@ -371,13 +403,13 @@ async def resolve_flow(
         # — every legacy/unknown-audience flow defaults to the first pool in
         # `_partition_audience`, so only explicitly returning-tagged flows are
         # excluded. `seen_before` is ignored under OFF.
-        winner = _pick_winner(_eligible(first_flows), click_levels)
+        winner = _pick(first_flows)
     else:
         winner = None
         if seen_before:
-            winner = _pick_winner(_eligible(returning_flows), click_levels)
+            winner = _pick(returning_flows)
         if winner is None:
-            winner = _pick_winner(_eligible(first_flows), click_levels)
+            winner = _pick(first_flows)
 
     if trace is not None and winner is not None:
         trace["winning_flow_id"] = winner.get("_id")
@@ -467,6 +499,29 @@ def _partition_audience(
         else:
             first.append(f)
     return returning, first
+
+
+def _split_by_binding(
+    survivors: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """GTD-R132 — split criteria/availability SURVIVORS (post-`_eligible`)
+    into (campaign_bound, global) by `campaign_id`. Mirrors the sync
+    builder's write-path invariant exactly (`sync/builders/flows.py` — a
+    flow lands in EITHER the campaign list OR a scope list, never both) —
+    so this is not an approximation, it's re-deriving the same partition
+    the write path already enforces, from the loaded flow row's own field.
+
+    MUST be called on `_eligible()`'s return value, never on the raw pool
+    — splitting BEFORE the criteria/availability filter would run
+    `_eligible` twice per audience pool and double-count
+    `trace["availability_excluded"]` / `rejected_sink` (both accumulate via
+    `+=`/`append` inside `_eligible`'s closure)."""
+    bound: list[dict[str, Any]] = []
+    global_: list[dict[str, Any]] = []
+    for f in survivors:
+        campaign_id = f.get("campaign_id") or "0"
+        (bound if campaign_id != "0" else global_).append(f)
+    return bound, global_
 
 
 def _referenced_target_ids(flow: dict[str, Any]) -> list[str]:
@@ -1010,6 +1065,13 @@ def _pick_winner(
       a. Campaign-bound flow (campaign_id != "0") beats global.
       b. Lower `seq_id` wins.
       c. `is_default=True` flows are always last.
+
+    GTD-R132 (2026-07-14): the caller (`resolve_flow`'s `_pick` closure) now
+    invokes this on an ALREADY campaign_id-partitioned `survivors` list (all
+    campaign-bound, or all global — never mixed), so tie-break (a) is
+    permanently constant within any single call — dead weight, not wrong.
+    This function's own logic is UNCHANGED; the binding axis lives one
+    layer up.
     """
     for scope_type in SCOPE_PRIORITY:
         click_id = click_levels.get(scope_type)
@@ -1042,6 +1104,11 @@ def _winner_sort_key(flow: dict[str, Any]) -> tuple[int, int, int]:
       - seq_id:         lower wins (oldest-by-creation; user-visible).
 
     All ascending; first item after sort wins.
+
+    GTD-R132: `bound_bucket` is permanently 0 for every element `_pick_winner`
+    is now called with under a campaign-bound partition, and permanently 1
+    under a global partition (see `_split_by_binding`) — left as-is
+    (cosmetic-only simplification deferred; see `resolve_flow`'s `_pick`).
     """
     is_default = flow.get("is_default") == "1"
     campaign_id = flow.get("campaign_id") or "0"

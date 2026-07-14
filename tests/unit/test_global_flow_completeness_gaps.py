@@ -163,18 +163,29 @@ def _stub_build_url():
 
 class TestGap1ActionCompositionOnGlobalWinner:
     """FINDINGS-G3-CRITIC.md §(c) gap 1 — `block`/`split` were never
-    exercised on a flow that won specifically because it was global and
-    out-scoped a campaign-bound competitor. Each layer already has generic
-    coverage on its own (`TestGap1AnchorGlobalPreemptsCampaignBound` for
-    winner-selection, `test_action_executor.py::TestSplit/TestBlock` for
-    execution mechanics) — these tests prove the two layers COMPOSE
-    correctly for a global-flow winner specifically, by feeding the exact
-    `resolve_flow` winner dict into `execute_action`."""
+    exercised on a flow that won specifically because it was global,
+    reached only via the fallthrough from an ineligible campaign-bound
+    competitor. Each layer already has generic coverage on its own
+    (`TestGap1AnchorGlobalPreemptsCampaignBound` for winner-selection,
+    `test_action_executor.py::TestSplit/TestBlock` for execution
+    mechanics) — these tests prove the two layers COMPOSE correctly for a
+    global-flow winner specifically, by feeding the exact `resolve_flow`
+    winner dict into `execute_action`.
+
+    GTD-R132 (2026-07-14) update: campaign-bound flows are now tried
+    FIRST across every scope level (Option a, criteria-gated) — a
+    campaign-bound flow at a LESS-specific scope no longer loses to a
+    global flow at a more-specific one purely on specificity. The
+    campaign-bound competitor here is given a NON-matching criterion so
+    it is excluded at the criteria-filter step (never even a survivor to
+    partition), and the walk correctly falls through to the global
+    flow — the fallthrough this class's tests are exercising."""
 
     async def test_global_split_flow_wins_and_executes(self):
         campaign_bound = _flow(
             "CB", scope_type="company", scope_id=1, campaign_id="1", seq_id=1,
             action_type="offer", action_config={"offer_id": 99, "target_id": 999},
+            criteria=[{"type": "geo", "op": "in", "values": ["RU"]}],
         )
         global_split = _flow(
             "GS", scope_type="buyer", scope_id=5, campaign_id="0", seq_id=2,
@@ -190,6 +201,7 @@ class TestGap1ActionCompositionOnGlobalWinner:
                 "101": {"url": "https://leg-101", "availability": "active"},
             },
         )
+        # US click — CB's RU-only criterion excludes it, GS falls through.
         winner = await _resolve(r, campaign_id="1", company_id=1, buyer_id=5)
         assert _wid(winner) == "GS"
         assert winner["scope_type"] == "buyer"
@@ -208,6 +220,7 @@ class TestGap1ActionCompositionOnGlobalWinner:
         campaign_bound = _flow(
             "CB", scope_type="company", scope_id=1, campaign_id="1", seq_id=1,
             action_type="redirect", action_config={"url": "https://fallback"},
+            criteria=[{"type": "geo", "op": "in", "values": ["RU"]}],
         )
         global_block = _flow(
             "GB", scope_type="buyer", scope_id=5, campaign_id="0", seq_id=2,
@@ -218,6 +231,7 @@ class TestGap1ActionCompositionOnGlobalWinner:
             campaign_lists={"1": ["CB"]},
             scope_lists={_scope_key(1, "buyer", 5): ["GB"]},
         )
+        # US click — CB's RU-only criterion excludes it, GB falls through.
         winner = await _resolve(r, campaign_id="1", company_id=1, buyer_id=5)
         assert _wid(winner) == "GB"
         assert winner["scope_type"] == "buyer"
@@ -427,24 +441,35 @@ class TestGap5CrossScopeTruncationCounterExample:
     org-scope level was ever appended — a WHOLE-WALK BLACKOUT for every
     global flow visible to that click, not just one tied flow's outcome.
 
-    GTD-R129 fix (2026-07-14) — INVERTED. Each list (campaign + each
-    present scope level) is now an INDEPENDENT pipeline read, tail-bounded
-    to its OWN cap (`cascade.py::_collect_candidate_ids`) — a bloated
-    campaign-bound backlog can no longer crowd out a buyer-scope override;
-    the two lists never compete for the same budget. This test now asserts
-    the buyer-scope override SURVIVES and wins, while the
-    `routing_trace.candidates_truncated` marker still fires (the
-    campaign's own 205-flow list is still over cap and still gets
-    tail-bounded — that per-bucket truncation is expected + safe, only the
-    cross-bucket blackout is fixed)."""
+    GTD-R129 fix (2026-07-14) — the CANDIDATE-COLLECTION half is INVERTED:
+    each list (campaign + each present scope level) is now an INDEPENDENT
+    pipeline read, tail-bounded to its OWN cap (`cascade.py
+    ::_collect_candidate_ids`) — a bloated campaign-bound backlog can no
+    longer crowd the buyer-scope override OUT OF CANDIDACY; the two lists
+    never compete for the same read budget. The `routing_trace.
+    candidates_truncated` marker still fires (the campaign's own 205-flow
+    list is still over cap and still gets tail-bounded — that per-bucket
+    truncation is expected + safe).
+
+    GTD-R132 (2026-07-14) changes WHO WINS once both are candidates:
+    campaign-bound survivors are now tried before global ones regardless
+    of scope specificity, so the old campaign-bound flows are given a
+    NON-matching criterion here — proving fix #1's candidate-collection
+    guarantee (the override is never silently excluded from the pool)
+    while staying consistent with fix #3's now-correct precedence (the
+    override wins via the criteria-gated FALLTHROUGH, not by out-scoping
+    a criteria-matching campaign-bound competitor)."""
 
     async def test_buyer_scope_global_override_survives_an_overgrown_campaign(self):
         # 205 old campaign-bound, company-scope flows — comfortably over the
-        # 200 cap so the campaign's OWN list still gets tail-bounded.
+        # cap so the campaign's OWN list still gets tail-bounded. RU-only
+        # criteria so they're excluded from ELIGIBILITY (not candidacy) on
+        # the default US click — isolates the candidate-collection proof
+        # from fix #3's campaign-bound-first precedence.
         old_campaign_flows = {
             f"OLD{n}": _flow(
                 f"OLD{n}", scope_type="company", scope_id=1, campaign_id="1",
-                seq_id=n, criteria=[],
+                seq_id=n, criteria=[{"type": "geo", "op": "in", "values": ["RU"]}],
             )
             for n in range(1, 206)
         }
@@ -465,10 +490,11 @@ class TestGap5CrossScopeTruncationCounterExample:
         winner = await _resolve(
             r, campaign_id="1", company_id=1, buyer_id=5, trace=trace,
         )
-        # Fixed: the buyer-scope override IS a candidate (its own 1-item
-        # list is nowhere near its cap) and wins — buyer is more specific
-        # than company, so `_pick_winner` never even reaches the
-        # campaign-bound company-scope survivors.
+        # The buyer-scope override IS a candidate (its own 1-item list is
+        # nowhere near its cap) and wins — the campaign-bound partition has
+        # ZERO eligible survivors (all 205 are RU-only, click is US), so
+        # the walk falls through to the global partition, where the
+        # override is the only — and winning — survivor.
         assert _wid(winner) == "BUYER_OVERRIDE"
         assert winner["scope_type"] == "buyer"
         # The campaign's own list (205 > 200) is still tail-bounded —

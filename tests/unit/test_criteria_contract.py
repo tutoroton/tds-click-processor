@@ -423,10 +423,16 @@ _ADMIN_STRUCTURAL_CRITERION_TYPES = frozenset({
 })
 
 # Mirror of admin-api `app/common/parameters.py` IDENTIFIER_SLOTS — the
-# owner's deliberate 25-slot subset (all 20 sub-slots + 5 named reserved
-# slots), not all 39 canonical slots.
+# owner's deliberate 34-slot subset (all 20 sub-slots + 14 named reserved
+# slots that pass the cohort-vs-per-click lens), not all 39 canonical slots.
+# Filter V2 (2026-07-15): added the 10 cohort slots, removed `source_click_id`
+# (per-click id, not a group) — see admin-api `parameters.py`'s
+# IDENTIFIER_SLOTS comment for the full rationale + the `buyer_id` security
+# note (kept STRUCTURAL-ONLY, never added here).
 _ADMIN_IDENTIFIER_SLOTS = frozenset(f"sub{i}" for i in range(1, 21)) | frozenset({
-    "creative_id", "ad_campaign_id", "source", "source_click_id", "keyword",
+    "creative_id", "ad_campaign_id", "source", "keyword",
+    "host", "placement", "adset_id", "ad_id", "pixel_id",
+    "funnel_id", "funnel_type", "landing_id", "external_id", "app_id",
 })
 
 

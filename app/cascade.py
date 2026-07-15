@@ -1114,10 +1114,15 @@ STRUCTURAL_CRITERION_DIMS: Final[frozenset[str]] = frozenset({
 # names to populate click_attrs); `_EVALUATED_IDENTIFIER_DIMS` carries the
 # "param:"-prefixed click_attrs KEYS. Mirror of admin-api `parameters.py`
 # IDENTIFIER_SLOTS / IDENTIFIER_CRITERION_DIMS — same owner-named subset.
+# Filter V2 (2026-07-15) — added the cohort slots, removed `source_click_id`
+# (per-click id, not a group) — see admin-api `parameters.py`'s IDENTIFIER_SLOTS
+# comment for the full cohort-lens rationale and the `buyer_id` security note.
 IDENTIFIER_SLOTS: Final[frozenset[str]] = frozenset(
     f"sub{i}" for i in range(1, 21)
 ) | frozenset({
-    "creative_id", "ad_campaign_id", "source", "source_click_id", "keyword",
+    "creative_id", "ad_campaign_id", "source", "keyword",
+    "host", "placement", "adset_id", "ad_id", "pixel_id",
+    "funnel_id", "funnel_type", "landing_id", "external_id", "app_id",
 })
 _EVALUATED_IDENTIFIER_DIMS: Final[frozenset[str]] = frozenset(
     f"param:{s}" for s in IDENTIFIER_SLOTS

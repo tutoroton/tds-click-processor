@@ -399,6 +399,16 @@ async def _deadletter_click(
     }
 
     # Local edge deadletter stream — primary durability path.
+    #
+    # F-DL-1 (GTD-R196) disposition: this `maxlen=` is EXEMPT from the
+    # LOSSFIX P1a/P1b reject-before-write treatment given to
+    # stream:clicks/stream:clicks-incoming. Rule `architecture` (TD-11):
+    # deadletter streams are EPHEMERAL operator-visibility, NOT a
+    # durability guarantee — a click reaching here has ALREADY exhausted
+    # shipper retries against the real durable path (stream:clicks →
+    # collector → stream:clicks-incoming), so an eviction from this ring
+    # loses only the operator's VIEW of an already-lost click, not
+    # additional live data. Bounding it is correct, not a gap.
     try:
         await redis_pool.xadd(
             DEADLETTER_STREAM_KEY,

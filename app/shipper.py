@@ -27,6 +27,7 @@ import sentry_sdk
 from redis.exceptions import ResponseError as RedisResponseError
 
 from app.config import _LOCAL_ENVIRONMENTS, settings
+from app.reclaim_metrics import record_reclaim_age_ms, stream_id_age_ms
 from app.shipper_metrics import metrics as shipper_metrics
 
 logger = logging.getLogger("tds.shipper")
@@ -797,6 +798,17 @@ async def _reclaim_shipper_pending(redis_pool, http_client) -> dict[str, int]:
             messages = result[1] if len(result) > 1 else []
             if not messages:
                 break
+
+            # GTD-R219/PERF-3 (GTD-V23, 2026-07-17) — record each claimed
+            # entry's AGE (now minus its stream-ID timestamp, i.e. the
+            # instant it was ORIGINALLY XADDed — not when this reclaim
+            # cycle found it) into the always-on rolling window. Not a
+            # fix: `shipper_reclaim_min_idle_ms`/`_interval_sec` are a
+            # deliberate durability tradeoff (see module docstring);
+            # this only makes the resulting click->CH visibility tail
+            # OBSERVABLE instead of silent.
+            for _msg_id, _fields in messages:
+                record_reclaim_age_ms(stream_id_age_ms(_msg_id))
 
             clicks, msg_ids = await _parse_messages_into_clicks(
                 redis_pool, messages,

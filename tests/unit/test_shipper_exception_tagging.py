@@ -39,6 +39,7 @@ from app.shipper import (
     OP_BATCH_POST,
     OP_LOOP_ITERATION,
     OP_PARSE_PAYLOAD,
+    OP_REJECTED_HANDLING,
     OP_XACK,
     OP_XACK_BATCH,
     OP_XREADGROUP,
@@ -73,6 +74,7 @@ def test_op_constants_are_stable_strings():
     assert OP_XACK == "xack"
     assert OP_XACK_BATCH == "xack_batch"
     assert OP_LOOP_ITERATION == "loop_iteration"
+    assert OP_REJECTED_HANDLING == "rejected_handling"
 
 
 # ---------------------------------------------------------------------------
@@ -246,3 +248,4 @@ def test_shipper_module_source_uses_op_helpers_not_bare_capture():
     assert "OP_XACK" in module_src
     assert "OP_XACK_BATCH" in module_src
     assert "OP_LOOP_ITERATION" in module_src
+    assert "OP_REJECTED_HANDLING" in module_src

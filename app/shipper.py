@@ -27,6 +27,7 @@ import sentry_sdk
 from redis.exceptions import ResponseError as RedisResponseError
 
 from app.config import _LOCAL_ENVIRONMENTS, settings
+from app.reclaim_metrics import record_reclaim_age_ms, stream_id_age_ms
 from app.shipper_metrics import metrics as shipper_metrics
 
 logger = logging.getLogger("tds.shipper")
@@ -90,6 +91,7 @@ from app.telemetry import (
     OP_LEGACY_COLLECTOR,
     OP_LOOP_ITERATION,
     OP_PARSE_PAYLOAD,
+    OP_REJECTED_HANDLING,
     OP_XACK,
     OP_XACK_BATCH,
     OP_XREADGROUP,
@@ -388,16 +390,33 @@ async def _deadletter_click(
     """
     import time as _time
     click_id = click.get("click_id", "<unknown>")
+    # GTD-R183 — ``reason`` is wire-sourced (a collector JSON response
+    # field, or a caller-built string). ``str`` in the signature isn't
+    # runtime-enforced: a ``None``/non-str value here used to raise
+    # ``TypeError`` on the slice below BEFORE the try/except further
+    # down, escaping this function uncaught. Coerce defensively so a
+    # malformed reason degrades to a placeholder instead of crashing.
+    safe_reason = str(reason)[:64] if reason else "unknown"
     record = {
         "click_id": str(click_id),
         "data": json.dumps(click, default=str),
         "attempt_count": str(attempt),
-        "last_rejection_reason": reason[:64],  # bound reason length
+        "last_rejection_reason": safe_reason,  # bound reason length
         "deadlettered_at": str(_time.time()),
         "node_id": settings.node_id,
     }
 
     # Local edge deadletter stream — primary durability path.
+    #
+    # F-DL-1 (GTD-R196) disposition: this `maxlen=` is EXEMPT from the
+    # LOSSFIX P1a/P1b reject-before-write treatment given to
+    # stream:clicks/stream:clicks-incoming. Rule `architecture` (TD-11):
+    # deadletter streams are EPHEMERAL operator-visibility, NOT a
+    # durability guarantee — a click reaching here has ALREADY exhausted
+    # shipper retries against the real durable path (stream:clicks →
+    # collector → stream:clicks-incoming), so an eviction from this ring
+    # loses only the operator's VIEW of an already-lost click, not
+    # additional live data. Bounding it is correct, not a gap.
     try:
         await redis_pool.xadd(
             DEADLETTER_STREAM_KEY,
@@ -798,6 +817,17 @@ async def _reclaim_shipper_pending(redis_pool, http_client) -> dict[str, int]:
             if not messages:
                 break
 
+            # GTD-R219/PERF-3 (GTD-V23, 2026-07-17) — record each claimed
+            # entry's AGE (now minus its stream-ID timestamp, i.e. the
+            # instant it was ORIGINALLY XADDed — not when this reclaim
+            # cycle found it) into the always-on rolling window. Not a
+            # fix: `shipper_reclaim_min_idle_ms`/`_interval_sec` are a
+            # deliberate durability tradeoff (see module docstring);
+            # this only makes the resulting click->CH visibility tail
+            # OBSERVABLE instead of silent.
+            for _msg_id, _fields in messages:
+                record_reclaim_age_ms(stream_id_age_ms(_msg_id))
+
             clicks, msg_ids = await _parse_messages_into_clicks(
                 redis_pool, messages,
             )
@@ -1187,6 +1217,14 @@ async def _process_new_shape_batch(
     iteration. The ack_failed short-circuit at step 4 records the
     ``ack_failed`` ship status and skips outcome metrics (consistent
     with pre-TD-1 behaviour at line 715-734 of the old shipper.py).
+
+    GTD-R183 — step 3 is wrapped locally (see below). Before this fix,
+    ANY exception raised while bookkeeping one rejected click (a bad
+    ``reason`` value, or any future bug in that per-click loop) escaped
+    this whole function BEFORE step 4 ran — stranding the entire batch,
+    including the already-central-confirmed accepted/duplicate portion,
+    unACKed in the local PEL until the periodic orphaned-PEL reclaim
+    (60s idle + 30s interval; the GTD-R177 60-90s landing tail).
     """
     accepted_ids = body.get("accepted", []) or []
     rejected_items = body.get("rejected", []) or []
@@ -1203,10 +1241,35 @@ async def _process_new_shape_batch(
         accepted_ids, duplicate_ids, click_id_to_msg_id,
     )
 
-    deadletter_count = await _handle_rejected_in_batch(
-        redis_pool, http_client, rejected_items,
-        clicks, click_id_to_msg_id, ack_msg_ids,
-    )
+    # GTD-R183 — a failure here must not block the ACK below for the
+    # accepted/duplicate portion `ack_msg_ids` already holds (central
+    # already confirmed those). Only the rejected item(s) still
+    # unprocessed at the point of failure stay pending — a much smaller,
+    # already-correct fallback (they weren't confirmed by central
+    # either), and now via a logged/captured path instead of a mystery
+    # uncaught exception.
+    deadletter_count = 0
+    try:
+        deadletter_count = await _handle_rejected_in_batch(
+            redis_pool, http_client, rejected_items,
+            clicks, click_id_to_msg_id, ack_msg_ids,
+        )
+    except Exception as exc:  # noqa: BLE001 — see GTD-R183 docstring above
+        logger.error(
+            "Shipper rejected-item bookkeeping failed (op=%s): %s. "
+            "ACKing the accepted/duplicate portion of this batch "
+            "regardless — only the still-unprocessed rejected clicks "
+            "stay pending for reclaim.",
+            OP_REJECTED_HANDLING, exc,
+        )
+        _capture_op_exc(
+            OP_REJECTED_HANDLING,
+            exc,
+            tags={"failure_kind": type(exc).__name__},
+            batch_size=batch_size,
+            rejected_count=len(rejected_items),
+            collector_status=response.status_code,
+        )
 
     acked = await _ack_shipped_batch(
         redis_pool, ack_msg_ids,

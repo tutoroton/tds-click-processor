@@ -179,7 +179,16 @@ def test_every_op_loop_iteration_call_site_tags_failure_kind():
     # calls that also mention OP_LOOP_ITERATION) — tolerant of either
     # call-site formatting style (args on one line vs each own line).
     call_count = len(re.findall(r"_capture_op_exc\(\s*OP_LOOP_ITERATION,\s*exc,", src))
-    tagged_count = src.count('tags={"failure_kind": type(exc).__name__}')
+    # GTD-R183 — scoped to the tags= line immediately following an
+    # OP_LOOP_ITERATION call site (not a file-wide substring count):
+    # a whole-file count would false-collide with any OTHER op's
+    # call site that happens to tag failure_kind the same way (e.g.
+    # OP_REJECTED_HANDLING), which isn't what this pin is about.
+    tagged_count = len(re.findall(
+        r'_capture_op_exc\(\s*OP_LOOP_ITERATION,\s*exc,'
+        r'\s*tags=\{"failure_kind": type\(exc\)\.__name__\}',
+        src,
+    ))
     assert call_count == 3, (
         f"Expected exactly 3 OP_LOOP_ITERATION call sites in shipper.py, "
         f"found {call_count} — update this pin if the count genuinely "

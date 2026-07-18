@@ -71,6 +71,8 @@ from app.disk_queue import (
     run_queue_stats_sampler,
 )
 from app.observability import get_cached_stream_clicks_length, run_observability_loop
+from app.reclaim_metrics import reclaim_age_stats
+from app.stream_write_metrics import record_stream_write_ms, stream_write_stats
 from app.sync_client import apply_snapshot, start_periodic_pull
 from app.watermark import run_watermark_sampler, watermark_state
 
@@ -1604,6 +1606,24 @@ async def decide(
     # Cap value is env-configurable (TDS_STREAM_CLICKS_MAXLEN; default
     # 300_000 — see app/config.py for the sizing rationale).
     t_stream = time.perf_counter()
+    # GTD-R218/PERF-2 (GTD-V23, 2026-07-17): the ONLY point at which
+    # `timing` can still be mutated and have it reach the CH-persisted
+    # record — `click_record["timing"]` is serialised into the XADD
+    # payload below (`json.dumps`), which FREEZES a snapshot; anything
+    # added to `timing` after that point (endpoint_total_ms,
+    # stream_write_ms, both set post-XADD near the end of this handler)
+    # never reaches storage, which is exactly why PERF-1's route_total_ms
+    # alone understates the true backend-total SLA. `pre_stream_ms`
+    # covers everything knowable BEFORE the write attempt — routing,
+    # record assembly, identity-cookie mint, the dedup gate — so it CAN
+    # be embedded honestly. The stream-write round-trip itself is
+    # structurally impossible to self-embed (its own duration can't be
+    # known before the call whose payload would carry it); that piece is
+    # tracked instead via the always-on rolling window in
+    # `app.stream_write_metrics` (surfaced on `/health`), the "equivalent
+    # durable metric" the finding's Verified clause allows in lieu of a
+    # per-click CH field.
+    timing["pre_stream_ms"] = round((t_stream - t_endpoint_start) * 1000, 2)
     stream_write_failed = False
     stream_failure_reason = ""
     if _check_stream_backpressure():
@@ -1659,9 +1679,17 @@ async def decide(
                 "stream:clicks",
                 {"data": json.dumps(click_record, default=str)},
             )
+            _stream_write_ms = round((time.perf_counter() - t_stream) * 1000, 2)
+            # GTD-R218/PERF-2 — feed the always-on rolling window (never
+            # reaches CH for THIS click's own row — see the
+            # `pre_stream_ms` comment above — but gives operators the
+            # backend-total SLA visibility PERF-1 needs without a
+            # per-click self-embed). Cheap: an in-process deque append,
+            # no I/O, no test_id gate (unlike emit_checkpoint below).
+            record_stream_write_ms(_stream_write_ms)
             emit_checkpoint("click.stream_xadd", {
                 "click_id": req.click_id,
-                "stream_write_ms": round((time.perf_counter() - t_stream) * 1000, 2),
+                "stream_write_ms": _stream_write_ms,
             })
             # LOSSFIX P2 fix (2026-07-07, GTD routing-audit
             # CRITICAL-disk-fallback-silent-loss) — mark `click:shipped`
@@ -2014,6 +2042,10 @@ async def health():
         stream_clicks_reject_threshold=settings.stream_clicks_maxlen,
         stream_backpressure_active=stream_backpressure_active,
         click_dedup_ttl_seconds=settings.click_dedup_ttl_seconds,
+        # GTD-R218/PERF-2 — see app.stream_write_metrics module docstring.
+        **stream_write_stats(),
+        # GTD-R219/PERF-3 — see app.reclaim_metrics module docstring.
+        **reclaim_age_stats(),
     )
 
 

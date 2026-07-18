@@ -60,6 +60,17 @@ OP_XACK = "xack"
 OP_XACK_BATCH = "xack_batch"
 OP_LOOP_ITERATION = "loop_iteration"
 
+# GTD-R183 (2026-07-18) — per-click rejected-item bookkeeping (retry
+# counter / re-XADD / deadletter) inside a per-batch verdict response.
+# Pre-fix, an exception anywhere in that bookkeeping propagated out of
+# the whole batch-response handler BEFORE the accepted/duplicate portion
+# was ACKed — stranding the entire batch (including clicks central had
+# already confirmed) in the local PEL until the periodic orphaned-PEL
+# reclaim (60s idle + 30s interval), observed as the GTD-R177 60-90s
+# landing tail. Now this bookkeeping is wrapped locally so a failure
+# there can't block the ACK of the rest of the batch.
+OP_REJECTED_HANDLING = "rejected_handling"
+
 # Hot-path /decide failure modes (Sprint 1.5+)
 OP_DISK_PRESSURE = "disk_pressure"
 

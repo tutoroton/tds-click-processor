@@ -386,3 +386,89 @@ async def test_unknown_shape_200_does_not_silent_ack(fake_redis):
     # it does not deadletter individual clicks).
     deadletter_entries = await fake_redis.xrange(DEADLETTER_STREAM_KEY)
     assert len(deadletter_entries) == 0
+
+
+# ---------------------------------------------------------------------------
+# GTD-R183 — a rejected item with a null ``reason`` (the concrete
+# GTD-R177 root cause) must not strand its accepted sibling in the PEL.
+# End-to-end against a mock central, mirroring the Sprint 2.6 chaos
+# harness above.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_rejected_null_reason_does_not_strand_accepted_sibling(
+    fake_redis, monkeypatch,
+):
+    """A mock central that 207s with one accepted + one rejected click,
+    the rejected item carrying ``reason: null``. Pre-fix this raised
+    ``TypeError`` inside ``_deadletter_click`` before the batch's ACK
+    ran, stranding BOTH clicks (including the accepted one) in the
+    local PEL until the periodic reclaim (60s idle + 30s interval —
+    the GTD-R177 60-90s landing tail). Post-fix, the accepted click is
+    ACKed immediately within this same batch and the loop keeps
+    running (no ``loop_error`` ship status)."""
+    monkeypatch.setattr(shipper.settings, "shipper_max_retry_attempts", 1)
+
+    await fake_redis.xadd(
+        STREAM_KEY, {"data": json.dumps({"click_id": "landed"})},
+    )
+    await fake_redis.xadd(
+        STREAM_KEY, {"data": json.dumps({"click_id": "poisoned"})},
+    )
+
+    def _null_reason_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/clicks/deadletter":
+            return httpx.Response(status_code=202, json={"status": "accepted"})
+        body = json.loads(request.content)
+        clicks = body.get("clicks", [])
+        return httpx.Response(
+            status_code=207,
+            json={
+                "received": len(clicks),
+                "queued": 1,
+                "accepted": ["landed"],
+                "rejected": [{"click_id": "poisoned", "reason": None}],
+                "duplicates": [],
+            },
+        )
+
+    transport = httpx.MockTransport(_null_reason_handler)
+    original_init = httpx.AsyncClient.__init__
+
+    def _patched_init(self, *args, **kwargs):
+        kwargs["transport"] = transport
+        original_init(self, *args, **kwargs)
+
+    with patch.object(httpx.AsyncClient, "__init__", _patched_init):
+        task = asyncio.create_task(shipper.run_shipper(fake_redis))
+        await asyncio.sleep(0.4)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    # The accepted sibling was NOT stranded — it's gone from the PEL
+    # within THIS batch's processing, not waiting on reclaim.
+    pending_info = await fake_redis.xpending(STREAM_KEY, GROUP_NAME)
+    pending_count = (
+        pending_info["pending"]
+        if isinstance(pending_info, dict)
+        else (pending_info[0] if pending_info else 0)
+    )
+    assert pending_count == 0, (
+        f"Expected both entries resolved (accepted ACKed, rejected "
+        f"deadlettered) within one batch pass; {pending_count} still "
+        f"pending in the local PEL — the GTD-R183 strand regression."
+    )
+
+    # The poisoned click landed in deadletter with a coerced reason —
+    # no crash, no loop_error ship status.
+    deadletter_entries = await fake_redis.xrange(DEADLETTER_STREAM_KEY)
+    deadlettered_ids = {
+        json.loads(fields["data"])["click_id"] for _, fields in deadletter_entries
+    }
+    assert "poisoned" in deadlettered_ids
+    assert smm.metrics.last_ship_status != "loop_error", (
+        "The response-handling exception must not have escaped to the "
+        "generic catch-all — the batch was resolved in-loop instead."
+    )

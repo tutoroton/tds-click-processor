@@ -207,6 +207,25 @@ async def test_deadletter_truncates_long_reason():
 
 
 @pytest.mark.asyncio
+async def test_deadletter_click_reason_none_uses_safe_default():
+    """GTD-R183 — a ``reason=None`` (present key, null value; a
+    ``.get("reason", "unknown")`` upstream only substitutes the
+    default on a MISSING key, not an explicit null) used to raise
+    ``TypeError`` on the ``reason[:64]`` slice, BEFORE the try/except
+    further down in this function — escaping uncaught into the
+    caller. Must now degrade to a safe placeholder instead of
+    crashing."""
+    redis_mock = AsyncMock()
+    click = {"click_id": "x"}
+
+    # Must not raise.
+    await _deadletter_click(redis_mock, click, attempt=1, reason=None)
+
+    record = redis_mock.xadd.call_args.args[1]
+    assert record["last_rejection_reason"] == "unknown"
+
+
+@pytest.mark.asyncio
 async def test_deadletter_swallows_xadd_failure():
     """If the deadletter XADD itself fails (Redis impaired), we log
     + capture but do NOT propagate — the caller's flow continues."""

@@ -639,6 +639,111 @@ async def test_process_new_shape_full_happy_path(monkeypatch):
 
 
 # ===========================================================================
+# _process_new_shape_batch — GTD-R183 regression: a rejected-item
+# bookkeeping failure must not strand the whole batch's ACK
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_process_new_shape_rejected_reason_none_does_not_strand_batch(
+    monkeypatch,
+):
+    """The concrete GTD-R177/R183 root cause: a collector response with
+    a rejected item carrying ``reason=None`` (present key, null value)
+    used to raise ``TypeError`` deep in ``_deadletter_click`` — BEFORE
+    the accepted-sibling ACK ran — stranding the WHOLE batch (including
+    ``c1``, which central already confirmed) in the local PEL until
+    periodic reclaim. Both siblings must now resolve within this same
+    call: c1 ACKed, c2 deadlettered with a safe reason."""
+    monkeypatch.setattr(shipper.settings, "shipper_max_retry_attempts", 1)
+    monkeypatch.setattr(shipper.settings, "node_id", "test-node-AU")
+
+    pipe = MagicMock()
+    pipe.incr = MagicMock(return_value=pipe)
+    pipe.expire = MagicMock(return_value=pipe)
+    pipe.execute = AsyncMock(return_value=[1, True])  # attempt=1 >= max=1
+
+    redis = AsyncMock()
+    redis.pipeline = MagicMock(return_value=pipe)
+    client = MagicMock()
+
+    clicks = [{"click_id": "c1"}, {"click_id": "c2"}]
+    msg_ids = ["1-0", "2-0"]
+    response = _make_response(207, "")
+    body = {
+        "accepted": ["c1"],
+        "rejected": [{"click_id": "c2", "reason": None}],
+        "duplicates": [],
+    }
+
+    # Must not raise.
+    await _process_new_shape_batch(
+        redis, client, response, body, clicks, msg_ids,
+    )
+
+    # c2 landed in the local deadletter stream with a coerced reason,
+    # not a crash.
+    dl_calls = [
+        c for c in redis.xadd.await_args_list
+        if c.args[0] == shipper.DEADLETTER_STREAM_KEY
+    ]
+    assert len(dl_calls) == 1
+    assert dl_calls[0].args[1]["last_rejection_reason"] == "unknown"
+
+    # Both msg_ids (accepted c1 AND deadlettered c2) were ACKed in the
+    # SAME call — no straggler left pending for reclaim.
+    redis.xack.assert_awaited_once()
+    ack_args = redis.xack.await_args.args
+    assert set(ack_args[2:]) == {"1-0", "2-0"}
+
+
+@pytest.mark.asyncio
+async def test_process_new_shape_rejected_handling_exception_still_acks_known_safe(
+    monkeypatch,
+):
+    """Defense-in-depth: even an UNANTICIPATED exception during
+    rejected-item bookkeeping (not just the reason=None class fixed
+    above) must not block the ACK of the accepted/duplicate portion
+    central already confirmed. Simulates a future bug by making
+    ``_handle_rejected_in_batch`` itself blow up."""
+    redis = AsyncMock()
+    client = MagicMock()
+
+    clicks = [{"click_id": "c1"}, {"click_id": "c2"}]
+    msg_ids = ["1-0", "2-0"]
+    response = _make_response(207, "")
+    body = {
+        "accepted": ["c1"],
+        "rejected": [{"click_id": "c2", "reason": "queue_failure"}],
+        "duplicates": [],
+    }
+
+    boom = RuntimeError("simulated bug in rejected-item bookkeeping")
+
+    async def _raise(*args, **kwargs):
+        raise boom
+
+    with patch.object(shipper, "_handle_rejected_in_batch", new=_raise), \
+         patch.object(shipper, "_capture_op_exc") as cap:
+        await _process_new_shape_batch(
+            redis, client, response, body, clicks, msg_ids,
+        )
+
+    # c1 (the known-safe accepted portion) was still ACKed — NOT
+    # stranded in the PEL by the rejected-handling crash.
+    redis.xack.assert_awaited_once()
+    ack_args = redis.xack.await_args.args
+    assert set(ack_args[2:]) == {"1-0"}
+
+    # The exception was logged + Sentry-captured under its own tag,
+    # not silently swallowed and not left to the generic loop-level
+    # catch-all.
+    cap.assert_called_once()
+    assert cap.call_args.args[0] == shipper.OP_REJECTED_HANDLING
+    assert cap.call_args.args[1] is boom
+
+
+# ===========================================================================
 # _process_legacy_shape_batch — Sprint 2.5 shim + one-shot Sentry semantics
 # ===========================================================================
 

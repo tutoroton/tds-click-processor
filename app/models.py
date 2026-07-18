@@ -348,3 +348,31 @@ class HealthResponse(BaseModel):
     # available" per the P3 brief; a live SCAN/DBSIZE count would NOT
     # be cheap, so this is the pressure signal actually exposed).
     click_dedup_ttl_seconds: int = 0
+
+    # GTD-R218/PERF-2 (GTD-V23, 2026-07-17) — always-on rolling window of
+    # the synchronous `stream:clicks` XADD round-trip (app.stream_write_
+    # metrics). Gives operators the backend-total SLA component that
+    # PERF-1's `route_total_ms` (CH-stored per click) structurally omits:
+    # this value can never ride in its own click's stored `timing` map
+    # (it measures the very write whose payload would carry it), so it
+    # is tracked here instead of per-click storage. None/0 before the
+    # first successful XADD this process has made.
+    stream_write_p50_ms: float | None = None
+    stream_write_p95_ms: float | None = None
+    stream_write_max_ms: float | None = None
+    stream_write_sample_count: int = 0
+
+    # GTD-R219/PERF-3 (GTD-V23, 2026-07-17) — always-on rolling window of
+    # the shipper's orphaned-PEL reclaim AGE (app.reclaim_metrics): how
+    # long a claimed entry sat since its ORIGINAL XADD before this reclaim
+    # cycle found it. NOT a fix — `shipper_reclaim_min_idle_ms`/
+    # `_interval_sec` (default 60000ms/30s) are a deliberate durability
+    # tradeoff (C3, audit-2026-06-03); this makes the resulting click->CH
+    # visibility bimodal tail (GTD-V23: ~5.8%/day in a 60-90s cluster)
+    # OBSERVABLE instead of silent. None/0 = healthy steady-state (nothing
+    # reclaimed in the window — reclaim only fires after a consumer
+    # crash/restart orphans PEL entries).
+    shipper_reclaim_age_p50_ms: float | None = None
+    shipper_reclaim_age_p95_ms: float | None = None
+    shipper_reclaim_age_max_ms: float | None = None
+    shipper_reclaim_age_sample_count: int = 0

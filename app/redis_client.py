@@ -85,3 +85,44 @@ async def close_identity_redis():
     if identity_pool:
         await identity_pool.aclose()
         identity_pool = None
+
+
+# Click shipper drainer (TDSP-E20, 2026-07-27). A DEDICATED pool so the
+# shipper's blocking `XREADGROUP ... BLOCK=BATCH_TIMEOUT_MS` (app/shipper.py)
+# never races the ROUTING pool's `socket_timeout` above (sized short, for
+# `/decide` — see config.py's `redis_shipper_*` comment for the full
+# incident writeup: a shared timeout shorter than BLOCK made every idle
+# poll throw `TimeoutError`, ~592K duplicate Sentry events). Unlike
+# `identity_pool`, this is the SAME physical Redis instance/URL as routing
+# — just an isolated connection pool with shipper-appropriate timeouts, not
+# a separate deployment.
+shipper_pool: redis.Redis | None = None
+
+
+async def get_shipper_redis() -> redis.Redis:
+    """Client for the click-shipper's local-stream drainer.
+
+    Isolated from `get_redis()` purely on timeout sizing: the shipper's
+    `BLOCK` wait needs a client-side `socket_timeout` WITH MARGIN above its
+    own BLOCK value, while the routing pool's short timeout is correctly
+    sized for the `/decide` hot path. Sharing a pool forces one of the two
+    to be wrong.
+    """
+    global shipper_pool
+    if shipper_pool is None:
+        shipper_pool = redis.Redis(connection_pool=BlockingConnectionPool.from_url(
+            settings.redis_url,
+            decode_responses=True,
+            max_connections=settings.redis_shipper_max_connections,
+            timeout=settings.redis_shipper_pool_timeout_seconds,
+            socket_timeout=settings.redis_shipper_socket_timeout_seconds,
+            socket_connect_timeout=settings.redis_shipper_socket_connect_timeout_seconds,
+        ))
+    return shipper_pool
+
+
+async def close_shipper_redis():
+    global shipper_pool
+    if shipper_pool:
+        await shipper_pool.aclose()
+        shipper_pool = None

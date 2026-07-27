@@ -61,6 +61,41 @@ class Settings(BaseSettings):
     redis_socket_timeout_seconds: float = 1.0
     redis_socket_connect_timeout_seconds: float = 1.0
 
+    # TDSP-E20 (2026-07-27) — dedicated pool sizing for the click shipper's
+    # local-stream drainer (app/shipper.py `run_shipper`). Root cause of
+    # ~592K duplicate Sentry `xreadgroup` TimeoutErrors (98% of the
+    # organisation's error volume, GTD-<pending>): the shipper blocks up to
+    # `BATCH_TIMEOUT_MS` (2000ms) waiting for new stream entries via
+    # `XREADGROUP ... BLOCK=2000`, but it shared the ROUTING pool above,
+    # whose `redis_socket_timeout_seconds` (1.0s) is sized for the `/decide`
+    # hot path. redis-py's client-side socket_timeout fires the instant the
+    # socket read exceeds it — it does NOT know the server itself intends to
+    # keep blocking for another second; it tears the connection down and
+    # raises `TimeoutError` (an empty BLOCK result is never distinguished
+    # from a dead connection). So EVERY idle poll — not just real Redis
+    # stalls — threw, and the catch-all logged + Sentry-captured twice.
+    #
+    # Fix: an isolated pool (same pattern as `identity_redis_url` /
+    # `get_identity_redis()` below — a second pool beside the routing one)
+    # whose `socket_timeout` carries margin OVER the BLOCK value so the
+    # client never races Redis's own timer.
+    #
+    # Do NOT raise `redis_socket_timeout_seconds` above instead: every
+    # `/decide` connection would inherit the longer deadline, and a
+    # genuinely-hung Redis response would hold a routing-pool slot for the
+    # shipper's multi-second budget instead of the sub-second one sized for
+    # the hot path — risking pool exhaustion under load.
+    # Do NOT shrink the shipper's BLOCK below ~1s either — that only
+    # narrows the race margin again on the next timing drift; it doesn't
+    # remove the race.
+    #
+    # `max_connections=1`: the shipper drains sequentially inside a single
+    # asyncio task — it never needs a second concurrent connection.
+    redis_shipper_max_connections: int = 1
+    redis_shipper_pool_timeout_seconds: float = 5.0
+    redis_shipper_socket_timeout_seconds: float = 5.0
+    redis_shipper_socket_connect_timeout_seconds: float = 1.0
+
     # Auth (shared secret with CF Worker)
     tds_secret_key: str = ""
 

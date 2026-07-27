@@ -44,8 +44,10 @@ from app.models import ClickRequest, ClickResponse, HealthResponse
 from app.redis_client import (
     get_redis,
     get_identity_redis,
+    get_shipper_redis,
     close_redis,
     close_identity_redis,
+    close_shipper_redis,
 )
 from app.router import route, get_full_ua_info, parse_accept_language, coerce_cost
 from app.ua_parser import warmup as warmup_ua_parser
@@ -194,8 +196,18 @@ async def lifespan(app: FastAPI):
     # in either case fail-closed is correct.
     assert_shipper_ready()
 
+    # TDSP-E20 (2026-07-27) — the shipper gets its OWN Redis pool, isolated
+    # from the routing pool `r` above purely on socket_timeout sizing. Root
+    # cause of ~592K duplicate `xreadgroup` TimeoutError events (98% of the
+    # organisation's error volume): the shipper's blocking XREADGROUP
+    # shared `r`'s short socket_timeout (sized for `/decide`), which fired
+    # before Redis's own BLOCK timer on every idle poll. See
+    # `get_shipper_redis()` (app/redis_client.py) + config.py's
+    # `redis_shipper_*` settings for the full writeup.
+    shipper_redis = await get_shipper_redis()
+
     # Start click shipper
-    shipper_task = asyncio.create_task(run_shipper(r))
+    shipper_task = asyncio.create_task(run_shipper(shipper_redis))
 
     # Start periodic sync pull from central
     sync_task = asyncio.create_task(start_periodic_pull(r, interval=settings.full_sync_interval_seconds))
@@ -327,6 +339,7 @@ async def lifespan(app: FastAPI):
         pass
     await close_redis()
     await close_identity_redis()
+    await close_shipper_redis()
 
 
 app = FastAPI(

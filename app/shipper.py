@@ -119,6 +119,37 @@ class ShipperDisabledError(RuntimeError):
     """
 
 
+def _assert_shipper_pool_timeout_margin() -> None:
+    """TDSP-E20 (2026-07-27) — fail loud if the shipper's dedicated Redis
+    pool (``get_shipper_redis()``, app/redis_client.py) doesn't leave
+    margin over ``BATCH_TIMEOUT_MS``.
+
+    This is exactly the condition that caused ~592K duplicate Sentry
+    ``xreadgroup`` ``TimeoutError`` events (98% of the organisation's
+    error volume): the shipper's blocking ``XREADGROUP ... BLOCK=
+    BATCH_TIMEOUT_MS`` shared the routing pool's shorter
+    ``socket_timeout`` — the client-side deadline fired before Redis's
+    own BLOCK timer on every idle poll. Defense-in-depth against a future
+    env/default drift reintroducing the same race (e.g. an operator
+    tuning ``TDS_REDIS_SHIPPER_SOCKET_TIMEOUT_SECONDS`` or
+    ``BATCH_TIMEOUT_MS`` without checking the other).
+    """
+    block_seconds = BATCH_TIMEOUT_MS / 1000
+    if settings.redis_shipper_socket_timeout_seconds <= block_seconds:
+        raise RuntimeError(
+            "Shipper Redis pool misconfigured: "
+            f"redis_shipper_socket_timeout_seconds="
+            f"{settings.redis_shipper_socket_timeout_seconds}s <= "
+            f"BLOCK={block_seconds}s (BATCH_TIMEOUT_MS). The client-side "
+            "socket timeout must stay comfortably ABOVE the XREADGROUP "
+            "BLOCK window, or every idle poll races Redis's own timer "
+            "and throws TimeoutError (the ~592K-event incident this "
+            "guard exists to prevent). Fix: raise "
+            "TDS_REDIS_SHIPPER_SOCKET_TIMEOUT_SECONDS or lower "
+            "BATCH_TIMEOUT_MS, whichever is the actual misconfiguration."
+        )
+
+
 def assert_shipper_ready() -> None:
     """Synchronous boot-time validation for the click shipper.
 
@@ -148,6 +179,8 @@ def assert_shipper_ready() -> None:
         ShipperDisabledError: when the fatal branch fires. Re-raised
         by lifespan to fail uvicorn startup.
     """
+    _assert_shipper_pool_timeout_margin()
+
     if settings.central_url:
         return  # Happy path — shipper will run normally.
 

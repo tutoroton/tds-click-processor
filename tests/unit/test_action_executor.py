@@ -883,3 +883,107 @@ class TestR68SplitReroll:
                 allowed_avail=frozenset({"active"}),
             )
         assert result is UNAVAILABLE_RESULT
+
+
+class TestOfferResolveSeverityBySplitAlternates:
+    """GTD — E22 (2026-07-27): Sentry issue GEO-TDS-EDGE-NODES-F —
+    "offer 217 not found in Redis (sync drift?)" fired 682 times, all
+    from campaign 35 / flow 300's split (offer_id=217 is intentionally
+    `status='paused'` in Postgres — correctly excluded from the sync
+    builder's `WHERE status='active'`, NOT sync drift). R68/ADR-0034
+    already drops the dead leg and re-rolls to the live sibling
+    (offer 174), so every one of those clicks was served correctly —
+    but the shared `_resolve_offer_url` helper logged `level="warning"`
+    regardless of whether a live alternate absorbed the click.
+
+    These tests pin the fix: the same unresolvable-offer condition is
+    `level="info"` when a split's other legs can (and do) absorb the
+    click, and stays `level="warning"` when there is no alternate —
+    a single `offer` action, or the LAST candidate in an all-dead
+    split (which is a genuine routing break, not a self-heal).
+    """
+
+    @pytest.mark.asyncio
+    async def test_split_leg_with_live_sibling_logs_info_not_warning(self):
+        flow = _flow("split", {
+            "offers": [
+                {"offer_id": 217, "weight": 50},  # paused — absent from Redis
+                {"offer_id": 174, "target_id": 182, "weight": 50},  # live
+            ],
+        })
+        r = _redis_with_hashes({
+            "offer_target:182": {"url": "https://live-174", "is_default": "0",
+                                 "availability": "active"},
+        })
+
+        def _pick_dead_first(population, weights=None, k=1):
+            for e in population:
+                if e.get("offer_id") == 217:
+                    return [e]
+            return [population[0]]
+
+        with patch.object(ae_mod, "capture_op_msg_throttled") as cap:
+            with patch.object(ae_mod.random, "choices", _pick_dead_first):
+                result = await execute_action(
+                    r, flow, _click(), "1",
+                    source_mappings=None, campaign_mappings=None,
+                    build_url_fn=_stub_build_url(),
+                )
+
+        # Traffic still served correctly via the live sibling.
+        assert result is not None and result is not UNAVAILABLE_RESULT
+        assert result["target_id"] == "182"
+        # Exactly one alert, at the downgraded "info" level — this is a
+        # routine self-heal, not an operator emergency.
+        cap.assert_called_once()
+        assert cap.call_args.args[0] == ae_mod.OP_OFFER_RESOLVE
+        assert cap.call_args.args[1] == "217"
+        assert cap.call_args.kwargs.get("level") == "info"
+
+    @pytest.mark.asyncio
+    async def test_single_offer_action_with_no_alternate_still_warns(self):
+        """No split, no fallback leg — the flow genuinely cannot route
+        via its own config. This case MUST stay `level="warning"` — it
+        is the real "an operator should look at this" signal."""
+        flow = _flow("offer", {"offer_id": 217})
+        r = _redis_with_hashes({})  # offer:217 absent (paused)
+
+        with patch.object(ae_mod, "capture_op_msg_throttled") as cap:
+            result = await execute_action(
+                r, flow, _click(), "1",
+                source_mappings=None, campaign_mappings=None,
+                build_url_fn=_stub_build_url(),
+            )
+
+        assert result is None  # falls back to legacy split — no self-heal here
+        cap.assert_called_once()
+        assert cap.call_args.args[0] == ae_mod.OP_OFFER_RESOLVE
+        assert cap.call_args.kwargs.get("level") == "warning"
+
+    @pytest.mark.asyncio
+    async def test_split_all_legs_dead_final_attempt_still_warns(self):
+        """Every leg unresolvable: the re-roll exhausts down to one
+        candidate with no alternate left — THAT final attempt must
+        still warn (a genuine break, not a self-heal), even though
+        earlier attempts (while alternates remained) were info-level."""
+        flow = _flow("split", {
+            "offers": [
+                {"offer_id": 217, "weight": 50},
+                {"offer_id": 218, "weight": 50},
+            ],
+        })
+        r = _redis_with_hashes({})  # both offers absent
+
+        with patch.object(ae_mod, "capture_op_msg_throttled") as cap:
+            result = await execute_action(
+                r, flow, _click(), "1",
+                source_mappings=None, campaign_mappings=None,
+                build_url_fn=_stub_build_url(),
+            )
+
+        assert result is UNAVAILABLE_RESULT
+        levels = [c.kwargs.get("level") for c in cap.call_args_list]
+        assert levels == ["info", "warning"], (
+            "first (dropped, alternate remained) attempt = info; "
+            "final (no alternate left) attempt = warning"
+        )

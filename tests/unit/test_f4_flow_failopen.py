@@ -390,6 +390,33 @@ def test_iii_successful_empty_read_still_no_flow_no_offer():
     assert reason != "flow_read_failed"
 
 
+def test_iii_no_flow_no_offer_captures_at_info_not_warning():
+    """GTD — E22 (2026-07-27): Sentry issue GEO-TDS-EDGE-NODES-X —
+    "no_flow_no_offer: campaign 180 matched but had no flow and no
+    legacy offer — served fallback" fired 145 times. Investigation:
+    campaign 180 is a real, live, domain-bound campaign (tagged
+    `GTDA-AUDIT`) with exactly ONE narrow flow (geo=PL AND os=android
+    AND first-time visitors only) and no catch-all — any click outside
+    that combination genuinely has no flow, genuinely has no legacy
+    offer (a modern flow-only campaign), and correctly falls to the
+    campaign's own configured `fallback_url`. Traffic IS served
+    correctly; this is the documented "genuinely flowless + offerless"
+    case Layer 3 (F4/GTD-R173) was built to record as a RATE signal,
+    not to eliminate.
+
+    This pins the ALREADY-correct classification (`level="info"`, not
+    "warning"/"error") so a future change doesn't "fix" the Sentry
+    noise by escalating severity on what is proven, by-design,
+    correctly-served traffic — the wrong direction entirely."""
+    with patch.object(router, "capture_op_msg_throttled") as cap:
+        result = _route_with(_match_snapshot(flows=[]))
+
+    assert result is not None and result.get("non_routed") is True
+    cap.assert_called_once()
+    assert cap.call_args.args[0] == router.OP_NO_FLOW_NO_OFFER
+    assert cap.call_args.kwargs.get("level") == "info"
+
+
 # ---------------------------------------------------------------------------
 # (iv) INV-3/5 — BlockingConnectionPool wait bounded by `timeout` (per-acquire),
 #      and get_redis() wires the env knobs.

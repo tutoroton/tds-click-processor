@@ -392,6 +392,11 @@ async def _execute_split(
             req, campaign_id, build_url_fn,
             source_mappings, campaign_mappings,
             flow_id, allowed_avail,
+            # GTD (E22) — other candidates still in `cand` besides the one
+            # we're resolving now → a failure here self-heals via re-roll,
+            # not a genuine routing break. See `_resolve_offer_url`'s
+            # `has_alternate_legs` docstring.
+            has_alternate_legs=len(cand) > 1,
         )
         # A chosen leg whose pinned/default target was excluded by the availability
         # floor → terminal_fallback (UNCHANGED C2 drain contract, pinned by
@@ -440,6 +445,8 @@ async def _resolve_offer_url(
     campaign_mappings,
     flow_id: str | None,
     allowed_avail,
+    *,
+    has_alternate_legs: bool = False,
 ) -> dict[str, Any] | None:
     """Shared between offer + split actions — load target → URL.
 
@@ -451,6 +458,22 @@ async def _resolve_offer_url(
       3. Else use offer's bare `url` field (legacy offers without
          per-target URLs — kept as a safety net during migration).
       4. Nothing usable → `None` so router falls back to legacy split.
+
+    Args:
+        has_alternate_legs: GTD (E22, 2026-07-27) — True when the caller
+            is `_execute_split`'s re-roll loop AND other candidate legs
+            remain. An unresolvable offer here is NOT the same severity
+            as an unresolvable single-`offer`-action flow (no fallback
+            at all): R68/ADR-0034 already drops this leg and re-rolls
+            to a live one, so the click still routes correctly — this
+            was previously logged as `level="warning"` regardless of
+            caller, conflating "the flow can't route at all" with "one
+            split leg is stale but the split self-healed", and paging
+            on the routine case of an operator pausing one leg of a
+            multi-leg split (GEO-TDS-EDGE-NODES-F: 682 events on a
+            flow whose split has a healthy sibling leg absorbing every
+            click). Downgraded to `level="info"` ONLY when a live
+            alternate is actually available to absorb the click.
     """
     pinned_template: str | None = None
     pinned_target_id: str | None = None
@@ -477,19 +500,37 @@ async def _resolve_offer_url(
         # offer.url field.
         offer = await r.hgetall(f"offer:{offer_id}")
         if not offer:
-            logger.warning(
-                "offer:%s not found in Redis — sync drift?", offer_id,
-            )
-            # D3 (audit 2026-06-03) — the flow points at an offer that
-            # isn't in Redis (sync drift / archived). Silent fallback on
-            # every click → surface it (throttled per offer id).
-            capture_op_msg_throttled(
-                OP_OFFER_RESOLVE, offer_id,
-                f"offer {offer_id} not found in Redis (sync drift?) — "
-                "action falling back to legacy selection",
-                level="warning",
-                offer_id=offer_id,
-            )
+            if has_alternate_legs:
+                # R68/ADR-0034 — the caller (_execute_split) drops this
+                # leg and re-rolls among the remaining live legs; the
+                # click is still served correctly. Informational only.
+                logger.info(
+                    "offer:%s not found in Redis (paused/archived) — "
+                    "split has other legs, re-rolling", offer_id,
+                )
+                capture_op_msg_throttled(
+                    OP_OFFER_RESOLVE, offer_id,
+                    f"offer {offer_id} not found in Redis (paused or "
+                    "archived) — split leg dropped, re-rolling to a "
+                    "live leg; traffic still served correctly",
+                    level="info",
+                    offer_id=offer_id,
+                )
+            else:
+                logger.warning(
+                    "offer:%s not found in Redis — sync drift?", offer_id,
+                )
+                # D3 (audit 2026-06-03) — the flow points at an offer that
+                # isn't in Redis (sync drift / archived) with NO fallback
+                # leg. Silent fallback on every click → surface it
+                # (throttled per offer id).
+                capture_op_msg_throttled(
+                    OP_OFFER_RESOLVE, offer_id,
+                    f"offer {offer_id} not found in Redis (sync drift?) — "
+                    "action falling back to legacy selection",
+                    level="warning",
+                    offer_id=offer_id,
+                )
             return UNAVAILABLE_RESULT if avail_blocked else None
         pinned_template, pinned_target_id, def_avail_blocked = (
             await _offer_default_template(r, offer_id, offer, allowed_avail)
@@ -499,18 +540,34 @@ async def _resolve_offer_url(
         # default target) → 'bare_url'.
         selection_path = "offer_default" if pinned_target_id else "bare_url"
         if not pinned_template:
-            logger.warning(
-                "offer:%s has no usable URL — falling back", offer_id,
-            )
-            # D3 — offer exists but has no default target + no bare url
-            # (the B4 shape). Falls back silently → surface it.
-            capture_op_msg_throttled(
-                OP_OFFER_RESOLVE, offer_id,
-                f"offer {offer_id} has no usable URL (no is_default target, "
-                "no bare url) — falling back to legacy selection",
-                level="warning",
-                offer_id=offer_id,
-            )
+            if has_alternate_legs:
+                logger.info(
+                    "offer:%s has no usable URL — split has other legs, "
+                    "re-rolling", offer_id,
+                )
+                capture_op_msg_throttled(
+                    OP_OFFER_RESOLVE, offer_id,
+                    f"offer {offer_id} has no usable URL (no is_default "
+                    "target, no bare url) — split leg dropped, re-rolling "
+                    "to a live leg; traffic still served correctly",
+                    level="info",
+                    offer_id=offer_id,
+                )
+            else:
+                logger.warning(
+                    "offer:%s has no usable URL — falling back", offer_id,
+                )
+                # D3 — offer exists but has no default target + no bare url
+                # (the B4 shape), with NO fallback leg. Falls back silently
+                # → surface it.
+                capture_op_msg_throttled(
+                    OP_OFFER_RESOLVE, offer_id,
+                    f"offer {offer_id} has no usable URL (no is_default "
+                    "target, no bare url) — falling back to legacy "
+                    "selection",
+                    level="warning",
+                    offer_id=offer_id,
+                )
             # v2 C2 — if the emptiness was caused by the availability floor
             # (pinned and/or default target excluded), route to terminal_fallback
             # (NO legacy re-serve). A genuinely URL-less offer → None (legacy).

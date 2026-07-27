@@ -25,6 +25,7 @@ from urllib.parse import quote
 
 import sentry_sdk
 from sentry_sdk.integrations.fastapi import FastApiIntegration
+from sentry_sdk.integrations.logging import LoggingIntegration
 from sentry_sdk.integrations.starlette import StarletteIntegration
 from fastapi import FastAPI, Header, HTTPException, Request
 from contextlib import asynccontextmanager
@@ -98,6 +99,13 @@ if settings.sentry_dsn:
         integrations=[
             StarletteIntegration(transaction_style="endpoint"),
             FastApiIntegration(transaction_style="endpoint"),
+            # [TDSP][E19] root-fix for GTD-R466 (2026-07-27): disables the SDK's
+            # default LoggingIntegration event path (already the mechanism PR
+            # #617 named as the ROOT CAUSE of the shipper double-capture — this
+            # closes it everywhere in this service, not just that one site).
+            # Every remaining alert path goes through capture_op_exc/
+            # capture_op_msg/_throttled explicitly, never the logger default.
+            LoggingIntegration(event_level=None),
         ],
         traces_sampler=diag_traces_sampler,
         before_send=diag_before_send,

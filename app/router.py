@@ -46,6 +46,7 @@ from app.redis_client import get_redis
 from app.param_rules import apply_param_rules, parse_param_rules
 from app.resolution import BINDING_SELECTOR_KEY, parse_param_mappings, resolve_slots
 from app.telemetry import (
+    OP_DOMAIN_BINDING_PARSE,
     OP_FLOW_READ_FAILED,
     OP_IDENTITY,
     OP_NO_FLOW_NO_OFFER,
@@ -1761,6 +1762,11 @@ def _parse_binding_value(raw: str | None) -> tuple[str, int, str | None]:
             )
         except (json.JSONDecodeError, TypeError, AttributeError):
             logger.error("corrupt JSON domain-binding value, treating as miss: %r", s[:80])
+            capture_op_msg_throttled(
+                OP_DOMAIN_BINDING_PARSE, s[:80],
+                f"corrupt JSON domain-binding value, treating as miss: {s[:80]!r}",
+                level="error",
+            )
             return "", 0, None
     return s, 0, None
 

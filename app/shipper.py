@@ -97,6 +97,7 @@ from app.telemetry import (
     OP_XREADGROUP,
     capture_op_exc as _capture_op_exc,
     capture_op_msg as _capture_op_msg,
+    capture_op_msg_throttled as _capture_op_msg_throttled,
 )
 
 
@@ -953,6 +954,13 @@ async def _reship_reclaimed_batch(
         "Shipper reclaim: collector returned status=%d shape=%s — "
         "leaving %d clicks in PEL for retry (op=%s).",
         response.status_code, shape, len(clicks), OP_BATCH_POST,
+    )
+    _capture_op_msg_throttled(
+        OP_BATCH_POST, "reclaim_contract_violation",
+        f"Shipper reclaim: contract violation — status={response.status_code} "
+        f"shape={shape} — leaving {len(clicks)} clicks in PEL for retry",
+        level="error", collector_status=response.status_code,
+        batch_size=len(clicks), shape=shape, context="reclaim",
     )
     return False
 

@@ -162,6 +162,22 @@ OP_NO_FLOW_NO_OFFER = "no_flow_no_offer"  # Layer 3 — rate signal on the (alre
 #                                           click looked "handled") so a future
 #                                           regression pages instead of hiding.
 
+# [TDSP][E19] root-fix for GTD-R466 (2026-07-27): these sites had no explicit
+# capture and relied entirely on Sentry's default LoggingIntegration (now
+# disabled via event_level=None in main.py). Each guards a periodic-loop
+# watchdog whose own silent crash disables a backstop with no other signal —
+# always via capture_op_msg_throttled (never raw), per this service's own
+# hard lesson (GTD-R454/PR #617: an unthrottled per-tick capture is how 77%
+# of the org's 90-day error volume happened).
+OP_OBS_STREAM_EMIT_FAILED = "obs_stream_emit_failed"
+OP_OBS_SHIPPER_HEALTH_EMIT_FAILED = "obs_shipper_health_emit_failed"
+OP_OBS_LOOP_ITERATION = "obs_loop_iteration"
+OP_WATERMARK_SAMPLER_ERROR = "watermark_sampler_error"
+OP_DISK_STATS_SAMPLER_ERROR = "disk_stats_sampler_error"
+OP_DISK_DRAINER_ERROR = "disk_drainer_error"
+OP_DOMAIN_BINDING_PARSE = "domain_binding_parse"
+OP_SYNC_PULL_FAILED = "sync_pull_failed"
+
 
 # ---------------------------------------------------------------------------
 # Throttled message capture (audit 2026-06-03 P3 observability).

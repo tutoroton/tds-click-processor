@@ -162,10 +162,13 @@ import sentry_sdk
 
 from app.config import _LOCAL_ENVIRONMENTS, settings
 from app.telemetry import (
+    OP_DISK_DRAINER_ERROR,
+    OP_DISK_STATS_SAMPLER_ERROR,
     OP_SEGMENT_BYTE_CAP,
     OP_SEGMENT_ORPHAN_ADOPTED,
     OP_SEGMENT_TORN_TAIL,
     capture_op_msg,
+    capture_op_msg_throttled,
 )
 
 logger = logging.getLogger("tds.disk_queue")
@@ -367,8 +370,13 @@ async def run_queue_stats_sampler(interval: float | None = None) -> None:
         except asyncio.CancelledError:
             logger.info("Disk-queue stats sampler cancelled — shutting down")
             raise
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
             logger.exception("Disk-queue stats sampler iteration failed")
+            capture_op_msg_throttled(
+                OP_DISK_STATS_SAMPLER_ERROR, "queue_stats_sampler",
+                f"Disk-queue stats sampler iteration failed — byte-cap gate "
+                f"may run on a stale/stuck cache: {exc!r}", level="error",
+            )
 
 
 async def get_queue_stats() -> dict:
@@ -1527,8 +1535,13 @@ async def run_drainer(redis, interval: int | None = None) -> None:
         except asyncio.CancelledError:
             logger.info("Disk-queue drainer cancelled — shutting down")
             raise
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
             logger.exception("Disk-queue drainer iteration failed")
+            capture_op_msg_throttled(
+                OP_DISK_DRAINER_ERROR, "disk_drainer",
+                f"Disk-queue drainer iteration failed — heartbeat/orphan-adopt"
+                f"/drain skipped this tick: {exc!r}", level="error",
+            )
 
 
 # ---------------------------------------------------------------------------

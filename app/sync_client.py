@@ -36,6 +36,7 @@ import time
 import httpx
 
 from app.config import settings
+from app.telemetry import OP_SYNC_PULL_FAILED, capture_op_msg_throttled
 
 logger = logging.getLogger("tds.sync_client")
 
@@ -310,5 +311,9 @@ async def start_periodic_pull(redis, interval: int = 60):
         await asyncio.sleep(interval)
         try:
             await pull_from_central(redis)
-        except Exception:
+        except Exception as exc:
             logger.exception("Periodic pull failed")
+            capture_op_msg_throttled(
+                OP_SYNC_PULL_FAILED, "periodic_pull",
+                f"Periodic config pull iteration failed: {exc!r}", level="error",
+            )

@@ -33,7 +33,12 @@ import logging
 import time
 
 from app.config import settings
-from app.telemetry import OP_WATERMARK_SIGNAL_STALE, capture_op_msg
+from app.telemetry import (
+    OP_WATERMARK_SAMPLER_ERROR,
+    OP_WATERMARK_SIGNAL_STALE,
+    capture_op_msg,
+    capture_op_msg_throttled,
+)
 
 logger = logging.getLogger("tds.click_processor.watermark")
 
@@ -217,8 +222,13 @@ async def run_watermark_sampler(redis, interval: float | None = None) -> None:
                     watermark_state.record_sample(pct)
                 else:
                     watermark_state.record_sample_failure()
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
                 logger.exception("Watermark sampler iteration failed — continuing")
+                capture_op_msg_throttled(
+                    OP_WATERMARK_SAMPLER_ERROR, "watermark_sampler",
+                    f"Watermark sampler iteration failed — may suppress the "
+                    f"staleness backstop: {exc!r}", level="error",
+                )
         except asyncio.CancelledError:
             logger.info("Watermark sampler cancelled — shutting down")
             raise

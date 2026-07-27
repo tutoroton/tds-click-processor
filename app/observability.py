@@ -65,6 +65,12 @@ import sentry_sdk
 from app.config import _LOCAL_ENVIRONMENTS, settings
 from app.disk_queue import get_queue_stats
 from app.shipper_metrics import metrics as shipper_metrics
+from app.telemetry import (
+    OP_OBS_LOOP_ITERATION,
+    OP_OBS_SHIPPER_HEALTH_EMIT_FAILED,
+    OP_OBS_STREAM_EMIT_FAILED,
+    capture_op_msg_throttled,
+)
 
 logger = logging.getLogger("tds.observability")
 
@@ -427,9 +433,14 @@ async def run_observability_loop(redis, interval: int = 60) -> None:
             # is re-raised so shutdown propagates cleanly).
             try:
                 await emit_stream_clicks_length(redis)
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
                 logger.exception(
                     "emit_stream_clicks_length raised — continuing",
+                )
+                capture_op_msg_throttled(
+                    OP_OBS_STREAM_EMIT_FAILED, "stream_clicks_length",
+                    f"emit_stream_clicks_length raised — backpressure cache "
+                    f"going stale: {exc!r}", level="error",
                 )
             try:
                 await emit_disk_queue_size()
@@ -439,12 +450,21 @@ async def run_observability_loop(redis, interval: int = 60) -> None:
                 )
             try:
                 await emit_shipper_health(redis)
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
                 logger.exception(
                     "emit_shipper_health raised — continuing",
+                )
+                capture_op_msg_throttled(
+                    OP_OBS_SHIPPER_HEALTH_EMIT_FAILED, "shipper_health",
+                    f"emit_shipper_health raised — blackout/stall detector "
+                    f"skipped this tick: {exc!r}", level="error",
                 )
         except asyncio.CancelledError:
             logger.info("Observability loop cancelled — shutting down")
             raise
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
             logger.exception("Observability loop iteration failed")
+            capture_op_msg_throttled(
+                OP_OBS_LOOP_ITERATION, "observability_loop",
+                f"Observability loop iteration failed: {exc!r}", level="warning",
+            )

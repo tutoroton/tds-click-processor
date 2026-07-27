@@ -1483,7 +1483,15 @@ async def _handle_shipper_loop_error(exc: Exception) -> None:
     own the retry_delay state because we can't reason about the batch
     size or operation type that triggered it.
     """
-    logger.error(
+    # Sentry audit 2026-07-27 (E16) — WARNING, not ERROR: sentry_sdk.init()
+    # never disables the SDK's default LoggingIntegration, which auto-
+    # captures every logger.error() as its own Sentry event. This call and
+    # the tagged _capture_op_exc() below were both firing per occurrence,
+    # ~590k/761k of the org's 90-day error volume from this one path alone.
+    # The tagged capture is the real signal (op tag, failure_kind tag) —
+    # keep this line below LoggingIntegration's default event_level=ERROR
+    # so it stays a log line/breadcrumb without a second, untagged capture.
+    logger.warning(
         "Shipper loop catch-all (op=%s): %s",
         OP_LOOP_ITERATION, exc,
     )

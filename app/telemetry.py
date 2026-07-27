@@ -178,9 +178,23 @@ OP_DISK_DRAINER_ERROR = "disk_drainer_error"
 OP_DOMAIN_BINDING_PARSE = "domain_binding_parse"
 OP_SYNC_PULL_FAILED = "sync_pull_failed"
 
+# [TDSP][E23] (2026-07-27) — GTD-R454 fixed the shipper loop's DOUBLE
+# report (log line + tagged capture -> 1 event); GTD-R466 fixed sites
+# that had NO capture at all. Neither touched the surviving gap this
+# closes: a handful of exception captures already routed through the
+# tagged helper, on a hot/cyclic path, with no throttle — so a GENUINE
+# sustained storage outage (not a code bug) still floods Sentry at the
+# path's natural tick/click rate for as long as the outage lasts. These
+# two are the previously-RAW (untagged AND unthrottled) `/decide`
+# hot-path sites found in that audit — every click hits them when local
+# Redis is down, which is the single largest volume source of the two.
+OP_CLICK_DEDUP_FAILED = "click_dedup_failed"  # SETNX dedup degraded, fail-open
+OP_STREAM_WRITE_FAILED = "stream_write_failed"  # primary stream:clicks XADD failed
+
 
 # ---------------------------------------------------------------------------
-# Throttled message capture (audit 2026-06-03 P3 observability).
+# Throttled capture (audit 2026-06-03 P3 observability; exception variant
+# added [TDSP][E23] 2026-07-27).
 # ---------------------------------------------------------------------------
 # The routing-decision skip/fallback paths fire PER CLICK. An unthrottled
 # Sentry capture there would flood the issue feed (a single misconfigured
@@ -188,17 +202,49 @@ OP_SYNC_PULL_FAILED = "sync_pull_failed"
 # the exact "Sentry quota / alert-fatigue" failure the shipper's one-shot
 # shim guard already learned. So these paths capture at most ONCE per
 # (op, dedup_key) per window. The dedup_key is the offending entity id
-# (flow/offer/source) so distinct misconfigurations are still each visible,
-# but a hot path doesn't self-DoS Sentry. The throttle check is a dict
-# lookup + monotonic read — negligible on the 10ms hot-path budget; the
-# actual capture only runs on the rare first-occurrence-per-window.
+# (flow/offer/source) or a failure classifier (e.g. exception type) so
+# distinct failure modes are still each visible, but a hot/cyclic path
+# doesn't self-DoS Sentry when the SAME failure repeats (a sustained
+# storage outage is exactly this shape — see OP_LOOP_ITERATION /
+# OP_STREAM_WRITE_FAILED / OP_CLICK_DEDUP_FAILED callers). The throttle
+# check is a dict lookup + monotonic read — negligible on the 10ms
+# hot-path budget; the actual capture only runs on the rare
+# first-occurrence-per-window.
+#
+# A throttled occurrence is not a LOST occurrence: every suppression
+# increments a per-key counter, and the next capture that actually fires
+# for that key reports it as a ``suppressed_since_last_capture`` extra —
+# so "how many did we not see" always survives even though the
+# individual suppressed events don't.
 
 _throttle_state: dict[tuple[str, str], float] = {}
-# Bound the dict so an adversarial spray of distinct dedup keys can't grow
-# it unbounded. A clear() on overflow just re-opens the throttle window for
-# everything — acceptable for an observability throttle (worst case: one
-# extra event per key after a flush), and far cheaper than an LRU.
+_suppressed_count: dict[tuple[str, str], int] = {}
+# Bound the dicts so an adversarial spray of distinct dedup keys can't grow
+# them unbounded. A clear() on overflow just re-opens the throttle window
+# for everything — acceptable for an observability throttle (worst case: one
+# extra event per key after a flush, and one under-count of suppressions
+# spanning the flush), and far cheaper than an LRU.
 _THROTTLE_MAX_KEYS = 1024
+
+
+def _throttle_gate(op_name: str, dedup_key: object, window_sec: float) -> tuple[bool, int]:
+    """Shared throttle decision for the message/exception helpers below.
+
+    Returns ``(should_capture, suppressed_since_last_capture)``. When
+    ``should_capture`` is False the caller must do nothing else — the
+    occurrence has been counted and folded into the next real capture.
+    """
+    now = time.monotonic()
+    key = (op_name, str(dedup_key))
+    last = _throttle_state.get(key)
+    if last is not None and (now - last) < window_sec:
+        _suppressed_count[key] = _suppressed_count.get(key, 0) + 1
+        return False, 0
+    if len(_throttle_state) >= _THROTTLE_MAX_KEYS and key not in _throttle_state:
+        _throttle_state.clear()
+        _suppressed_count.clear()
+    _throttle_state[key] = now
+    return True, _suppressed_count.pop(key, 0)
 
 
 def capture_op_msg_throttled(
@@ -217,21 +263,49 @@ def capture_op_msg_throttled(
     as ``dedup_key`` so distinct misconfigurations remain individually
     visible while a single one can't spam Sentry on every click.
     """
-    now = time.monotonic()
-    key = (op_name, str(dedup_key))
-    last = _throttle_state.get(key)
-    if last is not None and (now - last) < window_sec:
+    should_capture, suppressed = _throttle_gate(op_name, dedup_key, window_sec)
+    if not should_capture:
         return False
-    if len(_throttle_state) >= _THROTTLE_MAX_KEYS and key not in _throttle_state:
-        _throttle_state.clear()
-    _throttle_state[key] = now
+    if suppressed:
+        extras["suppressed_since_last_capture"] = suppressed
     capture_op_msg(op_name, message, level=level, **extras)
+    return True
+
+
+def capture_op_exc_throttled(
+    op_name: str,
+    dedup_key: object,
+    exc: BaseException,
+    *,
+    tags: dict[str, str] | None = None,
+    window_sec: float = 300.0,
+    **extras: object,
+) -> bool:
+    """Capture an exception at most once per ``(op_name, dedup_key)`` per
+    ``window_sec``. Returns True if it captured, False if throttled.
+
+    Use for exception paths on a hot request path or a periodic/cyclic
+    loop (shipper batches, reclaim ticks, watchdog ticks) where the SAME
+    failure can repeat every occurrence/tick for the duration of a real
+    outage — pass the failure classifier (typically
+    ``type(exc).__name__``, optionally namespaced by call site so
+    unrelated loops don't share a window) as ``dedup_key`` so a distinct
+    failure_kind remains individually visible while a persistent one
+    can't flood Sentry at the loop's natural tick rate.
+    """
+    should_capture, suppressed = _throttle_gate(op_name, dedup_key, window_sec)
+    if not should_capture:
+        return False
+    if suppressed:
+        extras["suppressed_since_last_capture"] = suppressed
+    capture_op_exc(op_name, exc, tags=tags, **extras)
     return True
 
 
 def _reset_throttle_for_tests() -> None:
     """Test-only — clear the throttle window between tests."""
     _throttle_state.clear()
+    _suppressed_count.clear()
 
 
 def capture_op_exc(

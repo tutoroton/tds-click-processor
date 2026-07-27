@@ -37,7 +37,7 @@ def _post(client, headers):
     with patch("app.main._check_tds_key", new_callable=AsyncMock), \
          patch("app.main.get_redis", new=AsyncMock(return_value=fake_redis)), \
          patch("app.main.route", new=AsyncMock(side_effect=RuntimeError("boom"))), \
-         patch("app.main.capture_op_exc") as cap, \
+         patch("app.main.capture_op_exc_throttled") as cap, \
          patch("app.main.sentry_sdk.set_tag") as set_tag:
         r = client.post("/decide", json=_payload(), headers=headers)
     return r, cap, set_tag

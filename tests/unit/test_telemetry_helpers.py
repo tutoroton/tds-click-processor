@@ -37,8 +37,19 @@ from app.telemetry import (
     OP_XACK_BATCH,
     OP_XREADGROUP,
     capture_op_exc,
+    capture_op_exc_throttled,
     capture_op_msg,
 )
+
+
+@pytest.fixture(autouse=True)
+def _reset_throttle():
+    """[TDSP][E23] (2026-07-27) — every throttled test starts and ends
+    with a clean window/suppressed-count state so tests can't leak
+    dedup keys into each other (mirrors test_observability_signals.py)."""
+    telemetry._reset_throttle_for_tests()
+    yield
+    telemetry._reset_throttle_for_tests()
 
 
 @pytest.fixture(autouse=True)
@@ -154,6 +165,99 @@ def test_capture_op_exc_tags_defaults_to_empty_no_crash():
 
 
 # ---------------------------------------------------------------------------
+# capture_op_exc_throttled — [TDSP][E23] (2026-07-27), GTD-R454/GTD-R455.
+#
+# GTD-R454 fixed the shipper loop's DOUBLE report (log line + tagged
+# capture -> 1 event). It did NOT throttle the surviving single capture —
+# a GENUINE sustained storage/central outage still fires it at the
+# loop's natural tick/click rate for as long as the outage lasts. These
+# tests pin the throttle contract these hot/cyclic-path call sites now
+# rely on.
+# ---------------------------------------------------------------------------
+
+
+class TestCaptureOpExcThrottled:
+    def test_first_fires_second_throttled(self):
+        """N identical consecutive failures in one window -> exactly 1
+        Sentry capture, not N — the core anti-flood property."""
+        exc = ConnectionError("redis down")
+        with patch.object(telemetry, "capture_op_exc") as cap:
+            r1 = telemetry.capture_op_exc_throttled("op_x", "TimeoutError", exc)
+            r2 = telemetry.capture_op_exc_throttled("op_x", "TimeoutError", exc)
+            r3 = telemetry.capture_op_exc_throttled("op_x", "TimeoutError", exc)
+        assert (r1, r2, r3) == (True, False, False)
+        cap.assert_called_once()
+
+    def test_distinct_failure_kind_not_throttled_by_same_window(self):
+        """A DIFFERENT failure_kind (dedup_key) must not be silenced by
+        an unrelated dedup_key's window — distinct failure modes stay
+        individually visible even while a persistent one is collapsed."""
+        with patch.object(telemetry, "capture_op_exc") as cap:
+            r1 = telemetry.capture_op_exc_throttled(
+                "op_x", "TimeoutError", ConnectionError("a"),
+            )
+            r2 = telemetry.capture_op_exc_throttled(
+                "op_x", "ValueError", ValueError("b"),
+            )
+        assert (r1, r2) == (True, True)
+        assert cap.call_count == 2
+
+    def test_suppressed_count_is_not_lost_it_arrives_on_the_next_capture(self):
+        """A throttled occurrence is not silently dropped — the count of
+        everything suppressed since the last real capture rides along on
+        the NEXT capture that actually fires for that key, so "how many
+        did we not see" always survives even though the individual
+        events don't."""
+        exc = TimeoutError("idle gap")
+        fake_now = [0.0]
+        with patch.object(telemetry.time, "monotonic", lambda: fake_now[0]), \
+             patch.object(telemetry, "capture_op_exc") as cap:
+            # 3 suppressed within the window (window_sec=10 default here).
+            telemetry.capture_op_exc_throttled("op_x", "k", exc, window_sec=10)
+            telemetry.capture_op_exc_throttled("op_x", "k", exc, window_sec=10)
+            telemetry.capture_op_exc_throttled("op_x", "k", exc, window_sec=10)
+            telemetry.capture_op_exc_throttled("op_x", "k", exc, window_sec=10)
+            # advance past the window — the next call is a real capture.
+            fake_now[0] = 11.0
+            fired = telemetry.capture_op_exc_throttled("op_x", "k", exc, window_sec=10)
+
+        assert fired is True
+        assert cap.call_count == 2  # the first capture + this one
+        last_call_kwargs = cap.call_args.kwargs
+        assert last_call_kwargs["suppressed_since_last_capture"] == 3
+
+    def test_throttle_state_bound_does_not_grow_unbounded(self):
+        """An adversarial spray of distinct dedup keys must not grow the
+        throttle dicts without bound — mirrors the existing
+        capture_op_msg_throttled bound (same shared _throttle_state /
+        _suppressed_count dicts, same _THROTTLE_MAX_KEYS eviction)."""
+        with patch.object(telemetry, "capture_op_exc"):
+            for i in range(telemetry._THROTTLE_MAX_KEYS + 50):
+                telemetry.capture_op_exc_throttled(
+                    "op_spray", f"key-{i}", RuntimeError("x"),
+                )
+        assert len(telemetry._throttle_state) <= telemetry._THROTTLE_MAX_KEYS
+        assert len(telemetry._suppressed_count) <= telemetry._THROTTLE_MAX_KEYS
+
+    def test_tags_and_extras_pass_through_on_the_firing_capture(self):
+        """The throttled wrapper must not drop the tags= / extras
+        contract the underlying capture_op_exc relies on for alert-rule
+        filtering (e.g. failure_kind)."""
+        exc = RuntimeError("boom")
+        with patch.object(telemetry, "capture_op_exc") as cap:
+            telemetry.capture_op_exc_throttled(
+                OP_LOOP_ITERATION, "RuntimeError", exc,
+                tags={"failure_kind": "RuntimeError"},
+                context="reclaim",
+            )
+        cap.assert_called_once_with(
+            OP_LOOP_ITERATION, exc,
+            tags={"failure_kind": "RuntimeError"},
+            context="reclaim",
+        )
+
+
+# ---------------------------------------------------------------------------
 # Source-pin — every OP_LOOP_ITERATION call site tags failure_kind
 # (LOSSFIX P3, 2026-07-07, alert-rule wiring)
 # ---------------------------------------------------------------------------
@@ -168,24 +272,36 @@ def test_every_op_loop_iteration_call_site_tags_failure_kind():
     must pass `tags={"failure_kind": ...}`, or a reclaim-path event
     with no failure_kind tag would behave unpredictably against the
     filter (Sentry's "tag != X" semantics on a MISSING tag are not
-    something to rely on)."""
+    something to rely on).
+
+    [TDSP][E23] (2026-07-27) — all three sites now go through
+    ``_capture_op_exc_throttled`` (op_name, dedup_key, exc, ...) instead
+    of the unthrottled ``_capture_op_exc`` (op_name, exc, ...); the
+    dedup_key positional argument sits between the op tag and the
+    exception. Updated pattern accordingly — still exactly 3 sites,
+    still all tagged.
+    """
     import re
     from pathlib import Path
 
     src_path = Path(__file__).parent.parent.parent / "app" / "shipper.py"
     src = src_path.read_text()
 
-    # Anchored to `_capture_op_exc(` specifically (not the `logger.error`
-    # calls that also mention OP_LOOP_ITERATION) — tolerant of either
-    # call-site formatting style (args on one line vs each own line).
-    call_count = len(re.findall(r"_capture_op_exc\(\s*OP_LOOP_ITERATION,\s*exc,", src))
+    # Anchored to `_capture_op_exc_throttled(` specifically (not the
+    # `logger.error`/`logger.warning` calls that also mention
+    # OP_LOOP_ITERATION) — tolerant of either call-site formatting style
+    # (args on one line vs each own line) and of the dedup_key argument
+    # (`type(exc).__name__` or `f"reclaim:{type(exc).__name__}"`).
+    call_count = len(re.findall(
+        r"_capture_op_exc_throttled\(\s*OP_LOOP_ITERATION,\s*[^,]+,\s*exc,", src,
+    ))
     # GTD-R183 — scoped to the tags= line immediately following an
     # OP_LOOP_ITERATION call site (not a file-wide substring count):
     # a whole-file count would false-collide with any OTHER op's
     # call site that happens to tag failure_kind the same way (e.g.
     # OP_REJECTED_HANDLING), which isn't what this pin is about.
     tagged_count = len(re.findall(
-        r'_capture_op_exc\(\s*OP_LOOP_ITERATION,\s*exc,'
+        r'_capture_op_exc_throttled\(\s*OP_LOOP_ITERATION,\s*[^,]+,\s*exc,'
         r'\s*tags=\{"failure_kind": type\(exc\)\.__name__\}',
         src,
     ))
@@ -200,6 +316,21 @@ def test_every_op_loop_iteration_call_site_tags_failure_kind():
         f"failure_kind (searchable, not **extras) — found {tagged_count}. "
         "A call site missing this tag breaks the "
         "`failure_kind != TimeoutError` alert filter's predictability."
+    )
+    # Every OP_LOOP_ITERATION site must ALSO be throttled — a regression
+    # back to the unthrottled `_capture_op_exc` would silently reopen
+    # the GTD-R454/GTD-R455 flood class this fix closes. `_capture_op_exc(`
+    # (exact literal, note the trailing paren) never matches inside
+    # `_capture_op_exc_throttled(` — the character after `_capture_op_exc`
+    # there is `_`, not `(` — so this only catches a genuine regression.
+    bare_count = len(re.findall(
+        r"_capture_op_exc\(\s*OP_LOOP_ITERATION,", src,
+    ))
+    assert bare_count == 0, (
+        f"Found {bare_count} OP_LOOP_ITERATION call site(s) using the "
+        "unthrottled _capture_op_exc — every site must use "
+        "_capture_op_exc_throttled (TDSP-E23 regression: a sustained "
+        "storage/central outage would flood Sentry again)."
     )
 
 

@@ -55,13 +55,15 @@ from app.ua_parser import warmup as warmup_ua_parser
 from app.shipper import assert_shipper_ready, run_shipper
 from app.shipper_metrics import metrics as shipper_metrics
 from app.telemetry import (
+    OP_CLICK_DEDUP_FAILED,
     OP_CLICK_UNCAPTURED,
     OP_DISK_PRESSURE,
     OP_IDENTITY_STORE_PRESSURE,
     OP_ROUTE_ERROR,
     OP_STREAM_ENTRY_LIMIT,
+    OP_STREAM_WRITE_FAILED,
     OP_WATERMARK_SPILL,
-    capture_op_exc,
+    capture_op_exc_throttled,
     capture_op_msg,
     capture_op_msg_throttled,
 )
@@ -710,7 +712,19 @@ async def _acquire_click_dedup(click_id: str) -> bool | None:
             "Click dedup SETNX failed for %s: %s — failing open",
             click_id, exc,
         )
-        sentry_sdk.capture_exception(exc)
+        # [TDSP][E23] (2026-07-27) — this used to be a RAW, UNTAGGED,
+        # UNTHROTTLED capture on the `/decide` hot path: every single
+        # click hits this branch when the routing Redis is genuinely
+        # down, which was one of the two dominant volume sources behind
+        # the "500 events/10min" flood this fix closes (the other is
+        # the stream-write failure below). Now tagged + throttled by
+        # failure_kind — same op tag, same failure_kind, once per
+        # window regardless of click rate.
+        capture_op_exc_throttled(
+            OP_CLICK_DEDUP_FAILED, type(exc).__name__, exc,
+            tags={"failure_kind": type(exc).__name__},
+            click_id=click_id,
+        )
         return None
 
 
@@ -1246,6 +1260,13 @@ async def decide(
             # Smoke XADD failure is itself a signal — the admin-api
             # smoke gate will time out and report the misconfig. Log
             # + Sentry so operators have both signals. Fingerprint only.
+            #
+            # [TDSP][E23] (2026-07-27) audit note — deliberately left OUT
+            # OF SCOPE for the hot/cyclic-path throttling pass. Smoke
+            # clicks are admin-triggered, one-shot node-activation probes
+            # (skill `provisioning-edge-node`), not continuous production
+            # traffic — a real storage outage does not make this fire
+            # repeatedly the way `/decide`'s real-click paths do.
             logger.error(
                 "Smoke-test XADD failed for click_id_fp=%s: %s",
                 smoke_fp, exc,
@@ -1316,8 +1337,16 @@ async def decide(
         # (via capture_op_exc) + returning-context (the gate states active when
         # the error fired, since route() spans the resolver/cascade). No control-
         # flow change — same except, same downstream fallback.
-        capture_op_exc(
-            OP_ROUTE_ERROR, e,
+        #
+        # [TDSP][E23] (2026-07-27) — throttled: this is the outer
+        # catch-all for whatever escapes route()'s OWN internal
+        # fail-open captures (router.py's OP_FLOW_READ_FAILED etc.,
+        # already throttled per campaign). A bug or outage wide enough
+        # to escape that would otherwise repeat on every click hitting
+        # this branch.
+        capture_op_exc_throttled(
+            OP_ROUTE_ERROR, type(e).__name__, e,
+            tags={"failure_kind": type(e).__name__},
             click_id=req.click_id, country=req.country,
             resolver_enabled=settings.returning_resolver_enabled,
             routing_enabled=settings.returning_routing_enabled,
@@ -1744,7 +1773,21 @@ async def decide(
                     )
         except Exception as e:
             logger.error("Failed to write click to stream: %s", e, extra={"click_id": req.click_id})
-            sentry_sdk.capture_exception(e)
+            # [TDSP][E23] (2026-07-27) — this was a RAW, UNTAGGED,
+            # UNTHROTTLED capture on the primary click-durability write:
+            # EVERY click hits it when the routing Redis is genuinely
+            # down, making it the single largest volume source behind
+            # the "500 events/10min" flood this fix closes (see
+            # OP_CLICK_DEDUP_FAILED above for the other). The click
+            # itself is not lost here — it falls through to the disk
+            # fallback below; OP_CLICK_UNCAPTURED (unthrottled by
+            # design, already PAGE-tier) is the terminal signal if THAT
+            # also fails. Now tagged + throttled by failure_kind.
+            capture_op_exc_throttled(
+                OP_STREAM_WRITE_FAILED, type(e).__name__, e,
+                tags={"failure_kind": type(e).__name__},
+                click_id=req.click_id,
+            )
             stream_write_failed = True
             stream_failure_reason = str(e)[:200]
 

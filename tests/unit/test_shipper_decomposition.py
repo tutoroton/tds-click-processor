@@ -724,7 +724,7 @@ async def test_process_new_shape_rejected_handling_exception_still_acks_known_sa
         raise boom
 
     with patch.object(shipper, "_handle_rejected_in_batch", new=_raise), \
-         patch.object(shipper, "_capture_op_exc") as cap:
+         patch.object(shipper, "_capture_op_exc_throttled") as cap:
         await _process_new_shape_batch(
             redis, client, response, body, clicks, msg_ids,
         )
@@ -737,10 +737,12 @@ async def test_process_new_shape_rejected_handling_exception_still_acks_known_sa
 
     # The exception was logged + Sentry-captured under its own tag,
     # not silently swallowed and not left to the generic loop-level
-    # catch-all.
+    # catch-all. Args are (op_name, dedup_key, exc, ...) — the
+    # throttled helper's dedup_key sits between the op tag and the
+    # exception object.
     cap.assert_called_once()
     assert cap.call_args.args[0] == shipper.OP_REJECTED_HANDLING
-    assert cap.call_args.args[1] is boom
+    assert cap.call_args.args[2] is boom
 
 
 # ===========================================================================

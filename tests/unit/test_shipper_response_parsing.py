@@ -233,7 +233,7 @@ async def test_deadletter_swallows_xadd_failure():
     redis_mock.xadd = AsyncMock(side_effect=ConnectionError("redis down"))
     click = {"click_id": "x"}
 
-    with patch("app.shipper._capture_op_exc") as mock_cap:
+    with patch("app.shipper._capture_op_exc_throttled") as mock_cap:
         # Must not raise.
         await _deadletter_click(redis_mock, click, attempt=5, reason="r")
         mock_cap.assert_called_once()

@@ -120,7 +120,7 @@ async def test_forward_returns_false_on_exception():
         "deadlettered_at": "1.0",
         "node_id": "x",
     }
-    with patch("app.shipper._capture_op_exc") as mock_cap:
+    with patch("app.shipper._capture_op_exc_throttled") as mock_cap:
         ok = await _forward_deadletter_to_central(http_mock, record)
         assert ok is False
         mock_cap.assert_called_once()

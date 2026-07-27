@@ -96,6 +96,7 @@ from app.telemetry import (
     OP_XACK_BATCH,
     OP_XREADGROUP,
     capture_op_exc as _capture_op_exc,
+    capture_op_exc_throttled as _capture_op_exc_throttled,
     capture_op_msg as _capture_op_msg,
     capture_op_msg_throttled as _capture_op_msg_throttled,
 )
@@ -383,8 +384,16 @@ async def _forward_deadletter_to_central(
             "%s. Click is preserved at edge local deadletter stream.",
             payload["click_id"], exc,
         )
-        _capture_op_exc(
-            "deadletter",
+        # [TDSP][E23] (2026-07-27) — throttled: a sustained central outage
+        # deadletters every click that exhausts retries, and each would
+        # hit this SAME failure repeatedly without a per-(stage,
+        # failure_kind) window (GTD-R454/GTD-R455 class — the click
+        # itself is already durably preserved at the edge; this failure
+        # is a visibility signal, not a loss signal, so collapsing
+        # repeats is safe).
+        _capture_op_exc_throttled(
+            OP_DEADLETTER,
+            f"central_forward:{type(exc).__name__}",
             exc,
             click_id=payload["click_id"],
             stage="central_forward",
@@ -467,8 +476,13 @@ async def _deadletter_click(
             "(attempt=%d, reason=%s): %s",
             click_id, attempt, reason, exc,
         )
-        _capture_op_exc(
-            "deadletter",
+        # [TDSP][E23] (2026-07-27) — throttled: if the LOCAL redis is
+        # genuinely down, every click that reaches max-attempts hits this
+        # exact double-failure. Per-(stage, failure_kind) window so a
+        # sustained outage reports once per window, not once per click.
+        _capture_op_exc_throttled(
+            OP_DEADLETTER,
+            f"local_xadd:{type(exc).__name__}",
             exc,
             click_id=click_id,
             attempt=attempt,
@@ -784,8 +798,12 @@ async def _parse_messages_into_clicks(
                     "Shipper xack failure (op=%s) for msg=%s: %s",
                     OP_XACK, msg_id, xack_exc,
                 )
-                _capture_op_exc(
+                # [TDSP][E23] (2026-07-27) — throttled by failure_kind: a
+                # broken local Redis fails XACK for every poison message
+                # in the batch, not just this one.
+                _capture_op_exc_throttled(
                     OP_XACK,
+                    type(xack_exc).__name__,
                     xack_exc,
                     msg_id=str(msg_id),
                     context="post-parse-failure-ack",
@@ -897,16 +915,19 @@ async def _reclaim_shipper_pending(redis_pool, http_client) -> dict[str, int]:
             await _ensure_local_consumer_group(redis_pool)
         else:
             logger.warning("Shipper reclaim ResponseError: %s", exc)
-            _capture_op_exc(
-                OP_LOOP_ITERATION, exc,
+            # [TDSP][E23] (2026-07-27) — throttled, namespaced "reclaim:"
+            # so a storm here never shares (and never gets suppressed by)
+            # the main loop's own OP_LOOP_ITERATION window below.
+            _capture_op_exc_throttled(
+                OP_LOOP_ITERATION, f"reclaim:{type(exc).__name__}", exc,
                 tags={"failure_kind": type(exc).__name__},
                 context="reclaim",
             )
         return counts
     except Exception as exc:  # noqa: BLE001 — never break the main loop
         logger.warning("Shipper reclaim cycle failed: %s", exc)
-        _capture_op_exc(
-            OP_LOOP_ITERATION, exc,
+        _capture_op_exc_throttled(
+            OP_LOOP_ITERATION, f"reclaim:{type(exc).__name__}", exc,
             tags={"failure_kind": type(exc).__name__},
             context="reclaim",
         )
@@ -1178,7 +1199,14 @@ async def _ack_shipped_batch(
         }
         if shim_active:
             capture_extras["shim_active"] = True
-        _capture_op_exc(OP_XACK_BATCH, ack_exc, **capture_extras)
+        # [TDSP][E23] (2026-07-27) — throttled: a broken XACK path fails
+        # on every successfully-shipped batch, at the loop's natural
+        # drain rate (no backoff on this branch — central already
+        # confirmed the batch). shim_active gets its own window so a
+        # rolling-deploy-window failure and a steady-state one are
+        # never conflated.
+        dedup_key = f"shim:{type(ack_exc).__name__}" if shim_active else type(ack_exc).__name__
+        _capture_op_exc_throttled(OP_XACK_BATCH, dedup_key, ack_exc, **capture_extras)
         shipper_metrics.record_ship("ack_failed", batch_size=batch_size)
         return False
     return True
@@ -1303,8 +1331,12 @@ async def _process_new_shape_batch(
             "stay pending for reclaim.",
             OP_REJECTED_HANDLING, exc,
         )
-        _capture_op_exc(
+        # [TDSP][E23] (2026-07-27) — throttled by failure_kind: a
+        # systemic bug in this bookkeeping repeats on every batch, not
+        # just this one.
+        _capture_op_exc_throttled(
             OP_REJECTED_HANDLING,
+            type(exc).__name__,
             exc,
             tags={"failure_kind": type(exc).__name__},
             batch_size=batch_size,
@@ -1492,6 +1524,20 @@ async def _handle_central_unreachable(
 
     Returns:
         New ``retry_delay`` after exponential backoff.
+
+    [TDSP][E23] (2026-07-27) audit note — this capture is DELIBERATELY
+    left unthrottled by ``capture_op_exc_throttled``. Unlike the
+    OP_LOOP_ITERATION / reclaim / XACK sites throttled the same day,
+    this call is already rate-bounded by its OWN mechanism: the caller
+    sleeps ``retry_delay`` (1s, doubling to MAX_RETRY_DELAY=30s) after
+    every capture, so a sustained central outage converges to ≤2
+    captures/min within ~30s of onset — comparable to an explicit
+    throttle window without the extra dedup-key bookkeeping. Adding a
+    second rate limiter on top of the exponential backoff would be
+    redundant. ``_process_collector_error``'s two ``_capture_op_msg``
+    calls (non-2xx / contract-violation branches, same OP_BATCH_POST)
+    share this exemption for the same reason — same ``retry_delay``
+    backoff, same caller.
     """
     logger.warning(
         "Central unreachable (op=%s): %s. Retry in %ss.",
@@ -1522,7 +1568,12 @@ async def _handle_shipper_loop_error(exc: Exception) -> None:
 
     Fixed 2-second sleep (NOT exponential backoff) — this path doesn't
     own the retry_delay state because we can't reason about the batch
-    size or operation type that triggered it.
+    size or operation type that triggered it. Unlike OP_BATCH_POST
+    (backed by its own exponential backoff, see
+    ``_handle_central_unreachable``), a fixed 2s sleep never converges
+    to a low steady-state rate on its own — a sustained failure here
+    would otherwise capture up to 30x/min for as long as it lasts. See
+    the throttled capture below ([TDSP][E23], 2026-07-27 / GTD-R454).
     """
     # Sentry audit 2026-07-27 (E16) — WARNING, not ERROR: sentry_sdk.init()
     # never disables the SDK's default LoggingIntegration, which auto-
@@ -1543,8 +1594,16 @@ async def _handle_shipper_loop_error(exc: Exception) -> None:
     # the fleet fires TimeoutError-class on every idle gap >1s (F-6,
     # steady-state until T-7 lands) — a naive rule on `op` alone would
     # page permanently on expected traffic.
-    _capture_op_exc(
+    #
+    # [TDSP][E23] (2026-07-27, GTD-R454) — throttled by failure_kind so
+    # a GENUINE sustained storage outage (not just the double-report
+    # GTD-R454 already fixed) can't flood Sentry at this loop's 2s
+    # tick rate for the outage's whole duration. Different failure
+    # kinds (e.g. a real bug vs. a TimeoutError) still surface
+    # independently — only repeats of the SAME kind collapse.
+    _capture_op_exc_throttled(
         OP_LOOP_ITERATION,
+        type(exc).__name__,
         exc,
         tags={"failure_kind": type(exc).__name__},
     )

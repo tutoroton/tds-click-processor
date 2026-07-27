@@ -33,10 +33,19 @@ _EXCLUDED_ROUTING_IDENTITY = {
     "OP_FLOW_READ_FAILED", "OP_NO_FLOW_NO_OFFER", "OP_IDENTITY",
     "OP_IDENTITY_PERSIST", "OP_STICKY_WRITE", "OP_PARTIAL_ACK",
     "OP_LEGACY_COLLECTOR",
+    # GTD-R466 (2026-07-27): same class as OP_CRITERIA_SKIP/OP_FLOW_LOAD —
+    # a malformed-config-parse fail-to-miss on the routing hot path, not a
+    # new LOSSFIX loss signal.
+    "OP_DOMAIN_BINDING_PARSE",
 }
 _EXCLUDED_PRE_EXISTING_SHIPPER = {
     "OP_XREADGROUP", "OP_PARSE_PAYLOAD", "OP_BATCH_POST", "OP_XACK",
     "OP_XACK_BATCH",
+}
+# GTD-R466 (2026-07-27) — real signals, but out of THIS doc's LOSSFIX-P3
+# click-loss scope: config-sync staleness, not click loss.
+_EXCLUDED_OUT_OF_SCOPE = {
+    "OP_SYNC_PULL_FAILED",
 }
 
 
@@ -55,7 +64,7 @@ def test_alert_rules_doc_exists():
 
 def test_every_non_excluded_op_tag_has_a_rule():
     tags = _telemetry_op_tags()
-    excluded = _EXCLUDED_ROUTING_IDENTITY | _EXCLUDED_PRE_EXISTING_SHIPPER
+    excluded = _EXCLUDED_ROUTING_IDENTITY | _EXCLUDED_PRE_EXISTING_SHIPPER | _EXCLUDED_OUT_OF_SCOPE
     needs_a_rule = tags - excluded
     doc = _alert_rules_doc_text()
 
@@ -72,7 +81,7 @@ def test_every_excluded_tag_is_still_a_real_constant():
     was renamed/removed in telemetry.py would silently make the
     exclusion list stale (excluding nothing)."""
     tags = _telemetry_op_tags()
-    excluded = _EXCLUDED_ROUTING_IDENTITY | _EXCLUDED_PRE_EXISTING_SHIPPER
+    excluded = _EXCLUDED_ROUTING_IDENTITY | _EXCLUDED_PRE_EXISTING_SHIPPER | _EXCLUDED_OUT_OF_SCOPE
     stale = excluded - tags
     assert stale == [] if isinstance(stale, list) else stale == set(), (
         f"Excluded tags no longer exist in telemetry.py (renamed or "

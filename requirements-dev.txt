@@ -12,3 +12,4 @@
 pytest==9.0.3
 pytest-asyncio==1.3.0    # @pytest.mark.asyncio in the unit suite
 fakeredis==2.35.1        # in-memory Redis for dedup / cache paths (test-only)
+ruff==0.11.13           # CI lint gate (see pr-validation.yml); pinned to match process-service

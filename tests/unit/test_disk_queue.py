@@ -403,26 +403,96 @@ class TestFinalizeIfStale:
     async def test_wired_into_run_drainer_cycle(self, monkeypatch):
         """Proves the retrofit is actually wired into `run_drainer`,
         not just callable on demand — an idle `.wip` with NO new
-        appends still gets drained by the background loop alone."""
-        monkeypatch.setattr(disk_queue.settings, "disk_segment_max_age_seconds", 0.01)
+        appends still gets drained by the background loop alone.
+
+        ── Why this waits on CYCLES and not on the clock ─────────────
+        This test used to budget 2 seconds of wall clock (200 x 10ms)
+        for the background task to finish, then assert the terminal
+        state. It failed on stage 2026-08-15 (one run in seven): the
+        assertion is sound, the budget is not.
+
+        ONE drainer cycle dispatches at least six `asyncio.to_thread`
+        calls — heartbeat touch, orphan adopt, finalize, read-lines,
+        read-offset, write-offset, delete. Every one of them queues on
+        the default ThreadPoolExecutor, so the budget is really a bet
+        that this process gets enough of a SHARED, machine-wide thread
+        pool within two seconds. Under parallel CI jobs that bet loses
+        occasionally, and the failure says "drained 0" — which reads
+        exactly like the regression the test exists to catch.
+
+        So the wait is now bounded in DRAINER CYCLES, a quantity this
+        test controls, instead of in seconds, a quantity it does not.
+        `drain_to_redis` is wrapped by a PASSTHROUGH that reports each
+        completed cycle; the real function still does the work and the
+        real `run_drainer` still drives it, so the property under test
+        is unchanged — the wrapper observes, it never substitutes.
+
+        🔴 THE PRECONDITION WAS A SECOND CLOCK BET, and it is the one
+        that actually bit while writing this. The old version set
+        `disk_segment_max_age_seconds = 0.01` and then asserted an
+        open `.wip` exists — but the writer's OWN rotate check runs
+        inside `_commit_batch_sync`, so if `enqueue_click` takes more
+        than 10ms the segment finalizes during SETUP and the test
+        loses the idle `.wip` it exists to exercise. Reproduced here
+        by running the suite while the machine was busy: `assert
+        len(_wip_segments()) == 1` -> `0 == 1`, with nothing wrong
+        anywhere. Lowering the threshold to make the test faster is
+        what put the threshold inside the machine's noise.
+
+        So the age threshold stays LARGE (the fixture's 1000s — the
+        writer can never rotate it out from under us) and the segment
+        is made stale BY CONSTRUCTION: its open-instant is moved an
+        hour into the past. `finalize_if_stale` then sees a stale
+        `.wip` on the first cycle no matter how anything is scheduled,
+        and `enqueue_click` cannot rotate no matter how slow it is.
+        Neither direction depends on the clock any more.
+        """
+        # NB: no max-age override — the autouse fixture's 1000s is what makes
+        # the enqueue side unrotatable. Do not "speed this up" by lowering it.
         await disk_queue.enqueue_click({"click_id": "cycle-1"})
         assert len(_wip_segments()) == 1
+        writer = disk_queue._get_writer()
+        writer._opened_monotonic -= 3600  # older than any plausible threshold
 
         redis = _make_redis_mock()
+        # Each completed cycle posts its TERMINAL state here. Reported AFTER the
+        # real `drain_to_redis` returns, so every await point between the xadd and
+        # the segment actually disappearing (click:shipped SET, offset persistence,
+        # the delete-to-thread call) has already happened — the intermediate
+        # `await_count` signal the previous version avoided, avoided the same way.
+        cycles: asyncio.Queue = asyncio.Queue()
+        real_drain = disk_queue.drain_to_redis
+
+        async def _observing_drain(r):
+            stats = await real_drain(r)
+            await cycles.put((_wip_segments(), _segments()))
+            return stats
+
+        monkeypatch.setattr(disk_queue, "drain_to_redis", _observing_drain)
+
         task = asyncio.create_task(disk_queue.run_drainer(redis, interval=0))
-        # Poll for the TERMINAL state (both empty) rather than the
-        # intermediate "xadd was called" signal — there are further
-        # await points (click:shipped SET, offset persistence, the
-        # delete-to-thread call) between the xadd and the segment
-        # actually disappearing, so breaking on await_count alone
-        # races with those and is flaky.
-        for _ in range(200):
-            await asyncio.sleep(0.01)
-            if not _wip_segments() and not _segments():
-                break
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
+        try:
+            # Bounded in CYCLES. One is enough (finalize runs before drain in the
+            # same cycle); the slack absorbs an adoption cycle without ever
+            # becoming a time budget. A broken wiring exhausts these promptly —
+            # the cycles keep arriving, they just never reach the terminal state —
+            # so the regression still fails FAST. The per-wait timeout is a
+            # hang guard for "the loop never ran at all", not a deadline for the
+            # work to finish inside.
+            for _ in range(5):
+                wip, done = await asyncio.wait_for(cycles.get(), timeout=30)
+                if not wip and not done:
+                    break
+            else:
+                pytest.fail(
+                    "5 drainer cycles completed and the idle .wip was never "
+                    "finalized+drained — the stale path is not wired into "
+                    "run_drainer"
+                )
+        finally:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
 
         assert redis.xadd.await_count == 1
         assert _wip_segments() == []

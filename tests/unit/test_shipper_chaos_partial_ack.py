@@ -38,6 +38,21 @@ import pytest
 import pytest_asyncio
 
 from app import shipper, shipper_metrics as smm
+
+
+@pytest.fixture(autouse=True)
+def _writable_park_root(tmp_path, monkeypatch):
+    """LOSSFIX-4 — the shipper now parks a deadlettered click to DISK before
+    it is allowed to ACK it off `stream:clicks`. These tests therefore need a
+    writable park root; without one the park (correctly) fails, nothing is
+    ACKed, and the failures are the NEW CONTRACT working, not a test bug.
+
+    `disk_queue_root` defaults to `/var/tds`, which is not writable in a test
+    environment — that is exactly how this fixture's absence announced itself.
+    """
+    from app import disk_queue as _dq
+    monkeypatch.setattr(_dq.settings, "disk_queue_root", str(tmp_path))
+
 from app.shipper import (
     DEADLETTER_STREAM_KEY,
     STREAM_KEY,

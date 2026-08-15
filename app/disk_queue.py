@@ -783,6 +783,93 @@ async def enqueue_click(record: dict) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# LOSSFIX-4 (2026-08-15) — the DURABLE deadletter park.
+# ---------------------------------------------------------------------------
+#
+# The shipper used to retire a click it could not ship into
+# `stream:clicks-deadletter`, a 10k `approximate` ring, and then ACK the click
+# off `stream:clicks` REGARDLESS of outcome (`shipper._handle_rejected_in_batch`).
+# So the evicting ring became the click's ONLY copy. The exemption recorded on
+# that XADD (F-DL-1/GTD-R196) argued the click was "already lost" by then — but
+# it is not: it becomes lost when the ring rotates. Same mechanism that lost 19
+# clicks in the collector (ANCHOR §182), one hop upstream, and it fires on
+# TRANSIENT faults (`counter_error:` = the edge's own Redis stuttered on an
+# INCR, `requeue_error:`, a collector `queue_failure` under load), not on bad
+# data. The ring is likeliest to rotate during exactly the incident that fills it.
+#
+# The collector could park into central Redis (512 MB, noeviction). The edge
+# cannot — its routing Redis is 256 MB and holds the live stream. So the park
+# lands HERE, on the disk this module already owns.
+#
+# Deliberately NOT the segment queue above: that one is DRAINED back into
+# `stream:clicks` automatically, and replaying a click the collector keeps
+# rejecting would be an infinite loop that only grows. This is an append-only
+# NDJSON file the drainer never scans, replayed by an OPERATOR
+# (`scripts/replay_deadletter_park.py`), the same shape as the collector's
+# `stream:clicks-poison` + its replay tool.
+
+_PARK_DIRNAME = "deadletter-park"
+
+
+def _park_path() -> Path:
+    return _queue_root() / _PARK_DIRNAME / f"park-{_worker_prefix()}.ndjson"
+
+
+def _append_parked_sync(record: dict) -> bool:
+    path = _park_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    line = (json.dumps(record, default=str) + "\n").encode()
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        os.write(fd, line)
+        # fsync the FILE (content) and then its DIRECTORY (the entry), or a
+        # freshly-created park file can survive a power loss as a name with
+        # no data — the same D2 discipline the segment writer uses.
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    _fsync_dir_sync(path.parent)
+    return True
+
+
+async def enqueue_parked_click(record: dict) -> bool:
+    """Durably park a click the shipper is giving up on. True iff it is now
+    safe to ACK the click off `stream:clicks`.
+
+    Returns False on a byte-cap rejection or any write/fsync failure — and
+    False MUST mean "do not ACK". A click whose park failed stays un-ACKed in
+    the PEL and is reclaimed later; that is strictly better than retiring it
+    into a ring that evicts.
+    """
+    if _check_byte_cap():
+        logger.error(
+            "deadletter park REFUSED: disk queue is at its byte cap — the "
+            "click stays un-ACKed in the PEL rather than being dropped",
+        )
+        return False
+    try:
+        return await asyncio.to_thread(_append_parked_sync, record)
+    except Exception as exc:  # noqa: BLE001 — no durable copy ⇒ no ACK
+        logger.error("deadletter park write failed: %s", exc)
+        return False
+
+
+async def parked_click_count() -> int:
+    """Lines currently in this worker's park file (0 when absent). For
+    /health + the operator tool — an unwatched park is a silent backlog."""
+    def _count() -> int:
+        path = _park_path()
+        if not path.exists():
+            return 0
+        with open(path, "rb") as fh:
+            return sum(1 for _ in fh)
+    try:
+        return await asyncio.to_thread(_count)
+    except Exception:  # noqa: BLE001
+        return -1
+
+
+# ---------------------------------------------------------------------------
 # Orphan adoption (B1, c2) — startup-only, atomic per-file rename claim.
 # ---------------------------------------------------------------------------
 

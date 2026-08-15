@@ -139,8 +139,9 @@ class TestTheClaimProtectsALiveWriter:
     @pytest.mark.asyncio
     async def test_a_claimed_leftover_is_re_adopted_not_stranded(self, _park_root):
         """A previous run that died after claiming must not strand the park.
-        A claimed snapshot is invisible to `parked_click_count()`, so if this
-        tool did not pick it up nothing ever would."""
+        A claimed snapshot is still counted by the `park_lines` health signal
+        (it keeps the `.ndjson` extension on purpose), but nothing DRAINS it
+        — if this tool did not pick it up, nothing ever would."""
         _write_park(_park_root, "park-100-1-claimed-1755000000.ndjson",
                     [_rec("stranded")])
         r = _redis()
@@ -319,9 +320,9 @@ class TestScanScope:
     @pytest.mark.asyncio
     async def test_every_workers_park_is_seen_not_just_this_process(
             self, _park_root, capsys):
-        """`parked_click_count()` reports only the CURRENT worker's file. A
-        recovery tool that inherited that scope would skip exactly the parks
-        of dead workers — the ones nobody else is coming back for."""
+        """A recovery tool scoped to the CURRENT process's park file would
+        skip exactly the parks of dead workers — the ones nobody else is
+        coming back for. Node-wide, like the `park_lines` health signal."""
         _write_park(_park_root, "park-100-1.ndjson", [_rec("mine")])
         _write_park(_park_root, "park-200-2.ndjson", [_rec("a-dead-worker")])
         _write_park(_park_root, "park-300-3-claimed-99.ndjson", [_rec("stranded")])

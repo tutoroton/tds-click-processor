@@ -311,9 +311,30 @@ _cached_queue_stats: dict | None = None
 
 
 def _scan_queue_stats_sync() -> dict:
+    """One walk, TWO populations — they are not the same thing and they
+    need opposite operator actions.
+
+    LOSSFIX-4 cascade (2026-08-15). This scan `rglob`s, and the deadletter
+    park lives INSIDE the queue root, so a parked click silently became a
+    "segment" in a metric whose own docstring says the drainer pulls
+    everything back on recovery. It does not: the park is NEVER drained
+    automatically — only by an operator running
+    `scripts/replay_deadletter_park.py`. Measured before the fix: one
+    parked click, zero segments, reported as `segments=1`, and its file's
+    age became `oldest_seconds`, i.e. "the oldest segment still awaiting
+    drainer replay" — a phantom emergency that no amount of waiting clears.
+
+    So `segments` / `oldest_seconds` describe the DRAINABLE backlog only
+    (their pre-LOSSFIX-4 meaning, restored), while `bytes` stays the TOTAL
+    — the byte cap bounds real disk use and must keep seeing the park, or
+    the park grows unbounded until the node's disk fills.
+    """
     root = _queue_root()
+    park_dir = root / _PARK_DIRNAME
     segments = 0
     total_bytes = 0
+    park_bytes = 0
+    park_lines = 0
     oldest_mtime: float | None = None
     if root.exists():
         for pattern in ("*.ndjson", "*.json"):
@@ -322,12 +343,26 @@ def _scan_queue_stats_sync() -> dict:
                     st = f.stat()
                 except OSError:
                     continue
-                segments += 1
                 total_bytes += st.st_size
+                if f.parent == park_dir:
+                    park_bytes += st.st_size
+                    try:
+                        with open(f, "rb") as fh:
+                            park_lines += sum(1 for line in fh if line.strip())
+                    except OSError:
+                        pass
+                    continue
+                segments += 1
                 if oldest_mtime is None or st.st_mtime < oldest_mtime:
                     oldest_mtime = st.st_mtime
     oldest_seconds = (time.time() - oldest_mtime) if oldest_mtime is not None else None
-    return {"segments": segments, "bytes": total_bytes, "oldest_seconds": oldest_seconds}
+    return {
+        "segments": segments,
+        "bytes": total_bytes,
+        "oldest_seconds": oldest_seconds,
+        "park_bytes": park_bytes,
+        "park_lines": park_lines,
+    }
 
 
 def get_cached_queue_stats() -> dict:
@@ -335,7 +370,8 @@ def get_cached_queue_stats() -> dict:
     the byte-cap gate. Never-sampled returns a zeroed dict — safe
     default for a fresh boot before the sampler's first tick."""
     if _cached_queue_stats is None:
-        return {"segments": 0, "bytes": 0, "oldest_seconds": None}
+        return {"segments": 0, "bytes": 0, "oldest_seconds": None,
+                "park_bytes": 0, "park_lines": 0}
     return _cached_queue_stats
 
 
@@ -854,19 +890,12 @@ async def enqueue_parked_click(record: dict) -> bool:
         return False
 
 
-async def parked_click_count() -> int:
-    """Lines currently in this worker's park file (0 when absent). For
-    /health + the operator tool — an unwatched park is a silent backlog."""
-    def _count() -> int:
-        path = _park_path()
-        if not path.exists():
-            return 0
-        with open(path, "rb") as fh:
-            return sum(1 for _ in fh)
-    try:
-        return await asyncio.to_thread(_count)
-    except Exception:  # noqa: BLE001
-        return -1
+# Park DEPTH is reported by `_scan_queue_stats_sync` (`park_lines` /
+# `park_bytes`) — node-wide, covering every worker's file including dead
+# workers', on the walk the sampler already performs. A per-worker counter
+# lived here briefly and was removed rather than wired: it would have been a
+# SECOND mechanism answering the same question with a narrower scope, and the
+# narrower answer is the one that hides the parks nobody is coming back for.
 
 
 # ---------------------------------------------------------------------------

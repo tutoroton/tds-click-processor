@@ -332,6 +332,12 @@ class Settings(BaseSettings):
     # path) rather than silently rotating the oldest segment. 0/negative
     # disables the cap (unbounded, operator opt-in).
     disk_segment_max_total_bytes: int = 5_000_000_000  # 5 GiB
+
+    # LOSSFIX-4 (2026-08-15) — WARN once the deadletter park holds this many
+    # clicks node-wide. Mirrors the collector's
+    # `poison_park_depth_alert_threshold`; the park is durable but is drained
+    # only by an operator, so depth is the whole signal.
+    deadletter_park_depth_alert_threshold: int = 25
     disk_queue_stats_scan_interval_seconds: float = 5.0
 
     # P2 c2 (B1) — orphan-adoption age floor. On EVERY adoption attempt

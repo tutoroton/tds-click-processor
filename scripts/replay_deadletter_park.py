@@ -99,10 +99,9 @@ def _park_files() -> list[Path]:
     every DEAD worker's, and any snapshot a previous run of this tool claimed
     and then crashed before finishing.
 
-    `disk_queue.parked_click_count()` deliberately reports only the CURRENT
-    process's file (it answers "how deep is my own backlog"). An operator
-    recovery tool that inherited that scope would silently skip exactly the
-    parks nobody is coming back for.
+    The same scope as the service's own `park_lines` health signal
+    (`disk_queue._scan_queue_stats_sync`) — deliberately node-wide, because a
+    per-worker count would hide exactly the parks nobody is coming back for.
     """
     d = _park_dir()
     if not d.exists():

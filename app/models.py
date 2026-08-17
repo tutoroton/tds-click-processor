@@ -295,6 +295,12 @@ class HealthResponse(BaseModel):
     # None when the queue is empty. A growing value under a healthy
     # Redis means the drainer itself is stuck, not just an outage.
     disk_queue_oldest_seconds: float | None = None
+    # LOSSFIX-4 (2026-08-15) — the DURABLE deadletter park, node-wide.
+    # Separate from `disk_queue_*` above because only ONE of the two
+    # resolves by waiting: a segment backlog drains itself once Redis
+    # recovers, a park is drained only by an operator replay (runbook §4b).
+    deadletter_park_lines: int = 0
+    deadletter_park_bytes: int = 0
     # Free bytes on the disk-queue mountpoint. None when the path does
     # not exist (local dev without TDS_DISK_QUEUE_ROOT). Sprint 1.5
     # pre-flight check uses this against

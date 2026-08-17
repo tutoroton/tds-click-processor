@@ -66,6 +66,7 @@ from app.config import _LOCAL_ENVIRONMENTS, settings
 from app.disk_queue import get_queue_stats
 from app.shipper_metrics import metrics as shipper_metrics
 from app.telemetry import (
+    OP_DEADLETTER_PARK_DEPTH,
     OP_OBS_LOOP_ITERATION,
     OP_OBS_SHIPPER_HEALTH_EMIT_FAILED,
     OP_OBS_STREAM_EMIT_FAILED,
@@ -255,6 +256,60 @@ async def emit_disk_queue_size() -> int:
             size, pct, extra=extra,
         )
     return size
+
+
+async def emit_deadletter_park_depth() -> int:
+    """LOSSFIX-4 (2026-08-15) — depth of the DURABLE deadletter park.
+
+    Its own signal, deliberately separate from `emit_disk_queue_size` above,
+    because the two need OPPOSITE operator actions and only one of them
+    resolves by waiting:
+
+    * a segment backlog DRAINS ITSELF once Redis recovers — the right action
+      is usually to fix Redis and wait;
+    * a park NEVER drains. A parked click is durable and NOT delivered, and
+      the only thing that closes that gap is a human running
+      `scripts/replay_deadletter_park.py` (runbook §4b).
+
+    Before this split the park's bytes were folded into `disk_queue.size` by
+    the sampler's `rglob` and its file age became `oldest_seconds` — so a
+    parked click read as "the oldest segment still awaiting drainer replay",
+    a phantom emergency that no amount of waiting clears. Measured: one
+    parked click, zero segments, reported as `segments=1`.
+
+    Returns the sampled line count so callers can log it themselves.
+    """
+    stats = await get_queue_stats()
+    lines = stats.get("park_lines", 0)
+    if lines <= 0:
+        return 0
+
+    extra = {
+        "area": "observability",
+        "metric": "deadletter_park.lines",
+        "lines": lines,
+        "bytes": stats.get("park_bytes", 0),
+        "threshold": settings.deadletter_park_depth_alert_threshold,
+    }
+    if lines >= settings.deadletter_park_depth_alert_threshold:
+        logger.warning(
+            "deadletter_park.lines=%d (>= %d) — clicks are DURABLE but NOT "
+            "delivered and this never drains on its own. Run "
+            "scripts/replay_deadletter_park.py (runbook §4b).",
+            lines, settings.deadletter_park_depth_alert_threshold,
+            extra=extra,
+        )
+        capture_op_msg_throttled(
+            OP_DEADLETTER_PARK_DEPTH, "depth",
+            f"Edge deadletter park holds {lines} click(s) "
+            f"({stats.get('park_bytes', 0)} bytes) on node "
+            f"{settings.node_id} — durable, undelivered, and drained only by "
+            f"an operator replay (runbook §4b).",
+            level="warning",
+        )
+    else:
+        logger.info("deadletter_park.lines=%d", lines, extra=extra)
+    return lines
 
 
 async def _shipper_backlog(redis) -> int | None:
@@ -447,6 +502,12 @@ async def run_observability_loop(redis, interval: int = 60) -> None:
             except Exception:  # noqa: BLE001
                 logger.exception(
                     "emit_disk_queue_size raised — continuing",
+                )
+            try:
+                await emit_deadletter_park_depth()
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "emit_deadletter_park_depth raised — continuing",
                 )
             try:
                 await emit_shipper_health(redis)

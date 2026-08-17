@@ -574,6 +574,10 @@ class TestQueueStats:
     def test_cached_stats_default_when_never_sampled(self):
         assert disk_queue.get_cached_queue_stats() == {
             "segments": 0, "bytes": 0, "oldest_seconds": None,
+            # LOSSFIX-4 cascade — the deadletter park is a SECOND population
+            # in this scan and a consumer reading it off the fresh-boot dict
+            # must not KeyError on the one path that exists to be safe.
+            "park_bytes": 0, "park_lines": 0,
         }
 
 

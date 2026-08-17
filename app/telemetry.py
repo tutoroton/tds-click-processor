@@ -119,6 +119,12 @@ OP_SEGMENT_BYTE_CAP = "segment_byte_cap"
 # that the WC=8 stranding class did NOT go silent.
 OP_SEGMENT_ORPHAN_ADOPTED = "segment_orphan_adopted"
 
+# LOSSFIX-4 (2026-08-15) — the DURABLE deadletter park never drains itself.
+# A parked click is safe but NOT delivered, and only an operator running
+# `scripts/replay_deadletter_park.py` closes that gap. Unwatched, "durable"
+# quietly becomes "forgotten".
+OP_DEADLETTER_PARK_DEPTH = "deadletter_park_depth"
+
 # Returning-user identity resolver fail-open (P2, 2026-06-05). Emitted (throttled
 # per company) when the resolver raises and the click degrades to legacy flags.
 OP_IDENTITY = "identity_resolve"

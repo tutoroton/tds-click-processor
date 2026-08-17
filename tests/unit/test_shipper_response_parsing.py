@@ -26,6 +26,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from app import shipper
+
 from app.shipper import (
     _parse_collector_response,
     _deadletter_click,
@@ -35,6 +36,20 @@ from app.shipper import (
     DEADLETTER_STREAM_MAXLEN,
     STREAM_KEY,
 )
+
+
+@pytest.fixture(autouse=True)
+def _writable_park_root(tmp_path, monkeypatch):
+    """LOSSFIX-4 — the shipper now parks a deadlettered click to DISK before
+    it is allowed to ACK it off `stream:clicks`. These tests therefore need a
+    writable park root; without one the park (correctly) fails, nothing is
+    ACKed, and the failures are the NEW CONTRACT working, not a test bug.
+
+    `disk_queue_root` defaults to `/var/tds`, which is not writable in a test
+    environment — that is exactly how this fixture's absence announced itself.
+    """
+    from app import disk_queue as _dq
+    monkeypatch.setattr(_dq.settings, "disk_queue_root", str(tmp_path))
 
 
 @pytest.fixture(autouse=True)
@@ -281,7 +296,7 @@ async def test_handle_rejected_retries_when_under_max(monkeypatch):
 
     retried = await _handle_rejected_click(redis_mock, click, "queue_failure")
 
-    assert retried is True
+    assert retried == (True, True)  # (retried, safe_to_ack)
     # Pipeline was used (atomic INCR+EXPIRE).
     pipe_mock.incr.assert_called_once_with("click:retry:x")
     pipe_mock.expire.assert_called_once_with("click:retry:x", 86400)
@@ -307,7 +322,7 @@ async def test_handle_rejected_deadletters_at_max(monkeypatch):
 
     retried = await _handle_rejected_click(redis_mock, click, "queue_failure")
 
-    assert retried is False
+    assert retried == (False, True)  # deadlettered, DURABLY parked first
     redis_mock.xadd.assert_awaited_once()
     # XADD must target the deadletter stream, not the retry stream.
     assert redis_mock.xadd.call_args.args[0] == DEADLETTER_STREAM_KEY
@@ -325,7 +340,7 @@ async def test_handle_rejected_missing_click_id_deadletters_immediately():
 
     retried = await _handle_rejected_click(redis_mock, click, "missing_click_id")
 
-    assert retried is False
+    assert retried == (False, True)  # deadlettered, DURABLY parked first
     redis_mock.xadd.assert_awaited_once()
     assert redis_mock.xadd.call_args.args[0] == DEADLETTER_STREAM_KEY
 
@@ -350,7 +365,7 @@ async def test_handle_rejected_counter_failure_deadletters(monkeypatch):
 
     retried = await _handle_rejected_click(redis_mock, click, "queue_failure")
 
-    assert retried is False
+    assert retried == (False, True)  # deadlettered, DURABLY parked first
     # Deadletter XADD called even though counter failed.
     redis_mock.xadd.assert_awaited_once()
     assert redis_mock.xadd.call_args.args[0] == DEADLETTER_STREAM_KEY
@@ -380,7 +395,7 @@ async def test_handle_rejected_requeue_failure_deadletters(monkeypatch):
 
     retried = await _handle_rejected_click(redis_mock, click, "queue_failure")
 
-    assert retried is False
+    assert retried == (False, True)  # deadlettered, DURABLY parked first
     # Two xadd calls — first retry attempt failed, second is deadletter.
     assert redis_mock.xadd.await_count == 2
     # Second call (deadletter) targets the right stream.

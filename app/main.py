@@ -1984,10 +1984,18 @@ async def health():
         disk_queue_size = _queue_stats["segments"]
         disk_queue_bytes = _queue_stats["bytes"]
         disk_queue_oldest_seconds = _queue_stats["oldest_seconds"]
+        # LOSSFIX-4 (2026-08-15) — reported SEPARATELY from the segment
+        # queue above on purpose. A segment backlog drains itself once Redis
+        # recovers; the park never does. Folding them into one number tells
+        # an operator to wait for something that will not happen.
+        deadletter_park_lines = _queue_stats.get("park_lines", 0)
+        deadletter_park_bytes = _queue_stats.get("park_bytes", 0)
     except Exception:
         disk_queue_size = 0
         disk_queue_bytes = 0
         disk_queue_oldest_seconds = None
+        deadletter_park_lines = 0
+        deadletter_park_bytes = 0
 
     # F.29 Sprint 1.4 — free bytes on the disk-queue mountpoint.
     # Used by Sprint 4.1 alert "disk_free_bytes < 1GB → warn". Returns
@@ -2086,6 +2094,8 @@ async def health():
         disk_queue_size=disk_queue_size,
         disk_queue_bytes=disk_queue_bytes,
         disk_queue_oldest_seconds=disk_queue_oldest_seconds,
+        deadletter_park_lines=deadletter_park_lines,
+        deadletter_park_bytes=deadletter_park_bytes,
         disk_free_bytes=disk_free_bytes,
         identity_store_used_bytes=identity_used_bytes,
         identity_store_max_bytes=identity_max_bytes,

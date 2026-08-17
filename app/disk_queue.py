@@ -311,9 +311,30 @@ _cached_queue_stats: dict | None = None
 
 
 def _scan_queue_stats_sync() -> dict:
+    """One walk, TWO populations — they are not the same thing and they
+    need opposite operator actions.
+
+    LOSSFIX-4 cascade (2026-08-15). This scan `rglob`s, and the deadletter
+    park lives INSIDE the queue root, so a parked click silently became a
+    "segment" in a metric whose own docstring says the drainer pulls
+    everything back on recovery. It does not: the park is NEVER drained
+    automatically — only by an operator running
+    `scripts/replay_deadletter_park.py`. Measured before the fix: one
+    parked click, zero segments, reported as `segments=1`, and its file's
+    age became `oldest_seconds`, i.e. "the oldest segment still awaiting
+    drainer replay" — a phantom emergency that no amount of waiting clears.
+
+    So `segments` / `oldest_seconds` describe the DRAINABLE backlog only
+    (their pre-LOSSFIX-4 meaning, restored), while `bytes` stays the TOTAL
+    — the byte cap bounds real disk use and must keep seeing the park, or
+    the park grows unbounded until the node's disk fills.
+    """
     root = _queue_root()
+    park_dir = root / _PARK_DIRNAME
     segments = 0
     total_bytes = 0
+    park_bytes = 0
+    park_lines = 0
     oldest_mtime: float | None = None
     if root.exists():
         for pattern in ("*.ndjson", "*.json"):
@@ -322,12 +343,26 @@ def _scan_queue_stats_sync() -> dict:
                     st = f.stat()
                 except OSError:
                     continue
-                segments += 1
                 total_bytes += st.st_size
+                if f.parent == park_dir:
+                    park_bytes += st.st_size
+                    try:
+                        with open(f, "rb") as fh:
+                            park_lines += sum(1 for line in fh if line.strip())
+                    except OSError:
+                        pass
+                    continue
+                segments += 1
                 if oldest_mtime is None or st.st_mtime < oldest_mtime:
                     oldest_mtime = st.st_mtime
     oldest_seconds = (time.time() - oldest_mtime) if oldest_mtime is not None else None
-    return {"segments": segments, "bytes": total_bytes, "oldest_seconds": oldest_seconds}
+    return {
+        "segments": segments,
+        "bytes": total_bytes,
+        "oldest_seconds": oldest_seconds,
+        "park_bytes": park_bytes,
+        "park_lines": park_lines,
+    }
 
 
 def get_cached_queue_stats() -> dict:
@@ -335,7 +370,8 @@ def get_cached_queue_stats() -> dict:
     the byte-cap gate. Never-sampled returns a zeroed dict — safe
     default for a fresh boot before the sampler's first tick."""
     if _cached_queue_stats is None:
-        return {"segments": 0, "bytes": 0, "oldest_seconds": None}
+        return {"segments": 0, "bytes": 0, "oldest_seconds": None,
+                "park_bytes": 0, "park_lines": 0}
     return _cached_queue_stats
 
 
@@ -780,6 +816,86 @@ async def enqueue_click(record: dict) -> bool:
     primary write path.
     """
     return await _get_writer().append(record)
+
+
+# ---------------------------------------------------------------------------
+# LOSSFIX-4 (2026-08-15) — the DURABLE deadletter park.
+# ---------------------------------------------------------------------------
+#
+# The shipper used to retire a click it could not ship into
+# `stream:clicks-deadletter`, a 10k `approximate` ring, and then ACK the click
+# off `stream:clicks` REGARDLESS of outcome (`shipper._handle_rejected_in_batch`).
+# So the evicting ring became the click's ONLY copy. The exemption recorded on
+# that XADD (F-DL-1/GTD-R196) argued the click was "already lost" by then — but
+# it is not: it becomes lost when the ring rotates. Same mechanism that lost 19
+# clicks in the collector (ANCHOR §182), one hop upstream, and it fires on
+# TRANSIENT faults (`counter_error:` = the edge's own Redis stuttered on an
+# INCR, `requeue_error:`, a collector `queue_failure` under load), not on bad
+# data. The ring is likeliest to rotate during exactly the incident that fills it.
+#
+# The collector could park into central Redis (512 MB, noeviction). The edge
+# cannot — its routing Redis is 256 MB and holds the live stream. So the park
+# lands HERE, on the disk this module already owns.
+#
+# Deliberately NOT the segment queue above: that one is DRAINED back into
+# `stream:clicks` automatically, and replaying a click the collector keeps
+# rejecting would be an infinite loop that only grows. This is an append-only
+# NDJSON file the drainer never scans, replayed by an OPERATOR
+# (`scripts/replay_deadletter_park.py`), the same shape as the collector's
+# `stream:clicks-poison` + its replay tool.
+
+_PARK_DIRNAME = "deadletter-park"
+
+
+def _park_path() -> Path:
+    return _queue_root() / _PARK_DIRNAME / f"park-{_worker_prefix()}.ndjson"
+
+
+def _append_parked_sync(record: dict) -> bool:
+    path = _park_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    line = (json.dumps(record, default=str) + "\n").encode()
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        os.write(fd, line)
+        # fsync the FILE (content) and then its DIRECTORY (the entry), or a
+        # freshly-created park file can survive a power loss as a name with
+        # no data — the same D2 discipline the segment writer uses.
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    _fsync_dir_sync(path.parent)
+    return True
+
+
+async def enqueue_parked_click(record: dict) -> bool:
+    """Durably park a click the shipper is giving up on. True iff it is now
+    safe to ACK the click off `stream:clicks`.
+
+    Returns False on a byte-cap rejection or any write/fsync failure — and
+    False MUST mean "do not ACK". A click whose park failed stays un-ACKed in
+    the PEL and is reclaimed later; that is strictly better than retiring it
+    into a ring that evicts.
+    """
+    if _check_byte_cap():
+        logger.error(
+            "deadletter park REFUSED: disk queue is at its byte cap — the "
+            "click stays un-ACKed in the PEL rather than being dropped",
+        )
+        return False
+    try:
+        return await asyncio.to_thread(_append_parked_sync, record)
+    except Exception as exc:  # noqa: BLE001 — no durable copy ⇒ no ACK
+        logger.error("deadletter park write failed: %s", exc)
+        return False
+
+
+# Park DEPTH is reported by `_scan_queue_stats_sync` (`park_lines` /
+# `park_bytes`) — node-wide, covering every worker's file including dead
+# workers', on the walk the sampler already performs. A per-worker counter
+# lived here briefly and was removed rather than wired: it would have been a
+# SECOND mechanism answering the same question with a narrower scope, and the
+# narrower answer is the one that hides the parks nobody is coming back for.
 
 
 # ---------------------------------------------------------------------------

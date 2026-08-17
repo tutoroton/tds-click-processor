@@ -32,6 +32,7 @@ import httpx
 import pytest
 
 from app import shipper, shipper_metrics as smm
+
 from app.shipper import (
     _ack_shipped_batch,
     _compute_ack_msg_ids_from_verdict,
@@ -48,6 +49,20 @@ from app.shipper import (
     MAX_RETRY_DELAY,
     STREAM_KEY,
 )
+
+
+@pytest.fixture(autouse=True)
+def _writable_park_root(tmp_path, monkeypatch):
+    """LOSSFIX-4 — the shipper now parks a deadlettered click to DISK before
+    it is allowed to ACK it off `stream:clicks`. These tests therefore need a
+    writable park root; without one the park (correctly) fails, nothing is
+    ACKed, and the failures are the NEW CONTRACT working, not a test bug.
+
+    `disk_queue_root` defaults to `/var/tds`, which is not writable in a test
+    environment — that is exactly how this fixture's absence announced itself.
+    """
+    from app import disk_queue as _dq
+    monkeypatch.setattr(_dq.settings, "disk_queue_root", str(tmp_path))
 
 
 @pytest.fixture(autouse=True)
@@ -577,11 +592,14 @@ async def test_handle_rejected_counts_deadletters():
     redis = AsyncMock()
     client = MagicMock()
 
-    # Patch _handle_rejected_click to return False (deadlettered) for c1
+    # Patch _handle_rejected_click to report c1 as deadlettered. LOSSFIX-4:
+    # it now returns (retried, safe_to_ack); c1 is deadlettered but DURABLY
+    # PARKED, so it is still safe to ACK — the counting behaviour under test
+    # is unchanged.
     # and True (retried) for c2 — the helper's bookkeeping should reflect
     # exactly 1 deadletter.
     async def fake_handle(redis_pool, click, reason, http_client=None):
-        return click["click_id"] != "c1"  # False (DL) for c1, True for c2
+        return (click["click_id"] != "c1", True)
 
     clicks = [{"click_id": "c1"}, {"click_id": "c2"}]
     mapping = {"c1": "1-0", "c2": "2-0"}
@@ -785,7 +803,7 @@ async def test_process_legacy_shape_sentry_fires_only_once_per_session():
         scope_mock = MagicMock()
         push_scope_mock = MagicMock()
         push_scope_mock.__enter__ = MagicMock(return_value=scope_mock)
-        push_scope_mock.__exit__ = MagicMock(return_value=False)
+        push_scope_mock.__exit__ = MagicMock(return_value=(False, True))
         mock_sentry.push_scope.return_value = push_scope_mock
 
         # Fire 3 times — Sentry should see ONE capture_message.

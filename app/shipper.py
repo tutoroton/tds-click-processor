@@ -27,6 +27,7 @@ import sentry_sdk
 from redis.exceptions import ResponseError as RedisResponseError
 
 from app.config import _LOCAL_ENVIRONMENTS, settings
+from app.disk_queue import enqueue_parked_click
 from app.reclaim_metrics import record_reclaim_age_ms, stream_id_age_ms
 from app.shipper_metrics import metrics as shipper_metrics
 
@@ -407,8 +408,13 @@ async def _deadletter_click(
     attempt: int,
     reason: str,
     http_client: httpx.AsyncClient | None = None,
-) -> None:
-    """Move a click to the local deadletter stream after max retries.
+) -> bool:
+    """Retire a click the shipper is giving up on. **True iff it is now safe
+    to ACK it off ``stream:clicks``.**
+
+    LOSSFIX-4 (2026-08-15) — this used to return None and the caller ACKed
+    unconditionally. Move a click to the local deadletter stream after max
+    retries.
 
     F.29 Sprint 2.2 (2026-05-23) introduced the local edge deadletter
     stream. Sprint 2.3 (2026-05-23) added the optional ``http_client``
@@ -449,17 +455,47 @@ async def _deadletter_click(
         "node_id": settings.node_id,
     }
 
-    # Local edge deadletter stream — primary durability path.
+    # LOSSFIX-4 (2026-08-15) — DURABLE PARK FIRST, and it is the ACK gate.
     #
-    # F-DL-1 (GTD-R196) disposition: this `maxlen=` is EXEMPT from the
-    # LOSSFIX P1a/P1b reject-before-write treatment given to
-    # stream:clicks/stream:clicks-incoming. Rule `architecture` (TD-11):
-    # deadletter streams are EPHEMERAL operator-visibility, NOT a
-    # durability guarantee — a click reaching here has ALREADY exhausted
-    # shipper retries against the real durable path (stream:clicks →
-    # collector → stream:clicks-incoming), so an eviction from this ring
-    # loses only the operator's VIEW of an already-lost click, not
-    # additional live data. Bounding it is correct, not a gap.
+    # F-DL-1 (GTD-R196) previously exempted the ring below from the LOSSFIX
+    # P1a/P1b reject-before-write treatment, on the grounds that "a click
+    # reaching here has ALREADY exhausted shipper retries against the real
+    # durable path … so an eviction from this ring loses only the operator's
+    # VIEW of an already-lost click".
+    #
+    # That premise is FALSE, and the sentence that falsifies it lives ~600
+    # lines below in `_handle_rejected_in_batch`: it ACKs the message off
+    # `stream:clicks` **regardless of outcome**. The ring was therefore the
+    # click's ONLY copy, and the click was not "already lost" on arrival — it
+    # became lost when the ring rotated. Identical mechanism to the 19 clicks
+    # proven lost in the collector (ANCHOR §182), one hop upstream.
+    #
+    # It also fires on TRANSIENT faults, not bad data: `counter_error:` means
+    # the edge's own Redis stuttered on an INCR, `requeue_error:` that a
+    # re-XADD failed, `queue_failure` that the collector was briefly
+    # overloaded. And the ring is likeliest to rotate during exactly the
+    # incident that fills it.
+    #
+    # So the durable copy goes to DISK (`disk_queue.enqueue_parked_click` —
+    # fsynced, never auto-drained, operator-replayed) BEFORE anything else,
+    # and it is the sole authority on whether an ACK may happen. The ring
+    # below keeps its `maxlen=` and becomes what TD-11 always said it was:
+    # ephemeral operator visibility, layered on top of a real copy.
+    if not await enqueue_parked_click(record):
+        logger.error(
+            "DURABLE deadletter park FAILED for click_id=%s (attempt=%d, "
+            "reason=%s) — the click is kept un-ACKed in the PEL and will be "
+            "reclaimed, never dropped into an evicting ring",
+            click_id, attempt, reason,
+        )
+        _capture_op_exc_throttled(
+            OP_DEADLETTER, "park_failed",
+            RuntimeError("durable deadletter park failed"),
+            click_id=click_id, attempt=attempt, reason=reason,
+            stage="durable_park",
+        )
+        return False
+
     try:
         await redis_pool.xadd(
             DEADLETTER_STREAM_KEY,
@@ -497,15 +533,26 @@ async def _deadletter_click(
     if http_client is not None:
         await _forward_deadletter_to_central(http_client, record)
 
+    return True  # a durable copy exists on disk — the ACK is now safe
+
 
 async def _handle_rejected_click(
     redis_pool,
     click: dict[str, Any],
     reason: str,
     http_client: httpx.AsyncClient | None = None,
-) -> bool:
-    """Increment retry counter; return True if click should be retried,
-    False if it was deadlettered (max attempts hit).
+) -> tuple[bool, bool]:
+    """Increment retry counter; return ``(retried, safe_to_ack)``.
+
+    LOSSFIX-4 (2026-08-15) — this used to return a single bool and the
+    caller ACKed unconditionally. There are THREE outcomes, not two, and
+    collapsing them is what let a deadlettered click be ACKed off
+    `stream:clicks` with only an evicting ring holding it:
+
+      * ``(True,  True)``  — re-queued; the click lives under a new msg_id.
+      * ``(False, True)``  — given up on, but DURABLY PARKED on disk first.
+      * ``(False, False)`` — given up on and the park FAILED. The message
+        must stay un-ACKed in the PEL so it is reclaimed, never dropped.
 
     The counter (``click:retry:{click_id}``) is per-click_id; the
     Sprint 2.1 central dedup gate (``click:central_seen:{click_id}``)
@@ -520,11 +567,11 @@ async def _handle_rejected_click(
         # Pathological — Sprint 2.1 collector returns
         # missing_click_id reason. Cannot retry without an id; just
         # deadletter immediately.
-        await _deadletter_click(
+        parked = await _deadletter_click(
             redis_pool, click, attempt=1, reason=reason,
             http_client=http_client,
         )
-        return False
+        return False, parked
 
     retry_key = f"{_RETRY_KEY_PREFIX}{click_id}"
     try:
@@ -551,14 +598,14 @@ async def _handle_rejected_click(
             "%s. Deadlettering conservatively.",
             click_id, exc,
         )
-        await _deadletter_click(
+        parked = await _deadletter_click(
             redis_pool, click, attempt=0, reason=f"counter_error:{reason}",
             http_client=http_client,
         )
-        return False
+        return False, parked
 
     if attempt >= settings.shipper_max_retry_attempts:
-        await _deadletter_click(
+        parked = await _deadletter_click(
             redis_pool, click, attempt=attempt, reason=reason,
             http_client=http_client,
         )
@@ -567,7 +614,7 @@ async def _handle_rejected_click(
             await redis_pool.delete(retry_key)
         except Exception:  # noqa: BLE001
             pass  # TTL will eventually clean it up
-        return False
+        return False, parked
 
     # Re-XADD for next iteration.
     try:
@@ -580,13 +627,13 @@ async def _handle_rejected_click(
             "%s. Deadlettering.",
             click_id, attempt, exc,
         )
-        await _deadletter_click(
+        parked = await _deadletter_click(
             redis_pool, click, attempt=attempt, reason=f"requeue_error:{reason}",
             http_client=http_client,
         )
-        return False
+        return False, parked
 
-    return True
+    return True, True
 
 
 # ---------------------------------------------------------------------------
@@ -1047,9 +1094,22 @@ async def _handle_rejected_in_batch(
          collector should only echo click_ids we sent).
       2. Hand it to :func:`_handle_rejected_click` which increments the
          per-click retry counter and either re-XADDs OR deadletters.
-      3. ACK the CURRENT (failed) msg_id regardless of outcome — the
-         click either lives under a new msg_id (re-XADD) or in the
-         deadletter stream.
+      3. ACK the CURRENT (failed) msg_id **only if a copy demonstrably
+         survives it** — under a new msg_id (re-XADD) or in the DURABLE
+         disk park.
+
+    🔴 LOSSFIX-4 (2026-08-15). Step 3 used to read "ACK the CURRENT
+    (failed) msg_id REGARDLESS of outcome". That single word is what made
+    the 10k `approximate` deadletter ring the click's ONLY copy — and it
+    is also the sentence that falsified the exemption recorded 600 lines
+    above on that ring's own XADD (F-DL-1/GTD-R196, "an eviction from this
+    ring loses only the operator's VIEW of an already-lost click"). The
+    click was not already lost; this ACK is what lost it.
+
+    The lesson generalises: **a durability claim must be verified at the
+    site of the ACK, never at the site of the write.** A write can only
+    tell you where a copy went; only the ACK tells you whether it was the
+    last one.
 
     Side-effect: mutates ``ack_msg_ids`` by adding the rejected msg_ids
     (passed as a set ref — caller's view updates in place).
@@ -1078,13 +1138,18 @@ async def _handle_rejected_in_batch(
             if cid in click_id_to_msg_id:
                 ack_msg_ids.add(click_id_to_msg_id[cid])
             continue
-        retried = await _handle_rejected_click(
+        retried, safe_to_ack = await _handle_rejected_click(
             redis_pool, original_click, reason,
             http_client=http_client,
         )
         if not retried:
             deadletter_count += 1
-        # ACK the current msg_id either way.
+        if not safe_to_ack:
+            # The durable park failed: NO copy of this click survives the
+            # ACK. Leave it un-ACKed in the PEL — it is reclaimed on a
+            # later cycle, which is strictly better than retiring it into
+            # a ring that evicts.
+            continue
         if cid in click_id_to_msg_id:
             ack_msg_ids.add(click_id_to_msg_id[cid])
     return deadletter_count

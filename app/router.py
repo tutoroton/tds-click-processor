@@ -269,6 +269,26 @@ async def route(req: ClickRequest) -> dict | None:
     # here — measured 14 such clicks in 30 days, none of them a client
     # traffic path.
     #
+    # 🔴 DO NOT "TIGHTEN" THE GATE ONTO HOST-LESS CALLS. That exception is
+    # LOAD-BEARING, not a leftover: `tds-ctl:181` documents a `/decide` body
+    # with no hostname, and `/admin/seed` seeds `geo:US` members that are
+    # reachable ONLY through the geo branch — so the entire local seed-and-
+    # probe development loop runs through this exception. Closing it would
+    # break local development while every production path stayed green,
+    # which is the kind of breakage nobody notices until a new engineer
+    # cannot get the stack to route at all.
+    # The residual reachability (an authenticated caller omitting hostname)
+    # is closed by workstream B, which makes the pool per-tenant: the real
+    # CF Worker always sends `url.hostname` (`worker/src/index.js:1354`), so
+    # A and B together leave no path from real traffic into a foreign pool.
+    #
+    # NOTE on the discriminator: this gate reads the RAW `req.hostname`,
+    # while `resolve_domain_campaign` normalises (strip / rstrip "." /
+    # lower). A junk value like `" "` or `"."` is therefore a no-match for
+    # resolution but truthy here, so it is REFUSED rather than routed to
+    # geo. The two can only diverge toward the stricter answer, which is
+    # the correct direction for a fail-closed gate.
+    #
     # WHAT THIS COSTS, measured on staging before the change: ~29 300
     # clicks/30d currently reach a campaign through this corridor. ALL of
     # it is synthetic — 7 `.xyz` soak hosts (each striking exactly 99

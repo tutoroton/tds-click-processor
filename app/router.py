@@ -49,6 +49,7 @@ from app.telemetry import (
     OP_DOMAIN_BINDING_PARSE,
     OP_FLOW_READ_FAILED,
     OP_IDENTITY,
+    OP_BLOCKED_NO_ROUTE,
     OP_NO_FLOW_NO_OFFER,
     capture_op_msg_throttled,
 )
@@ -301,6 +302,18 @@ async def route(req: ClickRequest) -> dict | None:
     # active campaign of every tenant.
     # ══════════════════════════════════════════════════════════════════
     if req.hostname:
+        # O1 — make the refusal VISIBLE. Every `domain_blocked` event measured
+        # on staging (7 330 over 90 days) carries `company_id=0`, so no
+        # tenant-scoped surface can show these to the tenant whose traffic they
+        # are. The refusal is correct; a SPIKE in it means a binding stopped
+        # resolving, and without this signal the first symptom would be a
+        # customer reporting a dead link. Throttled per hostname.
+        capture_op_msg_throttled(
+            OP_BLOCKED_NO_ROUTE, req.hostname,
+            f"blocked_no_route: {req.hostname} resolved no usable route — "
+            "refused at the geo-corridor mouth gate (A2 rate signal)",
+            level="info",
+        )
         timing["domain_matched"] = False
         timing["route_total_ms"] = _ms_since(t_start)
         timing["result"] = "blocked_no_route"

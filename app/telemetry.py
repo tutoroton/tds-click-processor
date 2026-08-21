@@ -184,6 +184,25 @@ OP_DISK_DRAINER_ERROR = "disk_drainer_error"
 OP_DOMAIN_BINDING_PARSE = "domain_binding_parse"
 OP_SYNC_PULL_FAILED = "sync_pull_failed"
 
+# A2 (tenant isolation, 2026-08-21) — rate signal on the geo corridor's mouth
+# gate: domain traffic refused because it resolved no usable route.
+#
+# WHY THIS NEEDS ITS OWN SIGNAL, in the same spirit as OP_NO_FLOW_NO_OFFER
+# above. Before A2 these clicks were SERVED by a draw over the global campaign
+# pool, so a misconfiguration looked like traffic working. Now they are
+# refused — correctly — but a refusal is only as good as its visibility, and
+# this path is the least visible in the service: measured on staging, all
+# 7 330 `domain_blocked` events over 90 days carry `company_id=0`, so no
+# tenant-scoped surface can show them to the tenant whose traffic they are.
+#
+# The refusal is RIGHT; a SPIKE in it is not. A binding that stops resolving
+# after a bad config push produces exactly this op at volume, and without the
+# signal the first symptom would be a customer asking why their link is dead.
+# Throttled per hostname so one broken host cannot drown the others — the
+# lesson of GTD-R454, where an unthrottled per-tick capture produced 77% of
+# the org's 90-day error volume.
+OP_BLOCKED_NO_ROUTE = "blocked_no_route"
+
 # [TDSP][E23] (2026-07-27) — GTD-R454 fixed the shipper loop's DOUBLE
 # report (log line + tagged capture -> 1 event); GTD-R466 fixed sites
 # that had NO capture at all. Neither touched the surviving gap this

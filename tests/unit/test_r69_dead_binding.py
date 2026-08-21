@@ -137,10 +137,21 @@ class TestR69DeadBinding:
         assert result["binding_id"] == BIND_ID
         assert result["binding_alias"] == BIND_ALIAS
 
-    async def test_present_campaign_no_route_still_falls_through(self):
-        """Regression guard (proves the move didn't over-block): a campaign whose
-        hash IS present but routes nowhere (no flow/offer, no own fallback) still
-        falls through to geo — CF-OBS-1 control, unchanged."""
+    async def test_present_campaign_no_route_is_refused_with_its_own_reason(self):
+        """A2 (tenant isolation, 2026-08-21) — INVERTED, and it still does the
+        job it was written for.
+
+        Its original purpose was to prove R69 did not OVER-block: a campaign
+        whose hash is present but routes nowhere must not be mistaken for a
+        dead binding. That discrimination is preserved and still asserted —
+        the two refusals carry DIFFERENT raw reasons.
+
+        What changed is the disposition of the second case. It used to fall
+        through to geo and assert `"foreign42.poach" in result["url"]` — a
+        foreign campaign serving a click that arrived on this host. Since the
+        geo pool is global, that is the cross-tenant leak. Domain traffic with
+        no usable route is now refused at the mouth of the corridor.
+        """
         fake = fakeredis.aioredis.FakeRedis(decode_responses=True)
         await _seed_dead_binding(fake)
         # Now ADD campDead's hash (present), with no flows/offers/split/fallback.
@@ -152,11 +163,33 @@ class TestR69DeadBinding:
         result = await _route(fake, _click("r69-present-1"))
 
         assert result is not None
-        # Present-but-no-route → fall through to geo (the foreign campaign serves).
-        assert result["timing"].get("domain_fallthrough") is True
-        assert result["campaign_id"] == CAMP_GEO
-        assert "foreign42.poach" in result["url"]
-        assert result["timing"].get("result") != "blocked_dead_binding"
+        assert result["blocked"] is True
+        assert result["url"] is None
+        # The foreign campaign never served — the leak this closes.
+        assert result["campaign_id"] != CAMP_GEO
+        # STRONGER than checking the fall-through flag: `geo_lookup_ms` is
+        # only stamped by Stage 2, so its ABSENCE proves the global
+        # `campaigns:active` set was never even read. (`domain_fallthrough`
+        # is still stamped upstream and stays honest: it marks that the
+        # domain path was exhausted — what changed is what follows it.)
+        assert "geo_lookup_ms" not in result["timing"]
+        # STILL DISCRIMINATING: present-but-no-route is NOT a dead binding.
+        # Same refusal, different reason — R69's no-over-block guarantee.
+        assert result["timing"]["result"] == "blocked_no_route"
+        assert result["timing"]["result"] != "blocked_dead_binding"
+
+    async def test_decision_reason_no_route_maps_to_domain_blocked(self):
+        """A2 companion: the mouth-gate refusal tags as the closed
+        `domain_blocked` analytics enum, exactly like the other domain-level
+        edge blocks. Without this the click would be reported as
+        `blocked_by_flow` — a false statement about which mechanism refused
+        it, since no flow was ever consulted."""
+        reason = _decision_reason(
+            {"blocked": True},
+            {"result": "blocked_no_route"},
+            {},
+        )
+        assert reason == "domain_blocked"
 
     async def test_decision_reason_dead_binding_maps_to_domain_blocked(self):
         """main.py companion: a `blocked_dead_binding` result tags as the closed

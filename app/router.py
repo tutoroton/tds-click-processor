@@ -237,6 +237,63 @@ async def route(req: ClickRequest) -> dict | None:
                 "blocked": True,
             }
 
+    # ══════════════════════════════════════════════════════════════════
+    # A2 (tenant isolation, 2026-08-21) — THE MOUTH OF THE GEO CORRIDOR.
+    #
+    # Every path that failed to resolve a domain binding converges HERE,
+    # and until now it fell through into geo targeting below. That fall-
+    # through is the cross-tenant leak: geo reads the GLOBAL
+    # `campaigns:active` set, so a click that arrived on company X's
+    # hostname could be served by company Y's campaign. Proven live on
+    # staging 2026-08-21 — a click on company 1's domain served by
+    # company 38's campaign 304, and 4 campaigns of 3 companies observed
+    # on ONE hostname
+    # (`docs/development/uniqueness-router-model-2026-08-21/01-GEO-PATH-FINDING.md`).
+    #
+    # WHY ONE GATE HERE AND NOT FOUR PATCHES ABOVE: the corridor has
+    # FIVE entrances (no binding at all; a binding whose campaign yields
+    # no route — `_route_via_campaign(fall_through_on_no_route=True)`;
+    # the legitimate bare-domain catch-all; corrupt binding JSON; and an
+    # empty hostname). Three of them were patched individually over the
+    # years (F9 `domains:disabled`, §6 wildcard, R69 dead binding) and
+    # the shared corridor stayed open behind them. A gate at the mouth
+    # cannot be bypassed by an entrance nobody enumerated — including
+    # the 4-label subdomain case that §6's 3-label split misses.
+    #
+    # WHY `req.hostname` IS THE DISCRIMINATOR: a click that arrived on a
+    # hostname is DOMAIN traffic and its routing authority is that
+    # domain's binding. If the binding did not resolve, the honest answer
+    # is a refusal — not a lottery over every tenant's campaigns. A
+    # host-less `/decide` call is a different shape (it names no domain,
+    # so no tenant owns it); its behaviour is deliberately left unchanged
+    # here — measured 14 such clicks in 30 days, none of them a client
+    # traffic path.
+    #
+    # WHAT THIS COSTS, measured on staging before the change: ~29 300
+    # clicks/30d currently reach a campaign through this corridor. ALL of
+    # it is synthetic — 7 `.xyz` soak hosts (each striking exactly 99
+    # campaigns across 3 companies) plus one-off probe bursts on
+    # `*.geotdsclicks.com`. No client traffic depends on the corridor.
+    #
+    # Geo targeting is NOT a feature being removed: no sync builder emits
+    # `geo:` / `device:` / `os:` / `has_geo` keys, so the filter below is
+    # structurally empty and the "winner" is a uniform draw over every
+    # active campaign of every tenant.
+    # ══════════════════════════════════════════════════════════════════
+    if req.hostname:
+        timing["domain_matched"] = False
+        timing["route_total_ms"] = _ms_since(t_start)
+        timing["result"] = "blocked_no_route"
+        return {
+            "url": None,
+            "campaign_id": None,
+            "offer_id": None,
+            "binding_id": resolution.binding_id,
+            "binding_alias": resolution.binding_alias,
+            "timing": timing,
+            "blocked": True,
+        }
+
     # Stage 1: UA parsing (cached, should be <0.1ms on cache hit)
     t0 = time.perf_counter()
     device_type = parse_device_type(req.user_agent)

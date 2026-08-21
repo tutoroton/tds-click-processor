@@ -101,19 +101,46 @@ class TestCFObs1DomainFallthroughPoach:
         # Its OWN terminal_fallback served (macro-resolved), NOT the geo offer.
         assert result["fallback_url"] == "https://own41.terminal/obs-own-1"
         # Did NOT fall through to geo.
-        assert result["timing"].get("domain_fallthrough") is not True
+        # STRONGER than checking the fall-through flag: `geo_lookup_ms` is
+        # only stamped by Stage 2, so its ABSENCE proves the global
+        # `campaigns:active` set was never even read. (`domain_fallthrough`
+        # is still stamped upstream and stays honest: it marks that the
+        # domain path was exhausted — what changed is what follows it.)
+        assert "geo_lookup_ms" not in result["timing"]
 
-    async def test_dead_end_no_fallback_still_falls_through_to_geo(self):
-        """Control / no-regression: a bound campaign with NO fallback_url still
-        falls through to global geo (the legitimate bare-domain catch-all)."""
+    async def test_dead_end_no_fallback_is_refused_not_poached(self):
+        """A2 (tenant isolation, 2026-08-21) — INVERTED, deliberately.
+
+        This test used to assert that a bound campaign with NO fallback_url
+        "still falls through to global geo (the legitimate bare-domain
+        catch-all)", and asserted `"foreign42.poach" in result["url"]` — i.e.
+        it CODIFIED a foreign campaign serving the click as correct.
+
+        That catch-all is the cross-tenant leak. `campaigns:active` is global,
+        so the "catch" can be any tenant's campaign; proven live on staging
+        (a click on company 1's domain served by company 38's campaign 304).
+        The honest disposition for domain traffic that resolves no route is a
+        refusal, so the corridor is now closed at its mouth.
+
+        The ORIGINAL intent of the test is preserved and strengthened: campFT
+        must never serve campGeo's offer. It now must not serve anything.
+        """
         fake = fakeredis.aioredis.FakeRedis(decode_responses=True)
         await _seed(fake, ft_fallback_url=None)
 
         result = await _route(fake, _click("obs-bare-1"))
 
         assert result is not None
-        # No own fallback → geo poach path preserved (bare-domain catch-all).
-        assert result["campaign_id"] == CAMP_GEO
-        assert result["timing"].get("domain_fallthrough") is True
-        # The geo offer (foreign campaign) served.
-        assert "foreign42.poach" in result["url"]
+        # Refused at the mouth of the corridor — no geo winner, no URL.
+        assert result["blocked"] is True
+        assert result["url"] is None
+        assert result["timing"]["result"] == "blocked_no_route"
+        # The foreign campaign was NOT reached — the point of the original test.
+        assert result["campaign_id"] != CAMP_GEO
+        # And geo was never consulted, so no fall-through was recorded.
+        # STRONGER than checking the fall-through flag: `geo_lookup_ms` is
+        # only stamped by Stage 2, so its ABSENCE proves the global
+        # `campaigns:active` set was never even read. (`domain_fallthrough`
+        # is still stamped upstream and stays honest: it marks that the
+        # domain path was exhausted — what changed is what follows it.)
+        assert "geo_lookup_ms" not in result["timing"]

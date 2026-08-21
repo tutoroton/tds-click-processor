@@ -97,61 +97,70 @@ def resolver_on(monkeypatch):
 
 
 class TestLAF1DomainFallthrough:
-    async def test_new_visitor_fallthrough_stamps_unique_not_poisoned(self, resolver_on):
-        """Brand-new visitor whose domain campaign falls through to geo:
-        the SERVING (geo) campaign stamps is_unique=True / is_returning=False /
-        is_roaming=False, and campaigns-seen holds ONLY the geo campaign — the
-        fallen-through campFT is NEVER minted nor written."""
+    async def test_refused_click_mints_no_identity_at_all(self, resolver_on):
+        """A2 (tenant isolation, 2026-08-21) — INVERTED, and the guarantee it
+        carries is now STRICTLY STRONGER than before.
+
+        This test used to assert that when campFT fell through, the SERVING geo
+        campaign stamped identity and campaigns-seen held only that geo
+        campaign. LA-F1's point was: a campaign that did not serve must never
+        write identity.
+
+        The corridor is closed, so there is no geo winner to serve. LA-F1's
+        principle therefore reaches its limit case: when NOTHING serves the
+        click, NOTHING may be written. A refused click must leave the identity
+        store byte-identical — no uid minted, no signal map, no campaigns-seen
+        set. Otherwise every refusal would silently poison the identity of a
+        visitor we did not serve, which is the LA-F1 bug in a new costume.
+        """
         fake = fakeredis.aioredis.FakeRedis(decode_responses=True)
         await _seed(fake)
 
         result = await _route(fake, _click("la-vid-ft2", "la-ft-2"))
 
-        # The geo campaign served (legacy split), NOT campFT.
+        # Refused at the mouth of the corridor — the geo campaign never served.
         assert result is not None
-        assert result["campaign_id"] == CAMP_GEO
-        assert result["timing"].get("domain_fallthrough") is True
-        attr = result["attribution"]
+        assert result["blocked"] is True
+        assert result["url"] is None
+        assert result["campaign_id"] != CAMP_GEO
+        assert result["timing"]["result"] == "blocked_no_route"
+        # STRONGER than checking the fall-through flag: `geo_lookup_ms` is
+        # only stamped by Stage 2, so its ABSENCE proves the global
+        # `campaigns:active` set was never even read. (`domain_fallthrough`
+        # is still stamped upstream and stays honest: it marks that the
+        # domain path was exhausted — what changed is what follows it.)
+        assert "geo_lookup_ms" not in result["timing"]
 
-        # Brand-new visitor — exactly one flag true (segment A).
-        assert attr["is_unique"] is True
-        assert attr["is_returning"] is False
-        assert attr["is_roaming"] is False
-
-        uid = attr["uid"]
-        assert uid  # a uid was minted (for the SERVING campaign)
-
-        # The signal map points at the served uid.
-        assert await fake.get(_sig_key(CO, "vid", "la-vid-ft2")) == uid
-
-        # campaigns-seen for the uid holds ONLY the SERVING (geo) campaign —
-        # the fallen-through campFT (86) must NOT be present (the LA-F1 poison).
-        seen = await fake.smembers(_campaigns_key(CO, uid))
-        assert seen == {CAMP_GEO}
-        assert CAMP_FT not in seen
-
-        # No OTHER uid's campaigns-seen set exists (campFT never minted a uid).
+        # NOTHING was committed to the identity store — the deferred resolve is
+        # only committed for a campaign that actually serves.
+        assert await fake.get(_sig_key(CO, "vid", "la-vid-ft2")) is None
         leaked = [
             k async for k in fake.scan_iter(match=f"id:{CO}:uid:*:campaigns")
         ]
-        assert leaked == [_campaigns_key(CO, uid)]
+        assert leaked == []
 
-    async def test_second_click_same_vid_is_returning(self, resolver_on):
-        """The SAME visitor's second click on the SAME serving campaign is
-        recognised as returning — proving the fix didn't break recognition."""
+    async def test_repeated_refusals_never_accumulate_identity(self, resolver_on):
+        """The same visitor refused twice still leaves no identity behind.
+
+        The original test proved recognition survived the LA-F1 fix (second
+        click = returning). With the corridor closed there is no serving
+        campaign to be returning TO, so the meaningful property becomes:
+        refusals do not accumulate state. A refusal that minted on the second
+        attempt would be just as poisonous as one that minted on the first,
+        and would be far harder to notice.
+        """
         fake = fakeredis.aioredis.FakeRedis(decode_responses=True)
         await _seed(fake)
 
         first = await _route(fake, _click("la-vid-ft2", "la-ft-2"))
-        uid1 = first["attribution"]["uid"]
-
         second = await _route(fake, _click("la-vid-ft2", "la-ft-3"))
-        attr2 = second["attribution"]
 
-        assert second["campaign_id"] == CAMP_GEO
-        assert attr2["uid"] == uid1            # same canonical identity
-        assert attr2["is_unique"] is False
-        assert attr2["is_returning"] is True   # return to the SAME campaign (B)
-        assert attr2["is_roaming"] is False
-        # Still only the geo campaign in the seen-set (campFT never poisons it).
-        assert await fake.smembers(_campaigns_key(CO, uid1)) == {CAMP_GEO}
+        for res in (first, second):
+            assert res["blocked"] is True
+            assert res["timing"]["result"] == "blocked_no_route"
+
+        assert await fake.get(_sig_key(CO, "vid", "la-vid-ft2")) is None
+        leaked = [
+            k async for k in fake.scan_iter(match=f"id:{CO}:uid:*:campaigns")
+        ]
+        assert leaked == []

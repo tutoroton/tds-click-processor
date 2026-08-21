@@ -1897,16 +1897,30 @@ class TestF9DisabledDomainFailClosed:
         result = _route_with(redis, req)
         assert (result or {}).get("blocked") is True
 
-    def test_non_disabled_host_is_not_blocked(self):
-        # Control: a host NOT in domains:disabled falls through (no 404). Other
-        # domains of the same campaign are untouched by another domain's archive.
+    def test_non_disabled_host_is_not_blocked_BY_F9(self):
+        # Control, and it still controls exactly what it was written to control:
+        # F9's archive-block must be SCOPED to the archived host. Another domain
+        # of the same campaign must not inherit it.
+        #
+        # A2 (tenant isolation, 2026-08-21) — the ASSERTION changed shape. This
+        # host has no binding at all, so it used to fall through to global geo
+        # and come back unblocked; "not blocked" was therefore a usable proxy
+        # for "F9 did not reach it". The corridor is closed now, so an unbound
+        # host IS refused — but by the mouth gate, with its own reason.
+        #
+        # Asserting on the REASON keeps the original guarantee and is strictly
+        # sharper than the old boolean: if F9 ever did over-reach onto a
+        # non-archived host, this fails, whereas `not blocked` would now fail
+        # for both the F9 bug and the ordinary no-route refusal — unable to
+        # tell the defect from the intended behaviour.
         redis = FakeRedis(sets={"domains:disabled": {"archived.xyz"}})
         req = ClickRequest(
             click_id="f9-ctrl", country="US", user_agent="Mozilla/5.0",
             hostname="live.xyz", path="/",
         )
         result = _route_with(redis, req)
-        assert not (result or {}).get("blocked")
+        assert (result or {}).get("timing", {}).get("result") == "blocked_no_route"
+        assert (result or {}).get("timing", {}).get("result") != "blocked_unmatched_subdomain"
 
 
 # ============================================================

@@ -888,7 +888,21 @@ def _decision_reason(result: dict, timing: dict, attr: dict) -> str:
         # R69 — a `blocked_dead_binding` (binding outlived its campaign hash)
         # is also a domain-level edge block; tag it `domain_blocked` while the
         # raw `routing_result` stays distinct for drill-down.
-        if timing.get("result") in ("blocked_unmatched_subdomain", "blocked_dead_binding"):
+        # A2 (tenant isolation, 2026-08-21) — `blocked_no_route` is the geo
+        # corridor's mouth gate: domain traffic that resolved no usable route
+        # is refused instead of being drawn from the GLOBAL campaign pool.
+        # It is a domain-level edge block like the two above, so it shares the
+        # client-facing `domain_blocked` reason — deliberately NOT a new value
+        # in the closed enum, which would need `filter_fields` + docs wiring
+        # for no analytic gain. The raw `routing_result` stays
+        # `blocked_no_route`, which is what lets us measure the new gate's
+        # effect separately from the pre-existing blocks.
+        # WITHOUT this line the click would fall to `blocked_by_flow` below and
+        # claim a FLOW blocked it — a false statement about which mechanism
+        # refused the click.
+        if timing.get("result") in (
+            "blocked_unmatched_subdomain", "blocked_dead_binding", "blocked_no_route",
+        ):
             return "domain_blocked"
         return "blocked_by_flow"
     if rs == "no_match":

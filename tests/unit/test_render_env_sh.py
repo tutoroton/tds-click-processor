@@ -52,6 +52,8 @@ def test_writes_full_canonical_key_set(tmp_path):
         "TDS_NODE_ID", "TDS_NODE_REGION", "TDS_ENVIRONMENT", "TDS_PORT",
         "CADDY_DOMAIN", "TDS_SECRET_KEY", "TDS_TDS_SECRET_KEY",
         "TDS_CENTRAL_URL", "TDS_CENTRAL_API_KEY", "TDS_SYNC_URL",
+        # GTD-R855 — the node's tenant, read only by the config-snapshot pull.
+        "TDS_COMPANY_ID",
         "TDS_SMOKE_PROBE_SECRET",
         "TDS_SENTRY_DSN", "TDS_DIAG_TRACES_BOOST", "TDS_DIAG_OBS_STREAM",
         "TDS_DIAG_VERBOSE_LOGS", "TDS_CODE_VERSION",

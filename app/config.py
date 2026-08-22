@@ -172,6 +172,26 @@ class Settings(BaseSettings):
     # disabled (push-only); set it to the admin-api host to re-enable.
     sync_url: str = ""
 
+    # GTD-R855 — WHICH TENANT THIS NODE IS, so its pull can ask for its own
+    # cut instead of the whole fleet's configuration.
+    #
+    # The pull above authenticates with the GLOBAL `X-TDS-Key`, which every
+    # node shares. That key therefore cannot tell admin-api who is asking —
+    # and once per-tenant delivery is enabled, admin-api REFUSES an
+    # unqualified snapshot request (409) precisely because answering it
+    # would mean serving one tenant another tenant's configuration.
+    #
+    # `edge_nodes.company_id` already holds the answer on the central side
+    # (it is what the push path resolves for itself); provisioning renders
+    # it here so the pull can carry `?company_id=` and be served its own
+    # cut. Unset (0) ⇒ the pull is unqualified, which is correct while
+    # per-tenant delivery is off and refused once it is on.
+    #
+    # 🔴 It is a CLAIM this node makes about itself, never a permission it
+    # holds — the shared `X-TDS-Key` is what authenticates, and it says
+    # only "a node". Do not read this value as an isolation boundary.
+    company_id: int = 0
+
     # F-2 (2026-06-10): the node-level default fallback URL is GONE. The
     # Worker is the single fallback owner (`workers.settings.fallback_url`,
     # admin-configured, deployed to CF as FALLBACK_URL): a no-route /decide

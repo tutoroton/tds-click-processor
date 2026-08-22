@@ -235,6 +235,31 @@ async def pull_from_central(redis) -> dict | None:
 
     snapshot_url = f"{sync_url.rstrip('/')}/api/system/sync/snapshot"
 
+    # GTD-R855 — state WHICH TENANT WE ARE, so central can serve us our
+    # own cut instead of the whole fleet's configuration.
+    #
+    # 🔴 THIS PARAMETER IS A CLAIM, NOT AUTHORISATION — the same sentence
+    # admin-api's own handler carries ("NAMING A TENANT IS NOT
+    # AUTHORISATION"), repeated here because this is the caller that makes
+    # the claim, and a reader who meets it here first would otherwise take
+    # it for a check. The header below is the fleet-wide `X-TDS-Key`, which
+    # every node shares: it authenticates the caller as "a node", never as
+    # "this company's node". Anyone holding that key can ask for any
+    # tenant's cut — which is not a regression, because today that same key
+    # already returns EVERY tenant's configuration in one response. Closing
+    # it properly needs a per-node credential, and that is separate work.
+    #
+    # What this DOES buy is the blast radius of normal operation: a node
+    # comes to hold one tenant's configuration instead of the fleet's.
+    #
+    # Why it is not optional once the flag is on: admin-api answers an
+    # unqualified pull with 409 rather than hand out everything, so without
+    # this the periodic pull fails every cycle behind nothing louder than a
+    # warning — the node would serve its LAST config forever — and a FRESH
+    # node bootstrapping by pull would come up with no routing data at all.
+    if settings.company_id:
+        snapshot_url = f"{snapshot_url}?company_id={settings.company_id}"
+
     try:
         # F-4 MEDIUM (audit 2026-05-25) — async httpx, not blocking
         # urllib.urlopen. This runs on the periodic-pull task inside the

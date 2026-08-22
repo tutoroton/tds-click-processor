@@ -72,6 +72,12 @@ TDS_CENTRAL_API_KEY=${central_api_key}
 # TDS_CENTRAL_URL=collector). Empty ⇒ pull disabled (push-only). Set to the
 # admin-api (e.g. https://api-tds.<base>) to enable the pull safety net.
 TDS_SYNC_URL=${TDS_SYNC_URL:-}
+# GTD-R855 — which tenant this node belongs to (edge_nodes.company_id).
+# Only the PULL above uses it, to ask for this tenant's cut rather than the
+# whole fleet's config; with per-tenant delivery on, an unqualified pull is
+# refused (409). A CLAIM, not authorisation — the shared X-TDS-Key is what
+# authenticates. Empty/0 ⇒ unqualified pull (fine while the flag is off).
+TDS_COMPANY_ID=${TDS_COMPANY_ID:-}
 TDS_SMOKE_PROBE_SECRET=${TDS_SMOKE_PROBE_SECRET:-}
 TDS_SENTRY_DSN=${TDS_SENTRY_DSN:-}
 # F.40 — per-instance Sentry environment tag (= node_id when attached to

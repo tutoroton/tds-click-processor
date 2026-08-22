@@ -580,10 +580,7 @@ async def _build_campaign_attribution(
             # Read previous-visit history (for prev_* matching) only when
             # segmented routing is ALSO live for this company (env AND
             # per-company) — otherwise RT#2 stays a single SISMEMBER.
-            with_history = (
-                settings.returning_routing_enabled
-                and _company_routing_enabled(campaign)
-            )
+            with_history = _returning_live(campaign)
             ident = await identity.resolve_and_stamp(
                 company_id=buyer_chain["company_id"],
                 funnel_user_id=slots.get("funnel_user_id"),
@@ -723,6 +720,42 @@ def _campaign_returning_flows_disabled(campaign: dict[str, Any]) -> bool:
     )
 
 
+def _returning_live(campaign: dict[str, Any]) -> bool:
+    """Is segmented returning routing live for THIS campaign's company?
+
+    env toggle AND per-company opt-in. Extracted so the two callers cannot
+    disagree - see `_seen_before` for why that matters."""
+    return settings.returning_routing_enabled and _company_routing_enabled(campaign)
+
+
+def _audience_routing(campaign: dict[str, Any]) -> bool:
+    """Does the returning-audience PARTITION run for this campaign?
+
+    Routing live AND the campaign has not opted out via `disable_returning_flows`
+    (MODEL V3 - the partition is gated by EXISTENCE, not by a per-campaign mode).
+    OFF at either half ⇒ no 2-pass ⇒ byte-identical to non-returning routing."""
+    return _returning_live(campaign) and not _campaign_returning_flows_disabled(campaign)
+
+
+def _seen_before(attribution: dict[str, Any]) -> bool:
+    """Did this visitor's uid exist BEFORE this click?
+
+    `seen_before` = B∪C. It is NOT the `is_returning` flag, which is B-only -
+    conflating them silently drops segment C (R4 G1). Only meaningful once the P2
+    resolver produced a uid; absent ⇒ False ⇒ first pool only, which is the
+    zero-regress reading when the resolver or routing is OFF.
+
+    WHY THIS IS A FUNCTION. Until 2026-08-22 this expression was written out twice
+    - in `_allowed_availability` and in `_try_flow_cascade` - and each copy carried
+    a comment saying it MUST stay the exact mirror of the other. A comment is not a
+    mechanism: two places that each compute the same decision will eventually
+    diverge, and no guard on either side can see it, because neither site is
+    individually wrong. The redesign that is about to change what "seen before"
+    MEANS is exactly the edit that would have split them. One definition, two
+    callers, and `test_seen_before_is_defined_once` keeps it that way."""
+    return bool(attribution.get("uid")) and attribution.get("is_unique") is False
+
+
 def _non_routed_result(
     campaign_id: str,
     attribution: dict[str, Any],
@@ -843,18 +876,12 @@ def _allowed_availability(
     Gated identically to the audience partition (MODEL V3): routing OFF, OR the
     campaign's `disable_returning_flows` flag set ⇒ `returning_visitor` is False
     ⇒ {active} ⇒ a 'draining' target blocks all ⇒ TOTAL byte-identical invariant
-    with production dark (all targets 'active' → every class passes). This MUST
-    stay the exact mirror of the main-route gate in `_try_flow_cascade`."""
-    returning_live = settings.returning_routing_enabled and _company_routing_enabled(
-        campaign
+    with production dark (all targets 'active' → every class passes). It shares the
+    gate with the main route in `_try_flow_cascade` BY CONSTRUCTION - both call
+    `_audience_routing` - rather than by two copies promising to mirror each other."""
+    returning_visitor = (
+        _seen_before(attribution) if _audience_routing(campaign) else False
     )
-    audience_routing = returning_live and not _campaign_returning_flows_disabled(
-        campaign
-    )
-    seen_before = bool(attribution.get("uid")) and (
-        attribution.get("is_unique") is False
-    )
-    returning_visitor = seen_before if audience_routing else False
     return (
         frozenset({"active", "draining"})
         if returning_visitor
@@ -1455,19 +1482,14 @@ async def _try_flow_cascade(
     # (fresh|sticky) no longer gates the partition — it governs only the
     # fallthrough/recorded mode + the Phase-S sticky pin (read below). routing OFF
     # OR partition disabled ⇒ no 2-pass ⇒ byte-identical to non-returning routing.
-    # MUST stay the exact mirror of `_allowed_availability`'s gate.
-    returning_live = settings.returning_routing_enabled and _company_routing_enabled(
-        campaign
-    )
+    # Shares the gate with `_allowed_availability` BY CONSTRUCTION — both call
+    # `_audience_routing` — instead of two copies promising to mirror each other.
+    returning_live = _returning_live(campaign)
     # `campaign_mode` (fresh|sticky) is KEPT — it drives the recorded effective
     # mode + the sticky pin below; it no longer participates in the gate.
     campaign_mode = (campaign.get("returning_mode") or "fresh").strip().lower()
-    audience_routing = returning_live and not _campaign_returning_flows_disabled(
-        campaign
-    )
-    seen_before = bool(attribution.get("uid")) and (
-        attribution.get("is_unique") is False
-    )
+    audience_routing = _audience_routing(campaign)
+    seen_before = _seen_before(attribution)
     # Returning-flow criterion palette (flow-level only, v1). Injected ONLY for
     # a seen_before user under segmented routing — first-pool flows never carry
     # these dims (palette-guard), and the offer_target inline matcher (which

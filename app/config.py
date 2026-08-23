@@ -624,12 +624,20 @@ class Settings(BaseSettings):
     # Default TRUE: the feature is important-by-default, and the deploy tooling
     # (deploy/render-env.sh) already forces `true`, so the bare code default
     # matches — a node/env that doesn't set the var still gets the feature.
-    # SAFE: behaviour stays gated by the PER-COMPANY check in router.py
-    # (`_company_returning_enabled`, reads `returning_resolver` from the campaign
-    # HASH, default closed) — env-true alone changes NO routing until a company
-    # opts in. The boot gate (app/identity.py) DEGRADES-not-crashes if the
-    # identity-redis store is absent in a non-local env, and warns-only in a
-    # local-class env (`local`/`development`) — so local boot stays quiet.
+    # 🔴 THE SAFETY ARGUMENT FOR THIS DEFAULT CHANGED ON 2026-08-23 (D4).
+    # It used to read "SAFE because behaviour stays gated by the PER-COMPANY
+    # check in router.py (`_company_returning_enabled`) — env-true alone changes
+    # NO routing until a company opts in". That per-company gate is GONE, so
+    # env-true now DOES turn the resolver on for every tenant. The default stays
+    # True on purpose: the owner ruled the per-tenant switches destructive (they
+    # fail silent — the 2026-08-21 incident), deploy/render-env.sh already forces
+    # true everywhere, and THIS flag is now the operator's only kill-switch, kept
+    # so the resolver can still be stopped fleet-wide during an incident.
+    # A comment that keeps a justification its mechanism no longer has is worse
+    # than no comment: it answers "is this safe?" with a reason that expired.
+    # The boot gate (app/identity.py) DEGRADES-not-crashes if the identity-redis
+    # store is absent in a non-local env, and warns-only in a local-class env
+    # (`local`/`development`) — so local boot stays quiet.
     returning_resolver_enabled: bool = True
     identity_redis_url: str = ""
     returning_uid_ttl_seconds: int = 15_552_000  # 180 days

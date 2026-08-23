@@ -568,14 +568,26 @@ async def _build_campaign_attribution(
     # bool is checked FIRST — OFF ⇒ instant skip, zero identity Redis I/O,
     # `attribution` carries no uid/flag keys, so `_phase3_attribution_fields`
     # falls back to the legacy is_unique/is_returning computation → the click
-    # record is byte-identical to pre-P2. The per-company flag rides on the
-    # already-in-hand campaign HASH (free; admin sync wires it in P4) so a
-    # tenant opts in individually (default closed).
+    # record is byte-identical to pre-P2.
+    #
+    # 🔴 THE PER-COMPANY OPT-IN IS GONE (D4, owner ruling, three times on
+    # 2026-08-21: "не потрібні нам ці відключачі, це деструктивно").
+    # It used to ride on the campaign HASH as `returning_resolver`, DEFAULT
+    # CLOSED — and default-closed is precisely what produced the 2026-08-21
+    # incident: one unlogged write to `companies.settings` flipped company 1
+    # to closed, every click after it stamped `flags_semantics_version=0`, and
+    # all 32 of that tenant's marketing cost entries parked silently. A switch
+    # whose OFF state is indistinguishable from healthy is not a feature.
+    # The GLOBAL `returning_resolver_enabled` kill-switch remains, so an
+    # operator can still stop the resolver fleet-wide in an incident.
+    # SEGMENTED ROUTING IS UNAFFECTED: it hangs off a DIFFERENT flag
+    # (`returning_routing` via `_company_routing_enabled` / `_returning_live`),
+    # so the two were verified independent before this was removed.
     #
     # Gate V1 (fail-open): the WHOLE resolver call is wrapped — ANY exception
     # degrades to legacy (no keys stamped) and the click still routes. The
     # resolver never raises out of here, never 5xx, never loses a click.
-    if settings.returning_resolver_enabled and _company_returning_enabled(campaign):
+    if settings.returning_resolver_enabled:
         try:
             # Read previous-visit history (for prev_* matching) only when
             # segmented routing is ALSO live for this company (env AND
@@ -677,15 +689,6 @@ async def _commit_deferred_identity(attribution: dict[str, Any] | None) -> None:
         attribution["is_unique"] = committed.is_unique
     except Exception as e:  # fail-open — never fail a click on a commit error
         logger.warning("deferred identity commit failed — fail-open: %s", e)
-
-
-def _company_returning_enabled(campaign: dict[str, Any]) -> bool:
-    """Per-company opt-in for the returning-user resolver, read FREE from the
-    already-fetched campaign HASH (default closed). Admin sync populates
-    `returning_resolver` in P4; until then it is absent → False → dark."""
-    return str(campaign.get("returning_resolver", "")).strip().lower() in (
-        "1", "true", "yes",
-    )
 
 
 def _company_routing_enabled(campaign: dict[str, Any]) -> bool:

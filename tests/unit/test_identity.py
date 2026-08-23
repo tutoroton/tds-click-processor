@@ -428,17 +428,50 @@ class TestRouterGate:
         )
         assert "uid" not in attr and "is_unique" not in attr
 
-    async def test_company_opt_out_skips_resolver(self, monkeypatch):
+    async def test_company_flag_no_longer_gates_the_resolver(self, monkeypatch):
+        """D4 — the per-company opt-in is GONE; the global switch alone decides.
+
+        This test is the INVERSE of the one it replaces
+        (`test_company_opt_out_skips_resolver`), which pinned the old
+        default-closed behaviour. That default is exactly what caused the
+        2026-08-21 incident: an unlogged write flipped a tenant closed, every
+        click after it stamped `flags_semantics_version=0`, and its marketing
+        cost parked silently. Owner ruling, 2026-08-21 (three times): remove the
+        switch. The old expectation is not deleted quietly — it is replaced by
+        its opposite, pinned just as tightly.
+        """
         monkeypatch.setattr(settings, "returning_resolver_enabled", True)
+        called = {"n": 0}
+
+        async def _stamp(**k):
+            called["n"] += 1
+            return IdentityResult(
+                uid="u-nogate", is_unique=True, is_returning=False,
+                is_roaming=False, signal_tier="vid",
+            )
+
+        monkeypatch.setattr(identity, "resolve_and_stamp", _stamp)
+        # A campaign HASH carrying NO `returning_resolver` key at all — the
+        # shape that used to mean "dark" and now means nothing.
+        _, _, attr = await _build_campaign_attribution(
+            _fr(), self._campaign(opt_in=False), "1", _req(),
+        )
+        assert called["n"] == 1, "the resolver MUST run without a per-company flag"
+        assert attr.get("uid") == "u-nogate"
+        assert attr.get("is_unique") is True
+
+    async def test_global_switch_still_stops_everything(self, monkeypatch):
+        """The fleet-wide kill-switch survives D4 — it is the incident lever."""
+        monkeypatch.setattr(settings, "returning_resolver_enabled", False)
 
         async def _boom(**k):
-            raise AssertionError("resolver must not run for an opted-out company")
+            raise AssertionError("global OFF must skip the resolver entirely")
 
         monkeypatch.setattr(identity, "resolve_and_stamp", _boom)
         _, _, attr = await _build_campaign_attribution(
             _fr(), self._campaign(opt_in=False), "1", _req(),
         )
-        assert "uid" not in attr
+        assert "uid" not in attr and "is_unique" not in attr
 
     async def test_fail_open_when_resolver_raises(self, monkeypatch):
         monkeypatch.setattr(settings, "returning_resolver_enabled", True)
@@ -482,17 +515,27 @@ class TestRouterGate:
 # ============================================================
 
 from app.router import (
-    _company_returning_enabled,
     _company_routing_enabled,
     _source_trusted,
 )
 
 
 class TestP5Gates:
-    def test_company_returning_enabled(self):
-        assert _company_returning_enabled({"returning_resolver": "1"}) is True
-        assert _company_returning_enabled({"returning_resolver": "0"}) is False
-        assert _company_returning_enabled({}) is False  # legacy HASH → dark
+    def test_the_resolver_gate_helper_is_gone(self):
+        """D4 — `_company_returning_enabled` no longer exists, by design.
+
+        Its old assertions (`{}` → False → dark) pinned the default-closed
+        behaviour that caused the 2026-08-21 incident. Deleting a test silently
+        is how a removed guarantee becomes invisible, so the removal itself is
+        pinned: if anyone re-introduces a per-company resolver gate, this fails
+        and they must come and read why it was taken out.
+        """
+        import app.router as _router
+
+        assert not hasattr(_router, "_company_returning_enabled"), (
+            "the per-company resolver opt-in was removed by owner ruling D4 — "
+            "re-adding it re-opens the silent-parking incident of 2026-08-21"
+        )
 
     def test_company_routing_enabled(self):
         assert _company_routing_enabled({"returning_routing": "1"}) is True

@@ -200,7 +200,16 @@ class TestCampaignsSeenSurface:
         # is True ⇒ is_returning. An off-by-one in the pipeline layout (e.g. the
         # appended SMEMBERS shifting the sismember slot) would flip these.
         assert res.is_returning is True
-        assert res.is_roaming is False
+        # Ф3(b), 2026-08-23 — this fixture WAS the fourth cell all along, and
+        # asserted it impossible. The token carries seen=[10, 30] and the click
+        # is on 10: the visitor has been in TWO places and has come BACK to this
+        # one. That is the owner's «роумінг, який повертається на той самий
+        # роутер» exactly. Before Ф3(b), `is_roaming = not is_returning` made
+        # (returning AND roaming) unconstructible, so the only assertion the
+        # suite could make here was False.
+        assert res.is_roaming is True
+        assert res.is_unique is False          # axis 1: returning
+        assert (res.is_unique, res.is_returning, res.is_roaming) == (False, True, True)
 
 
 # ============================================================

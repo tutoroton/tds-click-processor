@@ -586,7 +586,7 @@ class TestP5FlagsSemanticsVersion:
         fields = _phase3_attribution_fields(self._result(), _req(), {}, "ts")
         assert fields["flags_semantics_version"] == 0
 
-    async def test_version_2_when_resolver_on(self):
+    async def test_version_3_when_resolver_on(self):
         """Resolver stamped is_unique → canonical semantics.
 
         Ф3(a), 2026-08-23 — the marker is now 2, not 1. A semantics version is a
@@ -597,7 +597,7 @@ class TestP5FlagsSemanticsVersion:
         """
         result = self._result({"uid": "U", "is_unique": True, "is_returning": False})
         fields = _phase3_attribution_fields(result, _req(), {}, "ts")
-        assert fields["flags_semantics_version"] == 2
+        assert fields["flags_semantics_version"] == 3
         assert fields["flags_semantics_version"] != 0, (
             "non-vacuity: the resolver-OFF path must stay 0 and is pinned by "
             "test_version_0_when_resolver_off")

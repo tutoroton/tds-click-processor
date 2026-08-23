@@ -201,6 +201,37 @@ def _campaign_bucket(campaign_id) -> str:
     return str(campaign_id) if campaign_id else ""
 
 
+def _roaming(places_seen, bucket: str) -> bool:
+    """Ф3(b), 2026-08-23 — axis 2: has this visitor been seen in MORE THAN ONE
+    place? (place = campaign today, binding after Ф2/W7.)
+
+    DERIVED FROM THE OWNER'S OWN WORDS. He named the fourth cell «роумінг, який
+    повертається на той самий роутер» — a roamer who comes BACK to the same
+    router. That sentence only parses if roaming describes the visitor's
+    HISTORY, not this click's place: coming back to the same router makes you
+    `returning`, and you are still a roamer because you have been elsewhere.
+
+    Before Ф3(b) this was `not is_returning` — arithmetically the negation of
+    axis 1, so `(0,1,1)` was impossible and axis 2 carried no information axis 1
+    did not already carry. Now the two axes are genuinely independent:
+
+        first ever            places = {A}      -> not roaming, unique
+        again on A            places = {A}      -> not roaming, returning
+        now on B              places = {A,B}    -> ROAMING,     unique   (1,0,1)
+        back to A             places = {A,B}    -> ROAMING,     returning(0,1,1)
+
+    Costs nothing: `places_seen` is already read on the SAME pipeline that
+    answers is_returning (the P3 campaigns-seen SMEMBERS), so this adds zero
+    round-trips.
+
+    Every member is a `str`: `_campaign_bucket` stringifies, the token's `seen`
+    hint is built as `[str(c) for c in ...]`, and the redis client runs with
+    `decode_responses=True`. That matters because this counts SET SIZE — mixed
+    `10` and `"10"` would read as two places and manufacture roaming.
+    """
+    return len(frozenset(places_seen) | {bucket}) >= 2
+
+
 def _sig_key(company_id: int, tier: str, value: str) -> str:
     return f"id:{company_id}:{tier}:{value}"
 
@@ -379,7 +410,7 @@ async def resolve_via_token(
         return IdentityResult(
             uid=uid, seen_before=True,
             is_returning=_degraded_returning,
-            is_roaming=not _degraded_returning,
+            is_roaming=_roaming(_hint_set, bucket),
             signal_tier=_tier_label(_TIER_TOKEN), identity_conflict=False,
             campaigns_seen=_hint_set,
         )
@@ -396,10 +427,12 @@ async def resolve_via_token(
     # already SADD'd the hint → sismember=1 → the `or` is redundant).
     _hint_set = frozenset(seen_hint)
     is_returning = bool(rt[idx]) or (bucket in _hint_set)
-    is_roaming = not is_returning  # seen-before (token proves it) AND not this campaign
     # campaigns_seen feeds the cookie re-stamp; union the hint so a cold-node
     # commit=False hit does NOT SHRINK the durable cookie's seen-history.
     campaigns_seen = frozenset(rt[-1] or ()) | _hint_set  # last entry = SMEMBERS
+    # Ф3(b) — axis 2 is now read from the SAME set, one line later, so it can
+    # never again be the arithmetic negation of axis 1.
+    is_roaming = _roaming(campaigns_seen, bucket)
     if with_history:
         return IdentityResult(
             uid=uid, seen_before=True, is_returning=is_returning,
@@ -612,8 +645,8 @@ async def resolve_identity(
     rt2 = await pipe.execute()  # RT#2
 
     is_returning = bool(rt2[0])
-    is_roaming = not is_returning  # seen-before AND not this campaign
     campaigns_seen = frozenset(rt2[-1] or ())  # last entry = the SMEMBERS read
+    is_roaming = _roaming(campaigns_seen, bucket)  # Ф3(b) — independent axis
     if with_history:
         return IdentityResult(
             uid=resolved_uid, seen_before=True,
@@ -626,8 +659,7 @@ async def resolve_identity(
             campaigns_seen=campaigns_seen,
         )
     return IdentityResult(
-        uid=resolved_uid, seen_before=True,
-            is_returning=is_returning,
+        uid=resolved_uid, seen_before=True, is_returning=is_returning,
         is_roaming=is_roaming, signal_tier=_tier_label(winner_tier),
         identity_conflict=identity_conflict, campaigns_seen=campaigns_seen,
     )

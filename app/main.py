@@ -93,7 +93,9 @@ from app.watermark import run_watermark_sampler, watermark_state
 # one version, one definition. The money gate is unaffected either way: it
 # excludes `fsv < MIN_UNIQUE_SEMANTICS_VERSION` and MIN is 1, so any bump
 # passes (`unique_filter.py`, verified by reading, 2026-08-23).
-_FLAGS_SEMANTICS_VERSION = 2
+# Ф3(b) bumps to 3: `is_roaming` changed MEANING (place -> the
+# visitor's history), and ADR-0407 fixed one version = one definition.
+_FLAGS_SEMANTICS_VERSION = 3
 
 
 logger = logging.getLogger("tds.click-processor")

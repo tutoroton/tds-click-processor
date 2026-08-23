@@ -81,6 +81,21 @@ from app.stream_write_metrics import record_stream_write_ms, stream_write_stats
 from app.sync_client import apply_snapshot, start_periodic_pull
 from app.watermark import run_watermark_sampler, watermark_state
 
+# Ф3(a), 2026-08-23 — the semantics tag stamped on every resolver-produced click.
+#
+# A semantics version is a LABEL, not a quality ranking: v2 is not "better than"
+# v1, it is a DIFFERENT DEFINITION of `is_unique` (`not is_returning`, so a
+# roaming click is now unique) and of nothing else. It is bumped whenever the
+# MEANING of a flag changes, which is what lets `resolved.semantics` (W5) tell a
+# caller that the window they asked for blends two definitions.
+#
+# Ф3(b) redefines `is_roaming` and MUST bump this again rather than reuse 2 —
+# one version, one definition. The money gate is unaffected either way: it
+# excludes `fsv < MIN_UNIQUE_SEMANTICS_VERSION` and MIN is 1, so any bump
+# passes (`unique_filter.py`, verified by reading, 2026-08-23).
+_FLAGS_SEMANTICS_VERSION = 2
+
+
 logger = logging.getLogger("tds.click-processor")
 
 # Sentry initialization — DSN from config, not hardcoded [C1 fix]
@@ -1064,7 +1079,7 @@ def _phase3_attribution_fields(
         # when it ran, so its presence is the discriminator. Lets dashboards
         # branch pre/post cutover (the two columns are non-complementary across
         # the boundary).
-        "flags_semantics_version": 1 if "is_unique" in attr else 0,
+        "flags_semantics_version": _FLAGS_SEMANTICS_VERSION if "is_unique" in attr else 0,
         "is_bot": req.is_bot,
         "is_proxy": req.is_proxy,
         "cf_ray": req.cf_ray or "",

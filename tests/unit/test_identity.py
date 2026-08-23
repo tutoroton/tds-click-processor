@@ -107,7 +107,7 @@ class TestResolveCore:
     async def test_no_signal_is_unique_new_segment_A(self):
         # cookie-less, untrusted funnel → no persistent identity (segment A).
         res = await _resolve(_fr(), vid=None, fuid="U", trusted=False)
-        assert res == IdentityResult(uid="", is_unique=True, is_returning=False)
+        assert res == IdentityResult(uid="", is_returning=False)
         assert res.is_roaming is False and res.signal_tier == "none"
 
     async def test_new_vid_user_mints_unique(self):
@@ -138,14 +138,23 @@ class TestResolveCore:
         )
         v2 = await _resolve(r, vid="V", campaign="20")  # different campaign
         assert v2.uid == v1.uid
-        assert (v2.is_unique, v2.is_returning, v2.is_roaming) == (False, False, True)  # C
+        # Ф3(a), 2026-08-23 — was (False, False, True): the nameless third state.
+        # Axis 1 is a TOTAL dichotomy, so a roaming click is UNIQUE (first on
+        # this router) while axis 2 still records that we recognised the person.
+        assert (v2.is_unique, v2.is_returning, v2.is_roaming) == (True, False, True)  # C
+        assert v2.seen_before is True, (
+            "routing must still know the uid pre-existed - that is Ф1's field, "
+            "and it is precisely what `is_unique` stopped carrying")
 
     @pytest.mark.parametrize(
         "first_campaign,second_campaign,exp_unique,exp_returning,exp_roaming,segment",
         [
             (None, None, True, False, False, "A (new)"),          # first visit
             ("10", "10", False, True, False, "B (same campaign)"),
-            ("10", "20", False, False, True, "C (roaming)"),
+            # Ф3(a): roaming became UNIQUE. Before this it was (False, False,
+            # True) - unique=0 AND returning=0, the state that made every
+            # "new vs repeat" consumer silently drop 4567 clicks / 30 days.
+            ("10", "20", True, False, True, "C (roaming)"),
         ],
     )
     async def test_flag_semantics_table(
@@ -179,8 +188,20 @@ class TestConcurrencyAndTenancy:
         )
         uids = {x.uid for x in results}
         assert len(uids) == 1, "two concurrent first-clicks must share ONE uid"
+        # Ф3(a) — was `winners == 1`. Under a TOTAL axis-1 dichotomy the loser
+        # cannot be "neither", so BOTH concurrent first-clicks are unique: each
+        # is genuinely a first arrival on this router. The over-count is bounded
+        # by how often the NX race actually fires — measured on staging
+        # 2026-08-23 over 30 days: the (0,0,0) cell holds 8 clicks and ALL 8 are
+        # `flags_semantics_version = 0`, i.e. the resolver never ran. At fsv=1,
+        # where Ф3 operates, the cell is EMPTY: the race has not been observed
+        # to fire once. Recorded as a decision, not assumed away.
         winners = sum(1 for x in results if x.is_unique)
-        assert winners == 1, "exactly one click reports is_unique (NX winner)"
+        assert winners == 2, "both racers are unique; the loser adopts the uid"
+        losers = [x for x in results if x.seen_before]
+        assert len(losers) == 1, (
+            "exactly one lost the NX race and must carry seen_before, so "
+            "routing still treats it as a known visitor")
 
     async def test_cross_tenant_same_signal_isolated_uids(self):
         r = _fr()
@@ -217,7 +238,11 @@ class TestSignalGating:
         await r.set(_sig_key(1, "vid", "V"), "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
         res = await _resolve(r, fuid="U", vid="V", campaign="10", trusted=True)
         assert res.uid == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"  # highest-precedence (funnel_user_id) wins
-        assert res.is_unique is False
+        # Ф3(a) — was `is_unique is False`. Campaign 10 is not in this uid's
+        # campaigns-seen set, so it is a ROAMING click and therefore unique.
+        # `seen_before` is the assertion that actually carries the old meaning.
+        assert res.is_unique is True
+        assert res.seen_before is True
         assert res.signal_tier == "funnel_user_id"  # DOC-1 canonical label
         # vid↔fuid resolve to DIFFERENT uids → conflict flagged (log-not-merge),
         # but NOT merged (uid stays the highest-precedence one).
@@ -446,7 +471,7 @@ class TestRouterGate:
         async def _stamp(**k):
             called["n"] += 1
             return IdentityResult(
-                uid="u-nogate", is_unique=True, is_returning=False,
+                uid="u-nogate", is_returning=False,
                 is_roaming=False, signal_tier="vid",
             )
 
@@ -491,7 +516,7 @@ class TestRouterGate:
 
         async def _stamp(**k):
             return IdentityResult(
-                uid="UID-OK", is_unique=False, is_returning=True,
+                uid="UID-OK", is_returning=True,
                 campaigns_seen=frozenset({"7", "9"}),
             )
 
@@ -561,11 +586,21 @@ class TestP5FlagsSemanticsVersion:
         fields = _phase3_attribution_fields(self._result(), _req(), {}, "ts")
         assert fields["flags_semantics_version"] == 0
 
-    async def test_version_1_when_resolver_on(self):
-        # Resolver stamped is_unique → canonical semantics → marker 1.
+    async def test_version_2_when_resolver_on(self):
+        """Resolver stamped is_unique → canonical semantics.
+
+        Ф3(a), 2026-08-23 — the marker is now 2, not 1. A semantics version is a
+        LABEL, not a ranking: v2 is a DIFFERENT DEFINITION of `is_unique`
+        (`not is_returning`), so a window spanning the deploy blends two
+        meanings. That blend is what `resolved.semantics` (W5) exists to
+        declare; silently reusing 1 would have made it undeclarable.
+        """
         result = self._result({"uid": "U", "is_unique": True, "is_returning": False})
         fields = _phase3_attribution_fields(result, _req(), {}, "ts")
-        assert fields["flags_semantics_version"] == 1
+        assert fields["flags_semantics_version"] == 2
+        assert fields["flags_semantics_version"] != 0, (
+            "non-vacuity: the resolver-OFF path must stay 0 and is pinned by "
+            "test_version_0_when_resolver_off")
 
 
 # ============================================================
@@ -781,7 +816,12 @@ class TestTokenDualAccept:
             campaign_id="10", source_trusted=False, ttl=TTL, identity_token=tok,
         )
         assert res.uid == _TOK_UID
-        assert res.is_unique is False           # token proves seen-before
+        # Ф3(a) — the comment was always right and the assertion was on the
+        # wrong field: what the token proves is SEEN-BEFORE, which is now its
+        # own field. `is_unique` here is True (campaign 10 is not in the token's
+        # seen hint, so this is a roaming click).
+        assert res.seen_before is True          # token proves seen-before
+        assert res.is_unique is True            # ...and it is roaming, so unique
         assert res.signal_tier == "token"
         # The decisive assertion: NO `id:1:vid:VID1` GET was issued — recognition
         # was an in-process HMAC verify, zero store hit for the uid.

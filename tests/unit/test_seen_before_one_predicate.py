@@ -33,13 +33,14 @@ one. Cascade INPUT equivalence is the right level, and that is what the
 """
 from __future__ import annotations
 
+import inspect
 import pathlib
 import re
 
 import pytest
 from unittest.mock import patch
 
-from app import router
+from app import identity, router
 
 
 ROUTER_SRC = pathlib.Path(router.__file__).read_text(encoding="utf-8")
@@ -51,19 +52,22 @@ ROUTER_SRC = pathlib.Path(router.__file__).read_text(encoding="utf-8")
 @pytest.mark.parametrize(
     "attribution, expected, why",
     [
-        ({"uid": "u1", "is_unique": False}, True,
+        ({"uid": "u1", "seen_before": True}, True,
          "the uid existed before this click - B union C"),
-        ({"uid": "u1", "is_unique": True}, False,
+        ({"uid": "u1", "seen_before": False}, False,
          "resolver minted the uid on THIS click - a new visitor"),
         ({"uid": "u1"}, False,
-         "no is_unique key at all: resolver dark - fail closed to first pool"),
-        ({"uid": "", "is_unique": False}, False,
+         "no seen_before key at all: resolver dark - fail closed to first pool"),
+        ({"uid": "", "seen_before": True}, False,
          "empty uid is no uid"),
-        ({"is_unique": False}, False,
+        ({"seen_before": True}, False,
          "no uid: nothing to have seen before"),
         ({}, False, "empty attribution"),
-        ({"uid": "u1", "is_unique": 0}, False,
-         "0 is not False under `is` - identity, not truthiness, on purpose"),
+        ({"uid": "u1", "seen_before": 1}, False,
+         "1 is not True under `is` - identity, not truthiness, on purpose"),
+        ({"uid": "u1", "is_unique": False}, False,
+         "F1: is_unique NO LONGER decides routing. Before 2026-08-23 this row "
+         "was True; that coupling is what F3 would have broken silently"),
     ],
 )
 def test_seen_before_truth_table(attribution, expected, why):
@@ -75,8 +79,8 @@ def test_seen_before_has_a_discriminating_pair():
 
     Without this, every assertion above could be satisfied by a function that
     returns a constant, and the suite would still be green."""
-    seen = {"uid": "u1", "is_unique": False}
-    fresh = {"uid": "u1", "is_unique": True}
+    seen = {"uid": "u1", "seen_before": True}
+    fresh = {"uid": "u1", "seen_before": False}
     assert router._seen_before(seen) != router._seen_before(fresh)
 
 
@@ -110,8 +114,8 @@ def test_allowed_availability_admits_draining_only_for_a_returning_visitor():
     """`_allowed_availability` is one of the two former copies. Its answer must
     follow the shared predicate, and it must be able to answer BOTH ways."""
     campaign = {"returning_routing": "1"}
-    seen = {"uid": "u1", "is_unique": False}
-    fresh = {"uid": "u1", "is_unique": True}
+    seen = {"uid": "u1", "seen_before": True}
+    fresh = {"uid": "u1", "seen_before": False}
     with patch.object(router.settings, "returning_routing_enabled", True):
         assert router._allowed_availability(campaign, seen) == frozenset(
             {"active", "draining"})
@@ -121,7 +125,7 @@ def test_allowed_availability_admits_draining_only_for_a_returning_visitor():
 def test_allowed_availability_is_dark_when_routing_is_off():
     """The zero-regress invariant: routing off ⇒ {active} for everyone, so a
     'draining' target blocks all, exactly as before the partition existed."""
-    seen = {"uid": "u1", "is_unique": False}
+    seen = {"uid": "u1", "seen_before": True}
     with patch.object(router.settings, "returning_routing_enabled", False):
         assert router._allowed_availability(
             {"returning_routing": "1"}, seen) == frozenset({"active"})
@@ -139,7 +143,7 @@ def test_seen_before_is_defined_once():
     helper. This is the mechanism that replaces the two 'MUST stay the exact
     mirror' comments; if someone re-inlines a copy, this goes red immediately
     rather than after the two copies have silently drifted apart."""
-    hits = re.findall(r'attribution\.get\("is_unique"\)\s+is\s+False', ROUTER_SRC)
+    hits = re.findall(r'attribution\.get\("seen_before"\)\s+is\s+True', ROUTER_SRC)
     assert len(hits) == 1, (
         f"the seen_before predicate is written out {len(hits)} times in "
         "router.py - it must be computed once, in `_seen_before`, and called. "
@@ -168,3 +172,55 @@ def test_both_former_sites_now_call_the_helpers():
         "caller vanished is not a pin"
     )
     assert ROUTER_SRC.count("_audience_routing(campaign)") >= 2
+
+
+# ------------------------------- the arm that would have caught the gap ------
+
+
+def test_routing_predicate_does_not_read_a_display_flag():
+    """Ф1's REAL purpose: routing must be structurally unable to depend on the
+    three display flags, because Ф3/Ф4 redefine what they MEAN.
+
+    The de-duplication above shipped 2026-08-22 and was recorded as "Ф1 done".
+    It was not: `_seen_before` still read `is_unique`, so Ф3 (`is_unique =
+    NOT is_returning`) would have flipped every ROAMING click out of the
+    returning pool. Measured on staging 2026-08-23 before this fix: company 1
+    runs segmented routing with 26 returning-only flows, 103 of 160 campaigns
+    partition-enabled, and 2874 roaming clicks in 30 days.
+
+    A pin on the expression's ARITY could not see that — both copies agreeing on
+    the wrong field is exactly one copy. This pins the FIELD.
+    """
+    src = inspect.getsource(router._seen_before)
+    body = src.split('"""')[-1]  # skip the docstring, which discusses is_unique
+    for flag in ("is_unique", "is_returning", "is_roaming"):
+        assert flag not in body, (
+            f"`_seen_before` reads the display flag `{flag}`. Ф3/Ф4 redefine "
+            "those; routing must read the resolver's own `seen_before`."
+        )
+    assert 'attribution.get("seen_before")' in body, (
+        "non-vacuity: the predicate must still ASK the question - a test that "
+        "passes because the function stopped reading anything is not a pin")
+
+
+def test_every_identity_result_carries_seen_before():
+    """The write side of the same property: a construction that forgets
+    `seen_before` inherits the default (False) and silently under-routes."""
+    src = inspect.getsource(identity)
+    lines = src.splitlines()
+    starts = [i for i, ln in enumerate(lines) if "IdentityResult(" in ln]
+    assert len(starts) >= 8, f"only {len(starts)} construction sites found - " \
+        "the scanner is broken, not the code"
+    missing = []
+    for i in starts:
+        depth = 0
+        block = []
+        for j in range(i, min(i + 14, len(lines))):
+            block.append(lines[j])
+            depth += lines[j].count("(") - lines[j].count(")")
+            if depth <= 0:
+                break
+        if "seen_before=" not in "\n".join(block):
+            missing.append(i + 1)
+    assert not missing, (
+        f"IdentityResult built without an explicit seen_before at lines {missing}")

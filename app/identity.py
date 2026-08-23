@@ -136,6 +136,11 @@ class IdentityResult:
     is_unique: bool
     is_returning: bool
     is_roaming: bool = False
+    # Ф1 (completed 2026-08-23) — ROUTING's own predicate, deliberately NOT one
+    # of the three display flags. "The uid existed BEFORE this click" = B∪C.
+    # Default False = the documented fail-safe (first pool only), so a
+    # construction that forgets it under-routes rather than mis-routes.
+    seen_before: bool = False
     signal_tier: str = _TIER_NONE
     identity_conflict: bool = False
     prev_offers: frozenset = field(default_factory=frozenset)
@@ -351,7 +356,8 @@ async def resolve_via_token(
         _hint_set = frozenset(seen_hint)
         _degraded_returning = bucket in _hint_set
         return IdentityResult(
-            uid=uid, is_unique=False, is_returning=_degraded_returning,
+            uid=uid, is_unique=False, seen_before=True,
+            is_returning=_degraded_returning,
             is_roaming=not _degraded_returning,
             signal_tier=_tier_label(_TIER_TOKEN), identity_conflict=False,
             campaigns_seen=_hint_set,
@@ -375,7 +381,7 @@ async def resolve_via_token(
     campaigns_seen = frozenset(rt[-1] or ()) | _hint_set  # last entry = SMEMBERS
     if with_history:
         return IdentityResult(
-            uid=uid, is_unique=False, is_returning=is_returning,
+            uid=uid, is_unique=False, seen_before=True, is_returning=is_returning,
             is_roaming=is_roaming, signal_tier=_tier_label(_TIER_TOKEN),
             identity_conflict=False,
             prev_offers=frozenset(rt[idx + 1] or ()),
@@ -384,7 +390,7 @@ async def resolve_via_token(
             campaigns_seen=campaigns_seen,
         )
     return IdentityResult(
-        uid=uid, is_unique=False, is_returning=is_returning,
+        uid=uid, is_unique=False, seen_before=True, is_returning=is_returning,
         is_roaming=is_roaming, signal_tier=_tier_label(_TIER_TOKEN),
         identity_conflict=False, campaigns_seen=campaigns_seen,
     )
@@ -475,7 +481,8 @@ async def resolve_identity(
     # visitor. No persistent identity; unique·new (segment A). No writes.
     if not signals:
         return IdentityResult(
-            uid="", is_unique=True, is_returning=False, is_roaming=False,
+            uid="", is_unique=True, seen_before=False,
+            is_returning=False, is_roaming=False,
             signal_tier=_tier_label(_TIER_NONE), identity_conflict=False,
         )
 
@@ -514,14 +521,14 @@ async def resolve_identity(
             # can route, but write NOTHING. `commit_resolution` performs the NX
             # mint (with THIS uid) only when the campaign is confirmed to serve.
             return IdentityResult(
-                uid=new_uid, is_unique=True, is_returning=False,
+                uid=new_uid, is_unique=True, seen_before=False, is_returning=False,
                 is_roaming=False, signal_tier=_tier_label(top_tier),
                 identity_conflict=identity_conflict,
             )
         won = await r.set(top_key, new_uid, nx=True, ex=ttl)  # RT#2
         if won:
             return IdentityResult(
-                uid=new_uid, is_unique=True, is_returning=False,
+                uid=new_uid, is_unique=True, seen_before=False, is_returning=False,
                 is_roaming=False, signal_tier=_tier_label(top_tier),
                 identity_conflict=identity_conflict,
             )
@@ -535,7 +542,8 @@ async def resolve_identity(
         # token_hex winner → valid → unchanged.
         if not _valid_uid(adopted):
             return IdentityResult(
-                uid="", is_unique=True, is_returning=False, is_roaming=False,
+                uid="", is_unique=True, seen_before=False,
+            is_returning=False, is_roaming=False,
                 signal_tier=_tier_label(_TIER_NONE),
                 identity_conflict=identity_conflict,
             )
@@ -559,7 +567,7 @@ async def resolve_identity(
         #     routing harm, no cross-tenant leak. Rare (same new user, same
         #     instant, multiple in-flight first clicks).
         return IdentityResult(
-            uid=adopted, is_unique=False, is_returning=False,
+            uid=adopted, is_unique=False, seen_before=True, is_returning=False,
             is_roaming=False, signal_tier=_tier_label(top_tier),
             identity_conflict=identity_conflict,
         )
@@ -587,7 +595,8 @@ async def resolve_identity(
     campaigns_seen = frozenset(rt2[-1] or ())  # last entry = the SMEMBERS read
     if with_history:
         return IdentityResult(
-            uid=resolved_uid, is_unique=False, is_returning=is_returning,
+            uid=resolved_uid, is_unique=False, seen_before=True,
+            is_returning=is_returning,
             is_roaming=is_roaming, signal_tier=_tier_label(winner_tier),
             identity_conflict=identity_conflict,
             prev_offers=frozenset(rt2[1] or ()),
@@ -596,7 +605,8 @@ async def resolve_identity(
             campaigns_seen=campaigns_seen,
         )
     return IdentityResult(
-        uid=resolved_uid, is_unique=False, is_returning=is_returning,
+        uid=resolved_uid, is_unique=False, seen_before=True,
+            is_returning=is_returning,
         is_roaming=is_roaming, signal_tier=_tier_label(winner_tier),
         identity_conflict=identity_conflict, campaigns_seen=campaigns_seen,
     )

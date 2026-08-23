@@ -214,7 +214,7 @@ class TestAllowedAvailabilityRule:
         # no uid → not seen_before → {active}
         assert router._allowed_availability(
             {"returning_routing": "1"},
-            {"uid": "", "is_unique": True},
+            {"uid": "", "is_unique": True, "seen_before": False},
         ) == ACTIVE
 
     def test_routing_off_active_only(self, monkeypatch):
@@ -222,7 +222,7 @@ class TestAllowedAvailabilityRule:
         # even a seen_before returning visitor → {active} when routing OFF
         assert router._allowed_availability(
             {"returning_routing": "1"},
-            {"uid": "u1", "is_unique": False},
+            {"uid": "u1", "is_unique": False, "seen_before": True},
         ) == ACTIVE
 
     def test_returning_visitor_routing_on_active_draining(self, monkeypatch):
@@ -231,7 +231,7 @@ class TestAllowedAvailabilityRule:
         # unset) ⇒ a seen_before returning visitor may serve a draining target.
         assert router._allowed_availability(
             {"returning_routing": "1"},
-            {"uid": "u1", "is_unique": False},
+            {"uid": "u1", "is_unique": False, "seen_before": True},
         ) == RETURNING
 
     def test_disable_flag_active_only(self, monkeypatch):
@@ -241,7 +241,7 @@ class TestAllowedAvailabilityRule:
         # old mode=fresh gate). FAIL-OPEN: absent flag ⇒ partition eligible.
         assert router._allowed_availability(
             {"returning_routing": "1", "disable_returning_flows": "1"},
-            {"uid": "u1", "is_unique": False},
+            {"uid": "u1", "is_unique": False, "seen_before": True},
         ) == ACTIVE
 
     def test_mode_fresh_no_longer_disables_partition(self, monkeypatch):
@@ -251,7 +251,7 @@ class TestAllowedAvailabilityRule:
         # flag now gets the returning availability class.
         assert router._allowed_availability(
             {"returning_routing": "1", "returning_mode": "fresh"},
-            {"uid": "u1", "is_unique": False},
+            {"uid": "u1", "is_unique": False, "seen_before": True},
         ) == RETURNING
 
 

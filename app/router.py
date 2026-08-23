@@ -626,6 +626,9 @@ async def _build_campaign_attribution(
                 }
             attribution["uid"] = ident.uid
             attribution["is_unique"] = ident.is_unique
+            # Ф1 — ROUTING reads THIS, never a display flag. Written at every
+            # site that writes `is_unique`, so the two can never disagree.
+            attribution["seen_before"] = ident.seen_before
             # v2 R — is_returning is now CAMPAIGN-relative; is_roaming = seen
             # before but a DIFFERENT campaign (mutually exclusive).
             attribution["is_returning"] = ident.is_returning
@@ -687,6 +690,7 @@ async def _commit_deferred_identity(attribution: dict[str, Any] | None) -> None:
         # Re-stamp — a lost NX race may have adopted a different canonical uid.
         attribution["uid"] = committed.uid
         attribution["is_unique"] = committed.is_unique
+        attribution["seen_before"] = committed.seen_before
     except Exception as e:  # fail-open — never fail a click on a commit error
         logger.warning("deferred identity commit failed — fail-open: %s", e)
 
@@ -755,8 +759,23 @@ def _seen_before(attribution: dict[str, Any]) -> bool:
     diverge, and no guard on either side can see it, because neither site is
     individually wrong. The redesign that is about to change what "seen before"
     MEANS is exactly the edit that would have split them. One definition, two
-    callers, and `test_seen_before_is_defined_once` keeps it that way."""
-    return bool(attribution.get("uid")) and attribution.get("is_unique") is False
+    callers, and `test_seen_before_is_defined_once` keeps it that way.
+
+    🔴 Ф1 COMPLETED 2026-08-23 — this now reads the resolver's OWN `seen_before`,
+    not `is_unique`. The de-duplication above shipped on 2026-08-22 and was
+    recorded as "Ф1 done", but Ф1's actual purpose was to make routing
+    STRUCTURALLY unable to depend on `is_unique` — and the expression still
+    named it. Ф3 redefines `is_unique` as `NOT is_returning`, which would have
+    turned every ROAMING click (seen before, different campaign) into
+    `is_unique = True` and therefore `seen_before = False`, silently moving it
+    out of the returning pool. Measured on staging the day this was fixed:
+    company 1 has segmented routing ON, 26 returning-only flows, 103 of 160
+    campaigns with the partition enabled, and 2874 roaming clicks in 30 days.
+
+    `seen_before` is deliberately NOT one of the three display flags. Ф3/Ф4 are
+    free to redefine what `is_unique` and `is_roaming` MEAN to a reader without
+    touching what routing DOES."""
+    return bool(attribution.get("uid")) and attribution.get("seen_before") is True
 
 
 def _non_routed_result(

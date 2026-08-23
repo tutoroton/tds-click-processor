@@ -1265,7 +1265,8 @@ class TestAvailabilityClassGating:
             return None  # force non-route — we only assert the passed kwargs
 
         async def _fake_stamp(**kw):  # seen_before visitor (uid set, not unique)
-            return IdentityResult(uid="U", is_unique=False, is_returning=True)
+            return IdentityResult(uid="U", is_unique=False, seen_before=True,
+                                  is_returning=True)
 
         campaign_id = "10"
         camp = {"company_id": "1", "priority": "0", "returning_resolver": "1"}
@@ -1366,7 +1367,8 @@ class TestReturningModeV3:
         )
 
         async def _stamp(**kw):
-            return IdentityResult(uid="U", is_unique=False, is_returning=True)
+            return IdentityResult(uid="U", is_unique=False, seen_before=True,
+                                  is_returning=True)
 
         with patch.object(settings, "returning_resolver_enabled", True), \
              patch.object(settings, "returning_routing_enabled", routing_enabled), \
@@ -1454,7 +1456,8 @@ class TestReturningModeV3:
         )
 
         async def _stamp(**kw):
-            return IdentityResult(uid="U", is_unique=False, is_returning=True)
+            return IdentityResult(uid="U", is_unique=False, seen_before=True,
+                                  is_returning=True)
 
         with patch.object(settings, "returning_resolver_enabled", True), \
              patch.object(settings, "returning_routing_enabled", True), \
@@ -1509,7 +1512,9 @@ class TestStickyPhaseS:
         import asyncio
 
         async def _stamp(**kw):
-            return IdentityResult(uid=uid, is_unique=is_unique, is_returning=not is_unique)
+            return IdentityResult(uid=uid, is_unique=is_unique,
+                                  seen_before=not is_unique,
+                                  is_returning=not is_unique)
 
         async def _async_redis():
             return redis

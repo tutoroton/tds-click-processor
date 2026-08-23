@@ -201,6 +201,50 @@ def _campaign_bucket(campaign_id) -> str:
     return str(campaign_id) if campaign_id else ""
 
 
+def _active_place(company_id: int, uid: str, campaign_id, binding_id):
+    """Ф2 / W7 — which (key, member) pair answers `is_returning`/`is_roaming`.
+
+    ONE function, so the read side and the write side cannot drift into
+    disagreeing about what a "place" is — the drift that would make a visitor
+    returning by one measure and unique by the other, silently, on the money
+    path.
+
+    Dark by default: with `identity_rekey_to_binding` OFF this returns exactly
+    the campaign-keyed pair the resolver has always used, so the answer is
+    byte-identical to before the re-key existed. The binding-keyed set is still
+    WRITTEN while the flag is off (see `persist_identity`), so by the time
+    anyone flips it the new set is already warm and nobody is mass-re-uniquified
+    by a cold cutover.
+    """
+    if settings.identity_rekey_to_binding:
+        return _places_key(company_id, uid), _place_bucket(campaign_id, binding_id)
+    return _campaigns_key(company_id, uid), _campaign_bucket(campaign_id)
+
+
+def _place_bucket(campaign_id, binding_id) -> str:
+    """Ф2 / W7 — the PLACE this click happened in, for the binding-keyed set.
+
+    The owner's model is that a visitor is `returning` when they come back to
+    the same ROUTER, not merely to the same campaign. A campaign can carry many
+    domain bindings, so keying identity history on the campaign makes a visitor
+    who arrives through a DIFFERENT binding of the same campaign look like a
+    repeat — which is what W7's falsifier describes.
+
+    🔴 MEMBERS ARE PREFIXED, and that is not decoration. `_roaming` counts SET
+    SIZE, so two id spaces sharing one set would manufacture roaming the moment
+    a campaign id and a binding id happened to collide numerically — which, both
+    being small dense integers, is the common case rather than the rare one.
+    `b17` and `c17` cannot collide; `17` and `17` always do.
+
+    A click with no binding (the geo branch, and any pre-F.31 domain value)
+    keeps a campaign-scoped place rather than being dropped into a shared
+    bucket — `binding_id = 0` is "no binding", never "binding zero".
+    """
+    if binding_id:
+        return f"b{binding_id}"
+    return f"c{campaign_id}" if campaign_id else ""
+
+
 def _roaming(places_seen, bucket: str) -> bool:
     """Ф3(b), 2026-08-23 — axis 2: has this visitor been seen in MORE THAN ONE
     place? (place = campaign today, binding after Ф2/W7.)
@@ -242,6 +286,22 @@ def _campaigns_key(company_id: int, uid: str) -> str:
 
 def _profile_key(company_id: int, uid: str) -> str:
     return f"id:{company_id}:uid:{uid}"
+
+
+def _places_key(company_id: int, uid: str) -> str:
+    """Ф2 / W7 — the binding-keyed places-seen set.
+
+    A SEPARATE KEY, deliberately. Re-keying in place would have meant writing
+    binding ids into a set already full of campaign ids: `is_returning` would
+    read a member from the wrong space, and `is_roaming` — which counts set
+    size — would have counted one visitor's single place twice.
+
+    Keeping the old key untouched also makes the cutover reversible by a flag
+    rather than by a migration: flip `identity_rekey_to_binding` back and the
+    campaign-keyed set is still exactly where it was, still warm, never written
+    to in the new space.
+    """
+    return f"id:{company_id}:uid:{uid}:places"
 
 
 def _seen_key(company_id: int, uid: str) -> str:
@@ -310,6 +370,7 @@ async def resolve_via_token(
     company_id: int,
     identity_token: str | None,
     campaign_id,
+    binding_id: int = 0,
     with_history: bool = False,
     commit: bool = True,
 ) -> IdentityResult | None:
@@ -359,15 +420,27 @@ async def resolve_via_token(
     # recompute campaign-relative flags from the LOCAL (now-unioned) set. The
     # union and the read share one pipeline → at most 1 round-trip for the union
     # path; the SISMEMBER reflects the freshly-unioned membership.
-    bucket = _campaign_bucket(campaign_id)
+    ckey, bucket = _active_place(company_id, uid, campaign_id, binding_id)
     # SEC-LOW-03 (audit-2 2026-06-07): re-trim the hint to MAX_SEEN inline before
     # the SADD. `idtok.verify` already refuses a token whose declared seen-count
     # exceeds MAX_SEEN, so a NORMAL token can never overflow here — this is pure
     # defense-in-depth for a key-compromise / forged-payload path (a signer that
     # bypassed the codec's own cap), bounding the SADD fan-out regardless.
     seen_hint = [str(c) for c in (claims.get("seen") or [])][: idtok.MAX_SEEN]
-    ckey = _seen_key(company_id, uid)
-    union = bool(seen_hint) and commit
+    # 🔴 Ф2 / W7 — the cookie's `seen` hint is a list of CAMPAIGN ids. Unioning it
+    # into the binding-keyed set would put campaign ids in the place space, where
+    # `is_returning` would match the wrong member and `is_roaming` — which counts
+    # SET SIZE — would count one visitor's single place twice. So under the re-key
+    # the hint is not applied at all, and cross-node recognition degrades to
+    # Redis-authoritative, which this module already documents as the authority
+    # ("the seen set is authoritative-in-Redis, the cookie is only a hint").
+    #
+    # NAMED, NOT HIDDEN: until the token codec carries places (a TOKEN_VERSION
+    # bump, its own phase), a visitor's FIRST click on a node that has not seen
+    # them can read `unique` where the campaign-keyed path would have read
+    # `returning` from the hint. That is a smaller error than the one it avoids,
+    # and it is bounded by how fast the places set warms.
+    union = bool(seen_hint) and commit and not settings.identity_rekey_to_binding
     try:
         pipe = r.pipeline()
         if union:
@@ -457,6 +530,7 @@ async def resolve_identity(
     funnel_user_id: str | None,
     visitor_id: str | None,
     campaign_id,
+    binding_id: int = 0,
     source_trusted: bool,
     ttl: int,
     with_history: bool = False,
@@ -499,6 +573,7 @@ async def resolve_identity(
         company_id=company_id,
         identity_token=identity_token,
         campaign_id=campaign_id,
+        binding_id=binding_id,
         with_history=with_history,
         commit=commit,
     )
@@ -632,16 +707,16 @@ async def resolve_identity(
     # (`with_history`), the previous-visit history sets ride the SAME pipeline
     # so prev_* costs ZERO extra round-trips (RT#2 = campaigns SISMEMBER
     # (+ history SMEMBERS) in one round).
-    bucket = _campaign_bucket(campaign_id)
+    pkey, bucket = _active_place(company_id, resolved_uid, campaign_id, binding_id)
     pipe = r.pipeline()
-    pipe.sismember(_campaigns_key(company_id, resolved_uid), bucket)
+    pipe.sismember(pkey, bucket)
     if with_history:
         pipe.smembers(_offers_key(company_id, resolved_uid))
         pipe.smembers(_targets_key(company_id, resolved_uid))
         pipe.smembers(_subs_key(company_id, resolved_uid))
     # P3 mint — campaigns-seen set on the SAME RT#2 pipeline (no extra round-trip)
     # so the node can re-stamp the cookie's `seen` hint for cross-node recognition.
-    pipe.smembers(_campaigns_key(company_id, resolved_uid))
+    pipe.smembers(pkey)
     rt2 = await pipe.execute()  # RT#2
 
     is_returning = bool(rt2[0])
@@ -673,6 +748,7 @@ async def persist_identity(
     funnel_user_id: str | None,
     visitor_id: str | None,
     campaign_id,
+    binding_id: int = 0,
     source_trusted: bool,
     ttl: int,
 ) -> None:
@@ -688,6 +764,15 @@ async def persist_identity(
         signals = _present_signals(funnel_user_id, visitor_id, source_trusted)
         bucket = _campaign_bucket(campaign_id)
         ckey = _campaigns_key(company_id, uid)
+        # Ф2 / W7 dual-write. BOTH sets are written on every click regardless of
+        # the read flag, and that ordering is the whole point: flipping the read
+        # on a COLD places set would make every returning visitor look unique
+        # again for as long as it took to warm — a one-off mass re-uniquification
+        # straight into `unique_only` cost cohorts. Writing both from the start
+        # means the flip changes which set ANSWERS, not what either set knows.
+        # Cost: two pipelined commands on the DEFERRED (off-critical-path) write.
+        place_bucket = _place_bucket(campaign_id, binding_id)
+        place_key = _places_key(company_id, uid)
         pkey = _profile_key(company_id, uid)
 
         pipe = r.pipeline()
@@ -701,6 +786,10 @@ async def persist_identity(
         # Campaigns-seen set (membership = "uid has hit this campaign before").
         pipe.sadd(ckey, bucket)
         pipe.expire(ckey, ttl)
+        # Places-seen set (membership = "uid has hit this BINDING before"), Ф2/W7.
+        if place_bucket:
+            pipe.sadd(place_key, place_bucket)
+            pipe.expire(place_key, ttl)
         # Profile — first_seen stamped once; sliding TTL.
         pipe.hsetnx(pkey, "first_seen", str(int(time.time())))
         pipe.expire(pkey, ttl)
@@ -732,6 +821,7 @@ async def resolve_and_stamp(
     funnel_user_id: str | None,
     visitor_id: str | None,
     campaign_id,
+    binding_id: int = 0,
     source_trusted: bool,
     with_history: bool = False,
     identity_token: str | None = None,
@@ -760,6 +850,7 @@ async def resolve_and_stamp(
         funnel_user_id=funnel_user_id,
         visitor_id=visitor_id,
         campaign_id=campaign_id,
+        binding_id=binding_id,
         source_trusted=source_trusted,
         ttl=ttl,
         with_history=with_history,
@@ -778,6 +869,7 @@ async def resolve_and_stamp(
                 funnel_user_id=funnel_user_id,
                 visitor_id=visitor_id,
                 campaign_id=campaign_id,
+                binding_id=binding_id,
                 source_trusted=source_trusted,
                 ttl=ttl,
             )
@@ -792,6 +884,7 @@ async def commit_resolution(
     funnel_user_id: str | None,
     visitor_id: str | None,
     campaign_id,
+    binding_id: int = 0,
     source_trusted: bool,
 ) -> IdentityResult:
     """Commit the side-effects of a previously SIDE-EFFECT-FREE resolve (LA-F1).
@@ -845,6 +938,7 @@ async def commit_resolution(
                 funnel_user_id=funnel_user_id,
                 visitor_id=visitor_id,
                 campaign_id=campaign_id,
+                binding_id=binding_id,
                 source_trusted=source_trusted,
                 ttl=ttl,
             )

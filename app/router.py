@@ -475,6 +475,7 @@ async def _build_campaign_attribution(
     campaign_id: str,
     req: ClickRequest,
     *,
+    binding_id: int = 0,
     commit_identity: bool = True,
 ) -> tuple[list[dict[str, Any]] | None, list[dict[str, Any]] | None, dict[str, Any]]:
     """Resolve the click's full attribution for one matched campaign.
@@ -598,6 +599,11 @@ async def _build_campaign_attribution(
                 funnel_user_id=slots.get("funnel_user_id"),
                 visitor_id=req.visitor_id,
                 campaign_id=campaign_id,
+                # Ф2 / W7 — the PLACE this click happened in. `0` means "no
+                # binding" (the geo branch), never "binding zero": `_place_bucket`
+                # keeps such a click campaign-scoped rather than pooling every
+                # binding-less click into one shared place.
+                binding_id=binding_id,
                 source_trusted=source_trusted,
                 with_history=with_history,
                 # P2 dual-accept: signed `_tds_id` cookie value (None until the
@@ -622,6 +628,11 @@ async def _build_campaign_attribution(
                     "funnel_user_id": slots.get("funnel_user_id"),
                     "visitor_id": req.visitor_id,
                     "campaign_id": campaign_id,
+                    # The deferred commit must write into the SAME place the
+                    # resolve read from; carrying only campaign_id would have made
+                    # the serving path persist a campaign-scoped place for a click
+                    # the resolver judged binding-scoped.
+                    "binding_id": binding_id,
                     "source_trusted": source_trusted,
                 }
             attribution["uid"] = ident.uid
@@ -685,6 +696,11 @@ async def _commit_deferred_identity(attribution: dict[str, Any] | None) -> None:
             funnel_user_id=deferred["funnel_user_id"],
             visitor_id=deferred["visitor_id"],
             campaign_id=deferred["campaign_id"],
+            # `.get` rather than `[...]`: a deferred dict stashed by an OLDER
+            # process (rolling deploy, in-flight click) has no `binding_id` key,
+            # and a KeyError here would be swallowed by the fail-open and
+            # silently skip the commit — losing the mint, not just the binding.
+            binding_id=deferred.get("binding_id", 0),
             source_trusted=deferred["source_trusted"],
         )
         # Re-stamp — a lost NX race may have adopted a different canonical uid.
@@ -1007,6 +1023,7 @@ async def _route_via_campaign(
     source_mappings, campaign_mappings, attribution = (
         await _build_campaign_attribution(
             r, campaign, campaign_id, req,
+            binding_id=binding_id,
             commit_identity=not fall_through_on_no_route,
         )
     )

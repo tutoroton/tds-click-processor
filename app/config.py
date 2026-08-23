@@ -639,6 +639,19 @@ class Settings(BaseSettings):
     # store is absent in a non-local env, and warns-only in a local-class env
     # (`local`/`development`) — so local boot stays quiet.
     returning_resolver_enabled: bool = True
+
+    # Ф2 / W7 — READ side of the identity re-key from campaign to BINDING.
+    #
+    # DEFAULT FALSE, and it is the read that is gated, not the write: the
+    # binding-keyed places set is populated on every click regardless, so
+    # flipping this changes which set ANSWERS, never what either set knows. A
+    # flip onto a cold set would have made every returning visitor look unique
+    # again until it warmed — a one-off mass re-uniquification landing straight
+    # in `unique_only` cost cohorts, on the money path.
+    #
+    # Reversible by flipping it back: the campaign-keyed set is never written in
+    # the new space and stays exactly where it was.
+    identity_rekey_to_binding: bool = False
     identity_redis_url: str = ""
     returning_uid_ttl_seconds: int = 15_552_000  # 180 days
 

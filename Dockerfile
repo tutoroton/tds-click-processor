@@ -21,5 +21,8 @@ CMD ["/bin/sh", "-c", "exec uvicorn app.main:app --host 0.0.0.0 --port 8100 --wo
 
 EXPOSE 8100
 
+# `timeout=` is load-bearing: an unbounded urlopen blocks forever and Docker does not
+# reap the probe process — 4 118 leaked probes / 40.71 GB, measured 2026-08-25. See
+# services/admin-api/Dockerfile for the full account.
 HEALTHCHECK --interval=10s --timeout=3s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8100/health')"
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8100/health', timeout=3)"

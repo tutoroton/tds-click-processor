@@ -1236,19 +1236,29 @@ async def _route_via_campaign(
     #     whose subquery filters `status='active' AND is_default` with NO
     #     availability filter. So the URL served is the closed default target's
     #     own destination. Offer 181 / target 195 (availability=closed) / 304
-    #     clicks / 270 unique visitors reached exactly that URL. It happens BY
-    #     CONSTRUCTION on every offer whose default target is closed, not through
-    #     drift. The click is also written with `offer_target_id=0` and no reason,
-    #     so an operator cannot see that a closed target took traffic.
+    #     clicks / 270 unique visitors reached exactly that URL. It happens on
+    #     every offer where NO target is available AND the default is closed —
+    #     NOT merely wherever a default is closed: the loop skips an unavailable
+    #     target and keeps going, so an offer with a closed default and a live
+    #     sibling routes normally. Those two conditions coincide on today's fleet
+    #     only because all three such offers happen to have zero servable targets.
+    #     What makes it operator-invisible is not a missing reason — the row
+    #     carries `decision_reason='matched_legacy_split'` — nor `offer_target_id=0`,
+    #     which the legacy path stamped unconditionally before R68. It is that
+    #     nothing distinguishes this from an ordinary legacy-split serve except
+    #     `landing_url` matching the closed target's template byte for byte.
     #     This comment DESCRIBES that behaviour; it does not endorse it. Whether
     #     to keep it is an open decision (programme item A5), and it is
     #     money-bearing: it overrides the availability/cap machine.
     #
-    # (2) IT IS REACHABLE FROM AUTHORED CONFIG, not only from drift. Target 195
-    #     has `updated_at == created_at` — it was CREATED closed on 2026-06-06 and
-    #     never touched — and the automation ledger holds no row for offers
-    #     181/210/211 or any of their targets. Whatever admin-api validation was
-    #     assumed to make this state unreachable does not prevent it.
+    # (2) IT IS REACHABLE WITHOUT DRIFT. Two measurements, no inference beyond
+    #     them: target 195's row has `updated_at == created_at`, i.e. it has never
+    #     been updated since it was created on 2026-06-06; and the automation
+    #     ledger holds no row for offers 181/210/211 or any of their targets. So
+    #     the availability machine did not put them here. (Concluding it was
+    #     CREATED closed would additionally assume nothing changes availability
+    #     without bumping `updated_at` — not verified.) Whatever admin-api
+    #     validation was assumed to make this state unreachable does not.
     #
     # What IS true, and verified end to end: the bare `offer.url` is an
     # admin-AUTHORED destination, so the click reaches a real URL rather than a
@@ -1256,8 +1266,10 @@ async def _route_via_campaign(
     # `offer_targets.url_template` on purpose — "canonical URL source moved to
     # offer_targets in 2026-04".) NOT guaranteed, though: this fallback has no
     # empty-string check, and 8 of 65 published offers would publish an EMPTY
-    # Redis url, which emits `{"url": "", "status": 302}` — the block sentinel is
-    # None and "" does not match it. None of those 8 is in this state today.
+    # Redis url, which — by CODE READING, never observed — would emit
+    # `{"url": "", "status": 302}`, since the block sentinel is None and "" does
+    # not match it. No offer has ever been in that state, so unlike the two facts
+    # above this one is not a measurement.
     # Also A5: "serve the closed target's URL" and "serve an empty 302" are two
     # accidental answers to one undecided question — what do we serve when
     # nothing is available?

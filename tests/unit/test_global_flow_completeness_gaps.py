@@ -262,10 +262,22 @@ class TestGap2NotInFailOpenGlobalCrossScope:
     and only as build scope). So "confirmed INTENTIONAL" was a paraphrase
     promoted to a ratification by being cited.
 
-    What WAS genuinely by design — and is untouched — is the scope-priority
-    walk stopping at the first matching bucket. What changed is which flows
-    match: a buyer-scope `geo not_in [RU]` whose geo failed to resolve no
-    longer silently matches, so it can no longer preempt anything.
+    🔴 READ THIS BEFORE TREATING ANY OTHER TEST AS A DUPLICATE. What this
+    class USED to pin was the scope-walk priority property — "the walk stops
+    at the first matching bucket" — and the fail-open was merely the MEANS of
+    manufacturing a match in the buyer-scope flow. With the fail-open closed,
+    both flows drop and there is no walk left to observe, so **this test no
+    longer exercises first-match-wins at all**. Its assertion genuinely
+    CHANGED, from "buyer wins" to "nobody wins" — it is not the same claim in
+    new words.
+
+    That property is still covered, elsewhere and deliberately:
+        test_global_flow_matrix.py::test_campaign_bound_department_scope_wins
+        test_global_flow_matrix.py::test_campaign_bound_custom_group_scope_wins
+        test_cascade.py::test_scope_priority_constant
+    Those are the scope-priority pins now. Do NOT retire them as duplicates of
+    this class — they are the only remaining coverage of the property this
+    class was originally written to demonstrate.
 
     Both flows below now drop on the same unresolved `geo` (the buyer's by
     the new rule, the company's by the `in` rule that always applied), so no

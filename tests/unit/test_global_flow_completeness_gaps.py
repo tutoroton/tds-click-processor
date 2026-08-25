@@ -251,19 +251,29 @@ class TestGap1ActionCompositionOnGlobalWinner:
 
 
 class TestGap2NotInFailOpenGlobalCrossScope:
-    """FINDINGS-G3-CRITIC.md §(c) gap 2 — `not_in` fail-open on a missing
-    dim is ALREADY pinned generically and confirmed INTENTIONAL
-    (`test_cascade.py::test_empty_click_attr_passes_not_in_criterion`) —
-    this is NOT a new bug. It was never exercised on a GLOBAL flow at a
-    non-company scope, nor combined with the scope-priority walk. Pins the
-    documented trade-off at the compound shape G3 flagged as worth naming:
-    a buyer-scope flow whose block-list criterion silently passes because
-    its dimension failed to resolve wins the walk BEFORE a company-level
-    flow enforcing the same intent via a different (present) dimension is
-    ever reached — by design (the walk stops at the first matching
-    bucket), not a bug."""
+    """FINDINGS-G3-CRITIC.md §(c) gap 2 — RESOLVED by V25 (2026-08-25).
 
-    async def test_buyer_scope_not_in_fail_open_preempts_company_scope_check(self):
+    This class used to pin the fail-open as a "documented trade-off … by
+    design, not a bug", on the strength of one citation: `test_cascade.py::
+    test_empty_click_attr_passes_not_in_criterion`. That test's justification
+    was the comment "empty is in nothing" — a restatement of the MECHANISM
+    (`"" in values` is False), not a decision that it ought to be so. No ADR
+    ever ratified it (`.roadmap/decisions/`: only ADR-0107 mentions `not_in`,
+    and only as build scope). So "confirmed INTENTIONAL" was a paraphrase
+    promoted to a ratification by being cited.
+
+    What WAS genuinely by design — and is untouched — is the scope-priority
+    walk stopping at the first matching bucket. What changed is which flows
+    match: a buyer-scope `geo not_in [RU]` whose geo failed to resolve no
+    longer silently matches, so it can no longer preempt anything.
+
+    Both flows below now drop on the same unresolved `geo` (the buyer's by
+    the new rule, the company's by the `in` rule that always applied), so no
+    flow serves this click and it falls through — which is the correct answer
+    to "we could not determine the country", and the same answer positive
+    targeting has always given."""
+
+    async def test_buyer_scope_not_in_no_longer_preempts_on_an_unresolved_dim(self):
         buyer_flow = _flow(
             "BUYER_FAILOPEN", scope_type="buyer", scope_id=5, campaign_id="0",
             seq_id=1, criteria=[{"type": "geo", "op": "not_in", "values": ["RU"]}],
@@ -283,7 +293,13 @@ class TestGap2NotInFailOpenGlobalCrossScope:
             r, campaign_id="1", company_id=1, buyer_id=5,
             click_attrs={"os": "ios", "device_type": "mobile"},
         )
-        assert _wid(winner) == "BUYER_FAILOPEN"
+        # Reasoned BEFORE running, not fitted to the output: the buyer flow
+        # drops (V25 — `not_in` on an unresolved dim), the company flow drops
+        # (`in` on an unresolved dim, unchanged), so nothing matches.
+        assert winner is None, (
+            f"expected no flow to serve an unresolved-geo click, got "
+            f"{_wid(winner) if winner is not None else None}"
+        )
 
 
 # ============================================================

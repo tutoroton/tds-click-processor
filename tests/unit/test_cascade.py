@@ -503,9 +503,11 @@ class TestPhase6NoneClickValGuard:
         ) is False
 
     def test_in_and_not_in_unaffected_by_a_none_click_val(self):
-        # Byte-identical to pre-hardening behavior — None already never
-        # equalled a configured value, so coalescing it to "" changes
-        # nothing here unless "" is itself a configured value.
+        # THE GUARD THIS TEST EXISTS FOR is that a None click value behaves
+        # EXACTLY like "" — that is still true, and is what both assertions
+        # below demonstrate. The `not_in` outcome moved from True to False
+        # with V25 (2026-08-25) because "" itself now fails closed; None
+        # continues to track "" precisely, which is the invariant.
         assert _criteria_match(
             [{"type": "geo", "op": "in", "values": ["US"]}],
             {"geo": None},
@@ -513,7 +515,7 @@ class TestPhase6NoneClickValGuard:
         assert _criteria_match(
             [{"type": "geo", "op": "not_in", "values": ["US"]}],
             {"geo": None},
-        ) is True
+        ) is False
 
     def test_set_valued_dim_unaffected_by_the_none_guard(self):
         # The None-coalesce sits AFTER the set-valued branch's `continue` —
@@ -523,10 +525,14 @@ class TestPhase6NoneClickValGuard:
             [{"type": "prev_offer", "op": "in", "values": ["55"]}],
             {"prev_offer": frozenset()},
         ) is False
+        # V25 (2026-08-25) — an empty history set is "we measured nothing", so
+        # `not_in` now fails closed on it exactly as `in` always did. The
+        # guard this test names (the None-coalesce must not swallow a genuine
+        # empty set) is unaffected: both ops still reach the set-valued branch.
         assert _criteria_match(
             [{"type": "prev_offer", "op": "not_in", "values": ["55"]}],
             {"prev_offer": frozenset()},
-        ) is True
+        ) is False
 
 
 # ============================================================
@@ -624,14 +630,23 @@ class TestCasePreserveDims:
             {"region": ""},
         ) is False
 
-    def test_empty_click_attr_passes_not_in_criterion(self):
-        # `op=not_in` is permissive on missing data — that's the
-        # "exclude these regions" semantic. Empty region passes
-        # because empty is in nothing.
+    def test_empty_click_attr_fails_not_in_criterion(self):
+        # V25 (2026-08-25) — INVERTED. This assertion used to read `is True`,
+        # justified by "empty is in nothing" — a restatement of the MECHANISM
+        # (`"" in values` is False), not a decision that it should be so. A
+        # later reviewer cited this very test as proof the fail-open was
+        # "confirmed INTENTIONAL" (test_global_flow_completeness_gaps.py Gap 2),
+        # so a mechanism-paraphrase became a ratification by citation.
+        #
+        # It is now fail-CLOSED, matching every sibling operator (`in`,
+        # `contains`, `not_empty` all already dropped here) and matching what
+        # admin-api calls "the security-relevant direction of CF-3": an
+        # operator's "exclude California" must not silently pass every click
+        # whose region we failed to resolve.
         assert _criteria_match(
             [{"type": "region", "op": "not_in", "values": ["California"]}],
             {"region": ""},
-        ) is True
+        ) is False
 
 
 # ============================================================
@@ -858,15 +873,16 @@ class TestAuditCriteriaGaps:
             {"device_type": "desktop"},
         ) is True
 
-    def test_browser_not_in_with_empty_click_value_passes(self):
-        # GAP3: device_detector couldn't parse a browser (empty) →
-        # not_in is permissive (empty is in nothing) → passes. Same
-        # fail-open-on-missing semantics as the region case, pinned
-        # explicitly for the browser dimension.
+    def test_browser_not_in_with_empty_click_value_fails_closed(self):
+        # GAP3 (found by audit, pinned as-observed) → INVERTED by V25
+        # (2026-08-25). device_detector couldn't parse a browser (empty), so
+        # "exclude Chrome and Firefox" used to pass that click through. It now
+        # drops, same as the region case and same as `in` always did: a claim
+        # about a dimension we could not measure cannot be satisfied.
         assert _criteria_match(
             [{"type": "browser", "op": "not_in", "values": ["Chrome", "Firefox"]}],
             {"browser": ""},
-        ) is True
+        ) is False
 
     def test_browser_not_in_excludes_listed(self):
         assert _criteria_match(

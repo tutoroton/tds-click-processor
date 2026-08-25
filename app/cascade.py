@@ -892,6 +892,14 @@ def _first_failing_criterion(
             hist = frozenset(
                 x.lower() if isinstance(x, str) else x for x in click_val
             )
+            # V25 — an EMPTY history set is "we measured nothing" for this
+            # dim, exactly like an empty string on the scalar path. `in`
+            # already dropped on it (no intersection); `not_in` held, so an
+            # exclusion was a no-op for every user with no history. Ops other
+            # than in/not_in are untouched here — they fall through to the
+            # `else: return c` below exactly as before.
+            if not hist and criterion_fails_on_missing_value(op):
+                return c
             hit = bool(hist & cvals)
             if op == "in":
                 if not hit:
@@ -916,6 +924,17 @@ def _first_failing_criterion(
         # independent line of defense, not a behavior change.
         if click_val is None:
             click_val = ""
+
+        # V25 (2026-08-25) — the missing-VALUE sibling of the CF-3 missing-DIM
+        # guard above. The dim IS evaluated, but THIS click carries nothing for
+        # it. `in` / `contains` / `not_empty` already dropped here; `not_in`
+        # held (because `"" in values` is False), so "block these" silently
+        # became "allow everything we could not measure". Only `empty` may
+        # legitimately hold. Placed BEFORE the normalizers deliberately: both
+        # pass "" through unchanged (their docstrings say so), so this is
+        # equivalent, and it keeps their documented contracts untouched.
+        if click_val == "" and criterion_fails_on_missing_value(op):
+            return c
 
         # GTD-R135 Phase 4 (G5) — identifier (`param:<slot>`) dims are
         # case-preserve TOO (byte-exact wire match — "the sacred rule": the
@@ -1159,6 +1178,40 @@ def normalize_language(value: str) -> str:
     Shared by BOTH matchers (cascade `_first_failing_criterion` + router
     `resolve_target_with_id`) so they stay in lockstep."""
     return value.split("-", 1)[0] if "-" in value else value
+
+
+#: Operators a criterion can still SATISFY when the click carries NO value for
+#: its dimension. Exactly one — `empty`, whose whole meaning is "this dimension
+#: has no value". Every other operator asserts something a missing value cannot
+#: substantiate, so it fails CLOSED and drops the candidate.
+_OPS_SATISFIED_BY_MISSING_VALUE = frozenset({"empty"})
+
+
+def criterion_fails_on_missing_value(op: str) -> bool:
+    """V25 (2026-08-25) — the missing-VALUE sibling of CF-3's missing-DIM guard.
+
+    CF-3 closed the fail-OPEN for a dim the evaluator cannot populate at all.
+    The same hole existed one row down, for a dim we DO evaluate but for which
+    THIS click carries nothing: `in` / `contains` / `not_empty` all dropped the
+    candidate, `empty` correctly held — and `not_in` also held, because `"" in
+    values` is False. So an operator's "block these" silently became "allow
+    everything we could not measure". `language` is the live instance: it is
+    admin-accepted, it is evaluated, and it is absent from most clicks.
+
+    The rule, stated once and applied at every evaluator: ON A MISSING VALUE,
+    ONLY `empty` HOLDS. This is not a new posture — it is the one the two
+    normalizers above already document ("preserving the absent-value
+    fail-closed on `in`"), finally made total over the operator universe.
+
+    Shared by BOTH matchers (cascade `_first_failing_criterion` + router's
+    legacy offer_target matcher) so they cannot drift — router already imports
+    cascade, so no circular import (the prohibition is one-way: cascade must
+    not import router).
+
+    Totality + the per-operator expectations are pinned by
+    `tests/unit/test_criteria_contract.py` § 9.
+    """
+    return op not in _OPS_SATISFIED_BY_MISSING_VALUE
 
 
 def _criteria_match(

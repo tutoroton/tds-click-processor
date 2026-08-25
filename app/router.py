@@ -2335,6 +2335,17 @@ async def resolve_target_with_id(
                 match = False
                 break
 
+            # V25 (2026-08-25) — the missing-VALUE sibling of the CF-3
+            # missing-DIM guard directly above, and kept in lockstep with
+            # `cascade._first_failing_criterion` by CALLING the same helper
+            # rather than restating the rule (a restated rule is how these two
+            # matchers drift). The dim is evaluated, but this click carries no
+            # value for it: `in` already dropped the target here, `not_in` did
+            # not, so an exclusion passed for every click we could not measure.
+            if click_val == "" and cascade.criterion_fails_on_missing_value(op):
+                match = False
+                break
+
             # R72 — kept in lockstep with `cascade._first_failing_criterion`:
             # normalize time_of_day on BOTH sides so a saved "09" matches an
             # un-padded "9" click. Scoped to time_of_day ONLY.

@@ -1222,30 +1222,50 @@ async def _route_via_campaign(
         )
 
     # Stage 8 — legacy URL build via offer.url / target resolution.
-    # v2 C2 — resolve_target now honours the availability floor so the legacy
-    # path never RE-SERVES a drained/closed target; an unavailable target is
-    # skipped → falls to the offer's available default / bare url (byte-identical
-    # when all targets active).
-    # OBS-B1/B2 (audit-2 2026-06-07) — ACCEPTED DRIFT-ONLY RESIDUAL, documented.
-    # `resolve_target` returns None both when (a) the offer has NO targets at all
-    # (legit → serve the offer's own `url`), and when (b) the offer HAS targets
-    # but ALL were availability-excluded (drained/closed). In case (b) the legacy
-    # path serves the bare `offer.url` rather than the campaign terminal_fallback
-    # — bypassing the no-dead-end availability machine. This is NOT fixed by a
-    # contract change here because:
-    #   * It is NOT reachable via authored config — admin-api rejects an offer /
-    #     split that has no valid active target, so a live offer always has at
-    #     least one servable target. Case (b) only arises from DRIFT (every target
-    #     manually drained/closed out-of-band), out of the availability-machine
-    #     scope by design.
-    #   * The bare `offer.url` is itself an admin-AUTHORED destination, so even in
-    #     the drift case the click routes to a real URL (not a 404 dead-end) — the
-    #     only gap is provenance (offer.url vs campaign terminal_fallback).
-    #   * A clean distinction would change `resolve_target`'s deliberate C2
-    #     contract ("all-excluded → None → bare url") and break its pinning test
-    #     (`test_c2_availability_delivery.test_closed_default_excluded`) — higher
-    #     risk than the residual it removes. The cascade path already routes
-    #     all-unavailable flows to terminal_fallback (the reachable case).
+    #
+    # v2 C2 — `resolve_target` honours the availability floor: an unavailable
+    # target IS skipped. What it falls back to is NOT availability-checked, and
+    # the description that stood here until 2026-08-25 was false about that in
+    # four places. The two facts below are MEASURED on deployed staging, not
+    # inferred. Read them before changing anything in this stage.
+    #
+    # (1) THE FALLBACK CAN RE-SERVE THE CLOSED TARGET. When `resolve_target`
+    #     returns None because every target was availability-excluded, this path
+    #     serves `offer.url` — and `offer:<id>.url` is published by
+    #     `sync/builders/offers.py` from the DEFAULT TARGET's `url_template`,
+    #     whose subquery filters `status='active' AND is_default` with NO
+    #     availability filter. So the URL served is the closed default target's
+    #     own destination. Offer 181 / target 195 (availability=closed) / 304
+    #     clicks / 270 unique visitors reached exactly that URL. It happens BY
+    #     CONSTRUCTION on every offer whose default target is closed, not through
+    #     drift. The click is also written with `offer_target_id=0` and no reason,
+    #     so an operator cannot see that a closed target took traffic.
+    #     This comment DESCRIBES that behaviour; it does not endorse it. Whether
+    #     to keep it is an open decision (programme item A5), and it is
+    #     money-bearing: it overrides the availability/cap machine.
+    #
+    # (2) IT IS REACHABLE FROM AUTHORED CONFIG, not only from drift. Target 195
+    #     has `updated_at == created_at` — it was CREATED closed on 2026-06-06 and
+    #     never touched — and the automation ledger holds no row for offers
+    #     181/210/211 or any of their targets. Whatever admin-api validation was
+    #     assumed to make this state unreachable does not prevent it.
+    #
+    # What IS true, and verified end to end: the bare `offer.url` is an
+    # admin-AUTHORED destination, so the click reaches a real URL rather than a
+    # dead end. (`offers` carries no `url` column at all; the builder reads
+    # `offer_targets.url_template` on purpose — "canonical URL source moved to
+    # offer_targets in 2026-04".) NOT guaranteed, though: this fallback has no
+    # empty-string check, and 8 of 65 published offers would publish an EMPTY
+    # Redis url, which emits `{"url": "", "status": 302}` — the block sentinel is
+    # None and "" does not match it. None of those 8 is in this state today.
+    # Also A5: "serve the closed target's URL" and "serve an empty 302" are two
+    # accidental answers to one undecided question — what do we serve when
+    # nothing is available?
+    #
+    # Deliberately NOT changed here: `resolve_target`'s C2 contract
+    # ("all-excluded → None → bare url") and its pinning test
+    # (`test_c2_availability_delivery.test_closed_default_excluded`). Changing the
+    # contract is the A5 decision; this is a correction of the record.
     t0 = time.perf_counter()
     target_url, chosen_tid = await resolve_target_with_id(r, offer, req, allowed_avail)
     url_template = target_url if target_url else offer.get("url", "")

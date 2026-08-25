@@ -51,6 +51,7 @@ from app.redis_client import (
     close_shipper_redis,
 )
 from app.router import route, get_full_ua_info, parse_accept_language, coerce_cost
+from app.resolution import BINDING_SELECTOR_KEY
 from app.ua_parser import warmup as warmup_ua_parser
 from app.shipper import assert_shipper_ready, run_shipper
 from app.shipper_metrics import metrics as shipper_metrics
@@ -1145,6 +1146,19 @@ def _build_extra_params(attribution: dict | None, query_params: dict) -> dict:
     else:
         extras = dict(extras)
     extras.pop("debug", None)
+    # A1a/V18 — the binding selector is GLOBALLY RESERVED routing control
+    # (F-PARAM-2), never advertiser data. `resolve_slots` drops it on the
+    # RESOLVED path, but the no-match / pre-campaign branch above rebuilds
+    # extras from the RAW query params and so re-admitted it: the guard covered
+    # one path of two. Measured on deployed staging 2026-08-25 — one click in
+    # 252 568 over 30 days carried `{"c":"zz-a5-1787358817","routing_status":
+    # "blocked"}`, i.e. the reserved key masquerading as a custom param. Rare
+    # only because a no-match click carrying `?c=` is rare; the mechanism was
+    # unconditional. Dropped here so ONE rule holds on BOTH paths, and the value
+    # is not lost either: it is recorded in the dedicated `binding_selector`
+    # column, which is where the F-PARAM-2 comment already claimed binding
+    # attribution lived.
+    extras.pop(BINDING_SELECTOR_KEY, None)
     # GTD-R166 W2 — `_param_rules` is a SYSTEM-controlled provenance key (written
     # post-resolution by the record builder). Strip any advertiser-supplied
     # `?_param_rules=` on EVERY path (matched + no-match) so a forged value can
@@ -1511,6 +1525,17 @@ async def decide(
         # domain binding) default to 0 / "" (the "(default)" bucket).
         "binding_id": result.get("binding_id", 0),
         "binding_alias": result.get("binding_alias") or "",
+        # A1a/V18 — what the visitor ASKED for, and whether we honoured it.
+        # `binding_id`/`binding_alias` above record only the WINNER, so a click
+        # that asked for an unknown selector and fell through to the root binding
+        # was byte-identical to a visit to the bare domain. The selector is read
+        # straight from the request (never from the resolver) so it is present on
+        # every path, including the ones that never reach a campaign; the tier
+        # rides on `timing`, which every exit of route() returns.
+        # "" tier = route() did not run at all — NOT the same as "none", which
+        # means it ran and found no domain binding.
+        "binding_selector": str((qp or {}).get(BINDING_SELECTOR_KEY, "") or ""),
+        "binding_match_tier": routing_timing.get("binding_match_tier", ""),
         # Defensive: every path that reaches here now sets a string url
         # (matched offer OR fallback) — `.get` guards a hypothetical None
         # from becoming a KeyError (it lands as SQL NULL instead).

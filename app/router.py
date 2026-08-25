@@ -154,6 +154,17 @@ async def route(req: ClickRequest) -> dict | None:
     t0 = time.perf_counter()
     resolution = await resolve_domain_campaign(r, req)
     timing["domain_resolve_ms"] = _ms_since(t0)
+    # A1a/V18 — which tier answered, carried on `timing` because `timing` is the
+    # ONE object every exit of this function already returns (matched, blocked,
+    # fall-through and the caller's fallback, which copies it). Threading a new
+    # kwarg through `_route_via_campaign` instead would mean editing 10+ sites
+    # and the value would be absent on exactly the branch nobody tests.
+    # ONLY the closed enum rides here: the raw selector is attacker-supplied and
+    # `timing` is written to a JSON column with NO length cap, so putting it here
+    # would trade one recording gap for an unbounded write. The selector is taken
+    # from the request in `main._build_click_record`, where the collector's
+    # 255-char cap applies to it.
+    timing["binding_match_tier"] = resolution.match_tier
 
     # §6 (F.30 security): an unmatched subdomain of a wildcard-enabled
     # base fails closed — it must NOT inherit the base's binding nor
@@ -1873,10 +1884,19 @@ class DomainResolution(NamedTuple):
     binding_id: int
     binding_alias: str | None
     blocked: bool
+    #: A1a/V18 — which tier actually produced the binding:
+    #: subdomain | path | param | root | none | blocked.
+    #: `root` is the one that matters: a binding WAS found, but only the
+    #: catch-all, so whatever the visitor asked for was NOT honoured. Until this
+    #: existed, that click was indistinguishable from a visit to the bare domain
+    #: — measured 2026-08-25 on deployed staging, 14 129 of campaign 35's 15 977
+    #: domain-resolved clicks in 30 days.
+    #: Defaulted so the module-level sentinels below stay valid literals.
+    match_tier: str = ""
 
 
-_NO_DOMAIN_MATCH = DomainResolution(None, 0, None, False)
-_DOMAIN_BLOCKED = DomainResolution(None, 0, None, True)
+_NO_DOMAIN_MATCH = DomainResolution(None, 0, None, False, "none")
+_DOMAIN_BLOCKED = DomainResolution(None, 0, None, True, "blocked")
 
 
 def _parse_binding_value(raw: str | None) -> tuple[str, int, str | None]:
@@ -1922,17 +1942,27 @@ def _parse_binding_value(raw: str | None) -> tuple[str, int, str | None]:
     return s, 0, None
 
 
-async def _first_match(r, keys_to_check: list[str]) -> str | None:
-    """Batch-GET `keys_to_check` in one pipeline; first non-empty wins."""
+async def _first_match(
+    keys_to_check: list[tuple[str, str]], r
+) -> tuple[str, str] | None:
+    """Batch-GET `keys_to_check` in one pipeline; first non-empty wins.
+
+    Takes `(tier, redis_key)` pairs and returns `(tier, value)` — A1a/V18. The
+    tier is carried ALONGSIDE the key rather than parsed back out of it: a key is
+    `domain:{host}:path:{seg}` and a selector value may itself contain a colon,
+    so recovering the tier by splitting the string is a decoder that a crafted
+    selector can lie to. The caller already knows the tier when it builds the
+    list; the only reason it was ever lost is that this function dropped it.
+    """
     if not keys_to_check:
         return None
     pipe = r.pipeline()
-    for key in keys_to_check:
+    for _tier, key in keys_to_check:
         pipe.get(key)
     results = await pipe.execute()
-    for val in results:
+    for (tier, _key), val in zip(keys_to_check, results):
         if val:
-            return val
+            return tier, val
     return None
 
 
@@ -2035,17 +2065,18 @@ async def resolve_domain_campaign(r, req: ClickRequest) -> DomainResolution:
         #   3. No match → block (404).
         keys_to_check = []
         if first_segment:
-            keys_to_check.append(f"domain:{hostname}:path:{first_segment}")
+            keys_to_check.append(("path", f"domain:{hostname}:path:{first_segment}"))
         if param_c:
-            keys_to_check.append(f"domain:{hostname}:param:{param_c}")
-        keys_to_check.append(f"domain:{hostname}:root")
-        keys_to_check.append(f"domain:{sub_base}:subdomain:{sub_label}")
+            keys_to_check.append(("param", f"domain:{hostname}:param:{param_c}"))
+        keys_to_check.append(("root", f"domain:{hostname}:root"))
+        keys_to_check.append(("subdomain", f"domain:{sub_base}:subdomain:{sub_label}"))
 
-        raw = await _first_match(r, keys_to_check)
-        if raw:
+        hit = await _first_match(keys_to_check, r)
+        if hit:
+            tier, raw = hit
             cid, bid, alias = _parse_binding_value(raw)
             if cid:
-                return DomainResolution(cid, bid, alias, False)
+                return DomainResolution(cid, bid, alias, False, tier)
         return _DOMAIN_BLOCKED  # §6 fail-closed
 
     # Non-wildcard host — behaviour identical to the pre-§6 resolver.
@@ -2061,24 +2092,25 @@ async def resolve_domain_campaign(r, req: ClickRequest) -> DomainResolution:
 
     keys_to_check = []
     if subdomain:
-        keys_to_check.append(f"domain:{base_domain}:subdomain:{subdomain}")
+        keys_to_check.append(("subdomain", f"domain:{base_domain}:subdomain:{subdomain}"))
     if first_segment:
-        keys_to_check.append(f"domain:{hostname}:path:{first_segment}")
+        keys_to_check.append(("path", f"domain:{hostname}:path:{first_segment}"))
         if base_domain != hostname:
-            keys_to_check.append(f"domain:{base_domain}:path:{first_segment}")
+            keys_to_check.append(("path", f"domain:{base_domain}:path:{first_segment}"))
     if param_c:
-        keys_to_check.append(f"domain:{hostname}:param:{param_c}")
+        keys_to_check.append(("param", f"domain:{hostname}:param:{param_c}"))
         if base_domain != hostname:
-            keys_to_check.append(f"domain:{base_domain}:param:{param_c}")
-    keys_to_check.append(f"domain:{hostname}:root")
+            keys_to_check.append(("param", f"domain:{base_domain}:param:{param_c}"))
+    keys_to_check.append(("root", f"domain:{hostname}:root"))
     if base_domain != hostname:
-        keys_to_check.append(f"domain:{base_domain}:root")
+        keys_to_check.append(("root", f"domain:{base_domain}:root"))
 
-    raw = await _first_match(r, keys_to_check)
-    if raw:
+    hit = await _first_match(keys_to_check, r)
+    if hit:
+        tier, raw = hit
         cid, bid, alias = _parse_binding_value(raw)
         if cid:
-            return DomainResolution(cid, bid, alias, False)
+            return DomainResolution(cid, bid, alias, False, tier)
     return _NO_DOMAIN_MATCH
 
 

@@ -966,6 +966,7 @@ def _decision_reason(result: dict, timing: dict, attr: dict) -> str:
 
 def _phase3_attribution_fields(
     result: dict, req: ClickRequest, timing: dict, routing_decision_ts: str,
+    ua_is_bot: bool = False,
 ) -> dict:
     """Build the Phase-3 column additions for one click record.
 
@@ -1083,7 +1084,23 @@ def _phase3_attribution_fields(
         # branch pre/post cutover (the two columns are non-complementary across
         # the boundary).
         "flags_semantics_version": _FLAGS_SEMANTICS_VERSION if "is_unique" in attr else 0,
-        "is_bot": req.is_bot,
+        # is_bot — the UNION of the two detectors we actually have (C2/V9).
+        # `req.is_bot` is the EDGE verdict (CF Bot Management). We hold no CF
+        # Bot Management subscription, so on real traffic it is False for every
+        # click; the only 1s ever written came from the synthetic load generator
+        # and were ~2% random noise on ORDINARY browser UAs (the SAME UA string
+        # appears on both sides of the flag), while genuine crawlers -- curl,
+        # TLM-Audit-Scanner, WordPress-install probes -- were all recorded as
+        # human. `ua_is_bot` is device_detector's verdict, which this service
+        # has always COMPUTED (ua_parser.parse_ua) and never stored: measured on
+        # live staging it identifies 266 of 5606 distinct UAs and 14.78% of real
+        # post-load-generator clicks (ClaudeBot, Amazonbot, ChatGPT-User,
+        # PerplexityBot, OAI-SearchBot, cohere-ai, security scanners).
+        # OR, not replace: the two detectors are complementary -- CF catches a
+        # behavioural bot wearing a browser UA, device_detector catches one that
+        # declares itself -- so a click is a bot if EITHER says so, and the
+        # value stays correct if a CF subscription is ever added.
+        "is_bot": bool(req.is_bot) or bool(ua_is_bot),
         "is_proxy": req.is_proxy,
         "cf_ray": req.cf_ray or "",
         "request_id": req.request_id or "",
@@ -1603,7 +1620,10 @@ async def decide(
     # from the resolver's unmapped-key set in the literal.
     click_record["click_schema_version"] = _CLICK_SCHEMA_VERSION
     click_record.update(
-        _phase3_attribution_fields(result, req, timing, _utc_now_ms_iso())
+        _phase3_attribution_fields(
+            result, req, timing, _utc_now_ms_iso(),
+            ua_is_bot=bool(ua_info.get("is_bot")),
+        )
     )
 
     # P3 (2026-06-06) — MINT / re-stamp the signed `_tds_id` identity cookie for

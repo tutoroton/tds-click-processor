@@ -26,7 +26,7 @@ Canonical-binding rule (F.X, locked 2026-05-14; plan doc:
 `docs/roadmap/stage-1a-research/canonical-slot-binding-fix.md`):
 
   Every name in `CANONICAL_SLOTS` (= `RESERVED_SLOTS` ∪ `SUB_SLOTS`,
-  39 names) is ALWAYS treated as a primary input key for its slot
+  40 names) is ALWAYS treated as a primary input key for its slot
   regardless of whether a `SubIdMapping` entry exists. The
   `alias` field on an entry adds an ADDITIONAL alternative URL
   key. Both keys are tried at click time; canonical name wins on
@@ -75,7 +75,7 @@ __all__ = [
 ]
 
 
-# Pre-parse cap on `param_mappings` JSON. The 19-slot RESERVED_SLOTS
+# Pre-parse cap on `param_mappings` JSON. The 20-slot RESERVED_SLOTS
 # fully denormalized with 200-char free-text fields fits in a few KB;
 # 256 KB is generous and bounds the JSON-bomb / sync-poison surface
 # where an admin-authored mapping could be huge. See security audit

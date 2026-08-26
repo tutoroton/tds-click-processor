@@ -362,3 +362,63 @@ class TestScanScope:
 
         assert await r.xlen(tool.STREAM_KEY) == 2
         assert len(_remaining(_park_root)) == 3
+
+
+class TestDownstreamBlindnessIsStated:
+    """V12/NV-021 (2026-08-25) — this tool cannot ask ClickHouse whether the
+    click it is restoring is already stored, and by rule `architecture` it
+    must never learn how: the click-processor never reads PG or CH.
+
+    So the requirement here is the opposite of the collector's. There the
+    fix was to ASK; here it is to say plainly that we did not, and to name
+    the central handoff that can. A recovery tool must never let "restored
+    it" and "re-sent something already stored" be the same sentence.
+    """
+
+    @pytest.mark.asyncio
+    async def test_replay_states_that_it_did_not_check_downstream(
+            self, _park_root, capsys):
+        _write_park(_park_root, "park-100-1.ndjson", [_rec("c1")])
+
+        await tool.cmd_replay(_redis(), _args(reason="queue_failure"))
+
+        out = capsys.readouterr().out
+        assert "would replay 1" in out
+        assert "does NOT know whether these clicks are already stored" in out
+
+    @pytest.mark.asyncio
+    async def test_list_states_it_too(self, _park_root, capsys):
+        _write_park(_park_root, "park-100-1.ndjson", [_rec("c1")])
+
+        await tool.cmd_list(_redis(), _args())
+
+        assert "does NOT know whether these clicks are already stored" \
+            in capsys.readouterr().out
+
+    @pytest.mark.asyncio
+    async def test_an_empty_park_does_not_emit_the_caveat(
+            self, _park_root, capsys):
+        """Nothing to restore, nothing to warn about — a caveat printed on
+        every run is a caveat nobody reads."""
+        await tool.cmd_list(_redis(), _args())
+        assert "does NOT know whether" not in capsys.readouterr().out
+
+    def test_the_note_names_the_handoff_that_can_answer(self):
+        """If the pointer rots, the operator is left with a limitation and
+        no remedy — which is worse than not mentioning it."""
+        assert "replay_poison_park.py check --in" in tool._NO_DOWNSTREAM_CHECK
+
+    def test_the_tool_has_no_clickhouse_client_and_must_not_grow_one(self):
+        """The architecture invariant this fix is shaped around, asserted
+        rather than trusted. If someone 'improves' the tool by importing a
+        CH client, this is the test that says no."""
+        src = (Path(__file__).resolve().parents[2] / "scripts"
+               / "replay_deadletter_park.py").read_text()
+        # `.strip()` matters: a LAZY import inside a function is indented,
+        # and an unanchored check would wave it through. Found by mutation --
+        # the first version of this test could not see that case.
+        offending = [ln for ln in src.splitlines()
+                     if ln.strip().startswith(
+                         ("import clickhouse", "from clickhouse",
+                          "from app.clickhouse"))]
+        assert offending == [], offending

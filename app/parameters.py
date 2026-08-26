@@ -2,7 +2,7 @@
 
 Mirror of `services/admin-api/app/common/parameters.py` —
 `RESERVED_SLOTS` (19) + `SUB_SLOTS` (`sub1`..`sub20`). Combined,
-the 39 canonical click-row slot names that participate in the
+the 40 canonical click-row slot names that participate in the
 canonical-binding rule documented in
 `docs/roadmap/stage-1a-research/canonical-slot-binding-fix.md`
 (F.X plan locked 2026-05-14).
@@ -40,10 +40,12 @@ from __future__ import annotations
 # one side and not the other depending on which name was added or
 # removed. The two lists MUST match byte-for-byte.
 
-# 19 reserved slot names. Each has a dedicated click-row column on
+# 20 reserved slot names. Each has a dedicated click-row column on
 # the admin-api side (Stage 3 storage target). Source-platform
 # attribution + click identifiers + funnel/journey + org/buyer
-# attribution + mobile/app. Locked at 19 in Round 2 (2026-04-27).
+# attribution + mobile/app. Locked at 19 in Round 2 (2026-04-27); a 20th,
+# `funnel_user_id`, was added 2026-06-05 (P1) -- so the SET is 20 today and
+# the Round-2 number is history, not the current count.
 RESERVED_SLOTS: frozenset[str] = frozenset({
     # Group A — Source identity
     "source",          # which traffic source the click came from
@@ -77,7 +79,7 @@ RESERVED_SLOTS: frozenset[str] = frozenset({
 # Aliased to incoming GET keys via `sources.param_mappings[].alias`.
 SUB_SLOTS: frozenset[str] = frozenset(f"sub{i}" for i in range(1, 21))
 
-# The full canonical click-row vocabulary (39 names). Every name
+# The full canonical click-row vocabulary (40 names). Every name
 # in this set is treated as a *primary* GET key for its slot by
 # `resolve_slots` — see F.X plan § 3 for the binding rule and
 # § 4 for the design decision matrix.

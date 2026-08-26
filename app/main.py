@@ -1100,6 +1100,14 @@ def _phase3_attribution_fields(
         "worker_colo": req.colo or "",
         "tls_version": req.tls_version or "",
         "http_protocol": req.http_protocol or "",
+        # D1/V11 — the request VERB. Read straight from the request, like
+        # its neighbours, so it is present on EVERY click regardless of
+        # whether routing reached a campaign. Uppercased because the HTTP
+        # grammar is case-sensitive but clients are not always careful, and
+        # a column split across "GET"/"get" cannot be counted.
+        # "" = an edge that predates D1 — NOT the same as "no method"
+        # (every HTTP request has one), and no read may conflate them.
+        "http_method": (req.http_method or "").upper(),
         "hostname": req.hostname or "",
         "path": req.path or "",
         "language": parse_accept_language(req.accept_language) or "",

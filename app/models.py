@@ -119,6 +119,13 @@ class ClickRequest(BaseModel):
     # TLS
     tls_version: str = ""
     http_protocol: str = ""
+    # D1/V11 — the request VERB, forwarded by the edge. Bounded: it is
+    # attacker-influenced (a client picks its own method) and CF passes
+    # through any RFC-shaped token, so an unbounded field here would be a
+    # free string column. Empty = a worker that predates D1 (this model
+    # ignores unknown fields, so BOTH deploy orders are safe — pinned by
+    # tests/unit/test_http_method_recording.py).
+    http_method: str = Field(default="", max_length=20)
     # URL
     hostname: str = ""
     path: str = ""

@@ -1931,6 +1931,23 @@ _NO_DOMAIN_MATCH = DomainResolution(None, 0, None, False, "none")
 _DOMAIN_BLOCKED = DomainResolution(None, 0, None, True, "blocked")
 
 
+def _root_rung_allowed(first_segment: str, param_c: str) -> bool:
+    """V18 / A1b — may this request fall through to the domain ROOT binding?
+
+    Yes when the request named NO selector (a bare visit), which is exactly
+    what a root binding exists to answer. No when it named one that matched
+    nothing: answering that with someone else's campaign is not routing, it is
+    a catch-all that mints clicks for scanner probes.
+
+    `settings.root_fallthrough_on_unmatched_selector` restores the old
+    unconditional behaviour in one env var -- see the flag's comment in
+    config.py for the staging census that decided the default.
+    """
+    if settings.root_fallthrough_on_unmatched_selector:
+        return True
+    return not (first_segment or param_c)
+
+
 def _parse_binding_value(raw: str | None) -> tuple[str, int, str | None]:
     """Parse a `domain:...` Redis value → (campaign_id, binding_id, binding_alias).
 
@@ -2100,7 +2117,8 @@ async def resolve_domain_campaign(r, req: ClickRequest) -> DomainResolution:
             keys_to_check.append(("path", f"domain:{hostname}:path:{first_segment}"))
         if param_c:
             keys_to_check.append(("param", f"domain:{hostname}:param:{param_c}"))
-        keys_to_check.append(("root", f"domain:{hostname}:root"))
+        if _root_rung_allowed(first_segment, param_c):
+            keys_to_check.append(("root", f"domain:{hostname}:root"))
         keys_to_check.append(("subdomain", f"domain:{sub_base}:subdomain:{sub_label}"))
 
         hit = await _first_match(keys_to_check, r)
@@ -2133,9 +2151,10 @@ async def resolve_domain_campaign(r, req: ClickRequest) -> DomainResolution:
         keys_to_check.append(("param", f"domain:{hostname}:param:{param_c}"))
         if base_domain != hostname:
             keys_to_check.append(("param", f"domain:{base_domain}:param:{param_c}"))
-    keys_to_check.append(("root", f"domain:{hostname}:root"))
-    if base_domain != hostname:
-        keys_to_check.append(("root", f"domain:{base_domain}:root"))
+    if _root_rung_allowed(first_segment, param_c):
+        keys_to_check.append(("root", f"domain:{hostname}:root"))
+        if base_domain != hostname:
+            keys_to_check.append(("root", f"domain:{base_domain}:root"))
 
     hit = await _first_match(keys_to_check, r)
     if hit:

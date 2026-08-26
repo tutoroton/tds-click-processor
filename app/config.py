@@ -655,6 +655,38 @@ class Settings(BaseSettings):
     identity_redis_url: str = ""
     returning_uid_ttl_seconds: int = 15_552_000  # 180 days
 
+    # V18 / A1b — KILL-SWITCH for the unmatched-selector refusal.
+    #
+    # DEFAULT FALSE, i.e. the REFUSAL IS ON. Setting this True restores the
+    # old permissive behaviour (fall through to the domain root even when the
+    # request named a selector that matched nothing), and is the one-env-var
+    # way back if the refusal ever turns out to refuse something real.
+    #
+    # WHY THE REFUSAL IS THE DEFAULT. The root rung used to be appended
+    # UNCONDITIONALLY as the last rung, so a domain's root binding became a
+    # universal catch-all: every scanner probe on the domain minted a click
+    # attributed to a real earning campaign. Measured on staging over 30 days,
+    # by binding TYPE (read from campaign_domains, not inferred):
+    #     212 geotdsclicks.com  root   15 624 clicks, 14 195 (90.9%) non-bare
+    #     314 geotds.xyz        root    6 787 clicks,  5 498 (81.0%) non-bare
+    # and the head of 212's path census is entirely scanner traffic --
+    # /wp-admin/install.php 368 - /robots.txt 137 - /favicon.ico 100 -
+    # /wp-login.php 80 - /.env 69 - /.git/config 52 - /xmlrpc.php 41. Not one
+    # landing-page-shaped path appears.
+    #
+    # WHAT IS DELIBERATELY NOT REFUSED: a BARE request (no path segment and no
+    # ?c=) still resolves to root, which is what a root binding is FOR. Only a
+    # request that NAMED a selector and matched nothing stops falling through.
+    # A path- or param-bound request that MATCHES is untouched -- verified on
+    # the same census: binding 334 (path `audit-split`) and the param bindings
+    # 216/227/231 match their own rung and never reach this decision.
+    #
+    # THE RESIDUAL RISK, NAMED: a root-bound domain whose ads deep-link into a
+    # path would now be refused instead of silently routed. That population is
+    # ZERO in everything measured above, but it is not impossible -- hence the
+    # kill-switch rather than a deletion of the branch.
+    root_fallthrough_on_unmatched_selector: bool = False
+
     # ------------------------------------------------------------------
     # Signed identity cookie (`_tds_id`) — Layer-1 RECOGNITION (P2, DARK).
     # SoT: docs/development/returning-users-v2/DECISION-edge-identity-architecture.md

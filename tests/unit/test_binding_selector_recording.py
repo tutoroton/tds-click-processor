@@ -97,24 +97,34 @@ class TestWhichTierAnswered:
         assert res.match_tier == "path"
 
     @pytest.mark.asyncio
-    async def test_an_unknown_param_selector_falls_to_root_AND_SAYS_SO(self):
-        """THE 14 129 CASE. The visitor asked for something we do not have; the
-        click is served by the catch-all. `binding_id` alone cannot express that
-        — it reads 212 either way."""
+    async def test_an_unknown_param_selector_NO_LONGER_falls_to_root(self):
+        """THE 14 129 CASE — and A1b SUPERSEDES what A1a pinned here.
+
+        A1a asserted `binding_id == 212` with the comment "routing is UNCHANGED",
+        because A1a's whole job was to RECORD the dismissal without altering it.
+        A1b is the decision that followed, and it changes exactly this: a request
+        that NAMED a selector we do not have no longer inherits someone else's
+        campaign. Same population, one deliberate step later.
+        """
         r = _FakeRedis({f"domain:{HOST}:root": ROOT_BINDING})
         res = await resolve_domain_campaign(
             r, _req(hostname=HOST,
                     query_params={BINDING_SELECTOR_KEY: "rfixprobe-unknown-9x7q"}))
-        assert res.binding_id == 212, "routing is UNCHANGED — still the root binding"
-        assert res.match_tier == "root", "…but the dismissal is now recorded"
+        assert res.binding_id != 212, "the root catch-all must no longer answer"
+        assert res.campaign_id is None
+        assert not res.blocked, (
+            "this is a geo fall-through (_NO_DOMAIN_MATCH), NOT a hard block — "
+            "refusing outright would be a bigger change than the finding asked for"
+        )
 
     @pytest.mark.asyncio
-    async def test_an_unknown_path_selector_falls_to_root_AND_SAYS_SO(self):
+    async def test_an_unknown_path_selector_NO_LONGER_falls_to_root(self):
+        """The scanner-probe case, which is 90.9% of binding 212's traffic."""
         r = _FakeRedis({f"domain:{HOST}:root": ROOT_BINDING})
         res = await resolve_domain_campaign(
             r, _req(hostname=HOST, path="/wp-admin/install.php"))
-        assert res.binding_id == 212
-        assert res.match_tier == "root"
+        assert res.binding_id != 212
+        assert res.campaign_id is None
 
     @pytest.mark.asyncio
     async def test_no_selector_at_all_also_reports_root(self):
@@ -167,3 +177,85 @@ class TestTheReservedKeyIsHandledOneWayOnEveryPath:
         `?campaign=` or `?category=` is ordinary advertiser data."""
         extras = _build_extra_params(None, {"campaign": "x", "category": "y"})
         assert extras == {"campaign": "x", "category": "y"}
+
+
+class TestA1bUnmatchedSelectorRefusal:
+    """A1b / V18 — the DECISION that followed A1a's measurement.
+
+    A1a made the dismissal visible; this class pins what we decided to do about
+    it. Every assertion below is about ROUTING, not recording.
+
+    WHY THE ROOT RUNG WAS THE PROBLEM: it was appended UNCONDITIONALLY as the
+    last rung, so a root binding became a universal catch-all. Measured on
+    staging over 30 days, binding types read from `campaign_domains` rather than
+    inferred (the first cut of this measurement did NOT separate them and was
+    wrong — a path-bound binding legitimately has a non-bare path):
+
+        212 geotdsclicks.com  root  15 624 clicks, 14 195 (90.9%) non-bare
+        314 geotds.xyz        root   6 787 clicks,  5 498 (81.0%) non-bare
+        334 geotdsclicks.com  path      305 clicks — MATCHES its own rung
+        216/227/231           param     323 clicks — MATCH their own rung
+
+    and 212's path census is scanner traffic top to bottom: /wp-admin/install.php
+    368 · /robots.txt 137 · /favicon.ico 100 · /wp-login.php 80 · /.env 69 ·
+    /.git/config 52 · /xmlrpc.php 41. No landing-page-shaped path appears at all.
+    """
+
+    @pytest.mark.asyncio
+    async def test_CONTROL_a_bare_request_still_reaches_root(self):
+        """The one that stops this being 'refuse everything'. A bare visit is
+        what a root binding is FOR, and it must keep working."""
+        r = _FakeRedis({f"domain:{HOST}:root": ROOT_BINDING})
+        res = await resolve_domain_campaign(r, _req(hostname=HOST, path="/"))
+        assert res.binding_id == 212
+        assert res.campaign_id == "35"
+        assert res.match_tier == "root"
+
+    @pytest.mark.asyncio
+    async def test_CONTROL_a_matching_path_selector_still_routes(self):
+        """Binding 334's real population — it matches its own rung and must be
+        untouched by a change aimed at UNMATCHED selectors."""
+        r = _FakeRedis({f"domain:{HOST}:path:audit-split": PATH_BINDING,
+                        f"domain:{HOST}:root": ROOT_BINDING})
+        res = await resolve_domain_campaign(
+            r, _req(hostname=HOST, path="/audit-split"))
+        assert res.binding_id == 902
+        assert res.match_tier == "path"
+
+    @pytest.mark.asyncio
+    async def test_CONTROL_a_matching_param_selector_still_routes(self):
+        r = _FakeRedis({f"domain:{HOST}:param:t2-seg": PARAM_BINDING,
+                        f"domain:{HOST}:root": ROOT_BINDING})
+        res = await resolve_domain_campaign(
+            r, _req(hostname=HOST, path="/",
+                    query_params={BINDING_SELECTOR_KEY: "t2-seg"}))
+        assert res.binding_id == 901
+        assert res.match_tier == "param"
+
+    @pytest.mark.asyncio
+    async def test_the_KILL_SWITCH_restores_the_old_fallthrough(self, monkeypatch):
+        """A guard I cannot turn off is a guard I cannot roll back.
+
+        This is also the calibration in the OTHER direction: it proves the two
+        refusal tests above fail for the reason claimed (the new rule), not
+        because the fixture stopped resolving anything at all.
+        """
+        from app.config import settings as live_settings
+
+        monkeypatch.setattr(
+            live_settings, "root_fallthrough_on_unmatched_selector", True)
+        r = _FakeRedis({f"domain:{HOST}:root": ROOT_BINDING})
+        res = await resolve_domain_campaign(
+            r, _req(hostname=HOST, path="/wp-admin/install.php"))
+        assert res.binding_id == 212, "kill-switch must restore the old behaviour"
+        assert res.match_tier == "root"
+
+    def test_the_helper_is_the_one_deciding_and_not_a_stray_import(self):
+        """Structural, and deliberately NOT `hasattr` — presence of a name proves
+        nothing. This asserts the helper answers the four cases directly."""
+        from app.router import _root_rung_allowed
+
+        assert _root_rung_allowed("", "") is True, "bare request keeps root"
+        assert _root_rung_allowed("wp-admin", "") is False
+        assert _root_rung_allowed("", "unknown-seg") is False
+        assert _root_rung_allowed("wp-admin", "unknown-seg") is False

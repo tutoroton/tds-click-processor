@@ -28,6 +28,8 @@ from sentry_sdk.integrations.fastapi import FastApiIntegration
 from sentry_sdk.integrations.logging import LoggingIntegration
 from sentry_sdk.integrations.starlette import StarletteIntegration
 from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
 
 from app.config import _LOCAL_ENVIRONMENTS, settings
@@ -533,6 +535,61 @@ async def _check_tds_key(x_tds_key: str) -> int:
     # No legacy global-secret fallback (removed F.25 — see the
     # SINGLE-PATH PER-WORKER AUTH note above the helper).
     raise HTTPException(status_code=403, detail="Invalid TDS key")
+
+
+@app.exception_handler(RequestValidationError)
+async def _validation_error_handler(request: Request, exc: RequestValidationError):
+    """D2/V17 — do not describe the request schema to a caller that has not
+    authenticated.
+
+    THE DEFECT, measured on deployed node 55 (2026-08-26): `/decide` declares
+    `req: ClickRequest` as a BODY model and reads `X-TDS-Key` inside the
+    function. FastAPI validates the body while solving parameters, i.e. BEFORE
+    the handler body runs, so the auth check never happened yet:
+
+        no key + {}                -> 422 {"loc":["body","click_id"],
+                                           "msg":"Field required"}
+        no key + a VALID body      -> 403 {"detail":"Invalid TDS key"}
+        wrong key + {"click_id":12345}
+                                   -> 422 "Input should be a valid string",
+                                      and it echoes `12345` straight back
+
+    The 403 arm is what makes this a finding rather than an observation: the
+    endpoint IS gated, and the validator answers in front of the gate. So an
+    unauthenticated caller can enumerate field names, types and required-ness
+    one malformed request at a time, and see its own input reflected.
+
+    THE RULE APPLIED HERE: a caller that cannot authenticate learns nothing
+    about the shape of the request. It gets the SAME 403 it would have got for
+    a well-formed body, so malformed and well-formed are indistinguishable
+    before auth.
+
+    Why a handler and not a `Depends`: auth on this endpoint is not a pure
+    header check. A smoke click authenticates by the X-TDS-Smoke-Probe HMAC and
+    is recognised by `req.click_id`'s prefix — i.e. from the BODY. A dependency
+    that ran before body validation could not make that distinction. This
+    handler runs only when validation has ALREADY failed, in which case there
+    is no usable body and X-TDS-Key is the only credential that could apply; a
+    genuine smoke probe sends a well-formed body and never reaches here.
+
+    Not a hot path: this runs only on a request that failed validation, so the
+    added key lookup costs nothing on the click path.
+
+    Authenticated callers keep the full detail — the CF Worker still gets a
+    precise 422 when it sends something malformed with a valid key, which is
+    the diagnostic that makes a real integration bug findable.
+    """
+    key = request.headers.get("X-TDS-Key", "")
+    try:
+        await _check_tds_key(key)
+    except Exception:  # noqa: BLE001 — HTTPException(403) or any lookup failure
+        # Fail CLOSED, exactly as _check_tds_key itself does: if we could not
+        # establish that this caller is allowed to talk to us, we do not
+        # describe ourselves to it.
+        return JSONResponse(
+            status_code=403, content={"detail": "Invalid TDS key"}
+        )
+    return JSONResponse(status_code=422, content={"detail": exc.errors()})
 
 
 def _sync_secret_matches(x_tds_key: str) -> bool:

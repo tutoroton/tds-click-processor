@@ -28,6 +28,8 @@ from sentry_sdk.integrations.fastapi import FastApiIntegration
 from sentry_sdk.integrations.logging import LoggingIntegration
 from sentry_sdk.integrations.starlette import StarletteIntegration
 from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
 
 from app.config import _LOCAL_ENVIRONMENTS, settings
@@ -51,6 +53,7 @@ from app.redis_client import (
     close_shipper_redis,
 )
 from app.router import route, get_full_ua_info, parse_accept_language, coerce_cost
+from app.resolution import BINDING_SELECTOR_KEY
 from app.ua_parser import warmup as warmup_ua_parser
 from app.shipper import assert_shipper_ready, run_shipper
 from app.shipper_metrics import metrics as shipper_metrics
@@ -534,6 +537,61 @@ async def _check_tds_key(x_tds_key: str) -> int:
     raise HTTPException(status_code=403, detail="Invalid TDS key")
 
 
+@app.exception_handler(RequestValidationError)
+async def _validation_error_handler(request: Request, exc: RequestValidationError):
+    """D2/V17 — do not describe the request schema to a caller that has not
+    authenticated.
+
+    THE DEFECT, measured on deployed node 55 (2026-08-26): `/decide` declares
+    `req: ClickRequest` as a BODY model and reads `X-TDS-Key` inside the
+    function. FastAPI validates the body while solving parameters, i.e. BEFORE
+    the handler body runs, so the auth check never happened yet:
+
+        no key + {}                -> 422 {"loc":["body","click_id"],
+                                           "msg":"Field required"}
+        no key + a VALID body      -> 403 {"detail":"Invalid TDS key"}
+        wrong key + {"click_id":12345}
+                                   -> 422 "Input should be a valid string",
+                                      and it echoes `12345` straight back
+
+    The 403 arm is what makes this a finding rather than an observation: the
+    endpoint IS gated, and the validator answers in front of the gate. So an
+    unauthenticated caller can enumerate field names, types and required-ness
+    one malformed request at a time, and see its own input reflected.
+
+    THE RULE APPLIED HERE: a caller that cannot authenticate learns nothing
+    about the shape of the request. It gets the SAME 403 it would have got for
+    a well-formed body, so malformed and well-formed are indistinguishable
+    before auth.
+
+    Why a handler and not a `Depends`: auth on this endpoint is not a pure
+    header check. A smoke click authenticates by the X-TDS-Smoke-Probe HMAC and
+    is recognised by `req.click_id`'s prefix — i.e. from the BODY. A dependency
+    that ran before body validation could not make that distinction. This
+    handler runs only when validation has ALREADY failed, in which case there
+    is no usable body and X-TDS-Key is the only credential that could apply; a
+    genuine smoke probe sends a well-formed body and never reaches here.
+
+    Not a hot path: this runs only on a request that failed validation, so the
+    added key lookup costs nothing on the click path.
+
+    Authenticated callers keep the full detail — the CF Worker still gets a
+    precise 422 when it sends something malformed with a valid key, which is
+    the diagnostic that makes a real integration bug findable.
+    """
+    key = request.headers.get("X-TDS-Key", "")
+    try:
+        await _check_tds_key(key)
+    except Exception:  # noqa: BLE001 — HTTPException(403) or any lookup failure
+        # Fail CLOSED, exactly as _check_tds_key itself does: if we could not
+        # establish that this caller is allowed to talk to us, we do not
+        # describe ourselves to it.
+        return JSONResponse(
+            status_code=403, content={"detail": "Invalid TDS key"}
+        )
+    return JSONResponse(status_code=422, content={"detail": exc.errors()})
+
+
 def _sync_secret_matches(x_tds_key: str) -> bool:
     """Constant-time check of the static admin→node sync credential.
 
@@ -965,6 +1023,7 @@ def _decision_reason(result: dict, timing: dict, attr: dict) -> str:
 
 def _phase3_attribution_fields(
     result: dict, req: ClickRequest, timing: dict, routing_decision_ts: str,
+    ua_is_bot: bool = False,
 ) -> dict:
     """Build the Phase-3 column additions for one click record.
 
@@ -1041,6 +1100,14 @@ def _phase3_attribution_fields(
         "worker_colo": req.colo or "",
         "tls_version": req.tls_version or "",
         "http_protocol": req.http_protocol or "",
+        # D1/V11 — the request VERB. Read straight from the request, like
+        # its neighbours, so it is present on EVERY click regardless of
+        # whether routing reached a campaign. Uppercased because the HTTP
+        # grammar is case-sensitive but clients are not always careful, and
+        # a column split across "GET"/"get" cannot be counted.
+        # "" = an edge that predates D1 — NOT the same as "no method"
+        # (every HTTP request has one), and no read may conflate them.
+        "http_method": (req.http_method or "").upper(),
         "hostname": req.hostname or "",
         "path": req.path or "",
         "language": parse_accept_language(req.accept_language) or "",
@@ -1082,7 +1149,23 @@ def _phase3_attribution_fields(
         # branch pre/post cutover (the two columns are non-complementary across
         # the boundary).
         "flags_semantics_version": _FLAGS_SEMANTICS_VERSION if "is_unique" in attr else 0,
-        "is_bot": req.is_bot,
+        # is_bot — the UNION of the two detectors we actually have (C2/V9).
+        # `req.is_bot` is the EDGE verdict (CF Bot Management). We hold no CF
+        # Bot Management subscription, so on real traffic it is False for every
+        # click; the only 1s ever written came from the synthetic load generator
+        # and were ~2% random noise on ORDINARY browser UAs (the SAME UA string
+        # appears on both sides of the flag), while genuine crawlers -- curl,
+        # TLM-Audit-Scanner, WordPress-install probes -- were all recorded as
+        # human. `ua_is_bot` is device_detector's verdict, which this service
+        # has always COMPUTED (ua_parser.parse_ua) and never stored: measured on
+        # live staging it identifies 266 of 5606 distinct UAs and 14.78% of real
+        # post-load-generator clicks (ClaudeBot, Amazonbot, ChatGPT-User,
+        # PerplexityBot, OAI-SearchBot, cohere-ai, security scanners).
+        # OR, not replace: the two detectors are complementary -- CF catches a
+        # behavioural bot wearing a browser UA, device_detector catches one that
+        # declares itself -- so a click is a bot if EITHER says so, and the
+        # value stays correct if a CF subscription is ever added.
+        "is_bot": bool(req.is_bot) or bool(ua_is_bot),
         "is_proxy": req.is_proxy,
         "cf_ray": req.cf_ray or "",
         "request_id": req.request_id or "",
@@ -1145,6 +1228,19 @@ def _build_extra_params(attribution: dict | None, query_params: dict) -> dict:
     else:
         extras = dict(extras)
     extras.pop("debug", None)
+    # A1a/V18 — the binding selector is GLOBALLY RESERVED routing control
+    # (F-PARAM-2), never advertiser data. `resolve_slots` drops it on the
+    # RESOLVED path, but the no-match / pre-campaign branch above rebuilds
+    # extras from the RAW query params and so re-admitted it: the guard covered
+    # one path of two. Measured on deployed staging 2026-08-25 — one click in
+    # 252 568 over 30 days carried `{"c":"zz-a5-1787358817","routing_status":
+    # "blocked"}`, i.e. the reserved key masquerading as a custom param. Rare
+    # only because a no-match click carrying `?c=` is rare; the mechanism was
+    # unconditional. Dropped here so ONE rule holds on BOTH paths, and the value
+    # is not lost either: it is recorded in the dedicated `binding_selector`
+    # column, which is where the F-PARAM-2 comment already claimed binding
+    # attribution lived.
+    extras.pop(BINDING_SELECTOR_KEY, None)
     # GTD-R166 W2 — `_param_rules` is a SYSTEM-controlled provenance key (written
     # post-resolution by the record builder). Strip any advertiser-supplied
     # `?_param_rules=` on EVERY path (matched + no-match) so a forged value can
@@ -1511,6 +1607,17 @@ async def decide(
         # domain binding) default to 0 / "" (the "(default)" bucket).
         "binding_id": result.get("binding_id", 0),
         "binding_alias": result.get("binding_alias") or "",
+        # A1a/V18 — what the visitor ASKED for, and whether we honoured it.
+        # `binding_id`/`binding_alias` above record only the WINNER, so a click
+        # that asked for an unknown selector and fell through to the root binding
+        # was byte-identical to a visit to the bare domain. The selector is read
+        # straight from the request (never from the resolver) so it is present on
+        # every path, including the ones that never reach a campaign; the tier
+        # rides on `timing`, which every exit of route() returns.
+        # "" tier = route() did not run at all — NOT the same as "none", which
+        # means it ran and found no domain binding.
+        "binding_selector": str((qp or {}).get(BINDING_SELECTOR_KEY, "") or ""),
+        "binding_match_tier": routing_timing.get("binding_match_tier", ""),
         # Defensive: every path that reaches here now sets a string url
         # (matched offer OR fallback) — `.get` guards a hypothetical None
         # from becoming a KeyError (it lands as SQL NULL instead).
@@ -1578,7 +1685,10 @@ async def decide(
     # from the resolver's unmapped-key set in the literal.
     click_record["click_schema_version"] = _CLICK_SCHEMA_VERSION
     click_record.update(
-        _phase3_attribution_fields(result, req, timing, _utc_now_ms_iso())
+        _phase3_attribution_fields(
+            result, req, timing, _utc_now_ms_iso(),
+            ua_is_bot=bool(ua_info.get("is_bot")),
+        )
     )
 
     # P3 (2026-06-06) — MINT / re-stamp the signed `_tds_id` identity cookie for

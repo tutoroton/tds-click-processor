@@ -201,7 +201,7 @@ class TestBuildUrl:
     """Vector 2.8 — build_url integrates resolve_slots + safe_substitute.
 
     Macros split into three layers (precedence ascending):
-      1. Slot layer — sub1..sub20 + 19 reserved slots resolved via
+      1. Slot layer — sub1..sub20 + 20 reserved slots resolved via
          the merged source∪campaign mapping chain.
       2. Worker-auto layer — country, city, ip, user_agent, ...
          (system-fixed names, populated from request).

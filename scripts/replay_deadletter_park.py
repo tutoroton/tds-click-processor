@@ -49,6 +49,24 @@ Safety properties, each deliberate:
   from the service's own settings, never re-invented here.
 * **Never trims, never MAXLENs.** Re-injection matches `_retry_click`
   exactly: `XADD stream:clicks {"data": <click json>}`, no `maxlen`.
+* **Says out loud that it does NOT know whether a click is already stored**
+  (V12/NV-021, 2026-08-25). Every other replay tool in this system can ask
+  ClickHouse; this one cannot, and must not learn how: rule `architecture`
+  makes it an invariant that the click-processor never reads PG or CH, and
+  breaching an architecture invariant to improve a script is the wrong
+  trade. So instead of guessing, it states the gap and names the handoff.
+
+  🔴 **The handoff, when you need the answer:** export here, carry the file
+  to the central host, and ask the collector's tool, which has the client --
+
+      # on this node
+      python3 scripts/replay_deadletter_park.py export --out /root/park.jsonl
+      # on the central host, against the same file
+      python3 scripts/replay_poison_park.py check --in /root/park.jsonl
+
+  Replaying without doing that is not dangerous -- every reader plane
+  deduplicates by design -- but it may restore nothing while reporting
+  success, which is the defect this note exists to stop being invisible.
 """
 
 from __future__ import annotations
@@ -207,6 +225,20 @@ async def _assert_safe_to_write(r) -> None:
             )
 
 
+# V12/NV-021: this tool cannot see ClickHouse (and must not -- see the
+# module docstring). Both `list` and `replay` print this so that "restored
+# it" and "re-sent something already stored" are never silently the same
+# outcome.
+_NO_DOWNSTREAM_CHECK = (
+    "  NOTE: this tool does NOT know whether these clicks are already stored "
+    "downstream —\n"
+    "  an edge node has no ClickHouse client by design. To find out: "
+    "`export --out FILE` here,\n"
+    "  then on the central host "
+    "`python3 scripts/replay_poison_park.py check --in FILE`."
+)
+
+
 async def cmd_list(r, args) -> int:
     reasons: Counter = Counter()
     total = 0
@@ -236,6 +268,9 @@ async def cmd_list(r, args) -> int:
         print(f"\nNOTE: {claimed_files} claimed snapshot(s) above are safe to "
               f"replay — this tool re-adopts them automatically. They are NOT "
               f"counted by /health's per-worker park depth.")
+    if total:
+        print()
+        print(_NO_DOWNSTREAM_CHECK)
     return 0
 
 
@@ -321,6 +356,8 @@ async def cmd_replay(r, args) -> int:
 
     verb = "would replay" if not args.apply else "replayed"
     print(f"{verb} {replayed}, skipped {skipped} (no payload), failed {failed}")
+    if replayed:
+        print(_NO_DOWNSTREAM_CHECK)
     if not args.apply:
         print("DRY RUN — nothing was written or deleted. Re-run with --apply.")
     return 1 if failed else 0

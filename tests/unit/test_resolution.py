@@ -223,7 +223,7 @@ class TestPriority4Null:
         enumerated it. The same-named GET key was a stranger that
         landed in ``extras``.
 
-        Post-F.X: every name in ``CANONICAL_SLOTS`` (39 names) is a
+        Post-F.X: every name in ``CANONICAL_SLOTS`` (40 names) is a
         primary input key for its slot regardless of whether an
         entry exists. A same-named GET key auto-binds.
 

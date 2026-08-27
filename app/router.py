@@ -154,6 +154,17 @@ async def route(req: ClickRequest) -> dict | None:
     t0 = time.perf_counter()
     resolution = await resolve_domain_campaign(r, req)
     timing["domain_resolve_ms"] = _ms_since(t0)
+    # A1a/V18 — which tier answered, carried on `timing` because `timing` is the
+    # ONE object every exit of this function already returns (matched, blocked,
+    # fall-through and the caller's fallback, which copies it). Threading a new
+    # kwarg through `_route_via_campaign` instead would mean editing 10+ sites
+    # and the value would be absent on exactly the branch nobody tests.
+    # ONLY the closed enum rides here: the raw selector is attacker-supplied and
+    # `timing` is written to a JSON column with NO length cap, so putting it here
+    # would trade one recording gap for an unbounded write. The selector is taken
+    # from the request in `main._build_click_record`, where the collector's
+    # 255-char cap applies to it.
+    timing["binding_match_tier"] = resolution.match_tier
 
     # §6 (F.30 security): an unmatched subdomain of a wildcard-enabled
     # base fails closed — it must NOT inherit the base's binding nor
@@ -1222,30 +1233,62 @@ async def _route_via_campaign(
         )
 
     # Stage 8 — legacy URL build via offer.url / target resolution.
-    # v2 C2 — resolve_target now honours the availability floor so the legacy
-    # path never RE-SERVES a drained/closed target; an unavailable target is
-    # skipped → falls to the offer's available default / bare url (byte-identical
-    # when all targets active).
-    # OBS-B1/B2 (audit-2 2026-06-07) — ACCEPTED DRIFT-ONLY RESIDUAL, documented.
-    # `resolve_target` returns None both when (a) the offer has NO targets at all
-    # (legit → serve the offer's own `url`), and when (b) the offer HAS targets
-    # but ALL were availability-excluded (drained/closed). In case (b) the legacy
-    # path serves the bare `offer.url` rather than the campaign terminal_fallback
-    # — bypassing the no-dead-end availability machine. This is NOT fixed by a
-    # contract change here because:
-    #   * It is NOT reachable via authored config — admin-api rejects an offer /
-    #     split that has no valid active target, so a live offer always has at
-    #     least one servable target. Case (b) only arises from DRIFT (every target
-    #     manually drained/closed out-of-band), out of the availability-machine
-    #     scope by design.
-    #   * The bare `offer.url` is itself an admin-AUTHORED destination, so even in
-    #     the drift case the click routes to a real URL (not a 404 dead-end) — the
-    #     only gap is provenance (offer.url vs campaign terminal_fallback).
-    #   * A clean distinction would change `resolve_target`'s deliberate C2
-    #     contract ("all-excluded → None → bare url") and break its pinning test
-    #     (`test_c2_availability_delivery.test_closed_default_excluded`) — higher
-    #     risk than the residual it removes. The cascade path already routes
-    #     all-unavailable flows to terminal_fallback (the reachable case).
+    #
+    # v2 C2 — `resolve_target` honours the availability floor: an unavailable
+    # target IS skipped. What it falls back to is NOT availability-checked, and
+    # the description that stood here until 2026-08-25 was false about that in
+    # four places. The two facts below are MEASURED on deployed staging, not
+    # inferred. Read them before changing anything in this stage.
+    #
+    # (1) THE FALLBACK CAN RE-SERVE THE CLOSED TARGET. When `resolve_target`
+    #     returns None because every target was availability-excluded, this path
+    #     serves `offer.url` — and `offer:<id>.url` is published by
+    #     `sync/builders/offers.py` from the DEFAULT TARGET's `url_template`,
+    #     whose subquery filters `status='active' AND is_default` with NO
+    #     availability filter. So the URL served is the closed default target's
+    #     own destination. Offer 181 / target 195 (availability=closed) / 304
+    #     clicks / 270 unique visitors reached exactly that URL. It happens on
+    #     every offer where NO target is available AND the default is closed —
+    #     NOT merely wherever a default is closed: the loop skips an unavailable
+    #     target and keeps going, so an offer with a closed default and a live
+    #     sibling routes normally. Those two conditions coincide on today's fleet
+    #     only because all three such offers happen to have zero servable targets.
+    #     What makes it operator-invisible is not a missing reason — the row
+    #     carries `decision_reason='matched_legacy_split'` — nor `offer_target_id=0`,
+    #     which the legacy path stamped unconditionally before R68. It is that
+    #     nothing distinguishes this from an ordinary legacy-split serve except
+    #     `landing_url` matching the closed target's template byte for byte.
+    #     This comment DESCRIBES that behaviour; it does not endorse it. Whether
+    #     to keep it is an open decision (programme item A5), and it is
+    #     money-bearing: it overrides the availability/cap machine.
+    #
+    # (2) IT IS REACHABLE WITHOUT DRIFT. Two measurements, no inference beyond
+    #     them: target 195's row has `updated_at == created_at`, i.e. it has never
+    #     been updated since it was created on 2026-06-06; and the automation
+    #     ledger holds no row for offers 181/210/211 or any of their targets. So
+    #     the availability machine did not put them here. (Concluding it was
+    #     CREATED closed would additionally assume nothing changes availability
+    #     without bumping `updated_at` — not verified.) Whatever admin-api
+    #     validation was assumed to make this state unreachable does not.
+    #
+    # What IS true, and verified end to end: the bare `offer.url` is an
+    # admin-AUTHORED destination, so the click reaches a real URL rather than a
+    # dead end. (`offers` carries no `url` column at all; the builder reads
+    # `offer_targets.url_template` on purpose — "canonical URL source moved to
+    # offer_targets in 2026-04".) NOT guaranteed, though: this fallback has no
+    # empty-string check, and 8 of 65 published offers would publish an EMPTY
+    # Redis url, which — by CODE READING, never observed — would emit
+    # `{"url": "", "status": 302}`, since the block sentinel is None and "" does
+    # not match it. No offer has ever been in that state, so unlike the two facts
+    # above this one is not a measurement.
+    # Also A5: "serve the closed target's URL" and "serve an empty 302" are two
+    # accidental answers to one undecided question — what do we serve when
+    # nothing is available?
+    #
+    # Deliberately NOT changed here: `resolve_target`'s C2 contract
+    # ("all-excluded → None → bare url") and its pinning test
+    # (`test_c2_availability_delivery.test_closed_default_excluded`). Changing the
+    # contract is the A5 decision; this is a correction of the record.
     t0 = time.perf_counter()
     target_url, chosen_tid = await resolve_target_with_id(r, offer, req, allowed_avail)
     url_template = target_url if target_url else offer.get("url", "")
@@ -1873,10 +1916,36 @@ class DomainResolution(NamedTuple):
     binding_id: int
     binding_alias: str | None
     blocked: bool
+    #: A1a/V18 — which tier actually produced the binding:
+    #: subdomain | path | param | root | none | blocked.
+    #: `root` is the one that matters: a binding WAS found, but only the
+    #: catch-all, so whatever the visitor asked for was NOT honoured. Until this
+    #: existed, that click was indistinguishable from a visit to the bare domain
+    #: — measured 2026-08-25 on deployed staging, 14 129 of campaign 35's 15 977
+    #: domain-resolved clicks in 30 days.
+    #: Defaulted so the module-level sentinels below stay valid literals.
+    match_tier: str = ""
 
 
-_NO_DOMAIN_MATCH = DomainResolution(None, 0, None, False)
-_DOMAIN_BLOCKED = DomainResolution(None, 0, None, True)
+_NO_DOMAIN_MATCH = DomainResolution(None, 0, None, False, "none")
+_DOMAIN_BLOCKED = DomainResolution(None, 0, None, True, "blocked")
+
+
+def _root_rung_allowed(first_segment: str, param_c: str) -> bool:
+    """V18 / A1b — may this request fall through to the domain ROOT binding?
+
+    Yes when the request named NO selector (a bare visit), which is exactly
+    what a root binding exists to answer. No when it named one that matched
+    nothing: answering that with someone else's campaign is not routing, it is
+    a catch-all that mints clicks for scanner probes.
+
+    `settings.root_fallthrough_on_unmatched_selector` restores the old
+    unconditional behaviour in one env var -- see the flag's comment in
+    config.py for the staging census that decided the default.
+    """
+    if settings.root_fallthrough_on_unmatched_selector:
+        return True
+    return not (first_segment or param_c)
 
 
 def _parse_binding_value(raw: str | None) -> tuple[str, int, str | None]:
@@ -1922,17 +1991,27 @@ def _parse_binding_value(raw: str | None) -> tuple[str, int, str | None]:
     return s, 0, None
 
 
-async def _first_match(r, keys_to_check: list[str]) -> str | None:
-    """Batch-GET `keys_to_check` in one pipeline; first non-empty wins."""
+async def _first_match(
+    keys_to_check: list[tuple[str, str]], r
+) -> tuple[str, str] | None:
+    """Batch-GET `keys_to_check` in one pipeline; first non-empty wins.
+
+    Takes `(tier, redis_key)` pairs and returns `(tier, value)` — A1a/V18. The
+    tier is carried ALONGSIDE the key rather than parsed back out of it: a key is
+    `domain:{host}:path:{seg}` and a selector value may itself contain a colon,
+    so recovering the tier by splitting the string is a decoder that a crafted
+    selector can lie to. The caller already knows the tier when it builds the
+    list; the only reason it was ever lost is that this function dropped it.
+    """
     if not keys_to_check:
         return None
     pipe = r.pipeline()
-    for key in keys_to_check:
+    for _tier, key in keys_to_check:
         pipe.get(key)
     results = await pipe.execute()
-    for val in results:
+    for (tier, _key), val in zip(keys_to_check, results):
         if val:
-            return val
+            return tier, val
     return None
 
 
@@ -2035,17 +2114,19 @@ async def resolve_domain_campaign(r, req: ClickRequest) -> DomainResolution:
         #   3. No match → block (404).
         keys_to_check = []
         if first_segment:
-            keys_to_check.append(f"domain:{hostname}:path:{first_segment}")
+            keys_to_check.append(("path", f"domain:{hostname}:path:{first_segment}"))
         if param_c:
-            keys_to_check.append(f"domain:{hostname}:param:{param_c}")
-        keys_to_check.append(f"domain:{hostname}:root")
-        keys_to_check.append(f"domain:{sub_base}:subdomain:{sub_label}")
+            keys_to_check.append(("param", f"domain:{hostname}:param:{param_c}"))
+        if _root_rung_allowed(first_segment, param_c):
+            keys_to_check.append(("root", f"domain:{hostname}:root"))
+        keys_to_check.append(("subdomain", f"domain:{sub_base}:subdomain:{sub_label}"))
 
-        raw = await _first_match(r, keys_to_check)
-        if raw:
+        hit = await _first_match(keys_to_check, r)
+        if hit:
+            tier, raw = hit
             cid, bid, alias = _parse_binding_value(raw)
             if cid:
-                return DomainResolution(cid, bid, alias, False)
+                return DomainResolution(cid, bid, alias, False, tier)
         return _DOMAIN_BLOCKED  # §6 fail-closed
 
     # Non-wildcard host — behaviour identical to the pre-§6 resolver.
@@ -2061,24 +2142,26 @@ async def resolve_domain_campaign(r, req: ClickRequest) -> DomainResolution:
 
     keys_to_check = []
     if subdomain:
-        keys_to_check.append(f"domain:{base_domain}:subdomain:{subdomain}")
+        keys_to_check.append(("subdomain", f"domain:{base_domain}:subdomain:{subdomain}"))
     if first_segment:
-        keys_to_check.append(f"domain:{hostname}:path:{first_segment}")
+        keys_to_check.append(("path", f"domain:{hostname}:path:{first_segment}"))
         if base_domain != hostname:
-            keys_to_check.append(f"domain:{base_domain}:path:{first_segment}")
+            keys_to_check.append(("path", f"domain:{base_domain}:path:{first_segment}"))
     if param_c:
-        keys_to_check.append(f"domain:{hostname}:param:{param_c}")
+        keys_to_check.append(("param", f"domain:{hostname}:param:{param_c}"))
         if base_domain != hostname:
-            keys_to_check.append(f"domain:{base_domain}:param:{param_c}")
-    keys_to_check.append(f"domain:{hostname}:root")
-    if base_domain != hostname:
-        keys_to_check.append(f"domain:{base_domain}:root")
+            keys_to_check.append(("param", f"domain:{base_domain}:param:{param_c}"))
+    if _root_rung_allowed(first_segment, param_c):
+        keys_to_check.append(("root", f"domain:{hostname}:root"))
+        if base_domain != hostname:
+            keys_to_check.append(("root", f"domain:{base_domain}:root"))
 
-    raw = await _first_match(r, keys_to_check)
-    if raw:
+    hit = await _first_match(keys_to_check, r)
+    if hit:
+        tier, raw = hit
         cid, bid, alias = _parse_binding_value(raw)
         if cid:
-            return DomainResolution(cid, bid, alias, False)
+            return DomainResolution(cid, bid, alias, False, tier)
     return _NO_DOMAIN_MATCH
 
 
@@ -2268,6 +2351,17 @@ async def resolve_target_with_id(
             # exclusion on an unimplemented dim cannot silently pass for all
             # traffic (fail-open). An unknown dim drops this target.
             if dim not in cascade.KNOWN_EVALUATED_DIMS:
+                match = False
+                break
+
+            # V25 (2026-08-25) — the missing-VALUE sibling of the CF-3
+            # missing-DIM guard directly above, and kept in lockstep with
+            # `cascade._first_failing_criterion` by CALLING the same helper
+            # rather than restating the rule (a restated rule is how these two
+            # matchers drift). The dim is evaluated, but this click carries no
+            # value for it: `in` already dropped the target here, `not_in` did
+            # not, so an exclusion passed for every click we could not measure.
+            if click_val == "" and cascade.criterion_fails_on_missing_value(op):
                 match = False
                 break
 

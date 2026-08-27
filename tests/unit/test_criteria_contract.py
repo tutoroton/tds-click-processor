@@ -228,13 +228,21 @@ def test_time_of_day_regression_unpadded_and_two_digit_unaffected():
 
 def test_time_of_day_absent_click_fails_closed_preserved():
     """Absent arrival_ts ⇒ click_val "" passes through normalize unchanged →
-    fail-closed on `in`, fail-open on `not_in` (documented legacy semantics,
-    unchanged by R72)."""
+    fail-closed. THE SCOPE GUARD THIS TEST EXISTS FOR — that R72's hour
+    normalization does not disturb the absent-value case — is the `in` line,
+    and it is unchanged.
+
+    The `not_in` line asserted `is None` (fail-OPEN) and was annotated
+    "documented legacy semantics, unchanged by R72" — a statement that R72 did
+    not MOVE it, not a ratification that it was right. V25 (2026-08-25) settles
+    it: on a missing value only `empty` may hold, so `not_in` now drops too.
+    No ADR ever ratified the fail-open (checked: `.roadmap/decisions/`, only
+    ADR-0107 mentions `not_in`, and only as build scope)."""
     attrs = {"time_of_day": ""}
     assert _first_failing_criterion(
         [{"type": "time_of_day", "op": "in", "values": ["09"]}], attrs) is not None
     assert _first_failing_criterion(
-        [{"type": "time_of_day", "op": "not_in", "values": ["09"]}], attrs) is None
+        [{"type": "time_of_day", "op": "not_in", "values": ["09"]}], attrs) is not None
 
 
 def test_normalize_hour_scope_guard_other_digit_dims_untouched():
@@ -302,13 +310,20 @@ def test_language_bare_code_unaffected():
 
 def test_language_absent_click_fails_closed_preserved():
     """Absent/unparseable Accept-Language ⇒ click_val "" passes through
-    normalize unchanged → fail-closed on `in`, fail-open on `not_in`
-    (documented legacy semantics, unchanged by G1)."""
+    normalize unchanged → fail-closed. THE SCOPE GUARD THIS TEST EXISTS FOR —
+    that G1's BCP47 normalization does not disturb the absent-value case — is
+    the `in` line, and it is unchanged.
+
+    The `not_in` line asserted `is None` (fail-OPEN), annotated "documented
+    legacy semantics, unchanged by G1" — i.e. G1 did not MOVE it, not that it
+    was right. V25 (2026-08-25) settles it: on a missing value only `empty`
+    may hold. This is the dim where it mattered most — `language` is absent
+    from most clicks, so `language not_in [x]` excluded almost nothing."""
     attrs = {"language": ""}
     assert _first_failing_criterion(
         [{"type": "language", "op": "in", "values": ["en"]}], attrs) is not None
     assert _first_failing_criterion(
-        [{"type": "language", "op": "not_in", "values": ["en"]}], attrs) is None
+        [{"type": "language", "op": "not_in", "values": ["en"]}], attrs) is not None
 
 
 def test_normalize_language_scope_guard_other_case_preserve_dims_untouched():
@@ -424,7 +439,7 @@ _ADMIN_STRUCTURAL_CRITERION_TYPES = frozenset({
 
 # Mirror of admin-api `app/common/parameters.py` IDENTIFIER_SLOTS — the
 # owner's deliberate 34-slot subset (all 20 sub-slots + 14 named reserved
-# slots that pass the cohort-vs-per-click lens), not all 39 canonical slots.
+# slots that pass the cohort-vs-per-click lens), not all 40 canonical slots.
 # Filter V2 (2026-07-15): added the 10 cohort slots, removed `source_click_id`
 # (per-click id, not a group) — see admin-api `parameters.py`'s
 # IDENTIFIER_SLOTS comment for the full rationale + the `buyer_id` security
@@ -524,3 +539,75 @@ def test_cascade_still_fails_closed_on_a_token_outside_the_admin_vocabulary():
         {"param:creative_id": "x"},
     )
     assert failing is not None
+
+
+# ---- 9. MISSING VALUE on a KNOWN dim (V25) --------------------------------
+# Section 2 above enumerates the OPERATOR across the *unknown-dim* row. Nobody
+# ever drew the row for a dim the evaluator DOES know but for which THIS click
+# carries no value -- and there `not_in` was the one operator that still HELD,
+# i.e. an operator's "block these" was a no-op for exactly the traffic we could
+# not measure. `language` is the live instance: admin-accepted, evaluated, and
+# empty for most clicks.
+#
+# The rule these pin, stated once: ON A MISSING VALUE, ONLY `empty` HOLDS.
+# Every other operator makes a claim a missing value cannot substantiate, so it
+# fails CLOSED -- the posture `in` / `contains` / `not_empty` already had, and
+# the one `normalize_hour` / `normalize_language` already document in their own
+# docstrings ("preserving the absent-value fail-closed on `in`").
+
+_MISSING_VALUE_GRID = {
+    # op          -> does the criterion FAIL (drop the candidate)?
+    "in": True,
+    "not_in": True,          # V25: was False (fail-OPEN) before this fix
+    "contains": True,
+    "empty": False,          # the one operator a missing value satisfies
+    "not_empty": True,
+}
+
+
+def test_missing_value_grid_is_total_over_the_operator_universe():
+    """The grid must enumerate EVERY operator admin-api can persist. A new
+    operator added to `parameters.OPERATORS` with no decided missing-value row
+    is exactly how `not_in` stayed fail-OPEN."""
+    admin_operators = {"in", "not_in", "contains", "empty", "not_empty"}
+    assert set(_MISSING_VALUE_GRID) == admin_operators
+
+
+def test_known_dim_missing_value_every_operator():
+    """Cascade scalar path -- `language` known + evaluated, click carries none."""
+    for op, should_fail in _MISSING_VALUE_GRID.items():
+        values = [] if op in ("empty", "not_empty") else ["ru"]
+        c = [{"type": "language", "op": op, "values": values}]
+        failed = _first_failing_criterion(c, {"geo": "US", "language": ""}) is not None
+        assert failed is should_fail, (
+            f"language/{op} on a missing value: expected "
+            f"{'DROP' if should_fail else 'HOLD'}, got "
+            f"{'DROP' if failed else 'HOLD'}"
+        )
+
+
+def test_known_dim_absent_from_click_attrs_entirely():
+    """Same rule when the key is absent rather than empty -- `.get(dim, '')`."""
+    c = [{"type": "language", "op": "not_in", "values": ["ru"]}]
+    assert _first_failing_criterion(c, {"geo": "US"}) is not None
+
+
+def test_set_valued_dim_empty_history_not_in_fails_closed():
+    """Cascade set-valued path (prev_offer / prev_offer_target / prev_sub) -- an
+    EMPTY history set is the same "we measured nothing", and `in` already
+    dropped on it. `not_in` must too."""
+    c = [{"type": "prev_offer", "op": "not_in", "values": ["77"]}]
+    assert _first_failing_criterion(c, {"prev_offer": frozenset()}) is not None
+
+
+def test_set_valued_dim_empty_history_in_still_fails_closed():
+    """Control -- the `in` side of the same branch must not change."""
+    c = [{"type": "prev_offer", "op": "in", "values": ["77"]}]
+    assert _first_failing_criterion(c, {"prev_offer": frozenset()}) is not None
+
+
+def test_present_value_not_in_still_holds_and_still_excludes():
+    """Control -- the fix must not touch the case where we DO have a value."""
+    c = [{"type": "language", "op": "not_in", "values": ["ru"]}]
+    assert _first_failing_criterion(c, {"language": "en"}) is None
+    assert _first_failing_criterion(c, {"language": "ru"}) is not None

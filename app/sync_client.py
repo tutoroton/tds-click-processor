@@ -132,8 +132,30 @@ async def apply_snapshot(redis, snapshot: dict) -> dict:
         key_type = types.get(key, "string")
 
         if key_type == "hash" and isinstance(value, dict):
+            # B3/V24 (2026-08-25) — the SAME hoist A-2 applied to the set and
+            # list branches below, finally applied here. A-2 wrote the
+            # governing property in its own words — "HSET/SADD never remove
+            # omitted/absent members" — naming HSET, fixed the other two
+            # branches, and left this one. The comment that stood here,
+            # "HSET is idempotent — overwrites fields in-place, no delete
+            # needed", is TRUE of the fields you SEND and silent about the
+            # fields you STOP sending, which is the whole defect:
+            #   * a field dropped from the payload kept its old value forever;
+            #   * an ALL-THE-WAY-empty hash issued no command at all under the
+            #     `if value:` guard, so every stale field survived — exactly
+            #     the case A-2 hoisted for on set/list.
+            # Step 3's `stale_keys = all_existing - new_keys` only rescues a
+            # key that vanishes ENTIRELY; a key still present with fewer
+            # fields is precisely what it cannot see.
+            # Safe for the same reason as the branches below: the pipeline is
+            # `transaction=True` (above), so DELETE+HSET commit in ONE MULTI
+            # and no reader observes a missing key. For a non-empty hash this
+            # is byte-identical to before; DELETE of an absent key is a no-op.
+            # Verified before landing: the only other hash writer in this
+            # service is `/admin/seed` (main.py, whole-hash dev seeding) —
+            # nothing partially augments a sync-managed hash at runtime.
+            write_pipe.delete(key)
             if value:
-                # HSET is idempotent — overwrites fields in-place, no delete needed
                 write_pipe.hset(key, mapping={k: str(v) for k, v in value.items()})
         elif key_type == "set" and isinstance(value, list):
             # A-2: DELETE unconditionally (hoisted above the value guard)

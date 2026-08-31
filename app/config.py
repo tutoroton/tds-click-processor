@@ -732,6 +732,48 @@ class Settings(BaseSettings):
     # env-true alone changes no routing until a company opts in.
     returning_routing_enabled: bool = True
 
+    # ---------------------------------------------------------------- #
+    # Route preview (GTD-R965, 2026-08-31) — DARK by default            #
+    # ---------------------------------------------------------------- #
+    # Programme: docs/development/route-preview-2026-08-31/00-ANCHOR.md
+    #
+    # `route_code_keys` — the signing key RING for the carried routing
+    # decision, form `kid:secret,kid:secret` (kid = 0..255). A DEDICATED key:
+    # explicitly NOT `tds_secret_key` and NOT `identity_cookie_keys`, so a leak
+    # of either cannot forge a routing decision, and rotating this ring cannot
+    # disturb identity recognition. Empty ⇒ the codec is inert (verify returns
+    # None, sign raises) ⇒ byte-identical to pre-feature behaviour.
+    #
+    # ROTATION: add the NEW kid as `route_code_active_kid` while keeping the OLD
+    # kid(s) in the ring for the overlap window, so codes already handed to
+    # landing pages still verify. Drop a kid only after `route_code_ttl_seconds`
+    # has elapsed since it last signed anything.
+    #
+    # 🔴 The ring must be IDENTICAL across the fleet: the CF Worker races
+    # /decide to every node, so the node that verifies a code is in general NOT
+    # the node that minted it. A per-node ring would make honouring a code a
+    # coin flip. (Same constraint as `identity_cookie_keys`, same reason.)
+    route_code_keys: str = ""
+    route_code_active_kid: str = ""
+
+    # How long a minted route code stays honourable. The landing page shows the
+    # advertised offer and the visitor clicks through within one browsing
+    # session, so this is a session-scale value, not a durable one — a longer
+    # window only widens the gap between what was advertised and what is still
+    # true. Expiry is server-anchored (see route_code.sign).
+    route_code_ttl_seconds: int = 1800
+
+    # The master switch for the whole feature on this node. OFF ⇒ /preview
+    # returns 404 (not 403 — no existence oracle) AND the click path ignores any
+    # carried code entirely, so behaviour is byte-identical to pre-feature.
+    #
+    # Default FALSE, and deliberately unlike `returning_resolver_enabled` above:
+    # that one is defaulted true because the deploy tooling forces it anyway.
+    # This one gates a NEW hot-path branch, so it ships dark and is armed per
+    # environment only after the code is verified on the node
+    # (docs/.../01-PLAN.md §3 I-2).
+    route_preview_enabled: bool = False
+
     model_config = {"env_prefix": "TDS_"}
 
     @model_validator(mode="after")

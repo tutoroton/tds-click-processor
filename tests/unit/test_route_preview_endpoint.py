@@ -18,13 +18,15 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
+from pathlib import Path
+from unittest.mock import patch
 
 import fakeredis.aioredis
 import pytest
 from fastapi.testclient import TestClient
-from unittest.mock import patch
 
-from app import identity, main, router, sticky
+from app import identity, main, redis_client as rc, router, sticky
 from app.config import settings
 
 HOST = "preview.test"
@@ -163,13 +165,25 @@ def _post(store, body: dict | None = None, key: str | None = SECRET,
     async def _get_identity_redis():
         return ident
 
-    # 🔴 BOTH pools, not just the routing one. `identity.py` and `sticky.py`
-    # write through `get_identity_redis()` — a SEPARATE client on a dedicated
-    # noeviction instance. A recorder wrapped around the routing pool alone
-    # reports a clean run while the whole returning-user keyspace is being
+    # 🔴 BOTH REQUEST-PATH pools, not just the routing one. `identity.py` and
+    # `sticky.py` write through `get_identity_redis()` — a SEPARATE client on a
+    # dedicated noeviction instance. A recorder wrapped around the routing pool
+    # alone reports a clean run while the whole returning-user keyspace is being
     # written, which is the precise blind spot this feature must not have.
     # Measured: with only `router.get_redis` patched, a handler deliberately
     # supplying a `visitor_id` still showed zero writes.
+    #
+    # ⚠️ "BOTH" is the count of pools a REQUEST can reach, not of pools that
+    # exist. `app/redis_client.py` declares THREE factories — `get_redis`,
+    # `get_identity_redis` and `get_shipper_redis`. The third is deliberately
+    # NOT patched here and its absence is not a gap: its single caller is the
+    # app lifespan (`main.py`, `run_shipper`'s blocking XREADGROUP wants its own
+    # socket_timeout, TDSP-E20), so no request handler can reach it. Stated
+    # because the failure this recorder exists to catch is exactly "an
+    # instrument that wrapped one pool of N" — so the N has to be counted, and
+    # a later fourth factory has to be judged against this sentence rather than
+    # against the word "both". Count the FACTORIES (`get_*_redis`), never the
+    # call sites.
     #
     # NOT a context manager: `with TestClient(app)` runs the app lifespan,
     # which dials the real Redis at startup. The rest of this service's
@@ -210,6 +224,51 @@ def test_enabled_but_unauthenticated_is_403(enabled, key):
 # --------------------------------------------------------------------------- #
 # 🔴 The invariant: a preview creates nothing                                  #
 # --------------------------------------------------------------------------- #
+def test_the_recorder_still_covers_every_pool_a_request_can_reach():
+    """🔴 The ratchet behind the recorder's comment above.
+
+    `test_preview_performs_zero_writes` is only as wide as the set of clients it
+    wraps, and that set is currently spelled out in a COMMENT. A comment cannot
+    notice a fourth `get_*_redis` factory being added — and the failure mode of
+    this whole feature, recorded when it was nearly shipped, is precisely an
+    instrument that wrapped one pool of N and reported purity while another was
+    written.
+
+    So the factory set is pinned. If this goes red, do NOT widen the list to
+    match: decide first whether a REQUEST can reach the new pool. If it can, the
+    recorder must wrap it (add it to `_post`); if it cannot — as with
+    `get_shipper_redis`, whose only caller is the app lifespan — say so here,
+    with the caller named, and then extend the set.
+    """
+    src = (Path(rc.__file__)).read_text(encoding="utf-8")
+    factories = set(re.findall(r"^async def (get_\w*redis)\(", src, re.M))
+
+    assert factories == {"get_redis", "get_identity_redis", "get_shipper_redis"}, (
+        "the set of Redis client factories changed; see this test's docstring "
+        f"before touching it. Found: {sorted(factories)}"
+    )
+
+    # And the exclusion is a FACT about the app, not an assumption: the shipper
+    # factory has exactly ONE call site, and it is the lifespan.
+    #
+    # ⚠️ Counted as CALLS, not as occurrences of the string. The first version of
+    # this assertion counted `main_src.count("get_shipper_redis")` and expected
+    # 2 (an import plus a call) — it found 3, because the paragraph above that
+    # call also names the function in prose. A grep-shaped check cannot tell a
+    # mention from a use, which is the same class of error this whole test
+    # exists to guard against, one level up.
+    main_src = (Path(main.__file__)).read_text(encoding="utf-8")
+    call_lines = [
+        ln for ln in main_src.splitlines()
+        if "get_shipper_redis(" in ln and not ln.lstrip().startswith("#")
+    ]
+    assert len(call_lines) == 1, (
+        "get_shipper_redis now has more than the single lifespan call site — "
+        f"check whether a request path can reach that pool. Found: {call_lines}"
+    )
+    assert "await get_shipper_redis()" in call_lines[0]
+
+
 @pytest.mark.asyncio
 async def test_the_write_detector_can_actually_see_a_write():
     """Calibration. Drive a write through BOTH the client and a pipeline and

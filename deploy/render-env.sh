@@ -106,6 +106,15 @@ TDS_RETURNING_ROUTING_ENABLED=${TDS_RETURNING_ROUTING_ENABLED:-true}
 # returning users via the legacy _tds_vid path, just without the signed cookie.
 TDS_IDENTITY_COOKIE_KEYS=${TDS_IDENTITY_COOKIE_KEYS:-}
 TDS_IDENTITY_COOKIE_ACTIVE_KID=${TDS_IDENTITY_COOKIE_ACTIVE_KID:-1}
+# Route preview — the DEDICATED signing key ring for the carried routing
+# decision (`app/route_code.py`). Same shape and same reasoning as the
+# identity ring above, and deliberately a DIFFERENT ring: a leak of the
+# cookie key must not let an attacker forge routing decisions, and rotating
+# one must not disturb the other. ALL nodes in a fleet MUST carry the SAME
+# ring, because the node that MINTS a code is rarely the node that later
+# HONOURS it. Empty ⇒ codec inert ⇒ every click routes normally.
+TDS_ROUTE_CODE_KEYS=${TDS_ROUTE_CODE_KEYS:-}
+TDS_ROUTE_CODE_ACTIVE_KID=${TDS_ROUTE_CODE_ACTIVE_KID:-1}
 TDS_CODE_VERSION=${code_version}
 EOF
 

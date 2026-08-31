@@ -101,6 +101,14 @@ ensure_env_default() {
 }
 ensure_env_default TDS_RETURNING_RESOLVER_ENABLED true
 ensure_env_default TDS_RETURNING_ROUTING_ENABLED true
+# Route preview (dark). Seeded FALSE — unlike the returning flags above, this
+# one must stay off until an operator deliberately enables it per node. It is
+# written anyway (rather than relying on config.py's default) so the key is
+# VISIBLE in .env: enabling becomes a one-character edit instead of having to
+# know the exact variable name, and `grep` across the fleet then answers
+# "which nodes have this?" honestly. Costs one forced container recreate per
+# node, once, on the first update that heals it.
+ensure_env_default TDS_ROUTE_PREVIEW_ENABLED false
 
 # F.36 N3 — snapshot the SHA we are about to leave. This is the
 # rollback target if the new code fails health-gate. Captured BEFORE

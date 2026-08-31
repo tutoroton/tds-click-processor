@@ -389,3 +389,79 @@ class HealthResponse(BaseModel):
     shipper_reclaim_age_p95_ms: float | None = None
     shipper_reclaim_age_max_ms: float | None = None
     shipper_reclaim_age_sample_count: int = 0
+
+
+class PreviewRequest(BaseModel):
+    """Ask what a visitor WOULD be routed to, without routing them.
+
+    Programme: ``docs/development/route-preview-2026-08-31/00-ANCHOR.md``
+
+    The caller is admin-api, relaying a landing page's question. The fields are
+    the routing-relevant subset of :class:`ClickRequest` — everything the
+    engine actually reads to reach a decision, and nothing else.
+
+    🔴 THE IDENTITY FIELDS ARE ABSENT ON PURPOSE, and their absence is what
+    makes this side-effect-free. ``ClickRequest`` carries ``visitor_id`` and
+    ``identity_token``; this does not, and the handler builds a ClickRequest
+    with both empty. With no identity signal ``identity.resolve_identity``
+    returns ``uid=""`` on its documented "Case A … No writes" branch, and every
+    sticky verb is gated on ``bool(uid)`` — so the whole engine runs read-only
+    without a single preview-specific branch inside it.
+
+    A landing page could not supply them anyway: our cookies are ``HttpOnly``
+    and host-scoped, so they neither reach its JavaScript nor travel to it.
+    """
+
+    # The tracker link the landing page is about to show. `hostname` is the
+    # load-bearing one — campaign resolution is domain-first.
+    hostname: str = Field(min_length=1, max_length=255)
+    path: str = "/"
+    query_params: dict[str, str] = Field(default_factory=dict)
+
+    # Visitor context. A browser-side caller lets admin-api fill these from the
+    # live request; a server-side caller MUST pass them, or the decision is
+    # computed for the landing server rather than for the visitor.
+    ip: str = ""
+    country: str = ""
+    city: str = ""
+    region: str = ""
+    continent: str = ""
+    timezone: str = ""
+    user_agent: str = ""
+    accept_language: str = ""
+    referer: str = ""
+    is_bot: bool = False
+    is_proxy: bool = False
+
+    # Drives `time_of_day` / `day_of_week` criteria. Absent ⇒ the handler
+    # stamps "now", which is the honest reading for a preview taken now.
+    arrival_ts: str | None = None
+
+    _coerce_query_params = field_validator("query_params", mode="before")(
+        ClickRequest._coerce_query_params.__func__  # type: ignore[attr-defined]
+    )
+
+
+class PreviewResponse(BaseModel):
+    """The predicted destination — ids and a signed code, nothing else.
+
+    🔴 WHAT IS DELIBERATELY NOT HERE, and why this list is a contract:
+    ``url_template`` (the advertiser's real tracking link), ``payout_value``,
+    ``criteria`` (the targeting ruleset), the partner, and the offer's own
+    ``settings``. Every one is commercially sensitive and every one is within
+    arm's reach of the routing engine that produced this answer, so the
+    omission has to be deliberate rather than incidental. The human-facing
+    half — the offer NAME and its icon — is admin-api's to add from Postgres,
+    because that is the plane that owns tenant-scoped reads.
+
+    ``matched=False`` is a normal answer, not an error: the visitor simply has
+    no route under this link right now. ``reason`` names which shape it was so
+    a caller can distinguish "no campaign" from "campaign, but no offer".
+    """
+
+    matched: bool
+    offer_id: int | None = None
+    offer_target_id: int | None = None
+    route_code: str | None = None
+    expires_at: int | None = None
+    reason: str | None = None

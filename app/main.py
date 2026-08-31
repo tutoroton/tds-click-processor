@@ -18,6 +18,7 @@ import hmac
 import json
 import logging
 import os
+import secrets
 import shutil
 import time
 from datetime import datetime, timezone
@@ -42,8 +43,14 @@ from app.diag import (
     _is_valid_test_id,
     traces_sampler as diag_traces_sampler,
 )
-from app import history, identity
-from app.models import ClickRequest, ClickResponse, HealthResponse
+from app import history, identity, route_code
+from app.models import (
+    ClickRequest,
+    ClickResponse,
+    HealthResponse,
+    PreviewRequest,
+    PreviewResponse,
+)
 from app.redis_client import (
     get_redis,
     get_identity_redis,
@@ -2278,6 +2285,151 @@ async def health():
 _LOOPBACK_HOSTS = frozenset(
     {"127.0.0.1", "::1", "localhost", "::ffff:127.0.0.1"}
 )
+
+
+def _to_int_or_none(value) -> int | None:
+    """Coerce a routing-result id to a positive int, or None.
+
+    The engine's ids arrive as `str`, `int`, `""` or absent depending on which
+    branch produced them (the cascade stamps `""` for a redirect action that
+    has no offer). A preview must not promise a destination it cannot name, so
+    anything that is not a positive integer becomes None and the caller answers
+    `matched=False` rather than minting a code around a zero.
+    """
+    try:
+        out = int(value)
+    except (TypeError, ValueError):
+        return None
+    return out if out > 0 else None
+
+
+@app.post("/preview", response_model=PreviewResponse)
+async def preview(
+    req: PreviewRequest,
+    x_tds_key: str = Header("", alias="X-TDS-Key"),
+):
+    """Predict where a visitor WOULD be routed, without routing them.
+
+    Programme: ``docs/development/route-preview-2026-08-31/00-ANCHOR.md``
+
+    Called by admin-api, relaying a landing page's question: "here is the
+    tracker link I am about to show this visitor — which offer will they get?"
+    The answer carries a signed route code the visitor can bring back on that
+    link, so the landing page can advertise the offer it will actually deliver.
+
+    🔴 THIS HANDLER PERFORMS ZERO WRITES, and not by remembering to avoid them:
+
+    * it runs the REAL ``route()`` — no second engine to drift from the first
+      (the objection that closed the 2026-07 dossier's option (a));
+    * it builds a ``ClickRequest`` with NO identity signals, so
+      ``identity.resolve_identity`` takes its documented "Case A … No writes"
+      branch and returns ``uid=""`` — and every sticky verb is gated on
+      ``bool(uid)``, so all four are unreachable;
+    * it never enters the ``/decide`` handler body, where the dedup SETNX, the
+      ``stream:clicks`` XADD and the history capture live — so those are
+      excluded by control flow, not by a flag.
+
+    The consequence that matters to the product: a preview does not create a
+    visit. ``is_unique`` / ``is_returning`` / ``seen_before`` for the real click
+    that follows are exactly what they would have been (anchor §21.1).
+
+    Returns ``matched=False`` rather than an error when there is no route — a
+    visitor with no destination under this link is a normal answer, and
+    ``reason`` names which shape it was.
+    """
+    # DARK gate FIRST, and before auth: a disabled feature must not confirm it
+    # exists to anyone, authenticated or not. 404, never 403 — the same
+    # no-existence-oracle posture as the postback ingress and the internal-key
+    # guards elsewhere in the fleet.
+    if not settings.route_preview_enabled:
+        raise HTTPException(status_code=404, detail="Not Found")
+
+    # The /admin/sync ladder: the static sync secret first, then the per-Worker
+    # index (which raises 403 on a miss). DELIBERATELY no `_LOOPBACK_HOSTS`
+    # carve-out — see the comment above that constant: on a Caddy-fronted node
+    # the peer address is the proxy's docker IP, so the carve-out is dead code
+    # there and a latent hole anywhere a host-level proxy is introduced.
+    if not _sync_secret_matches(x_tds_key):
+        await _check_tds_key(x_tds_key)
+
+    arrival = req.arrival_ts or datetime.now(timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%S.%f"
+    )[:-3] + "Z"
+
+    click_req = ClickRequest(
+        # A preview is not a click, so it gets its own throwaway id. It is NOT
+        # reused as the later click's click_id: that would put the preview's
+        # timestamp into the click's `created_at` (main.py parses the ms prefix)
+        # and would collide with the 600s dedup window, suppressing the real
+        # click's analytics entirely.
+        click_id=f"preview{secrets.token_hex(8)}",
+        hostname=req.hostname,
+        path=req.path,
+        query_params=req.query_params,
+        ip=req.ip,
+        country=req.country,
+        city=req.city,
+        region=req.region,
+        continent=req.continent,
+        timezone=req.timezone,
+        user_agent=req.user_agent,
+        accept_language=req.accept_language,
+        referer=req.referer,
+        is_bot=req.is_bot,
+        is_proxy=req.is_proxy,
+        arrival_ts=arrival,
+        # 🔴 THE INVARIANT, stated at the only place it can be violated.
+        # Supplying either of these would make the preview resolve — and
+        # possibly MINT — an identity, manufacturing a visit that never
+        # happened and corrupting is_returning for the real click.
+        visitor_id=None,
+        identity_token=None,
+        is_returning=False,
+    )
+
+    result = await route(click_req)
+
+    if not result:
+        return PreviewResponse(matched=False, reason="no_campaign")
+    if result.get("blocked"):
+        return PreviewResponse(matched=False, reason="blocked")
+    if result.get("non_routed"):
+        return PreviewResponse(matched=False, reason="non_routed")
+    if not result.get("url"):
+        return PreviewResponse(matched=False, reason="no_destination")
+
+    attribution = result.get("attribution") or {}
+    offer_id = _to_int_or_none(result.get("offer_id"))
+    target_id = _to_int_or_none(attribution.get("offer_target_id"))
+    company_id = _to_int_or_none(attribution.get("company_id"))
+
+    if not (offer_id and target_id and company_id):
+        # A destination we cannot name is a destination we cannot promise.
+        return PreviewResponse(matched=False, reason="unidentified_target")
+
+    code = None
+    expires_at = None
+    if route_code.is_enabled():
+        ttl = settings.route_code_ttl_seconds
+        code = route_code.sign(
+            company_id=company_id,
+            offer_id=offer_id,
+            offer_target_id=target_id,
+            ttl_seconds=ttl,
+        )
+        expires_at = int(time.time()) + ttl
+
+    # NOTE the shape of what leaves this handler: ids and a signed code. The
+    # `url` the engine just built is the advertiser's real tracking link and
+    # NEVER leaves the node; the offer's human-facing name and icon are
+    # admin-api's to add from Postgres (anchor §9.1, plan I-5).
+    return PreviewResponse(
+        matched=True,
+        offer_id=offer_id,
+        offer_target_id=target_id,
+        route_code=code,
+        expires_at=expires_at,
+    )
 
 
 @app.get("/stats")

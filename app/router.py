@@ -36,7 +36,7 @@ from typing import Any, Final, NamedTuple
 
 import redis  # F4 — for the BASE `redis.RedisError` exception class only.
 import sentry_sdk
-from app import action_executor, cascade, identity, sticky
+from app import action_executor, cascade, identity, route_code, sticky
 from app.config import settings
 from app.diag import get_test_id
 from app.enrichment import enrich_buyer
@@ -1328,6 +1328,118 @@ async def _route_via_campaign(
     }
 
 
+# ───────────────────────────────────────────────────────────────────────────── #
+# Route code — honour a routing decision THIS system minted earlier (dark)      #
+# ───────────────────────────────────────────────────────────────────────────── #
+#
+# Programme SoT: `docs/development/route-preview-2026-08-31/00-ANCHOR.md`
+#
+# A landing page (the FIRST hop) asked `/preview` which offer this visitor would
+# get; the node computed a real routing decision WITHOUT committing it and minted
+# a signed code (`app/route_code.py`). The visitor then arrives on the tracker
+# link carrying that code, and this is where we honour it — so the offer the
+# landing advertised is the offer the visitor actually lands on.
+
+#: Query parameter carrying the signed route code. Namespaced `tds_` so it can
+#: never collide with a canonical slot or a client's own parameter — every name
+#: in `RESERVED_SLOTS`/`SUB_SLOTS` is a business name (`source`, `sub1`, ...).
+#: The CF Worker forwards it as an ordinary query parameter, which is why
+#: `services/worker/` needs no change at all (plan I-1).
+ROUTE_CODE_PARAM: Final[str] = "tds_rc"
+
+
+async def _route_code_target(
+    r,
+    req: ClickRequest,
+    campaign_id: str,
+    *,
+    company_id: int | None,
+    flow_id: str | None,
+    allowed_avail,
+    build_url_fn,
+    source_mappings,
+    campaign_mappings,
+) -> dict[str, Any] | None:
+    """Return the coded target's result, or None to route normally.
+
+    🔴 The code is a RE-VALIDATED HINT, never an authority. A valid signature
+    buys the bearer ONE thing: the right to have a target *considered*. Whether
+    it is served is decided by the SAME availability floor every other click
+    obeys — so a code naming a paused / closed / vanished target falls through
+    to ordinary routing, silently (that is correct product behaviour, not an
+    error, and it is the condition under which the edge-identity architecture
+    permits carrying a decision in the client at all).
+
+    Re-validation mirrors the sticky-pin gate VERBATIM (`hgetall` -> non-empty
+    `url` -> `availability in allowed`) so the two paths can never drift apart,
+    plus two binds the pin does not have:
+
+      * **tenant** — the code's `company_id` must equal the company resolved for
+        THIS click. The code's claim is checked against the click, never trusted.
+      * **offer/target coherence** — the target hash's `offer_id` must equal the
+        offer the code names. (`offer_target:{id}` carries `offer_id` and NOT
+        `company_id` — measured against the live staging snapshot, recorded in
+        `admin-api/app/sync/attribution.py`; that is why the tenant bind is
+        against the click and not against the target.)
+
+    🔴 **This function performs NO writes** (anchor §21.2): no `repin`, no
+    `set_sticky_nx`, nothing. The route code never mutates returning-user state.
+
+    KNOWN, BOUNDED LIMITATION — no flow-membership bind. A code minted for
+    campaign X can be replayed on campaign Y of the SAME company, serving X's
+    target under Y's flow. It cannot cross a tenant. This is the same property
+    the sticky pin already has (a pin minted under one flow serves under
+    another), and binding the campaign would need `campaign_id` in the payload,
+    i.e. `CODE_VERSION` 2. Recorded rather than silently inherited.
+
+    FAIL-OPEN by construction: any fault at all returns None and the click
+    routes normally. An optional enhancement must never be able to break a
+    redirect.
+    """
+    if not settings.route_preview_enabled:
+        return None
+
+    raw = (req.query_params or {}).get(ROUTE_CODE_PARAM)
+    if not raw:
+        return None
+
+    try:
+        decoded = route_code.verify(raw if isinstance(raw, str) else str(raw))
+        if decoded is None:
+            return None
+
+        # Tenant bind — the code's claim, checked against the click's company.
+        if company_id is None or decoded.company_id != company_id:
+            return None
+
+        tid = str(decoded.offer_target_id)
+        target = await r.hgetall(f"offer_target:{tid}")
+        # Mirrors the sticky-pin gate below, verbatim: absent hash / empty url /
+        # availability outside the click's class -> fall through to normal.
+        avail = (target.get("availability") if target else None) or "active"
+        if not (target and target.get("url") and avail in allowed_avail):
+            return None
+
+        # Offer/target coherence — the target must belong to the offer the code
+        # names, so a tampered or stale pairing cannot be served.
+        if str(target.get("offer_id") or "") != str(decoded.offer_id):
+            return None
+
+        result = action_executor.pinned_target_result(
+            target, tid, req, campaign_id, build_url_fn,
+            source_mappings, campaign_mappings, flow_id,
+        )
+        if result is None:
+            return None
+        # Provenance: an existing free-text column (anchor §21.3) -> analytics
+        # can answer "how many clicks followed a preview" with no migration.
+        result["target_selection_path"] = "route_code"
+        return result
+    except Exception as exc:  # pragma: no cover - fail-open, never break a click
+        logger.warning("route code honouring failed (%s) - routing normally", exc)
+        return None
+
+
 async def _resolve_action_with_sticky(
     r,
     flow: dict[str, Any],
@@ -1394,7 +1506,28 @@ async def _resolve_action_with_sticky(
         )
 
     if not sticky_active:
-        result = await _normal()
+        # Route code (dark) — consulted ONLY here, where the sticky/returning
+        # machinery is silent. That placement is what makes the anchor §21.2
+        # priority STRUCTURAL rather than a rule someone has to remember:
+        #
+        #     returning-flow pick  >  sticky pin  >  ROUTE CODE  >  fresh pick
+        #
+        # A pin is knowledge about a RECOGNISED visitor; a code is a guess about
+        # an anonymous one (a landing page cannot read our HttpOnly cookie). The
+        # guess must never overwrite the knowledge, so when `sticky_active` is
+        # True the code is not consulted at all. Flag OFF ⇒ `_route_code_target`
+        # returns None on its first line ⇒ byte-identical to before this change.
+        result = await _route_code_target(
+            r, req, campaign_id,
+            company_id=company_id,
+            flow_id=flow_id,
+            allowed_avail=allowed_avail,
+            build_url_fn=_build_url,
+            source_mappings=source_mappings,
+            campaign_mappings=campaign_mappings,
+        )
+        if result is None:
+            result = await _normal()
         # B-track — fresh-mode pin tracking: overwrite the pin with the target
         # this click ACTUALLY served (available by construction — it was just
         # picked under the availability floor). `repin` = SET EX (sliding TTL,

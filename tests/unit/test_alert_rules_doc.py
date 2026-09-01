@@ -53,6 +53,13 @@ _EXCLUDED_OUT_OF_SCOPE = {
     # alerting posture lives with the edge-preview programme
     # (docs/development/route-preview-2026-08-31/), not this doc.
     "OP_PREVIEW_KEYS_UNSYNCED",
+    # GTD-D149 — the preview admission cap shed a request. This is the
+    # bulkhead PROTECTING clicks by shedding PREVIEW load, on the zero-writes
+    # /preview surface — the opposite of a click-loss signal. Working as
+    # designed under an above-click-volume preview flood (the owner's own
+    # mandate for the feature). Its alerting posture belongs to the
+    # edge-preview programme, same as the tag above.
+    "OP_PREVIEW_CAPACITY_SHED",
 }
 
 

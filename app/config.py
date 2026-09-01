@@ -753,6 +753,18 @@ class Settings(BaseSettings):
     # /decide to every node, so the node that verifies a code is in general NOT
     # the node that minted it. A per-node ring would make honouring a code a
     # coin flip. (Same constraint as `identity_cookie_keys`, same reason.)
+    # GTD-D149 — the preview admission cap, PER WORKER PROCESS (node budget =
+    # value x WEB_CONCURRENCY). The bulkhead between /preview and click
+    # serving: previews beyond this many in flight answer 503 immediately and
+    # never touch Redis or the routing engine. Default 8: far above any
+    # legitimate landing page's per-node concurrency (a landing asks about
+    # once per visitor, and 8 in flight at ~few ms each clears hundreds of
+    # previews/second/worker), and a small fraction of the shared event loop
+    # and the 128-connection pool — chosen from the D149 rig, which showed the
+    # LOOP saturating first under an unbounded preview flood. Values < 1 are
+    # clamped to 1 at the use site; there is deliberately no "0 = off" state —
+    # the guarantee must hold with nothing tuned.
+    preview_max_concurrency: int = 8
     route_code_keys: str = ""
     route_code_active_kid: str = ""
 

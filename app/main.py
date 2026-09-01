@@ -69,6 +69,7 @@ from app.telemetry import (
     OP_CLICK_UNCAPTURED,
     OP_DISK_PRESSURE,
     OP_IDENTITY_STORE_PRESSURE,
+    OP_PREVIEW_CAPACITY_SHED,
     OP_PREVIEW_KEYS_UNSYNCED,
     OP_ROUTE_ERROR,
     OP_STREAM_ENTRY_LIMIT,
@@ -2353,6 +2354,61 @@ async def preview(
     if not _sync_secret_matches(x_tds_key):
         await _check_tds_key(x_tds_key)
 
+    # GTD-D149 — THE BULKHEAD. Admission cap on concurrent previews, per
+    # WORKER PROCESS (hazard 5: module state is per-worker; node-wide budget =
+    # this value x WEB_CONCURRENCY, 2 by default). Checked AFTER auth (an
+    # unauthenticated prober cannot occupy or even observe the cap) and BEFORE
+    # any Redis or routing work, so an over-limit preview costs the node one
+    # counter read and nothing else.
+    #
+    # WHY AN ADMISSION CAP and not a pool split or --limit-concurrency: the
+    # rig (tests/unit/test_preview_bulkhead.py, measured numbers in the PR)
+    # shows the EVENT LOOP/CPU saturates long before the 128-connection pool —
+    # so a bulkhead must bound ENTRY into the work, which caps loop share,
+    # CPU share and pool draw at once. uvicorn --limit-concurrency would cap
+    # clicks too (rejecting the product to protect it), and a separate pool
+    # would bound only the resource that binds LAST.
+    #
+    # Over-limit answers 503 and NEVER falls through to a click (the D149
+    # brief's invariant (a)): a preview flood converted into clicks is R3
+    # reopened through capacity. Both callers already map a non-200 to their
+    # own "unavailable" — the worker refuses with its own 503 (never the
+    # click path: only `preview_denied` sends it there), admin-api raises
+    # PreviewUnavailable. No await sits between the check and the increment,
+    # so the counter is race-free on a single-threaded event loop; the
+    # `finally` makes leak-on-exception structurally impossible.
+    global _preview_inflight
+    if _preview_inflight >= max(1, settings.preview_max_concurrency):
+        capture_op_msg_throttled(
+            OP_PREVIEW_CAPACITY_SHED,
+            settings.node_id,
+            "preview admission cap reached — shedding preview load to protect "
+            "click serving (bounded, by design; raise "
+            "TDS_PREVIEW_MAX_CONCURRENCY only with D149's rig re-run)",
+            node_id=settings.node_id,
+            cap=max(1, settings.preview_max_concurrency),
+        )
+        raise HTTPException(status_code=503, detail="preview_capacity")
+    _preview_inflight += 1
+    try:
+        return await _preview_body(req)
+    finally:
+        _preview_inflight -= 1
+
+
+# GTD-D149 — the number of previews this WORKER will run at once. Module
+# state on purpose (per-process, like every counter in this service); the
+# admission check and increment sit with no await between them, so the
+# single-threaded loop makes the pair atomic without a lock.
+_preview_inflight = 0
+
+
+async def _preview_body(req: PreviewRequest) -> PreviewResponse:
+    """The preview computation, verbatim — extracted from the route handler so
+    the D149 admission cap can wrap ALL of it (every Redis read, route(), the
+    code signing) in one try/finally. Behaviour is byte-identical to the
+    pre-extraction handler; the route handler above owns the dark gate, auth
+    and the cap, in that order."""
     # Edge-preview P2.2 (anchor §8 R19, §11) — node-side tenant check, stage 1
     # of 2: resolve the presented key hash BEFORE routing runs. An UNKNOWN
     # hash refuses here: a revoked key's hash is exactly "present but not in

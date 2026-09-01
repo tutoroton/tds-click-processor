@@ -237,7 +237,7 @@ def test_time_of_day_absent_click_fails_closed_preserved():
     not MOVE it, not a ratification that it was right. V25 (2026-08-25) settles
     it: on a missing value only `empty` may hold, so `not_in` now drops too.
     No ADR ever ratified the fail-open (checked: `.roadmap/decisions/`, only
-    ADR-0107 mentions `not_in`, and only as build scope)."""
+    ADR-0107-filter-build-scope-correctness-structural-identifier-ops-now-defer-complex mentions `not_in`, and only as build scope)."""
     attrs = {"time_of_day": ""}
     assert _first_failing_criterion(
         [{"type": "time_of_day", "op": "in", "values": ["09"]}], attrs) is not None

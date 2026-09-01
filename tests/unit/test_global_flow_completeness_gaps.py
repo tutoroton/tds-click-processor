@@ -258,7 +258,7 @@ class TestGap2NotInFailOpenGlobalCrossScope:
     test_empty_click_attr_passes_not_in_criterion`. That test's justification
     was the comment "empty is in nothing" — a restatement of the MECHANISM
     (`"" in values` is False), not a decision that it ought to be so. No ADR
-    ever ratified it (`.roadmap/decisions/`: only ADR-0107 mentions `not_in`,
+    ever ratified it (`.roadmap/decisions/`: only ADR-0107-filter-build-scope-correctness-structural-identifier-ops-now-defer-complex mentions `not_in`,
     and only as build scope). So "confirmed INTENTIONAL" was a paraphrase
     promoted to a ratification by being cited.
 

@@ -486,3 +486,23 @@ class PreviewResponse(BaseModel):
     route_code: str | None = None
     expires_at: int | None = None
     reason: str | None = None
+    # R24 (anchor — the four-outcome contract) — the IN-BAND verdict that sends
+    # an AUTHED caller (the Worker) to the ordinary click path, i.e. row 2 made
+    # implementable across the seam. Emitted ONLY for outcome (c): a presented
+    # hash that MISSED an index that is PRESENT. Never for cross-tenant (b) —
+    # a VALID key must learn nothing about foreign links; I-8 protects the
+    # PUBLIC boundary, and there the CLICK is the indistinguishable answer,
+    # which is exactly what the worker turns this verdict into. Never for (d)
+    # (index never synced): a degraded node claiming "refused" would convert a
+    # preview stream above click volume into a CLICK stream — R3 reopened
+    # through degradation.
+    preview_denied: str | None = None
+    # R25 — the echo that makes deploy ORDER structural instead of operator
+    # memory: True whenever this node actually processed a presented hash
+    # against a PRESENT index (outcomes a, b, c — including the no-route
+    # ladder answers a keyed caller gets, so outcome (b) stays byte-identical
+    # to a keyed dead-link probe). ABSENT in (d) and when no hash was
+    # presented. A caller that SENT a hash and does not see this field is
+    # talking to a node that ignored it (pre-R24 build, extra='ignore') and
+    # must treat the answer as no-verdict, never as validated.
+    tenant_checked: bool | None = None

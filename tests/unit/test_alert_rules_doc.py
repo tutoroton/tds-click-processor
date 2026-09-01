@@ -46,6 +46,13 @@ _EXCLUDED_PRE_EXISTING_SHIPPER = {
 # click-loss scope: config-sync staleness, not click loss.
 _EXCLUDED_OUT_OF_SCOPE = {
     "OP_SYNC_PULL_FAILED",
+    # Edge-preview P2.2 (anchor §11) — same class as OP_SYNC_PULL_FAILED:
+    # the preview_key family never synced to this node. Config-sync
+    # staleness on a NON-click surface (/preview performs zero writes by
+    # contract), so it is not a LOSSFIX loss/shed/pressure signal. Its
+    # alerting posture lives with the edge-preview programme
+    # (docs/development/route-preview-2026-08-31/), not this doc.
+    "OP_PREVIEW_KEYS_UNSYNCED",
 }
 
 

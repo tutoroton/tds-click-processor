@@ -437,6 +437,27 @@ class PreviewRequest(BaseModel):
     # stamps "now", which is the honest reading for a preview taken now.
     arrival_ts: str | None = None
 
+    # Edge-preview P2.2 (anchor §8 R19) — the tenant check, re-homed to the
+    # node. sha256 hex of the presented route-preview key: a HASH, never the
+    # raw token, so the credential itself never crosses the caller→node hop
+    # (admin-api today, the Worker in P2.3) and never lands in a log on it.
+    # The node GETs `preview_key:{hash}` from the synced index and compares
+    # the value against the routed attribution's company_id.
+    #
+    # Absent ⇒ no node-side tenant check — today's callers, byte-identical
+    # behaviour; the central check in admin-api stays live as the independent
+    # canary (R19 amendment c). Present ⇒ STRICT: a hash that resolves to a
+    # DIFFERENT company than the routed attribution — or resolves to nothing,
+    # which is exactly what a REVOKED key's hash looks like once the builder
+    # drops it and the managed-keys sweep deletes it — is answered with the
+    # same `matched:false` a nonexistent link gets (I-8: no existence
+    # oracle). The reason string is "blocked" — the MEASURED dead-link answer
+    # (the geo path fails closed; test_route_preview_tenant_check pins the
+    # byte-parity against a live probe) — §11's ruled literal "no_campaign"
+    # rested on a premise the measurement refuted, and a shape no innocent
+    # path produces would itself be the distinguishable answer.
+    preview_key_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+
     _coerce_query_params = field_validator("query_params", mode="before")(
         ClickRequest._coerce_query_params.__func__  # type: ignore[attr-defined]
     )

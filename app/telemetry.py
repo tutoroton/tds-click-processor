@@ -101,6 +101,15 @@ OP_WATERMARK_SPILL = "watermark_spill"
 # wins (accept/XADD proceeds) — this tag is pure visibility.
 OP_WATERMARK_SIGNAL_STALE = "watermark_signal_stale"
 
+# Edge-preview P2.2 (anchor §11) — a /preview presented a key hash, the
+# lookup missed, AND the `preview_keys:synced` marker is absent: this node
+# has never received the preview_key family at all. Degraded sync, NOT a
+# cross-tenant probe — the two answer the IDENTICAL wire shape by design
+# (the dead-link `matched:false`), so this op is the only place the
+# difference is visible. Throttled: a stuck sync would otherwise fire it
+# on every keyed preview.
+OP_PREVIEW_KEYS_UNSYNCED = "preview_keys_unsynced"
+
 # LOSSFIX P2 c1 (2026-07-07) — a recovered `.wip` segment (orphan
 # adoption, B1) had a torn tail: the last line was incomplete or failed
 # to parse. Loss-free by construction (see disk_queue._truncate_torn_

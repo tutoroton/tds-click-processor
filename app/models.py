@@ -78,6 +78,33 @@ class ClickRequest(BaseModel):
         default=None, max_length=1024, pattern=r'^[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+$'
     )
     is_returning: bool = False
+    # EPV-DEFECT-1 (ADR-0468) — MAY this request write persistent identity?
+    #
+    # Blanking `visitor_id` and `identity_token` was believed to be a complete
+    # zero-writes proof for `/preview`. It is not. A THIRD identity signal
+    # reaches the resolver: `funnel_user_id`, which arrives in `query_params`
+    # — the very field a preview must forward VERBATIM, because a lost
+    # parameter can change the route. On a source with `funnel_user_id_trusted`
+    # the preview then minted and stamped an identity, and the REAL click that
+    # followed resolved as RETURNING. Worse, with a usable uid the sticky verbs
+    # opened: a preview could pin the offer a later real click would serve, or
+    # overwrite a live returning visitor's existing pin.
+    #
+    # Named for the EFFECT, not the caller. `is_preview` would invite unrelated
+    # behaviour to hang off it, and a second behavioural code path through the
+    # router is exactly what the routing mandate forbids. This flag answers one
+    # question and can only ever answer that one.
+    #
+    # It also fails in the SAFE direction: setting it False can only REMOVE
+    # writes, never add them, so a mistake here degrades a preview's fidelity
+    # and can never corrupt a click.
+    #
+    # Default True so every existing caller is byte-identical. `/preview` is the
+    # only place that sets it False; `router.py` gates the WHOLE resolver block
+    # on it — not just the resolve call — because the deferred-commit path
+    # (`_commit_deferred_identity`) re-feeds the same signals when a domain
+    # campaign serves.
+    identity_writes: bool = True
     # Stage 3 · Phase 4 S2 — edge quality signals from CF Bot Management
     # (fail-open false at the worker on a non-Enterprise zone). Bools so a
     # missing field defaults cleanly; collector maps each to a CH UInt8.
@@ -400,16 +427,25 @@ class PreviewRequest(BaseModel):
     the routing-relevant subset of :class:`ClickRequest` — everything the
     engine actually reads to reach a decision, and nothing else.
 
-    🔴 THE IDENTITY FIELDS ARE ABSENT ON PURPOSE, and their absence is what
-    makes this side-effect-free. ``ClickRequest`` carries ``visitor_id`` and
-    ``identity_token``; this does not, and the handler builds a ClickRequest
-    with both empty. With no identity signal ``identity.resolve_identity``
-    returns ``uid=""`` on its documented "Case A … No writes" branch, and every
-    sticky verb is gated on ``bool(uid)`` — so the whole engine runs read-only
-    without a single preview-specific branch inside it.
+    🔴 THE IDENTITY FIELDS ARE ABSENT ON PURPOSE — but their absence is NOT
+    what makes this side-effect-free, and believing it was is what let
+    EPV-DEFECT-1 ship. ``ClickRequest`` carries ``visitor_id`` and
+    ``identity_token``; this does not, and the handler blanks both. That closes
+    two signals out of three. The third, ``funnel_user_id``, arrives inside
+    ``query_params`` — a field this model DOES carry, and must, because the
+    preview has to reproduce the real click's routing conditions exactly and a
+    lost parameter can change the route.
 
-    A landing page could not supply them anyway: our cookies are ``HttpOnly``
-    and host-scoped, so they neither reach its JavaScript nor travel to it.
+    So the structural absence is a useful guard against a caller inventing an
+    identity, and it is not a zero-writes proof. The proof is one gate:
+    the handler sets ``ClickRequest.identity_writes=False`` and ``route()``
+    skips the entire returning-resolver block, including the deferred commit
+    that fires when a domain campaign serves. See ADR-0468.
+
+    A landing page could not supply the two absent fields anyway: our cookies
+    are ``HttpOnly`` and host-scoped, so they neither reach its JavaScript nor
+    travel to it. That is true, and it was never the whole story — the funnel
+    id is something a landing page can absolutely put in a link.
     """
 
     # The tracker link the landing page is about to show. `hostname` is the

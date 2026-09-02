@@ -2323,13 +2323,32 @@ async def preview(
 
     * it runs the REAL ``route()`` — no second engine to drift from the first
       (the objection that closed the 2026-07 dossier's option (a));
-    * it builds a ``ClickRequest`` with NO identity signals, so
-      ``identity.resolve_identity`` takes its documented "Case A … No writes"
-      branch and returns ``uid=""`` — and every sticky verb is gated on
-      ``bool(uid)``, so all four are unreachable;
+    * it sets ``identity_writes=False``, and ``route()`` gates the WHOLE
+      returning-resolver block on that — so ``uid`` stays empty, and every
+      sticky and fresh-track write is unreachable by control flow, as is the
+      deferred ``_commit_deferred_identity`` path that fires when a domain
+      campaign serves;
     * it never enters the ``/decide`` handler body, where the dedup SETNX, the
       ``stream:clicks`` XADD and the history capture live — so those are
-      excluded by control flow, not by a flag.
+      excluded by control flow, not by a flag. (``history.schedule_capture``
+      has exactly one caller in this service, and it is that body; it is
+      additionally a no-op on an empty uid.)
+    * ``diag``'s obs/checkpoint writes need a request-bound test id, and
+      ``set_test_id`` is called only by ``/decide`` and ``/admin/sync`` — never
+      here.
+
+    ⚠️ WHAT THIS DOCSTRING USED TO CLAIM, AND WHY IT IS WRITTEN DOWN.
+    Until 2026-09-01 the second bullet read "it builds a ``ClickRequest`` with
+    NO identity signals". That was FALSE and it is the reason the defect
+    survived review: a reader who trusted it stopped looking. There are THREE
+    identity signals, not two. ``visitor_id`` and ``identity_token`` are
+    blanked at the constructor, but ``funnel_user_id`` arrives inside
+    ``query_params`` — which a preview must forward verbatim, since a lost
+    parameter can change the route — and it binds with no operator
+    configuration at all. On a source with ``funnel_user_id_trusted`` the
+    preview minted and stamped a persistent identity. See EPV-DEFECT-1 /
+    ADR-0468. A zero-writes claim is only worth what its mechanism is worth,
+    so the mechanism is now one gate rather than an enumeration of signals.
 
     The consequence that matters to the product: a preview does not create a
     visit. ``is_unique`` / ``is_returning`` / ``seen_before`` for the real click
@@ -2503,13 +2522,35 @@ async def _preview_body(req: PreviewRequest) -> PreviewResponse:
         is_bot=req.is_bot,
         is_proxy=req.is_proxy,
         arrival_ts=arrival,
-        # 🔴 THE INVARIANT, stated at the only place it can be violated.
-        # Supplying either of these would make the preview resolve — and
-        # possibly MINT — an identity, manufacturing a visit that never
-        # happened and corrupting is_returning for the real click.
+        # 🔴 THE INVARIANT — and the two lines below are NOT all of it.
+        #
+        # This comment used to read "stated at the only place it can be
+        # violated". That was false, and the counterexample is twenty lines
+        # ABOVE it in this same constructor: `query_params=req.query_params`.
+        # A third identity signal rides in there — `funnel_user_id` — and a
+        # bare `?funnel_user_id=` binds with no operator configuration at all
+        # (the canonical-binding rule, `resolution.py:28-38`). On a source with
+        # `funnel_user_id_trusted` the preview minted and stamped an identity,
+        # the real click behind it resolved as RETURNING, and with a usable uid
+        # the sticky verbs opened — so a preview could pin the offer a later
+        # real click would serve. Recorded as EPV-DEFECT-1 / ADR-0468.
+        #
+        # We do NOT fix that by blanking the funnel slot: routing must still
+        # SEE every parameter, because macros and criteria read the slots and a
+        # lost parameter can change the route. The neutralisation belongs at
+        # the resolver, and it is `identity_writes=False` below.
+        #
+        # Forwarding the query params is therefore deliberate and stays. What
+        # changed is that forwarding them is no longer enough to write.
         visitor_id=None,
         identity_token=None,
         is_returning=False,
+        # The actual zero-writes mechanism. `router.py` gates the whole
+        # resolver BLOCK on this — not merely the resolve call, because the
+        # deferred-commit path re-feeds the same signals when a domain campaign
+        # serves. With the block skipped, `uid` stays empty and every sticky
+        # and fresh-track write is unreachable by control flow.
+        identity_writes=False,
     )
 
     result = await route(click_req)

@@ -115,7 +115,7 @@ def _dead_link_answer():
 # --------------------------------------------------------------------------- #
 # The check itself                                                             #
 # --------------------------------------------------------------------------- #
-def test_cross_tenant_key_is_byte_identical_to_a_dead_link(enabled):
+def test_cross_tenant_key_is_byte_identical_to_a_dead_link(enabled):  # noqa: F811
     """🔴 THE ONE THE RULING IS ABOUT. A key of company 2 asking about a
     company-1 campaign gets EXACTLY what a random dead URL gets — compared as
     whole response bodies against a live dead-link probe, not against a
@@ -130,7 +130,7 @@ def test_cross_tenant_key_is_byte_identical_to_a_dead_link(enabled):
     assert refused.json()["matched"] is False
 
 
-def test_unknown_hash_with_present_index_carries_the_refusal_verdict(enabled):
+def test_unknown_hash_with_present_index_carries_the_refusal_verdict(enabled):  # noqa: F811
     """R24 outcome (c) — the seam fix. A hash missing from a PRESENT index is
     the revoked/garbage-key shape, and the answer now carries the IN-BAND
     verdict the Worker's fall-to-click predicate reads (`preview_denied` —
@@ -150,7 +150,7 @@ def test_unknown_hash_with_present_index_carries_the_refusal_verdict(enabled):
     assert body["tenant_checked"] is True
 
 
-def test_matching_company_key_previews_normally(enabled):
+def test_matching_company_key_previews_normally(enabled):  # noqa: F811
     """Calibration leg 2: the comparison reads the VALUE. The right company
     passes — so the refusals above are the comparison, not key-presence."""
     store = _seeded_store(key_company=str(COMPANY))
@@ -162,7 +162,7 @@ def test_matching_company_key_previews_normally(enabled):
     assert body["offer_id"] == OFFER
 
 
-def test_absent_field_is_todays_behaviour(enabled):
+def test_absent_field_is_todays_behaviour(enabled):  # noqa: F811
     """Calibration leg 1: the SAME fixture matches when no key is presented —
     proving the cross-tenant `false` above comes from the check, and pinning
     the rollout property (no caller sends the field today ⇒ byte-identical)."""
@@ -171,7 +171,7 @@ def test_absent_field_is_todays_behaviour(enabled):
     assert _post_keyed(store).json()["matched"] is True
 
 
-def test_malformed_hash_is_refused_before_it_reaches_the_lookup(enabled):
+def test_malformed_hash_is_refused_before_it_reaches_the_lookup(enabled):  # noqa: F811
     """Schema, not handler: a non-sha256-shaped value never reaches the
     lookup. The status is 403, not 422, and that is THIS SERVICE'S OWN
     convention (D2/V17, `_validation_error_handler`): a validation error must
@@ -184,7 +184,7 @@ def test_malformed_hash_is_refused_before_it_reaches_the_lookup(enabled):
     assert resp.status_code == 403
 
 
-def test_keyed_preview_still_performs_zero_writes(enabled):
+def test_keyed_preview_still_performs_zero_writes(enabled):  # noqa: F811
     """I-1 extended to the new path: the tenant check adds a GET (and, on a
     miss, an EXISTS) — reads only. The recorder that caught the identity-pool
     blindness (hazard 9) watches both request-path pools here too."""
@@ -200,7 +200,7 @@ def test_keyed_preview_still_performs_zero_writes(enabled):
 # --------------------------------------------------------------------------- #
 # The degraded-state discriminator (anchor §11)                                #
 # --------------------------------------------------------------------------- #
-def test_unsynced_node_answers_no_verdict_and_no_echo(enabled):
+def test_unsynced_node_answers_no_verdict_and_no_echo(enabled):  # noqa: F811
     """R24 outcome (d), and the trap the obvious fix walks into: a DEGRADED
     node must never claim `key_refused` — the Worker would turn a preview
     stream above click volume into a CLICK stream the moment sync breaks
@@ -232,7 +232,7 @@ def test_unsynced_node_answers_no_verdict_and_no_echo(enabled):
     assert (d["matched"], d["reason"]) == (c["matched"], c["reason"]) == (False, "blocked")
 
 
-def test_absent_hash_answers_carry_neither_new_field(enabled):
+def test_absent_hash_answers_carry_neither_new_field(enabled):  # noqa: F811
     """The rollout pin, R24 edition: a caller that presents NO hash gets
     null for both new fields — the pre-R24 shape plus two nulls, which is
     what keeps the admin-api path and every old caller byte-stable."""
@@ -244,7 +244,7 @@ def test_absent_hash_answers_carry_neither_new_field(enabled):
     assert body["tenant_checked"] is None
 
 
-def test_matched_answer_under_a_key_carries_the_echo(enabled):
+def test_matched_answer_under_a_key_carries_the_echo(enabled):  # noqa: F811
     """R24 outcome (a) + R25: a validated, matching preview says so — the
     field the Worker requires whenever it SENT a hash, which is what turns
     deploy order from operator memory into structure (a pre-R24 node that

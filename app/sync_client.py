@@ -65,6 +65,12 @@ _ROUTING_PREFIXES = [
     # Worker. A miss falls through to the legacy global secret
     # constant-time compare (dual-window discipline).
     "worker_secret_hash:",
+    # Edge-preview P2.2 — route-preview key auth index. `/preview` GETs
+    # `preview_key:{sha256(token)}` → company_id for the node-side tenant
+    # check, and reads the `preview_keys:synced` marker (plural — a
+    # different literal) to tell "family never synced" from "hash unknown".
+    "preview_key:",
+    "preview_keys:synced",
 ]
 
 

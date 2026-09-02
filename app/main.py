@@ -69,6 +69,7 @@ from app.telemetry import (
     OP_CLICK_UNCAPTURED,
     OP_DISK_PRESSURE,
     OP_IDENTITY_STORE_PRESSURE,
+    OP_PREVIEW_KEYS_UNSYNCED,
     OP_ROUTE_ERROR,
     OP_STREAM_ENTRY_LIMIT,
     OP_STREAM_WRITE_FAILED,
@@ -2371,6 +2372,50 @@ async def preview(
     if not _sync_secret_matches(x_tds_key):
         await _check_tds_key(x_tds_key)
 
+    # Edge-preview P2.2 (anchor §8 R19, §11) — node-side tenant check, stage 1
+    # of 2: resolve the presented key hash BEFORE routing runs. An UNKNOWN
+    # hash refuses here: a revoked key's hash is exactly "present but not in
+    # the store" (the builder drops it, the managed-keys sweep deletes it), so
+    # anything softer makes node-side revocation vacuous — and refusing before
+    # route() also denies an unauthorised prober the routing work itself.
+    #
+    # The refusal is the DEAD-LINK answer — reason "blocked", because that
+    # is the MEASURED shape a probe at a URL that routes nothing actually
+    # gets (twice: an unbound hostname in a seeded store, and any hostname
+    # in an empty one — the geo path answers fail-closed blocked, not a bare
+    # None; test_route_preview_tenant_check pins the parity against a LIVE
+    # probe, so a drift in either shape goes red). §11 ruled the literal
+    # "no_campaign" on the belief that is what a dead link answers; the
+    # measurement refuted the premise, and a shape no innocent path produces
+    # would itself be the distinguishable answer — the oracle I-8 forbids,
+    # same argument that removed the null-reason form. A Redis failure here
+    # deliberately RAISES → 5xx →
+    # admin-api's PreviewUnavailable: could-not-validate is "ask again", never
+    # "no route" — the refused-vs-unavailable distinction R9 pins one layer up.
+    key_company: str | None = None
+    if req.preview_key_hash:
+        r = await get_redis()
+        key_company = await r.get(f"preview_key:{req.preview_key_hash}")
+        if key_company is None:
+            # Ours-only observability (§11): a node that never received the
+            # preview_key family answers this same dead-link shape to EVERY
+            # keyed preview — fail-closed and safe, and indistinguishable
+            # from cross-tenant in our own logs unless something says so.
+            # The builder writes `preview_keys:synced` UNCONDITIONALLY (even
+            # at zero keys), so marker-absent == family never delivered;
+            # marker-present == this hash is genuinely unknown / revoked /
+            # foreign. The WIRE answer is identical in both branches.
+            if not await r.exists("preview_keys:synced"):
+                capture_op_msg_throttled(
+                    OP_PREVIEW_KEYS_UNSYNCED,
+                    settings.node_id,
+                    "preview presented a key hash but the preview_key family "
+                    "has never synced to this node — degraded sync, not a "
+                    "cross-tenant probe",
+                    node_id=settings.node_id,
+                )
+            return PreviewResponse(matched=False, reason="blocked")
+
     arrival = req.arrival_ts or datetime.now(timezone.utc).strftime(
         "%Y-%m-%dT%H:%M:%S.%f"
     )[:-3] + "Z"
@@ -2447,6 +2492,19 @@ async def preview(
     if not (offer_id and target_id and company_id):
         # A destination we cannot name is a destination we cannot promise.
         return PreviewResponse(matched=False, reason="unidentified_target")
+
+    # Edge-preview P2.2 — tenant check, stage 2 of 2: the key's company
+    # against the ROUTED attribution's. ROUTING-now semantics on purpose
+    # (anchor §8 R19): this is the same Redis the real click would be routed
+    # from, so the answer stays the truthful prediction of the click even in
+    # the seconds PG and sync disagree. A mismatch answers the dead-link
+    # shape — byte-identical to a link that resolves nothing — so a caller
+    # holding another tenant's key learns exactly what a random probed URL
+    # would have told them (I-8, no existence oracle; see stage 1 for why
+    # the reason string is the MEASURED "blocked", not "no_campaign" and
+    # not null).
+    if key_company is not None and key_company != str(company_id):
+        return PreviewResponse(matched=False, reason="blocked")
 
     code = None
     expires_at = None

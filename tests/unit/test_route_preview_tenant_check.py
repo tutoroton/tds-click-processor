@@ -99,14 +99,17 @@ def _seeded_store(*, key_company: str | None, marker: bool = True):
 
 
 def _dead_link_answer():
-    """The innocent twin: a link that routes NOTHING, measured from the
-    running handler rather than hand-written. Deliberately probed against an
-    EMPTY store: in the seeded fixture an unbound hostname is not dead — the
-    geo fallback still finds the seeded campaign and answers `blocked`
-    (measured; an artifact of the seed, not of dead links). An attacker's
-    baseline for "this URL does not exist" is a URL that resolves nowhere,
-    which is exactly what an empty store models."""
-    return _post_keyed(_fake(), body={"hostname": "never-bound.example"})
+    """The innocent twin for a KEY-HOLDING caller (R24 outcome b's I-8
+    population): the SAME valid same-tenant hash probing a hostname that
+    routes nothing. Measured from the running handler, never hand-written —
+    under a present index the keyed no-route ladder carries
+    `tenant_checked: true` exactly as outcome (b) does, so whole-body parity
+    is the honest claim. (The unkeyed empty-store probe that stood here
+    before R24 stopped being the right twin the moment answers grew the
+    R25 echo: a prober WITH a key compares against keyed probes.)"""
+    store = _seeded_store(key_company=str(COMPANY))
+    return _post_keyed(store, body={"hostname": "never-bound.example",
+                                    "preview_key_hash": KEY_HASH})
 
 
 # --------------------------------------------------------------------------- #
@@ -127,15 +130,24 @@ def test_cross_tenant_key_is_byte_identical_to_a_dead_link(enabled):  # noqa: F8
     assert refused.json()["matched"] is False
 
 
-def test_unknown_hash_refuses_with_the_dead_link_shape(enabled):  # noqa: F811
-    """A hash the store does not hold IS the revoked-key shape: the builder
-    drops a revoked key and the managed-keys sweep deletes it, so 'present
-    but missing' must refuse or node-side revocation is vacuous."""
+def test_unknown_hash_with_present_index_carries_the_refusal_verdict(enabled):  # noqa: F811
+    """R24 outcome (c) — the seam fix. A hash missing from a PRESENT index is
+    the revoked/garbage-key shape, and the answer now carries the IN-BAND
+    verdict the Worker's fall-to-click predicate reads (`preview_denied` —
+    the ONLY field that sends it to the click path, which is what makes row 2
+    implementable across the chain). The BODY stays the dead-link shape; the
+    verdict rides beside it and the public never sees it — the worker
+    collapses it into an ordinary click, which IS the non-oracular public
+    answer."""
     store = _seeded_store(key_company=None)  # marker present, no key entry
 
     refused = _post_keyed(store, body={"preview_key_hash": KEY_HASH})
 
-    assert refused.json() == _dead_link_answer().json()
+    body = refused.json()
+    assert body["matched"] is False
+    assert body["reason"] == "blocked"
+    assert body["preview_denied"] == "key_refused"
+    assert body["tenant_checked"] is True
 
 
 def test_matching_company_key_previews_normally(enabled):  # noqa: F811
@@ -188,11 +200,20 @@ def test_keyed_preview_still_performs_zero_writes(enabled):  # noqa: F811
 # --------------------------------------------------------------------------- #
 # The degraded-state discriminator (anchor §11)                                #
 # --------------------------------------------------------------------------- #
-def test_unsynced_node_fires_the_op_and_answers_the_identical_shape(enabled):  # noqa: F811
-    """Marker ABSENT + miss ⇒ the throttled op fires (ours to see) and the
-    wire answer is the SAME dead-link shape — both halves of the ruling in
-    one test, the wire half measured by comparing bodies across the two
-    branches rather than asserting a literal."""
+def test_unsynced_node_answers_no_verdict_and_no_echo(enabled):  # noqa: F811
+    """R24 outcome (d), and the trap the obvious fix walks into: a DEGRADED
+    node must never claim `key_refused` — the Worker would turn a preview
+    stream above click volume into a CLICK stream the moment sync breaks
+    (R3 reopened through degradation) — and must never claim
+    `tenant_checked` either, or a validated "no route" and a
+    could-not-validate collapse into one answer. So (d) carries NEITHER
+    field, the throttled op fires (ours to see), and (c) differs from (d) in
+    exactly those two fields while the public-visible core (matched/reason)
+    stays identical — the §11 wire-identity claim survives at the PUBLIC
+    boundary (admin-api collapses both to bare matched:false) and is
+    deliberately superseded at the authed hop, where the Worker NEEDS the
+    difference: (d) reads as no-verdict → 503, never a click, never an
+    answer."""
     unsynced = _seeded_store(key_company=None, marker=False)
     synced = _seeded_store(key_company=None, marker=True)
 
@@ -202,9 +223,36 @@ def test_unsynced_node_fires_the_op_and_answers_the_identical_shape(enabled):  #
     assert op.call_args.args[0] == telemetry.OP_PREVIEW_KEYS_UNSYNCED
 
     with patch.object(main, "capture_op_msg_throttled") as op:
-        genuine = _post_keyed(synced, body={"preview_key_hash": KEY_HASH})
+        refused = _post_keyed(synced, body={"preview_key_hash": KEY_HASH})
     assert op.call_count == 0, "marker present — a plain miss must NOT alarm"
 
-    assert degraded.json() == genuine.json(), (
-        "the degraded and genuine branches must be indistinguishable on the wire"
-    )
+    d, c = degraded.json(), refused.json()
+    assert d["preview_denied"] is None and d["tenant_checked"] is None
+    assert c["preview_denied"] == "key_refused" and c["tenant_checked"] is True
+    assert (d["matched"], d["reason"]) == (c["matched"], c["reason"]) == (False, "blocked")
+
+
+def test_absent_hash_answers_carry_neither_new_field(enabled):  # noqa: F811
+    """The rollout pin, R24 edition: a caller that presents NO hash gets
+    null for both new fields — the pre-R24 shape plus two nulls, which is
+    what keeps the admin-api path and every old caller byte-stable."""
+    store = _seeded_store(key_company=None)
+
+    body = _post_keyed(store).json()
+    assert body["matched"] is True
+    assert body["preview_denied"] is None
+    assert body["tenant_checked"] is None
+
+
+def test_matched_answer_under_a_key_carries_the_echo(enabled):  # noqa: F811
+    """R24 outcome (a) + R25: a validated, matching preview says so — the
+    field the Worker requires whenever it SENT a hash, which is what turns
+    deploy order from operator memory into structure (a pre-R24 node that
+    IGNORED the hash answers without it, and the caller maps that to
+    no-verdict → 503, never to a validated preview)."""
+    store = _seeded_store(key_company=str(COMPANY))
+
+    body = _post_keyed(store, body={"preview_key_hash": KEY_HASH}).json()
+    assert body["matched"] is True
+    assert body["tenant_checked"] is True
+    assert body["preview_denied"] is None

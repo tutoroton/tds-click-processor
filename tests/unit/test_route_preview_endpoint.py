@@ -412,6 +412,13 @@ def test_the_response_carries_no_commercially_sensitive_field(enabled):
     assert set(body) == {
         "matched", "offer_id", "offer_target_id", "route_code",
         "expires_at", "reason",
+        # R24/R25 (the four-outcome contract) — a refusal verdict and a
+        # validation echo for AUTHED callers. Neither is commercial data:
+        # the verdict names OUR decision about the presented credential, the
+        # echo names whether OUR check ran. Both are null on this unkeyed
+        # request; their semantics are pinned in
+        # test_route_preview_tenant_check.py.
+        "preview_denied", "tenant_checked",
     }
 
 

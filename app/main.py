@@ -2392,20 +2392,34 @@ async def preview(
     # deliberately RAISES → 5xx →
     # admin-api's PreviewUnavailable: could-not-validate is "ask again", never
     # "no route" — the refused-vs-unavailable distinction R9 pins one layer up.
+    # R24 — the four-outcome contract this stage implements toward an AUTHED
+    # caller: (a) resolved+match -> the preview; (b) resolved+MISMATCH -> the
+    # pure dead-link shape, no verdict (I-8: a VALID key learns nothing about
+    # foreign links); (c) miss + index PRESENT -> the dead-link shape PLUS
+    # preview_denied="key_refused" — the in-band verdict that lets the Worker
+    # implement row 2 (the seam finding: the worker falls to the click ONLY on
+    # this field, and no shape without it can be a refusal); (d) miss + index
+    # ABSENT -> plain false + the throttled op, NO verdict and NO
+    # tenant_checked — a degraded node must never claim "refused", or the
+    # preview stream (above click volume by mandate) becomes a CLICK stream
+    # the moment sync breaks: R3 reopened through degradation.
+    #
+    # `tenant_checked` (R25) rides every answer produced under a PRESENT
+    # index for a presented hash — (a), (b), (c) AND the no-route ladder
+    # below — so a caller that sent a hash can tell "validated" from "an
+    # older node ignored the field" (extra='ignore'), making deploy order
+    # structural rather than operator memory.
     key_company: str | None = None
+    tenant_checked: bool | None = None
     if req.preview_key_hash:
         r = await get_redis()
         key_company = await r.get(f"preview_key:{req.preview_key_hash}")
         if key_company is None:
-            # Ours-only observability (§11): a node that never received the
-            # preview_key family answers this same dead-link shape to EVERY
-            # keyed preview — fail-closed and safe, and indistinguishable
-            # from cross-tenant in our own logs unless something says so.
-            # The builder writes `preview_keys:synced` UNCONDITIONALLY (even
-            # at zero keys), so marker-absent == family never delivered;
-            # marker-present == this hash is genuinely unknown / revoked /
-            # foreign. The WIRE answer is identical in both branches.
             if not await r.exists("preview_keys:synced"):
+                # Outcome (d) — family never delivered. Ours-only op (§11);
+                # the answer carries neither verdict nor tenant_checked, so
+                # an authed caller reads it as could-not-validate, never as
+                # a refusal and never as a validated "no route".
                 capture_op_msg_throttled(
                     OP_PREVIEW_KEYS_UNSYNCED,
                     settings.node_id,
@@ -2414,7 +2428,17 @@ async def preview(
                     "cross-tenant probe",
                     node_id=settings.node_id,
                 )
-            return PreviewResponse(matched=False, reason="blocked")
+                return PreviewResponse(matched=False, reason="blocked")
+            # Outcome (c) — the index is present and this hash is not in it:
+            # unknown, revoked, or a key newer than the last sync tick. The
+            # body stays the dead-link shape; the verdict field is what the
+            # worker consumes and the public never sees (it collapses to a
+            # click there, which IS the non-oracular public answer).
+            return PreviewResponse(
+                matched=False, reason="blocked",
+                preview_denied="key_refused", tenant_checked=True,
+            )
+        tenant_checked = True
 
     arrival = req.arrival_ts or datetime.now(timezone.utc).strftime(
         "%Y-%m-%dT%H:%M:%S.%f"
@@ -2476,13 +2500,17 @@ async def preview(
     result = await route(click_req)
 
     if not result:
-        return PreviewResponse(matched=False, reason="no_campaign")
+        return PreviewResponse(matched=False, reason="no_campaign",
+                               tenant_checked=tenant_checked)
     if result.get("blocked"):
-        return PreviewResponse(matched=False, reason="blocked")
+        return PreviewResponse(matched=False, reason="blocked",
+                               tenant_checked=tenant_checked)
     if result.get("non_routed"):
-        return PreviewResponse(matched=False, reason="non_routed")
+        return PreviewResponse(matched=False, reason="non_routed",
+                               tenant_checked=tenant_checked)
     if not result.get("url"):
-        return PreviewResponse(matched=False, reason="no_destination")
+        return PreviewResponse(matched=False, reason="no_destination",
+                               tenant_checked=tenant_checked)
 
     attribution = result.get("attribution") or {}
     offer_id = _to_int_or_none(result.get("offer_id"))
@@ -2491,7 +2519,8 @@ async def preview(
 
     if not (offer_id and target_id and company_id):
         # A destination we cannot name is a destination we cannot promise.
-        return PreviewResponse(matched=False, reason="unidentified_target")
+        return PreviewResponse(matched=False, reason="unidentified_target",
+                               tenant_checked=tenant_checked)
 
     # Edge-preview P2.2 — tenant check, stage 2 of 2: the key's company
     # against the ROUTED attribution's. ROUTING-now semantics on purpose
@@ -2504,7 +2533,12 @@ async def preview(
     # the reason string is the MEASURED "blocked", not "no_campaign" and
     # not null).
     if key_company is not None and key_company != str(company_id):
-        return PreviewResponse(matched=False, reason="blocked")
+        # Outcome (b) — a VALID key, someone else's campaign: the pure
+        # dead-link shape, tenant_checked and nothing else. Byte-identical to
+        # what the same keyed caller gets probing a URL that routes nothing
+        # (the ladder above under a present index) — I-8's population.
+        return PreviewResponse(matched=False, reason="blocked",
+                               tenant_checked=tenant_checked)
 
     code = None
     expires_at = None
@@ -2528,6 +2562,7 @@ async def preview(
         offer_target_id=target_id,
         route_code=code,
         expires_at=expires_at,
+        tenant_checked=tenant_checked,
     )
 
 

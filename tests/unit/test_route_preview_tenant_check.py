@@ -112,7 +112,7 @@ def _dead_link_answer():
 # --------------------------------------------------------------------------- #
 # The check itself                                                             #
 # --------------------------------------------------------------------------- #
-def test_cross_tenant_key_is_byte_identical_to_a_dead_link(enabled):
+def test_cross_tenant_key_is_byte_identical_to_a_dead_link(enabled):  # noqa: F811
     """🔴 THE ONE THE RULING IS ABOUT. A key of company 2 asking about a
     company-1 campaign gets EXACTLY what a random dead URL gets — compared as
     whole response bodies against a live dead-link probe, not against a
@@ -127,7 +127,7 @@ def test_cross_tenant_key_is_byte_identical_to_a_dead_link(enabled):
     assert refused.json()["matched"] is False
 
 
-def test_unknown_hash_refuses_with_the_dead_link_shape(enabled):
+def test_unknown_hash_refuses_with_the_dead_link_shape(enabled):  # noqa: F811
     """A hash the store does not hold IS the revoked-key shape: the builder
     drops a revoked key and the managed-keys sweep deletes it, so 'present
     but missing' must refuse or node-side revocation is vacuous."""
@@ -138,7 +138,7 @@ def test_unknown_hash_refuses_with_the_dead_link_shape(enabled):
     assert refused.json() == _dead_link_answer().json()
 
 
-def test_matching_company_key_previews_normally(enabled):
+def test_matching_company_key_previews_normally(enabled):  # noqa: F811
     """Calibration leg 2: the comparison reads the VALUE. The right company
     passes — so the refusals above are the comparison, not key-presence."""
     store = _seeded_store(key_company=str(COMPANY))
@@ -150,7 +150,7 @@ def test_matching_company_key_previews_normally(enabled):
     assert body["offer_id"] == OFFER
 
 
-def test_absent_field_is_todays_behaviour(enabled):
+def test_absent_field_is_todays_behaviour(enabled):  # noqa: F811
     """Calibration leg 1: the SAME fixture matches when no key is presented —
     proving the cross-tenant `false` above comes from the check, and pinning
     the rollout property (no caller sends the field today ⇒ byte-identical)."""
@@ -159,7 +159,7 @@ def test_absent_field_is_todays_behaviour(enabled):
     assert _post_keyed(store).json()["matched"] is True
 
 
-def test_malformed_hash_is_refused_before_it_reaches_the_lookup(enabled):
+def test_malformed_hash_is_refused_before_it_reaches_the_lookup(enabled):  # noqa: F811
     """Schema, not handler: a non-sha256-shaped value never reaches the
     lookup. The status is 403, not 422, and that is THIS SERVICE'S OWN
     convention (D2/V17, `_validation_error_handler`): a validation error must
@@ -172,7 +172,7 @@ def test_malformed_hash_is_refused_before_it_reaches_the_lookup(enabled):
     assert resp.status_code == 403
 
 
-def test_keyed_preview_still_performs_zero_writes(enabled):
+def test_keyed_preview_still_performs_zero_writes(enabled):  # noqa: F811
     """I-1 extended to the new path: the tenant check adds a GET (and, on a
     miss, an EXISTS) — reads only. The recorder that caught the identity-pool
     blindness (hazard 9) watches both request-path pools here too."""
@@ -188,7 +188,7 @@ def test_keyed_preview_still_performs_zero_writes(enabled):
 # --------------------------------------------------------------------------- #
 # The degraded-state discriminator (anchor §11)                                #
 # --------------------------------------------------------------------------- #
-def test_unsynced_node_fires_the_op_and_answers_the_identical_shape(enabled):
+def test_unsynced_node_fires_the_op_and_answers_the_identical_shape(enabled):  # noqa: F811
     """Marker ABSENT + miss ⇒ the throttled op fires (ours to see) and the
     wire answer is the SAME dead-link shape — both halves of the ruling in
     one test, the wire half measured by comparing bodies across the two

@@ -599,7 +599,27 @@ async def _build_campaign_attribution(
     # Gate V1 (fail-open): the WHOLE resolver call is wrapped — ANY exception
     # degrades to legacy (no keys stamped) and the click still routes. The
     # resolver never raises out of here, never 5xx, never loses a click.
-    if settings.returning_resolver_enabled:
+    #
+    # Gate V2 — `req.identity_writes` (EPV-DEFECT-1, ADR-0468). A route PREVIEW
+    # must predict a destination without leaving a trace, and the two signals
+    # `/preview` blanks (`visitor_id`, `identity_token`) are NOT all of them:
+    # `funnel_user_id` arrives through `query_params`, which a preview forwards
+    # verbatim by design, and a bare `?funnel_user_id=` binds with no operator
+    # configuration at all (the canonical-binding rule, `resolution.py:28-38`).
+    #
+    # The gate is on the BLOCK, not on the `resolve_and_stamp` call, and that
+    # distinction is the whole fix. Gating the call alone leaves the DEFERRED
+    # path live: a domain-matched click resolves with `commit_identity=False`,
+    # stashes `funnel_user_id` + `source_trusted` below, and
+    # `_commit_deferred_identity` writes them the moment the campaign serves —
+    # which a matched preview does. Gating here kills resolve, the stash, that
+    # commit, and (via an empty `uid`) every sticky and fresh-track write, by
+    # CONTROL FLOW rather than by a rule someone has to remember.
+    #
+    # Ordering note: `identity_writes` is checked SECOND deliberately. The
+    # operator kill-switch stays the outermost condition, so reading this line
+    # answers "is the resolver on" before "is this caller allowed to write".
+    if settings.returning_resolver_enabled and req.identity_writes:
         try:
             # Read previous-visit history (for prev_* matching) only when
             # segmented routing is ALSO live for this company (env AND

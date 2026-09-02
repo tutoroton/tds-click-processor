@@ -101,6 +101,15 @@ OP_WATERMARK_SPILL = "watermark_spill"
 # wins (accept/XADD proceeds) — this tag is pure visibility.
 OP_WATERMARK_SIGNAL_STALE = "watermark_signal_stale"
 
+# GTD-D149 — the preview admission cap refused a request: the bulkhead is
+# SHEDDING preview load to protect click serving. Working as designed under
+# a preview flood (the owner's mandate says preview volume may exceed
+# clicks), so this is visibility, not an error — but a SUSTAINED stream of
+# these is the signal to look at TDS_PREVIEW_MAX_CONCURRENCY and the D149
+# rig before raising anything. Throttled: a flood would otherwise fire it
+# per refused request.
+OP_PREVIEW_CAPACITY_SHED = "preview_capacity_shed"
+
 # Edge-preview P2.2 (anchor §11) — a /preview presented a key hash, the
 # lookup missed, AND the `preview_keys:synced` marker is absent: this node
 # has never received the preview_key family at all. Degraded sync, NOT a

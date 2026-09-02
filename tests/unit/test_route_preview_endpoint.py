@@ -137,6 +137,13 @@ async def _seed_domain_route(r) -> None:
         "url": "https://advertiser.example/landing?c={click_id}",
         "is_default": "1", "availability": "active",
         "offer_id": str(OFFER), "criteria": "[]", "priority": "0"})
+    # P2.5 (GTD-D151) — the offer hash the node reads for the human-facing
+    # name+icon a matched preview returns. Synced from admin-api in production;
+    # a realistic matched route has one.
+    await r.hset(f"offer:{OFFER}", mapping={
+        "name": "Acme Sports Bonus", "icon_url": "https://cdn.example/acme.png",
+        "company_id": str(COMPANY), "url": "https://advertiser.example/landing",
+        "payout_value": "40", "payout_currency": "USD", "has_targets": "1"})
 
 
 @pytest.fixture
@@ -188,7 +195,18 @@ def _post(store, body: dict | None = None, key: str | None = SECRET,
     # NOT a context manager: `with TestClient(app)` runs the app lifespan,
     # which dials the real Redis at startup. The rest of this service's
     # endpoint tests construct it the same way, for the same reason.
+    # ⚠️ And the binding is per-MODULE, not per-factory. The paragraph above
+    # counts FACTORIES, which is the right unit for "which pools can a request
+    # reach" and the wrong one for "is every reach intercepted": `patch.object`
+    # rebinds the NAME inside one module, so a handler that calls `get_redis`
+    # from `main` is untouched by patching `router.get_redis` — measured here
+    # when the P2.5 offer-hash read landed in `main` and eight tests that had
+    # never mentioned it dialled a real Redis. It fails loudly rather than
+    # silently, which is why this is a note and not an incident; patching
+    # `main` too also puts those reads INSIDE the write recorder, so the
+    # zero-writes guarantee now covers the module that grew a new call site.
     with patch.object(router, "get_redis", _get_redis), \
+            patch.object(main, "get_redis", _get_redis), \
             patch.object(identity, "get_identity_redis", _get_identity_redis), \
             patch.object(sticky, "get_identity_redis", _get_identity_redis):
         return TestClient(main.app).post(
@@ -344,6 +362,37 @@ def test_a_matched_preview_returns_the_decision_and_a_code(enabled):
     assert body["expires_at"] > 0
 
 
+def test_a_matched_preview_carries_the_offer_name_and_icon(enabled):
+    """P2.5 (GTD-D151) — the feature's PURPOSE on the campaign-domain path:
+    the node returns enough for a landing page to advertise the offer, because
+    no admin-api is in that chain to enrich. Read from the synced offer hash."""
+    store = _fake()
+    _run(_seed_domain_route(store.client()))
+
+    body = _post(store).json()
+
+    assert body["matched"] is True
+    assert body["offer_name"] == "Acme Sports Bonus"
+    assert body["offer_icon_url"] == "https://cdn.example/acme.png"
+
+
+def test_an_offer_with_no_icon_answers_empty_not_absent(enabled):
+    """An offer whose icon_url is unset returns "" — additive, byte-stable with
+    today's shape for the no-icon case; a landing renders name and no image."""
+    store = _fake()
+
+    async def _seed(r):
+        await _seed_domain_route(r)
+        await r.hset(f"offer:{OFFER}", mapping={"name": "No-Icon Offer",
+                                                "icon_url": ""})
+
+    _run(_seed(store.client()))
+    body = _post(store).json()
+
+    assert body["offer_name"] == "No-Icon Offer"
+    assert body["offer_icon_url"] == ""
+
+
 def test_the_returned_code_verifies_and_names_the_same_target(enabled):
     """End-to-end for the pair: what /preview mints, route_code.verify accepts,
     and it names the decision the engine actually made."""
@@ -419,6 +468,11 @@ def test_the_response_carries_no_commercially_sensitive_field(enabled):
         # request; their semantics are pinned in
         # test_route_preview_tenant_check.py.
         "preview_denied", "tenant_checked",
+        # P2.5 (GTD-D151) — the offer's human-facing name+icon. The OPPOSITE
+        # of commercial data: these are what the landing shows the visitor.
+        # The forbidden set above still holds; these were RULED to cross the
+        # public boundary (the sibling admin-api path already returns them).
+        "offer_name", "offer_icon_url",
     }
 
 

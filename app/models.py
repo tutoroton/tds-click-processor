@@ -519,6 +519,20 @@ class PreviewResponse(BaseModel):
     matched: bool
     offer_id: int | None = None
     offer_target_id: int | None = None
+    # Edge-preview P2.5 (GTD-D151) — the offer's human-facing NAME and ICON, so
+    # a landing page on the CAMPAIGN-DOMAIN path can advertise the offer the
+    # visitor will actually get. That path calls the node directly, with no
+    # admin-api to enrich from Postgres, so the node carries them itself
+    # (synced offer hash). NOT commercial data — the OPPOSITE of the fields the
+    # docstring below forbids: name+icon are DESIGNED to be shown to the
+    # visitor, whereas url_template/payout/criteria must never reach one. The
+    # public boundary ALREADY carries them on the sibling admin-api path
+    # (route_preview/service.py returns `offer:{name,icon_url}`), so this makes
+    # the bypassing path MATCH that exposure, never exceed it. Present only on
+    # a matched, tenant-verified preview (outcome a); a dead-link answer carries
+    # neither, so they add no oracle. Empty string when the offer has no icon.
+    offer_name: str | None = None
+    offer_icon_url: str | None = None
     route_code: str | None = None
     expires_at: int | None = None
     reason: str | None = None

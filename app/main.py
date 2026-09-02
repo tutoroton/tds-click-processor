@@ -2552,14 +2552,37 @@ async def preview(
         )
         expires_at = int(time.time()) + ttl
 
-    # NOTE the shape of what leaves this handler: ids and a signed code. The
-    # `url` the engine just built is the advertiser's real tracking link and
-    # NEVER leaves the node; the offer's human-facing name and icon are
-    # admin-api's to add from Postgres (anchor §9.1, plan I-5).
+    # Edge-preview P2.5 (GTD-D151) — the offer's human-facing NAME and ICON,
+    # read from the synced offer hash. The old note here said "the name and
+    # icon are admin-api's to add from Postgres" — TRUE of the original panel
+    # path, and false of the system once the mandate added the CAMPAIGN-DOMAIN
+    # path, where the Worker calls this node directly with no admin-api in the
+    # chain. Numbers-only there would make the feature's whole purpose (a
+    # landing page advertising the offer) unachievable. Ruled to cross the
+    # public boundary (P2.5 ruling): name+icon are the OPPOSITE of the
+    # commercial fields — designed to be shown to the visitor — and the sibling
+    # admin-api path already returns them publicly, so this MATCHES that
+    # exposure. Returned only on this matched + tenant-verified branch, so the
+    # dead-link answers above carry neither and no oracle is added.
+    #
+    # One `offer:{id}` read on the PREVIEW path only (never the click path): a
+    # keyed preview already read this pool for the tenant check; an unkeyed one
+    # pays one hmget, off the hot path and behind the admission cap.
+    offer_hash = await (await get_redis()).hmget(
+        f"offer:{offer_id}", "name", "icon_url",
+    )
+    offer_name = (offer_hash[0] if offer_hash else None) or ""
+    offer_icon_url = (offer_hash[1] if offer_hash and len(offer_hash) > 1 else None) or ""
+
+    # NOTE the shape of what leaves this handler: ids, the human-facing
+    # name+icon, and a signed code. The advertiser's real tracking `url` the
+    # engine built NEVER leaves the node — nor does payout, criteria or partner.
     return PreviewResponse(
         matched=True,
         offer_id=offer_id,
         offer_target_id=target_id,
+        offer_name=offer_name,
+        offer_icon_url=offer_icon_url,
         route_code=code,
         expires_at=expires_at,
         tenant_checked=tenant_checked,

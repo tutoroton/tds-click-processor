@@ -159,8 +159,51 @@ health_gate() {
 }
 
 # --- 1. Forward path: fetch + reset to release tip ---
+#
+# The fetch RETRIES, and the reason is not general flakiness. Measured
+# 2026-09-03: this node clones and fetches ANONYMOUSLY (see
+# admin-api _bootstrap.py, `git clone ... {git_repo}` with no credential of any
+# kind), and GitHub refuses anonymous `POST /git-upload-pack` in bursts:
+#
+#     GET  /info/refs?service=git-upload-pack  -> HTTP 200
+#     POST /git-upload-pack                    -> HTTP 401
+#                                                 www-authenticate: Basic realm="GitHub"
+#
+# git reads that 401 as "credentials required", tries to prompt, and with
+# GIT_TERMINAL_PROMPT=0 dies exit 128 -- which is why this has looked for days
+# like a credential or wrong-remote fault and is neither.
+#
+# Two things make retry the right remedy rather than a plaster:
+#   * the refusal is BURSTY, not permanent -- interleaved trials went 1/5 in one
+#     window and 5/5 ten minutes later, on the same URL, same protocol
+#   * an up-to-date fetch STILL issues the POST (verified), so there is no
+#     "already have the objects" shortcut around the failing surface
+#
+# What retry does NOT fix: sustained throttling. The durable answer is to stop
+# fetching anonymously (deploy key or token), which is an owner decision because
+# it puts a credential on every edge box. Recorded as GTD-D168.
+fetch_with_retry() {
+	local attempt=1 max=6 delay=5
+	while :; do
+		if git fetch --depth 1 origin "$BRANCH"; then
+			[ "$attempt" -gt 1 ] && echo "=== STEP: fetch === succeeded on attempt $attempt"
+			return 0
+		fi
+		if [ "$attempt" -ge "$max" ]; then
+			echo "=== STEP: fetch === FAILED after $max attempts." >&2
+			echo "fetch: if the log above shows 'could not read Username', this is the" >&2
+			echo "fetch: anonymous-throttling case, NOT a credential misconfiguration." >&2
+			return 1
+		fi
+		echo "=== STEP: fetch === attempt $attempt failed; retrying in ${delay}s" >&2
+		sleep "$delay"
+		attempt=$((attempt + 1))
+		delay=$((delay * 2))
+	done
+}
+
 echo "=== STEP: fetch === branch=$BRANCH"
-git fetch --depth 1 origin "$BRANCH"
+fetch_with_retry
 git reset --hard "origin/$BRANCH"
 NEW_SHA="$(git rev-parse --short HEAD)"
 echo "=== STEP: fetch === new_sha=$NEW_SHA prev_sha=$PREV_SHA"

@@ -95,6 +95,8 @@ __all__ = ["RouteCode", "CODE_VERSION", "is_enabled", "sign", "verify"]
 # and served X's target -- measured 20/20 on staging, a total override of Y's own
 # routing, not a partial effect. ADR-0454 recorded that as a known limitation and
 # named this exact remedy ("campaign_id in the payload, i.e. CODE_VERSION 2").
+# Full slug, the number is ambiguous in this repo:
+# ADR-0454-route-code-yields-to-the-sticky-pin-and-never-writes-the-returning-system-outranks-a-guess-about-an-anonymous-visitor
 # Old v1 codes fail closed at the version check below, which is the correct
 # outcome: their TTL is 30 minutes and they carry an unbindable claim.
 CODE_VERSION = 2

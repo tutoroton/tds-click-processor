@@ -41,6 +41,9 @@ _COMPANY = 1
 _OFFER = 7
 _CODED_TARGET = 99      # what the CODE names
 _NORMAL_TARGET = "42"   # what ordinary routing would serve
+# v2: the campaign `_resolve` drives the resolver with. A code minted for
+# any other campaign must NOT be honoured on it -- that is the bind.
+_CAMPAIGN = 35
 
 
 class FakeIdentRedis:
@@ -124,12 +127,12 @@ def _click(code):
     )
 
 
-def _sign(*, company_id=_COMPANY, offer_id=_OFFER, target_id=_CODED_TARGET,
-          ttl=600, now=None):
+def _sign(*, company_id=_COMPANY, campaign_id=_CAMPAIGN, offer_id=_OFFER,
+          target_id=_CODED_TARGET, ttl=600, now=None):
     with patch.object(settings, "route_code_keys", _KEYS), \
          patch.object(settings, "route_code_active_kid", _ACTIVE_KID):
         return route_code.sign(
-            company_id=company_id, offer_id=offer_id,
+            company_id=company_id, campaign_id=campaign_id, offer_id=offer_id,
             offer_target_id=target_id, ttl_seconds=ttl, now=now,
         )
 
@@ -306,6 +309,38 @@ class TestReturningSystemIsNotDisturbed:
             hashes=hashes, ident=ident,
         )
         assert ("offer_target:%d" % _CODED_TARGET) not in r.reads
+
+    def test_a_code_minted_for_another_campaign_is_refused(self):
+        """v2 campaign bind -- the defect this closes, in one test.
+
+        Measured on staging 2026-09-03 BEFORE the bind: a code minted by
+        previewing campaign X and replayed on campaign Y of the SAME company was
+        served X's target on 20 of 20 clicks, while the control (same link, no
+        code) served Y's own. A total override of the other campaign's routing,
+        including its geo/device/cap decisions.
+
+        `_resolve` drives the resolver with campaign `_CAMPAIGN`; this code names
+        a different one, so it must fall through to ordinary routing.
+        """
+        result, status, _, _ = _resolve(code=_sign(campaign_id=_CAMPAIGN + 1))
+        assert result["target_id"] == _NORMAL_TARGET, (
+            "a code minted for another campaign was honoured -- the campaign "
+            "bind is not in force"
+        )
+        assert result["target_selection_path"] != "route_code"
+
+    def test_the_foreign_campaigns_target_is_never_even_read(self):
+        """Structural, like the sticky twin: the refusal happens on the code's
+        own claim, before any target lookup. A weaker assertion would pass
+        against an implementation that reads the target and then discards it."""
+        _, _, r, _ = _resolve(code=_sign(campaign_id=_CAMPAIGN + 1))
+        assert ("offer_target:%d" % _CODED_TARGET) not in r.reads
+
+    def test_the_matching_campaign_is_still_honoured(self):
+        """Reverse-direction calibration: the bind must not disable the feature.
+        Same call, the code's campaign matching the click's."""
+        result, _, _, _ = _resolve(code=_sign(campaign_id=_CAMPAIGN))
+        assert result["target_id"] == str(_CODED_TARGET)
 
     def test_returning_flow_beats_the_code(self):
         """ADR-0454 term 1 — `returning-flow pick > sticky pin > ROUTE CODE`.

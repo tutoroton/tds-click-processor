@@ -89,10 +89,18 @@ __all__ = ["RouteCode", "CODE_VERSION", "is_enabled", "sign", "verify"]
 
 # Current wire-format version. Bump to evolve the layout; an old version on the
 # wire fails verify (treated as no-code), which is the graceful fall-through.
-CODE_VERSION = 1
+#
+# v2 (2026-09-03) BINDS THE CAMPAIGN. v1 carried no campaign id, so a code minted
+# by previewing campaign X could be replayed on campaign Y of the same company
+# and served X's target -- measured 20/20 on staging, a total override of Y's own
+# routing, not a partial effect. ADR-0454 recorded that as a known limitation and
+# named this exact remedy ("campaign_id in the payload, i.e. CODE_VERSION 2").
+# Old v1 codes fail closed at the version check below, which is the correct
+# outcome: their TTL is 30 minutes and they carry an unbindable claim.
+CODE_VERSION = 2
 
-# 1B(v) + 1B(kid) + 4B(c) + 4B(o) + 4B(t) + 4B(exp)
-_PAYLOAD_BYTES = 18
+# 1B(v) + 1B(kid) + 4B(company) + 4B(campaign) + 4B(offer) + 4B(target) + 4B(exp)
+_PAYLOAD_BYTES = 22
 
 # HMAC-SHA256 digest width.
 _SIG_BYTES = 32
@@ -114,6 +122,11 @@ class RouteCode:
     """
 
     company_id: int
+    # v2. The campaign the code was MINTED on. The honour site refuses a code
+    # whose campaign is not the campaign the click landed on, which is what
+    # makes the code a hint about ONE campaign rather than a company-wide
+    # override.
+    campaign_id: int
     offer_id: int
     offer_target_id: int
     expires_at: int
@@ -199,6 +212,7 @@ def is_enabled() -> bool:
 def sign(
     *,
     company_id: int,
+    campaign_id: int,
     offer_id: int,
     offer_target_id: int,
     ttl_seconds: int,
@@ -218,6 +232,7 @@ def sign(
 
     for name, value in (
         ("company_id", company_id),
+        ("campaign_id", campaign_id),
         ("offer_id", offer_id),
         ("offer_target_id", offer_target_id),
     ):
@@ -234,6 +249,7 @@ def sign(
     payload = (
         bytes([CODE_VERSION, kid])
         + company_id.to_bytes(4, "big")
+        + campaign_id.to_bytes(4, "big")
         + offer_id.to_bytes(4, "big")
         + offer_target_id.to_bytes(4, "big")
         + exp.to_bytes(4, "big")
@@ -286,13 +302,15 @@ def verify(code: str | None, *, now: int | None = None) -> RouteCode | None:
         return None
 
     company_id = int.from_bytes(payload[2:6], "big")
-    offer_id = int.from_bytes(payload[6:10], "big")
-    offer_target_id = int.from_bytes(payload[10:14], "big")
-    exp = int.from_bytes(payload[14:18], "big")
+    campaign_id = int.from_bytes(payload[6:10], "big")
+    offer_id = int.from_bytes(payload[10:14], "big")
+    offer_target_id = int.from_bytes(payload[14:18], "big")
+    exp = int.from_bytes(payload[18:22], "big")
 
     # A validly signed code naming id 0 is still nonsense — refuse it rather
     # than hand a caller an id it would go on to look up.
-    if company_id <= 0 or offer_id <= 0 or offer_target_id <= 0:
+    if (company_id <= 0 or campaign_id <= 0
+            or offer_id <= 0 or offer_target_id <= 0):
         return None
 
     current = int(now if now is not None else time.time())
@@ -301,6 +319,7 @@ def verify(code: str | None, *, now: int | None = None) -> RouteCode | None:
 
     return RouteCode(
         company_id=company_id,
+        campaign_id=campaign_id,
         offer_id=offer_id,
         offer_target_id=offer_target_id,
         expires_at=exp,

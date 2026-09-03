@@ -1432,6 +1432,20 @@ async def _route_code_target(
         if company_id is None or decoded.company_id != company_id:
             return None
 
+        # Campaign bind (v2). Without it the tenant check was the ONLY bind, so
+        # a code minted by previewing campaign X was honoured on ANY campaign of
+        # the same company -- measured 20/20 on staging: every click on campaign
+        # Y carrying X's code was served X's target, while the control (same
+        # link, no code) served Y's own. That is a total override of the other
+        # campaign's routing, including its geo/device/cap decisions, and the
+        # preview key is universal by owner ruling and reachable from a browser
+        # (the Worker answers preview with `Access-Control-Allow-Origin: *`).
+        #
+        # Compared as strings deliberately: `campaign_id` arrives here as the
+        # str the routing layer uses, while the code carries a uint32.
+        if str(decoded.campaign_id) != str(campaign_id):
+            return None
+
         tid = str(decoded.offer_target_id)
         target = await r.hgetall(f"offer_target:{tid}")
         # Mirrors the sticky-pin gate below, verbatim: absent hash / empty url /

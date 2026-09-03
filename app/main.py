@@ -2598,10 +2598,18 @@ async def _preview_body(req: PreviewRequest) -> PreviewResponse:
 
     code = None
     expires_at = None
-    if route_code.is_enabled():
+    # v2 binds the CAMPAIGN into the code (see route_code.CODE_VERSION). Without
+    # it, a code minted here was honoured on any campaign of the same company --
+    # measured 20/20 on staging, a total override of the other campaign's own
+    # routing. If the campaign cannot be identified we mint NOTHING rather than
+    # an unbindable code: no code degrades to ordinary routing, which is the
+    # feature simply not applying, while an unbindable one is the defect.
+    preview_campaign_id = _to_int_or_none(result.get("campaign_id"))
+    if route_code.is_enabled() and preview_campaign_id:
         ttl = settings.route_code_ttl_seconds
         code = route_code.sign(
             company_id=company_id,
+            campaign_id=preview_campaign_id,
             offer_id=offer_id,
             offer_target_id=target_id,
             ttl_seconds=ttl,

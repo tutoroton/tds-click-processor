@@ -30,6 +30,7 @@ KEY_A = "route-code-test-key-aaaaaaaaaaaaaaaaaaaaaaaa"
 KEY_B = "route-code-test-key-bbbbbbbbbbbbbbbbbbbbbbbb"
 
 COMPANY = 7
+CAMPAIGN = 4242   # v2: the campaign the code is bound to
 OFFER = 181
 TARGET = 195
 TTL = 1800
@@ -52,6 +53,9 @@ def keys_ring(monkeypatch):
 def _mint(**over) -> str:
     kwargs = {
         "company_id": COMPANY,
+        # v2 binds the campaign into the payload; the codec now refuses to mint
+        # without one, because an unbindable code is the defect v2 closes.
+        "campaign_id": CAMPAIGN,
         "offer_id": OFFER,
         "offer_target_id": TARGET,
         "ttl_seconds": TTL,
@@ -99,11 +103,21 @@ def test_code_fits_the_workers_query_param_cap(keys_1):
     so an over-long code would not fail loudly, it would arrive corrupted and
     every click would silently route as if no code were present.
 
-    68 chars is the whole margin of that decision; pin it.
+    The length is pinned exactly, so any payload change has to come here and
+    re-justify itself against the clamp rather than drift toward it silently.
+
+    v1 was 68 chars (18-byte payload). v2 added a 4-byte campaign id to close the
+    cross-campaign replay (see `route_code.CODE_VERSION`), taking the payload to
+    22 bytes and the code to 74. Verified against the real clamp, not a
+    remembered one: `MAX_PARAM_VALUE_LENGTH = 512` at
+    `services/worker/src/index.js:264`, applied by `substring` at :1363. 74 of
+    512 leaves ~85% of the budget unused.
     """
     code = _mint()
 
-    assert len(code) == 68, f"expected the documented 68-char code, got {len(code)}"
+    assert len(code) == 74, f"expected the documented 74-char v2 code, got {len(code)}"
+    # The invariant that actually matters: the worker TRUNCATES above this, so
+    # exceeding it would corrupt the code silently rather than fail loudly.
     assert len(code) < 512
 
 

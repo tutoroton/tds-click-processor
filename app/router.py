@@ -1470,6 +1470,8 @@ async def _resolve_action_with_sticky(
     campaign_mappings,
     sticky_active: bool,
     # ADR-0454's priority has THREE terms; `sticky_active` only ever expressed
+    # (full slug, the number is ambiguous:
+    #  ADR-0454-route-code-yields-to-the-sticky-pin-and-never-writes-the-returning-system-outranks-a-guess-about-an-anonymous-visitor)
     # the middle one. See the hook site below for why that gap was invisible.
     returning_flow_won: bool = False,
     uid: str,

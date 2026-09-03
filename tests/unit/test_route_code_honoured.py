@@ -310,6 +310,9 @@ class TestReturningSystemIsNotDisturbed:
     def test_returning_flow_beats_the_code(self):
         """ADR-0454 term 1 — `returning-flow pick > sticky pin > ROUTE CODE`.
 
+        Full slug (the number names two decisions):
+        ADR-0454-route-code-yields-to-the-sticky-pin-and-never-writes-the-returning-system-outranks-a-guess-about-an-anonymous-visitor
+
         This test did not exist, and its absence is the whole reason the defect
         shipped: the ADR's evidence cited the two STICKY tests above as pinning
         "the priority", and they pin the middle term only.

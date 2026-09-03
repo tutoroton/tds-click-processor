@@ -160,28 +160,38 @@ health_gate() {
 
 # --- 1. Forward path: fetch + reset to release tip ---
 #
-# The fetch RETRIES, and the reason is not general flakiness. Measured
-# 2026-09-03: this node clones and fetches ANONYMOUSLY (see
-# admin-api _bootstrap.py, `git clone ... {git_repo}` with no credential of any
-# kind), and GitHub refuses anonymous `POST /git-upload-pack` in bursts:
+# The fetch RETRIES. Below is what is PROVEN from the node itself (admin-api
+# deploy probe, 2026-09-03T09:00Z, node 55, git 2.34.1), kept separate from what
+# is not -- because an earlier version of this comment asserted a cause that the
+# node's own output refutes.
 #
-#     GET  /info/refs?service=git-upload-pack  -> HTTP 200
-#     POST /git-upload-pack                    -> HTTP 401
-#                                                 www-authenticate: Basic realm="GitHub"
+# PROVEN, on the node, in one deploy:
+#   * GET  /info/refs?service=git-upload-pack  -> HTTP 200
+#   * `git ls-remote` (prompting disabled)     -> exit 0
+#   * `git fetch --depth 1 origin "$BRANCH"`   -> exit 128, with
+#         fatal: could not read Username for 'https://github.com'
+#         fatal: expected flush after ref listing
 #
-# git reads that 401 as "credentials required", tries to prompt, and with
-# GIT_TERMINAL_PROMPT=0 dies exit 128 -- which is why this has looked for days
-# like a credential or wrong-remote fault and is neither.
+# REFUTED as a blanket claim: "GitHub refuses anonymous POST /git-upload-pack
+# from this node". Under protocol v2 -- the default since git 2.26, and this
+# node runs 2.34.1 -- `ls-remote` ITSELF issues that POST (verified directly
+# with GIT_TRACE_CURL), and it exits 0 on the node seconds before the fetch
+# dies. So an anonymous POST demonstrably succeeds here; whatever is refused is
+# specific to the fetch/deepen negotiation, not to anonymous POSTs at large.
 #
-# Two things make retry the right remedy rather than a plaster:
-#   * the refusal is BURSTY, not permanent -- interleaved trials went 1/5 in one
-#     window and 5/5 ten minutes later, on the same URL, same protocol
-#   * an up-to-date fetch STILL issues the POST (verified), so there is no
-#     "already have the objects" shortcut around the failing surface
+# The claim that replaced ("refusal is BURSTY -- 1/5 in one window, 5/5 ten
+# minutes later") was measured on a workstation: different IP, git 2.43.0. That
+# is a different population and cannot license a statement about this node.
 #
-# What retry does NOT fix: sustained throttling. The durable answer is to stop
-# fetching anonymously (deploy key or token), which is an owner decision because
-# it puts a credential on every edge box. Recorded as GTD-D168.
+# Why retry regardless, with the cause still open: it is cheap, it cannot make
+# an already-failing fetch worse, and it spends a bounded wait on a path that is
+# dead anyway. It is a STOPGAP, not the remedy. Establishing the remedy needs
+# the node-side HTTP response headers, which the admin-api warm-up step now
+# captures on final failure.
+#
+# If this does turn out to be any form of anonymous refusal, the durable answer
+# is to stop fetching anonymously (deploy key or token) -- an owner decision,
+# because it puts a credential on every edge box. Recorded as GTD-D168.
 fetch_with_retry() {
 	local attempt=1 max=6 delay=5
 	while :; do

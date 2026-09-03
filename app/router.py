@@ -1469,6 +1469,9 @@ async def _resolve_action_with_sticky(
     source_mappings,
     campaign_mappings,
     sticky_active: bool,
+    # ADR-0454's priority has THREE terms; `sticky_active` only ever expressed
+    # the middle one. See the hook site below for why that gap was invisible.
+    returning_flow_won: bool = False,
     uid: str,
     company_id: int | None,
     seen_before: bool,
@@ -1537,15 +1540,48 @@ async def _resolve_action_with_sticky(
         # guess must never overwrite the knowledge, so when `sticky_active` is
         # True the code is not consulted at all. Flag OFF ⇒ `_route_code_target`
         # returns None on its first line ⇒ byte-identical to before this change.
-        result = await _route_code_target(
-            r, req, campaign_id,
-            company_id=company_id,
-            flow_id=flow_id,
-            allowed_avail=allowed_avail,
-            build_url_fn=_build_url,
-            source_mappings=source_mappings,
-            campaign_mappings=campaign_mappings,
-        )
+        #
+        # 🔴 `not sticky_active` ALONE enforced only the MIDDLE term, and the gap
+        # was invisible because the two conditions look like one. `sticky_active`
+        # (line ~1831) is DELIBERATELY forced False when a returning flow wins —
+        # that is the D35 exclusion, and its purpose is to stop the sticky pin
+        # from overriding the returning-flow pick. So the guard that protects
+        # returning traffic from sticky was exactly what handed the decision to
+        # the route code: two locally-correct choices composing into the outcome
+        # term 1 forbids.
+        #
+        # Measured on staging 2026-09-03 (campaign 333, `/pvret`), N=10 per arm,
+        # in BOTH returning modes: a returning visitor carrying a preview's code
+        # landed on the FIRST-time offer 10/10, while the same visitor without a
+        # code landed on the returning offer 10/10. Deterministic, single
+        # variable. Fresh mode matters most — `sticky_active` requires
+        # `effective_mode == "sticky"`, so in fresh mode (150 of 163 staging
+        # campaigns) it is False for EVERY flow and term 1 had no guard at all.
+        #
+        # `returning_flow_won` is therefore a SEPARATE term, not a refinement of
+        # sticky: it must hold even where sticky can never be active.
+        # Record: docs/development/route-preview-2026-08-31/09-ROUTING-VARIABILITY-SWEEP-2026-09-03.md §9
+        #
+        # 🔴 THE GATE IS ON THE CALL, NOT ON THE BLOCK. Gating the whole `if not
+        # sticky_active` block on `returning_flow_won` instead looks equivalent
+        # and is a DIFFERENT, worse bug: this block ends in `return result,
+        # "na"`, so everything below it is the STICKY path. A returning-flow
+        # winner excluded from the block falls THROUGH to it and gets served the
+        # stale pin — reintroducing exactly the D35 violation the exclusion at
+        # line ~1831 exists to prevent. Caught by
+        # `test_d35_returning_flow_winner_not_overridden_by_sticky_pin`, which
+        # went red on the first attempt at this fix.
+        result = None
+        if not returning_flow_won:
+            result = await _route_code_target(
+                r, req, campaign_id,
+                company_id=company_id,
+                flow_id=flow_id,
+                allowed_avail=allowed_avail,
+                build_url_fn=_build_url,
+                source_mappings=source_mappings,
+                campaign_mappings=campaign_mappings,
+            )
         if result is None:
             result = await _normal()
         # B-track — fresh-mode pin tracking: overwrite the pin with the target
@@ -1857,6 +1893,10 @@ async def _try_flow_cascade(
         source_mappings=source_mappings,
         campaign_mappings=campaign_mappings,
         sticky_active=sticky_active,
+        # ADR-0454 term 1. Computed from the SAME predicate the D35 exclusion
+        # above uses, deliberately: the two must never drift apart, because it
+        # is exactly that exclusion which makes this term necessary.
+        returning_flow_won=(flow.get("audience") or "first") == "returning",
         fresh_track=fresh_track,
         rng=rng,
         uid=uid,

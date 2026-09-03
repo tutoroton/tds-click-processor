@@ -139,6 +139,7 @@ def _resolve(
     code,
     enabled=True,
     sticky_active=False,
+    returning_flow_won=False,
     seen_before=True,
     fresh_track=False,
     hashes=None,
@@ -175,7 +176,9 @@ def _resolve(
             return await router._resolve_action_with_sticky(
                 r, {"action_type": "split"}, _click(code), "35",
                 source_mappings={}, campaign_mappings={},
-                sticky_active=sticky_active, uid="U", company_id=company_id,
+                sticky_active=sticky_active,
+                returning_flow_won=returning_flow_won,
+                uid="U", company_id=company_id,
                 seen_before=seen_before, returning_visitor=True,
                 flow_id="300", allowed_avail=frozenset({"active"}),
                 fresh_track=fresh_track,
@@ -303,6 +306,53 @@ class TestReturningSystemIsNotDisturbed:
             hashes=hashes, ident=ident,
         )
         assert ("offer_target:%d" % _CODED_TARGET) not in r.reads
+
+    def test_returning_flow_beats_the_code(self):
+        """ADR-0454 term 1 — `returning-flow pick > sticky pin > ROUTE CODE`.
+
+        This test did not exist, and its absence is the whole reason the defect
+        shipped: the ADR's evidence cited the two STICKY tests above as pinning
+        "the priority", and they pin the middle term only.
+
+        The trap is that `sticky_active` is DELIBERATELY False here. The D35
+        exclusion (`router.py`, `sticky_active = ... and flow.audience !=
+        "returning"`) forces it False precisely so the sticky pin cannot
+        override a returning-flow pick — which, with the hook gated on `not
+        sticky_active` alone, handed the decision straight to the code.
+
+        Measured live before the fix (staging campaign 333, N=10, BOTH returning
+        modes): a returning visitor carrying a preview's code got the FIRST-time
+        offer 10/10; without the code, the returning offer 10/10.
+        """
+        result, status, _, _ = _resolve(
+            code=_sign(), sticky_active=False, returning_flow_won=True,
+            seen_before=True,
+        )
+        assert result["target_id"] == _NORMAL_TARGET, (
+            "the route code overrode the returning-flow pick — ADR-0454 term 1"
+        )
+        assert result["target_selection_path"] != "route_code"
+
+    def test_code_is_not_consulted_at_all_when_a_returning_flow_won(self):
+        """Structural twin of `test_code_is_not_consulted_at_all_under_sticky`.
+
+        Not merely "the code loses" — it is never READ. A weaker assertion would
+        pass against an implementation that consults the code and then discards
+        it, which is a different (and still wrong) design.
+        """
+        _, _, r, _ = _resolve(
+            code=_sign(), sticky_active=False, returning_flow_won=True,
+            seen_before=True,
+        )
+        assert ("offer_target:%d" % _CODED_TARGET) not in r.reads
+
+    def test_a_first_audience_flow_still_honours_the_code(self):
+        """The calibration in the OTHER direction: the fix must not disable the
+        feature. Same call, `returning_flow_won=False`, code still wins."""
+        result, _, _, _ = _resolve(
+            code=_sign(), sticky_active=False, returning_flow_won=False,
+        )
+        assert result["target_id"] == str(_CODED_TARGET)
 
     def test_honouring_a_code_writes_nothing_to_the_routing_keyspace(self):
         _, _, r, _ = _resolve(code=_sign())

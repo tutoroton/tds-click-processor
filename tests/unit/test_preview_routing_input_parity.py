@@ -34,7 +34,8 @@ or listed in ``NOT_A_ROUTING_INPUT`` below with a reason. A new dim therefore
 fails this test until somebody makes a decision about it.
 
 The exemption list is deliberately tiny and every entry is load-bearing:
-neutralising the identity fields is the ADR-0468 invariant, not an oversight, so
+neutralising the identity fields is the invariant of
+ADR-0468-route-preview-identity-neutralisation-gates-the-resolver-block-not-the-resolve-call-line, not an oversight, so
 the guard must ALLOW their absence while still refusing a silent new one.
 """
 
@@ -56,7 +57,8 @@ NOT_A_ROUTING_INPUT = {
     # (`preview<hex>`), deliberately NOT reused as the later click's id.
     "click_id",
     # The three identity signals. Their absence is the ADR-0468 invariant —
-    # a preview routes as a first-time visitor BY CONSTRUCTION, and the
+    # a preview routes as a first-time visitor BY CONSTRUCTION (see the
+    # identity-neutralisation ADR named in this module docstring), and the
     # structural absence from PreviewRequest is what makes a caller inventing
     # an identity unrepresentable rather than merely forbidden.
     "visitor_id",

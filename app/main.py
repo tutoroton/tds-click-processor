@@ -2521,6 +2521,10 @@ async def _preview_body(req: PreviewRequest) -> PreviewResponse:
         referer=req.referer,
         is_bot=req.is_bot,
         is_proxy=req.is_proxy,
+        # Feeds `isp_asn` via router._extra_click_dims. Dropping it here made
+        # every preview evaluate isp_asn as "0" (ClickRequest.asn's default)
+        # while the click evaluated the real ASN.
+        asn=req.asn,
         arrival_ts=arrival,
         # 🔴 THE INVARIANT — and the two lines below are NOT all of it.
         #

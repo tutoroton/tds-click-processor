@@ -469,6 +469,17 @@ class PreviewRequest(BaseModel):
     is_bot: bool = False
     is_proxy: bool = False
 
+    # Drives the `isp_asn` criterion dim. Absent ⇒ 0 ⇒ `isp_asn` evaluates as
+    # "0" while the real click evaluates the visitor's actual ASN, so a flow
+    # filtering on isp_asn matched the CLICK and never the PREVIEW — measured
+    # live on staging 2026-09-04 at 0/12 vs 12/12, with a control on a carried
+    # dim at 12/12 vs 12/12. It is a routing input like `country`, and it was
+    # simply missed: the docstring above calls this model "the routing-relevant
+    # subset ... and nothing else", which was the intent and not the fact.
+    # `test_preview_routing_input_parity.py` now derives that claim from
+    # router.py instead of trusting it.
+    asn: int = 0
+
     # Drives `time_of_day` / `day_of_week` criteria. Absent ⇒ the handler
     # stamps "now", which is the honest reading for a preview taken now.
     arrival_ts: str | None = None

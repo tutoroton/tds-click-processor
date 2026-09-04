@@ -536,10 +536,22 @@ class PreviewResponse(BaseModel):
     # admin-api to enrich from Postgres, so the node carries them itself
     # (synced offer hash). NOT commercial data — the OPPOSITE of the fields the
     # docstring below forbids: name+icon are DESIGNED to be shown to the
-    # visitor, whereas url_template/payout/criteria must never reach one. The
-    # public boundary ALREADY carries them on the sibling admin-api path
-    # (route_preview/service.py returns `offer:{name,icon_url}`), so this makes
-    # the bypassing path MATCH that exposure, never exceed it. Present only on
+    # visitor, whereas url_template/payout/criteria must never reach one.
+    #
+    # HISTORY, and it matters because the ORIGINAL argument no longer holds.
+    # This was justified as "the public boundary ALREADY carries them on the
+    # sibling admin-api path (route_preview/service.py returns
+    # `offer:{name,icon_url}`), so this only MATCHES that exposure, never
+    # exceeds it". That sibling is GONE — the panel path was cancelled by the
+    # owner and `admin-api/app/route_preview/` deleted (PR #3311). The number
+    # 0480 alone names THREE unrelated decisions, so cite the slug, not it:
+    # ADR-0480-panelnyy-shlyakh-prev-yu-skasovano-yedynyy-shlyakh-zarezervovanyy-parametr-na-realnomu-posylanni-kampaniyi
+    # There is no peer to be bounded by, so do not read this field set as
+    # capped by one. What DOES cap it is `PREVIEW_PUBLIC_FIELDS` in
+    # `services/worker/src/index.js` — the single authority on what a preview
+    # may say publicly; the standalone reason above (name+icon are DESIGNED to
+    # be shown to the visitor) is what keeps these two fields legitimate.
+    # Present only on
     # a matched, tenant-verified preview (outcome a); a dead-link answer carries
     # neither, so they add no oracle. Empty string when the offer has no icon.
     offer_name: str | None = None

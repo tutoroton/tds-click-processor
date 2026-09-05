@@ -122,6 +122,49 @@ class TestMixedInputPartitionsIndependently:
         seen = {f["_id"] for f in returning} | {f["_id"] for f in first}
         assert 15 not in seen and 16 not in seen
 
+    def test_an_excluded_flow_is_visible_in_the_trace_not_silently_gone(self):
+        """G2.5 — the exclusion must be OBSERVABLE, or it is just a silent drop
+        with better intentions than the one it replaced.
+
+        It reuses the sink every other drop reason already writes to, so an
+        operator reads one list rather than learning about a new counter.
+        """
+        sink: list[dict] = []
+        _partition_audience([_flow(40, "offerwall")], rejected_sink=sink)
+        assert len(sink) == 1
+        assert sink[0]["flow_id"] == 40
+        assert "offerwall" in sink[0]["failed"]
+
+    def test_ordinary_and_legacy_flows_never_enter_the_sink(self):
+        """A sink that also collected the flows that DID route would tell an
+        operator nothing — every flow would be in it."""
+        sink: list[dict] = []
+        _partition_audience(
+            [_flow(41), _flow(42, "first"), _flow(43, "returning"), _flow(44, "")],
+            rejected_sink=sink,
+        )
+        assert sink == []
+
+    def test_the_no_trace_path_is_unchanged(self):
+        """The sink is None on a live click unless a trace was threaded. The
+        partition must be identical with and without it — otherwise the
+        instrumentation changed the routing it was meant to observe."""
+        flows = [_flow(45, "first"), _flow(46, "offerwall"), _flow(47, "returning")]
+        without = _partition_audience(flows)
+        with_sink = _partition_audience(flows, rejected_sink=[])
+        assert [f["_id"] for f in without[0]] == [f["_id"] for f in with_sink[0]]
+        assert [f["_id"] for f in without[1]] == [f["_id"] for f in with_sink[1]]
+
+    def test_a_hostile_audience_value_cannot_bloat_the_trace(self):
+        """The value is read from Redis, so nothing in this process bounds its
+        length, and the trace has a defensive size limit downstream. One row
+        must not be able to crowd out every other rejection reason."""
+        sink: list[dict] = []
+        _partition_audience([_flow(48, "x" * 5000)], rejected_sink=sink)
+        assert len(sink[0]["failed"]) < 120, (
+            f"the reason string grew with the input: {len(sink[0]['failed'])} chars"
+        )
+
     def test_the_partition_no_longer_conserves_the_input(self):
         """A property worth pinning because downstream code might assume it:
         `returning + first` USED to reconstruct the whole input list. It no longer

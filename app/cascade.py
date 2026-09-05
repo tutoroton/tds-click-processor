@@ -389,7 +389,9 @@ async def resolve_flow(
         )
 
     winner: dict[str, Any] | None
-    returning_flows, first_flows = _partition_audience(flows)
+    returning_flows, first_flows = _partition_audience(
+        flows, rejected_sink=rejected_sink,
+    )
     if not audience_routing:
         # MODEL V3 — when the partition is OFF (returning routing not live for the
         # company, OR the campaign opted out via `disable_returning_flows`) a
@@ -494,6 +496,8 @@ ORDINARY_AUDIENCES = frozenset({"first", "returning"})
 
 def _partition_audience(
     flows: list[dict[str, Any]],
+    *,
+    rejected_sink: list[dict[str, Any]] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Split loaded flows into (returning, first) by `flow.audience`.
 
@@ -537,6 +541,28 @@ def _partition_audience(
         # value never reaches the exclusion branch below.
         audience = f.get("audience") or "first"
         if audience not in ORDINARY_AUDIENCES:
+            if rejected_sink is not None:
+                # Same sink, same entry shape and the same bounded rendering as
+                # every other drop reason, so an excluded flow is visible in the
+                # trace an operator already reads — rather than through a new
+                # counter nobody knows to look at.
+                #
+                # Cost: nothing when tracing is off. `rejected_sink` is None
+                # unless a trace was threaded, and this branch sits inside a
+                # loop that already walks every flow — the module's own cost
+                # invariant, "capture alongside, don't recompute".
+                #
+                # The value is CLAMPED. It is read from Redis, so nothing in
+                # this process constrains its length, and the trace has a
+                # defensive size limit downstream. Deliberately NOT emitted as
+                # a metric label anywhere: an unknown value is unbounded in
+                # cardinality by definition, which is how one bad row becomes a
+                # monitoring outage.
+                rejected_sink.append({
+                    "flow_id": f.get("_id"),
+                    "failed": f"audience {audience[:24]!r} is not evaluated by "
+                              f"the ordinary cascade",
+                })
             continue
         if audience == "returning":
             returning.append(f)

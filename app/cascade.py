@@ -485,16 +485,60 @@ def _finalize_availability_trace(
     avail.setdefault("reason", avail_excluded_sink[0][1])
 
 
+#: The audiences the ORDINARY cascade may evaluate. Deliberately a positive list
+#: rather than a denylist of the values we are adding: a denylist has to be
+#: extended for every future value, and the one it forgets is the one that ends
+#: up serving live traffic.
+ORDINARY_AUDIENCES = frozenset({"first", "returning"})
+
+
 def _partition_audience(
     flows: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Split loaded flows into (returning, first) by `flow.audience`. A missing
-    or unknown audience defaults to 'first' — so every legacy flow (and any
-    flow synced before P4) is a first-flow, guaranteeing zero-regress."""
+    """Split loaded flows into (returning, first) by `flow.audience`.
+
+    A MISSING / null / empty audience is still a first-flow — that is the
+    zero-regress contract for every legacy row and for anything synced before
+    P4, and it must not change.
+
+    An audience that is present but NOT one of `ORDINARY_AUDIENCES` is returned
+    in NEITHER list: it is excluded from ordinary routing entirely.
+
+    WHY THE TWO CASES ARE NOW SEPARATE (they used to be one)
+    --------------------------------------------------------
+    This function used to read `if (audience or "first") == "returning": … else:
+    first`, so anything that was not literally "returning" — including a value
+    this build has never heard of — landed in the pool that serves LIVE CLICKS.
+    Nothing errored; a visitor was simply routed by whatever that flow was.
+
+    The offerwall programme adds `audience='offerwall'`, a CATALOGUE of tiles a
+    visitor chooses from, which must never be evaluated by the ordinary cascade.
+    Under the old split it would have been, silently. Isolation therefore ships
+    BEFORE the value can exist (ADR-0500): the DB CHECK still refuses the value
+    at this point, so this guard is armed with nothing yet able to trip it.
+
+    Collapsing the two cases in EITHER direction is a defect, and the second one
+    is the more damaging:
+      * treating unknown as "first"  -> a catalogue routes real traffic
+      * treating empty as unknown    -> every legacy flow silently leaves routing
+
+    No normalisation is performed. `"Returning"`, `"first "` and similar are
+    UNKNOWN, not corrected: silently repairing a value would let a typo become
+    live routing config.
+
+    NOTE FOR CALLERS: the two returned lists no longer reconstruct the input.
+    `len(returning) + len(first)` can be smaller than `len(flows)`.
+    """
     returning: list[dict[str, Any]] = []
     first: list[dict[str, Any]] = []
     for f in flows:
-        if (f.get("audience") or "first") == "returning":
+        # `or "first"` keeps the legacy contract: absent / None / "" are a
+        # first-flow. It is applied BEFORE the membership test so that an empty
+        # value never reaches the exclusion branch below.
+        audience = f.get("audience") or "first"
+        if audience not in ORDINARY_AUDIENCES:
+            continue
+        if audience == "returning":
             returning.append(f)
         else:
             first.append(f)

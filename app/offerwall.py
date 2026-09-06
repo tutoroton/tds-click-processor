@@ -43,11 +43,48 @@ silently. That is why this splits first and calls the picker twice, mirroring
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
-from app.cascade import _pick_winner, _split_by_binding
+from app.cascade import (
+    _filter_by_criteria,
+    _load_flow_records,
+    _pick_winner,
+    _split_by_binding,
+)
 
-__all__ = ["select_wall"]
+logger = logging.getLogger("tds.offerwall")
+
+__all__ = ["load_wall_candidates", "select_wall", "MAX_WALL_TILES_PER_REQUEST"]
+
+
+# The wall plane's OWN work ceiling, and it is counted in TILES, not in walls.
+#
+# 🔴 RISK A19, IN THE CONTRACT'S OWN WORDS: "the work unit is buckets x
+# candidates x tiles, not the winner's tiles". A cap on the number of WALLS
+# would be a cap on the wrong quantity — six buckets of twenty walls of
+# twenty-four tiles is 2 880 tiles under a "20 candidates" ceiling that sounds
+# tight. What a preview actually costs is proportional to the tiles it has to
+# load and render, so that is what is bounded.
+#
+# DELIBERATELY SEPARATE from `_MAX_FLOWS_PER_CLICK` (50). Sharing routing's
+# ceiling would mean a wall-capacity decision silently changes routing capacity,
+# and vice versa — the same welding mistake `app/common/audiences.py` documents
+# for the audience sets, one plane down.
+#
+# The number: `35-G4-WALL-CONTRACT.md` puts the per-wall tile ceiling at 24, so
+# this admits ~20 fully-loaded walls before it bites. It is a BULKHEAD, not a
+# product limit: an operator who legitimately has more walls in scope loses the
+# oldest ones from the candidate set, exactly as routing does, and the truncation
+# is reported rather than silent.
+MAX_WALL_TILES_PER_REQUEST: int = 480
+
+# How many tiles a wall is ASSUMED to carry when its own config cannot be read.
+# Fail-EXPENSIVE on purpose: an unparseable wall counts against the budget as if
+# it were full, so a corrupt row cannot buy itself unlimited admission by being
+# unreadable. The opposite default is the one that turns a parse failure into a
+# capacity hole.
+_ASSUMED_TILES_ON_UNREADABLE = 24
 
 
 def select_wall(
@@ -91,3 +128,152 @@ def select_wall(
         _pick_winner(campaign_bound, click_levels)
         or _pick_winner(global_, click_levels)
     )
+
+
+def _tile_count(wall: dict[str, Any]) -> int:
+    """How many tiles this wall carries, for the WORK budget.
+
+    Unreadable config counts as a full wall (`_ASSUMED_TILES_ON_UNREADABLE`)
+    rather than as zero: a corrupt row must not be able to buy unlimited
+    admission by being corrupt.
+    """
+    import json
+
+    raw = wall.get("action_config")
+    if not raw:
+        return _ASSUMED_TILES_ON_UNREADABLE
+    try:
+        cfg = json.loads(raw) if isinstance(raw, str) else raw
+        tiles = cfg.get("tiles")
+    except (ValueError, AttributeError, TypeError):
+        return _ASSUMED_TILES_ON_UNREADABLE
+    if not isinstance(tiles, list):
+        return _ASSUMED_TILES_ON_UNREADABLE
+    return len(tiles)
+
+
+async def load_wall_candidates(
+    r,
+    *,
+    campaign_id: str,
+    company_id: int | None,
+    buyer_id: int | None,
+    team_id: int | None,
+    department_id: int | None,
+    custom_group_id: int | None,
+    click_attrs: dict[str, str],
+    max_tiles: int = MAX_WALL_TILES_PER_REQUEST,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Read the ELIGIBLE walls for this request from the node's own Redis.
+
+    The missing link. `sync/builders/flows.py` publishes walls into
+    `campaign:{id}:walls` and `walls:scope:{company}:{type}:{id}`; `select_wall`
+    picks among candidates someone else fetched. Until now NOTHING on this node
+    read those keys, so the two halves could not meet.
+
+    Returns `(candidates, stats)`. `candidates` is what `select_wall` expects:
+    walls whose criteria match this click, in the loader's Redis-shaped
+    representation, with `_id` stamped on. `stats` carries what a caller needs to
+    be honest about truncation.
+
+    🔴 IT READS THE WALL KEYSPACE AND ONLY THE WALL KEYSPACE. Not one LRANGE
+    touches `campaign:{id}:flows` or `flows:scope:…`. That is not tidiness: the
+    two keyspaces exist because routing's candidate read is TAIL-CAPPED BEFORE
+    the audience partition (`cascade.py:778`, `:823`), so anything sharing those
+    lists can evict a routing flow that no later filtering recovers
+    (`35-G4-WALL-CONTRACT.md` §4.1). A loader that "helpfully" also read the
+    routing lists would re-open that from the read side.
+
+    THE BUDGET IS TILES, NOT WALLS (risk A19). A wall costs what its tiles cost,
+    so `max_tiles` bounds the work rather than the row count. Walls are admitted
+    newest-first — the same direction routing trims, and for the same reason: a
+    freshly-authored override is the one an operator is watching.
+
+    WHAT IT DOES NOT DO, so nothing is inherited as covered:
+      * it does not decide WHICH wall wins — that is `select_wall`, and keeping
+        membership out of it is §2.2's contract;
+      * it does not check tenancy. The caller resolved this campaign for this
+        request and passes the hierarchy ids; a foreign tenant's wall is
+        unreachable because its ids are never asked for, not because this
+        function rejects them. G4.3 tests that at the endpoint, where a foreign
+        tenant can actually be asked for.
+    """
+    fetch_log: list[str] = []
+
+    def _build_pipe():
+        fetch_log.clear()
+        pipe = r.pipeline()
+        # cap+1, the same probe trick the cascade uses: a list AT the cap and a
+        # list OVER it are otherwise indistinguishable, and "we may have dropped
+        # something" is exactly what a caller must be told.
+        pipe.lrange(f"campaign:{campaign_id}:walls", -(max_tiles + 1), -1)
+        fetch_log.append(f"campaign:{campaign_id}")
+        if company_id is not None:
+            for scope_type, scope_id in (
+                ("buyer", buyer_id),
+                ("custom_group", custom_group_id),
+                ("team", team_id),
+                ("department", department_id),
+                ("company", company_id),
+            ):
+                if scope_id is not None:
+                    pipe.lrange(
+                        f"walls:scope:{company_id}:{scope_type}:{scope_id}",
+                        -(max_tiles + 1), -1,
+                    )
+                    fetch_log.append(f"scope:{scope_type}:{scope_id}")
+        return pipe
+
+    results = await _build_pipe().execute()
+
+    wall_ids: list[str] = []
+    seen: set[str] = set()
+    for raw in results:
+        for wid in raw or []:
+            wid = wid.decode() if isinstance(wid, bytes) else str(wid)
+            # A wall is in EITHER a campaign list or a scope list, never both
+            # (the publisher's invariant) — so a repeat here is sync drift, not
+            # a legitimate second binding. Dedupe rather than double-charge it
+            # against the budget.
+            if wid not in seen:
+                seen.add(wid)
+                wall_ids.append(wid)
+
+    if not wall_ids:
+        return [], {"buckets": len(fetch_log), "loaded": 0, "eligible": 0,
+                    "tiles": 0, "truncated": False}
+
+    records = await _load_flow_records(r, wall_ids)
+
+    # THEN the budget, applied to what was actually loaded. Counting before the
+    # HGETALL would bound a guess; counting after bounds the real thing.
+    admitted: list[dict[str, Any]] = []
+    tiles = 0
+    truncated = False
+    for wall in reversed(records):        # newest first
+        cost = _tile_count(wall)
+        if tiles + cost > max_tiles and admitted:
+            truncated = True
+            break
+        tiles += cost
+        admitted.append(wall)
+    admitted.reverse()                    # restore publication order
+
+    if truncated:
+        # Visible, never silent. A capacity decision the operator cannot see is
+        # a capacity decision that will be mistaken for a missing wall.
+        logger.warning(
+            "offerwall: candidate set truncated at %d tiles (%d of %d walls "
+            "admitted, buckets=%s) — an operator will see fewer walls than they "
+            "authored",
+            max_tiles, len(admitted), len(records), fetch_log,
+        )
+
+    eligible = _filter_by_criteria(admitted, click_attrs)
+    return eligible, {
+        "buckets": len(fetch_log),
+        "loaded": len(records),
+        "eligible": len(eligible),
+        "tiles": tiles,
+        "truncated": truncated,
+    }

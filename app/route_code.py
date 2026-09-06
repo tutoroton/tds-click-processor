@@ -85,7 +85,15 @@ from app.config import settings
 
 logger = logging.getLogger("tds.route_code")
 
-__all__ = ["RouteCode", "CODE_VERSION", "is_enabled", "sign", "verify"]
+__all__ = [
+    "RouteCode",
+    "CODE_VERSION",
+    "KIND_PREVIEW",
+    "KIND_WALL",
+    "is_enabled",
+    "sign",
+    "verify",
+]
 
 # Current wire-format version. Bump to evolve the layout; an old version on the
 # wire fails verify (treated as no-code), which is the graceful fall-through.
@@ -99,10 +107,50 @@ __all__ = ["RouteCode", "CODE_VERSION", "is_enabled", "sign", "verify"]
 # ADR-0454-route-code-yields-to-the-sticky-pin-and-never-writes-the-returning-system-outranks-a-guess-about-an-anonymous-visitor
 # Old v1 codes fail closed at the version check below, which is the correct
 # outcome: their TTL is 30 minutes and they carry an unbindable claim.
-CODE_VERSION = 2
+# v3 (2026-09-06) BINDS THE ORIGIN. It carries a signed KIND and a signed origin
+# `flow_id`, because a wall tile and an ordinary preview are different claims and
+# were previously indistinguishable: two walls in one campaign holding the SAME
+# offer mint v2 codes identical in every field, so nothing could answer "which
+# wall was this visitor actually shown". An unsigned `offerwall=1` parameter
+# establishes nothing — it is attacker-controlled. Plan:
+# `docs/development/offerwall-2026-09-04/26-THE-PLAN-PART-A.md` Phase 5.
+#
+# 🔴 BOTH VERSIONS ARE MINTED, AND THAT IS THE DESIGN — NOT A MIGRATION WINDOW.
+# An ordinary preview still mints v2; only a wall tile mints v3. They are not two
+# generations of one claim, they are two claims: a preview says "this visitor
+# would be routed here", a wall tile says "this visitor was shown wall W and
+# picked this offer from it". Minting v3 for both would put a meaningless
+# `origin_flow_id` in every ordinary preview and force a fleet-wide flag day for
+# no gain, degrading live previews for the length of a deploy window.
+#
+# WHY NOT LET THE VERSION *BE* THE KIND, since v2⇒preview and v3⇒wall today: a
+# future v4 preview would silently invert that inference. The kind is READ from a
+# signed byte in v3, and only *interpreted* for v2 — where preview is all it could
+# ever have meant, because v2 has no other claim to make.
+CODE_VERSION = 3
 
-# 1B(v) + 1B(kid) + 4B(company) + 4B(campaign) + 4B(offer) + 4B(target) + 4B(exp)
-_PAYLOAD_BYTES = 22
+#: The version an ordinary (non-wall) preview mints. v2 codes stay verifiable for
+#: their full remaining lifetime, which the plan states explicitly rather than
+#: leaving it to be discovered.
+PREVIEW_CODE_VERSION = 2
+
+#: What the code claims to be. Signed in v3; inferred for v2.
+KIND_PREVIEW = 1
+KIND_WALL = 2
+_KINDS = frozenset({KIND_PREVIEW, KIND_WALL})
+
+# v2: 1B(v) + 1B(kid) + 4B(company) + 4B(campaign) + 4B(offer) + 4B(target) + 4B(exp)
+# v3: the same + 1B(kind) + 4B(origin_flow_id)
+#
+# The pair (version, length) is checked as a PAIR. A version byte that does not
+# match its own payload length is refused outright rather than parsed leniently:
+# accepting a v3 header over 22 bytes would read the expiry out of whatever
+# happened to follow, and "reject it" is cheaper than "reason about it".
+_PAYLOAD_BYTES_BY_VERSION = {
+    PREVIEW_CODE_VERSION: 22,
+    CODE_VERSION: 27,
+}
+_PAYLOAD_BYTES = _PAYLOAD_BYTES_BY_VERSION[PREVIEW_CODE_VERSION]
 
 # HMAC-SHA256 digest width.
 _SIG_BYTES = 32
@@ -132,6 +180,27 @@ class RouteCode:
     offer_id: int
     offer_target_id: int
     expires_at: int
+    # v3. What this code CLAIMS to be — `KIND_PREVIEW` or `KIND_WALL`. Signed in
+    # v3; a v2 code reports `KIND_PREVIEW` because that is the only claim v2 can
+    # make, never because the absence was read as a default.
+    kind: int = KIND_PREVIEW
+    # v3, and `None` on a v2 code. 🔴 `None` MEANS "this code carries no
+    # authenticated wall-origin claim" — it is not "unknown" and it is not zero.
+    # A caller asking a wall question must require a value here; see
+    # `is_wall_claim` rather than testing the field, so the two conditions
+    # (kind AND origin) cannot drift apart at a call site.
+    origin_flow_id: int | None = None
+
+    @property
+    def is_wall_claim(self) -> bool:
+        """Does this code make an authenticated claim about a WALL?
+
+        Both halves, always together. A `kind` of WALL with no origin cannot say
+        WHICH wall, and an origin with a preview kind is a field nobody signed a
+        meaning for. Either shape is refused at verify; this property exists so
+        no caller re-implements the conjunction and gets one half of it.
+        """
+        return self.kind == KIND_WALL and self.origin_flow_id is not None
 
 
 # --------------------------------------------------------------------------- #
@@ -218,6 +287,7 @@ def sign(
     offer_id: int,
     offer_target_id: int,
     ttl_seconds: int,
+    origin_flow_id: int | None = None,
     now: int | None = None,
 ) -> str:
     """Mint a signed route code. Raises if the codec is not enabled.
@@ -243,19 +313,44 @@ def sign(
     if ttl_seconds <= 0:
         raise ValueError("route_code: ttl_seconds must be positive")
 
+    # The version is DERIVED from what the caller can substantiate, never chosen.
+    # Supplying an origin says "this came from wall W" — the only claim v3 exists
+    # to carry — and omitting it mints exactly the v2 bytes an ordinary preview
+    # has always minted. So an ordinary preview cannot accidentally become a wall
+    # claim, and a wall tile cannot accidentally lose one.
+    if origin_flow_id is None:
+        version = PREVIEW_CODE_VERSION
+        kind = KIND_PREVIEW
+    else:
+        if (not isinstance(origin_flow_id, int)
+                or isinstance(origin_flow_id, bool)
+                or not (1 <= origin_flow_id <= _UINT32_MAX)):
+            raise ValueError(
+                "route_code: origin_flow_id must be a positive uint32"
+            )
+        version = CODE_VERSION
+        kind = KIND_WALL
+
     issued = int(now if now is not None else time.time())
     exp = issued + int(ttl_seconds)
     if not (0 <= exp <= _UINT32_MAX):
         raise ValueError("route_code: expiry out of uint32 range")
 
     payload = (
-        bytes([CODE_VERSION, kid])
+        bytes([version, kid])
         + company_id.to_bytes(4, "big")
         + campaign_id.to_bytes(4, "big")
         + offer_id.to_bytes(4, "big")
         + offer_target_id.to_bytes(4, "big")
         + exp.to_bytes(4, "big")
     )
+    if version == CODE_VERSION:
+        # APPENDED, never interleaved: bytes 2..22 mean exactly what they mean in
+        # v2, so the shared fields have ONE parse for both versions. Inserting the
+        # new fields in the middle would give two layouts for the same five
+        # values and one offset table to get wrong.
+        payload += bytes([kind]) + origin_flow_id.to_bytes(4, "big")
+    assert len(payload) == _PAYLOAD_BYTES_BY_VERSION[version]
     sig = hmac.new(ring[kid], payload, sha256).digest()
     return f"{_b64url(payload)}.{_b64url(sig)}"
 
@@ -289,9 +384,15 @@ def verify(code: str | None, *, now: int | None = None) -> RouteCode | None:
     except Exception:
         return None
 
-    if len(payload) != _PAYLOAD_BYTES or len(sig) != _SIG_BYTES:
+    # Version and length are checked AS A PAIR, and only against versions this
+    # build understands. A v3 header over 22 bytes would otherwise read the
+    # expiry out of whatever followed; refusing is cheaper than reasoning about
+    # it. v1 has no entry here and stays refused — it carried an unbindable
+    # claim, which is the hole v2 closed.
+    if len(sig) != _SIG_BYTES or not payload:
         return None
-    if payload[0] != CODE_VERSION:
+    version = payload[0]
+    if len(payload) != _PAYLOAD_BYTES_BY_VERSION.get(version, -1):
         return None
 
     kid = payload[1]
@@ -309,6 +410,26 @@ def verify(code: str | None, *, now: int | None = None) -> RouteCode | None:
     offer_target_id = int.from_bytes(payload[14:18], "big")
     exp = int.from_bytes(payload[18:22], "big")
 
+    # v3's two extra fields, read only AFTER the MAC held. The version byte is
+    # itself authenticated, so it cannot be flipped to reach this branch — but
+    # authenticity is not applicability: an authentic code still has to make a
+    # COHERENT claim, and these are the invariants that say so.
+    kind = KIND_PREVIEW
+    origin_flow_id: int | None = None
+    if version == CODE_VERSION:
+        kind = payload[22]
+        origin = int.from_bytes(payload[23:27], "big")
+        if kind not in _KINDS:
+            return None
+        # A wall claim that cannot name its wall is not a wall claim, and a
+        # preview claim carrying an origin is a field nobody signed a meaning
+        # for. Refuse both rather than pick an interpretation.
+        if kind == KIND_WALL and origin <= 0:
+            return None
+        if kind == KIND_PREVIEW and origin != 0:
+            return None
+        origin_flow_id = origin or None
+
     # A validly signed code naming id 0 is still nonsense — refuse it rather
     # than hand a caller an id it would go on to look up.
     if (company_id <= 0 or campaign_id <= 0
@@ -325,4 +446,6 @@ def verify(code: str | None, *, now: int | None = None) -> RouteCode | None:
         offer_id=offer_id,
         offer_target_id=offer_target_id,
         expires_at=exp,
+        kind=kind,
+        origin_flow_id=origin_flow_id,
     )

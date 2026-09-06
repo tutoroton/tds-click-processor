@@ -1706,10 +1706,25 @@ async def _try_flow_cascade(
     # admin-api validates — see `cascade._CASE_PRESERVE` for which dims preserve
     # case (geo / region / browser / language) vs lowercase (os / device_type /
     # city). A KNOWN dim whose value CF or the parser couldn't resolve falls
-    # through as `""` — `op=in` fails closed (no match), `op=not_in` passes
-    # everyone (unchanged). A dim OUTSIDE the evaluated set (cascade.
-    # KNOWN_EVALUATED_DIMS) now fails CLOSED in the matcher (CF-3, no not_in
-    # fail-open).
+    # through as `""`, and EVERY operator except `empty` then fails CLOSED —
+    # `not_in` INCLUDED. A dim OUTSIDE the evaluated set
+    # (cascade.KNOWN_EVALUATED_DIMS) fails closed too (CF-3).
+    #
+    # 🔴 THE `not_in` CLAUSE IS A CORRECTION, NOT A RESTATEMENT. This comment
+    # said `not_in` "passes everyone (unchanged)" until 2026-09-06 — which is
+    # what it did BEFORE V25, because `"" in values` is False, so "block these"
+    # silently became "allow everything we could not measure"
+    # (`cascade.py:1000-1006`). V25 closed that; the comment kept describing the
+    # hole as current behaviour. Verified by running the matcher, calibrated
+    # both ways: `geo not_in [UA]` keeps `geo="PL"`, drops `geo="UA"`, and drops
+    # `geo=""`.
+    #
+    # The one operator a missing value SATISFIES is `empty`
+    # (`cascade._OPS_SATISFIED_BY_MISSING_VALUE`). That asymmetry matters to any
+    # caller tempted to build a narrower click_attrs than this one: omitting a
+    # dim does not merely hide candidates, it ADMITS the ones whose criterion is
+    # `<dim> empty`. See risk A33 in
+    # `docs/development/offerwall-2026-09-04/27-RISK-REGISTER-PART-A.md`.
     click_attrs: dict[str, Any] = {
         "geo": (req.country or "").upper(),
         "os": parse_os(req.user_agent).lower(),

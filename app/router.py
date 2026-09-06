@@ -1386,8 +1386,16 @@ async def _route_code_target(
     build_url_fn,
     source_mappings,
     campaign_mappings,
+    wall_only: bool = False,
 ) -> dict[str, Any] | None:
     """Return the coded target's result, or None to route normally.
+
+    `wall_only` restricts this to codes that make an authenticated WALL claim.
+    It exists so the ONE caller that consults a code while a sticky pin is live
+    (G7.2 — a tile outranks the pin) cannot accidentally let an ordinary preview
+    code through the same door. Every other validation below is unchanged and
+    still applies; this only narrows WHICH codes are eligible, never what they
+    must satisfy.
 
     🔴 The code is a RE-VALIDATED HINT, never an authority. A valid signature
     buys the bearer ONE thing: the right to have a target *considered*. Whether
@@ -1443,6 +1451,13 @@ async def _route_code_target(
     try:
         decoded = route_code.verify(raw if isinstance(raw, str) else str(raw))
         if decoded is None:
+            return None
+
+        # 🔴 KIND FILTER, and it sits HERE on purpose — after `verify()`, so the
+        # kind is read from a payload whose MAC has already been checked, never
+        # from an unverified parse. A caller asking for wall-only precedence
+        # must not be able to be handed a claim nobody signed.
+        if wall_only and not decoded.is_wall_claim:
             return None
 
         # Tenant bind — the code's claim, checked against the click's company.
@@ -1658,6 +1673,57 @@ async def _resolve_action_with_sticky(
                     settings.returning_uid_ttl_seconds,
                 )
         return result, "na"
+
+    # ── G7.2 — A TILE OUTRANKS THE PIN ──────────────────────────────────────
+    # Owner decision D3, quoted rather than paraphrased: «Сильніша плитка. Якщо
+    # користувач хоче потрапити на конкретний офер, він потрапляє на конкретний
+    # офер.» and, on this link shape specifically, «переходи по ось такому
+    # формату URL не діє прив'язка.»
+    #
+    # 🔴 `ADR-0454` IS NOT SUPERSEDED. Its title says the returning system
+    # outranks *a guess* about an anonymous visitor — and a tile click is not a
+    # guess. A preview code is a PREDICTION the landing page made; a tile code
+    # is a CHOICE the visitor made one click ago, from a catalogue we showed
+    # them. Between a memory and a request, the request is newer and it is
+    # theirs. `20-OWNER-DECISIONS` D9 fenced this pair off explicitly as the one
+    # the owner had NOT ruled on; `41-G7-PRECEDENCE-DECISION.md` closes it.
+    #
+    # WHY IT IS SAFE TO LET A CODE PAST THE PIN HERE, in three parts:
+    #   * `wall_only=True` — an ordinary v2 preview code cannot use this door,
+    #     and the kind is read only from a MAC-verified payload;
+    #   * membership (G6.3) — a tile is honoured only while its wall still
+    #     carries it, so this precedence cannot outlive the wall it came from;
+    #   * `not returning_flow_won` — ADR-0454 term 1, unchanged and evaluated
+    #     first.
+    #
+    # ⚠️ THAT LAST GUARD IS DEFENCE, NOT A LIVE GATE, and saying so matters:
+    # `sticky_active` is already forced False when a returning flow wins (the
+    # D35 exclusion), so inside this branch `returning_flow_won` is False by
+    # construction today. It is written anyway so term 1 survives any future
+    # change to how `sticky_active` is computed — the exact drift the comment
+    # above the `not sticky_active` branch records as having happened once.
+    #
+    # FLAG-OFF IS BYTE-IDENTICAL: `_route_code_target` returns None on its first
+    # line when `route_preview_enabled` is False, and nothing mints a v3 WALL
+    # code until the wall endpoint is armed. With either off this block cannot
+    # produce a result.
+    if not returning_flow_won:
+        wall_result = await _route_code_target(
+            r, req, campaign_id,
+            company_id=company_id,
+            flow_id=flow_id,
+            allowed_avail=allowed_avail,
+            build_url_fn=_build_url,
+            source_mappings=source_mappings,
+            campaign_mappings=campaign_mappings,
+            wall_only=True,
+        )
+        if wall_result is not None:
+            # No write, deliberately: the pin keeps exactly ONE writer (the
+            # ordinary path), and D3's third row — the plain URL later returns
+            # the visitor to the last offer they were on — depends on that
+            # writer being the one that recorded it.
+            return wall_result, "na"
 
     ttl = settings.returning_uid_ttl_seconds
     # v2 C2 — use the threaded allowed_avail (computed ONCE in _route_via_campaign)

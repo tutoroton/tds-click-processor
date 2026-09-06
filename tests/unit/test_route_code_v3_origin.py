@@ -21,6 +21,7 @@ COHERENCE of an authentic claim is.
 """
 from __future__ import annotations
 
+import base64
 import hmac
 import time
 from hashlib import sha256
@@ -71,6 +72,29 @@ def _resign(payload: bytes) -> str:
     """
     sig = hmac.new(KEY_A.encode(), payload, sha256).digest()
     return f"{route_code._b64url(payload)}.{route_code._b64url(sig)}"
+
+
+def _forge_signature(code: str) -> str:
+    """Return `code` with a signature that is GUARANTEED to differ.
+
+    🔴 Not `code[:-1] + "A"`, which this file used until 2026-09-06. A 32-byte
+    HMAC is 43 base64url characters, and the LAST of them carries only 4 real
+    bits (256 - 42*6), so it takes one of just 16 values — one of which is "A".
+    That substitution is therefore a silent NO-OP about one run in sixteen:
+    measured against the real signer, `verify` accepted the "forgery" on
+    **255 of 4000** mints (0.0638), because it was handed a VALID code. When it
+    landed on stage the convergence test failed accusing the verifier of
+    accepting a forgery, and every PR in the repository inherited the red.
+
+    Editing the CHARACTER cannot be fixed by choosing a different letter
+    either: the final character's low 2 bits are discarded on decode, so
+    several distinct characters decode to the same 32 signature bytes. The only
+    tamper that is always a tamper is one applied to the BYTES.
+    """
+    payload_b64, _, sig_b64 = code.partition(".")
+    sig = bytearray(route_code._b64url_decode(sig_b64))
+    sig[0] ^= 0x01
+    return f"{payload_b64}.{route_code._b64url(bytes(sig))}"
 
 
 # --------------------------------------------------------------------------- #
@@ -280,7 +304,7 @@ class TestFailureModesConverge:
             "malformed": "not-a-code",
             "expired": _mint(origin_flow_id=WALL, ttl_seconds=1,
                              now=past - 3600),
-            "tampered signature": _mint(origin_flow_id=WALL)[:-1] + "A",
+            "tampered signature": _forge_signature(_mint(origin_flow_id=WALL)),
             "unknown kind": _resign(payload[:22] + bytes([9])
                                     + WALL.to_bytes(4, "big")),
             "wall without an origin": _resign(payload[:22]
@@ -295,6 +319,40 @@ class TestFailureModesConverge:
         assert all(v is None for v in outcomes.values()), {
             k: v for k, v in outcomes.items() if v is not None
         }
+
+    def test_the_forgery_helper_always_actually_forges(self, keys_1):
+        """Calibration for the "tampered signature" row above.
+
+        The row is only evidence if its input is genuinely a forgery. The
+        helper flips a BIT of the decoded signature, so this holds for every
+        code rather than for most of them — which is exactly the property the
+        substitution it replaced did not have.
+        """
+        for i in range(256):
+            code = _mint(origin_flow_id=WALL, ttl_seconds=TTL + i)
+            forged = _forge_signature(code)
+            assert forged != code
+            real = route_code._b64url_decode(code.partition(".")[2])
+            fake = route_code._b64url_decode(forged.partition(".")[2])
+            assert fake != real
+            assert route_code.verify(forged) is None
+
+    def test_a_signature_can_end_in_the_letter_the_old_tamper_wrote(self):
+        """The root cause, pinned deterministically so it cannot come back.
+
+        A 32-byte HMAC encodes to 43 base64url characters; the last one carries
+        only 256 - 42*6 = 4 real bits, so it takes one of exactly 16 values.
+        "A" is one of them, which is why `code[:-1] + "A"` silently forged
+        nothing about one run in sixteen (measured: 255/4000 = 0.0638).
+        """
+        finals = {
+            base64.urlsafe_b64encode(bytes(31) + bytes([b]))
+            .rstrip(b"=")
+            .decode()[-1]
+            for b in range(256)
+        }
+        assert len(finals) == 16
+        assert "A" in finals
 
     def test_the_convergence_table_is_not_vacuous(self, keys_1):
         """Calibration for the test above: a VALID code must not be None.

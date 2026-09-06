@@ -1,0 +1,93 @@
+{
+  "_": "CANONICAL wall-record contract across the admin-api -> click-processor seam. Generated from the REAL sync builder; admin-api asserts the builder still reproduces it, click-processor asserts select_wall consumes it. Neither side may hand-edit a record: change the builder, regenerate, and both tests move together or one of them goes red.",
+  "vectors": {
+    "campaign_bound_wall": {
+      "flow_id": 4101,
+      "lists": {
+        "campaign:770:walls": [
+          "4101"
+        ]
+      },
+      "record": {
+        "action_config": "{\"tiles\": [{\"offer_id\": 11, \"target_id\": 21}, {\"offer_id\": 12, \"target_id\": 22}]}",
+        "action_type": "offerwall",
+        "audience": "offerwall",
+        "campaign_id": "770",
+        "company_id": "7",
+        "criteria": "[{\"type\": \"geo\", \"operator\": \"in\", \"values\": [\"UA\", \"PL\"]}]",
+        "current_version_id": "91",
+        "is_default": "0",
+        "name": "Summer wall",
+        "scope_id": "7",
+        "scope_type": "company",
+        "seq_id": "3"
+      }
+    },
+    "global_buyer_wall": {
+      "flow_id": 4103,
+      "lists": {
+        "walls:scope:7:buyer:42": [
+          "4103"
+        ]
+      },
+      "record": {
+        "action_config": "{\"tiles\": [{\"offer_id\": 11, \"target_id\": 21}, {\"offer_id\": 12, \"target_id\": 22}]}",
+        "action_type": "offerwall",
+        "audience": "offerwall",
+        "campaign_id": "0",
+        "company_id": "7",
+        "criteria": "[{\"type\": \"geo\", \"operator\": \"in\", \"values\": [\"UA\", \"PL\"]}]",
+        "current_version_id": "93",
+        "is_default": "0",
+        "name": "Buyer wall",
+        "scope_id": "42",
+        "scope_type": "buyer",
+        "seq_id": "2"
+      }
+    },
+    "global_company_wall": {
+      "flow_id": 4102,
+      "lists": {
+        "walls:scope:7:company:7": [
+          "4102"
+        ]
+      },
+      "record": {
+        "action_config": "{\"tiles\": [{\"offer_id\": 11, \"target_id\": 21}, {\"offer_id\": 12, \"target_id\": 22}]}",
+        "action_type": "offerwall",
+        "audience": "offerwall",
+        "campaign_id": "0",
+        "company_id": "7",
+        "criteria": "[]",
+        "current_version_id": "0",
+        "is_default": "0",
+        "name": "Company-wide wall",
+        "scope_id": "7",
+        "scope_type": "company",
+        "seq_id": "8"
+      }
+    },
+    "routing_flow_for_comparison": {
+      "flow_id": 4104,
+      "lists": {
+        "campaign:770:flows": [
+          "4104"
+        ]
+      },
+      "record": {
+        "action_config": "{\"tiles\": [{\"offer_id\": 11, \"target_id\": 21}, {\"offer_id\": 12, \"target_id\": 22}]}",
+        "action_type": "offer",
+        "audience": "first",
+        "campaign_id": "770",
+        "company_id": "7",
+        "criteria": "[{\"type\": \"geo\", \"operator\": \"in\", \"values\": [\"UA\", \"PL\"]}]",
+        "current_version_id": "91",
+        "is_default": "0",
+        "name": "Ordinary flow",
+        "scope_id": "7",
+        "scope_type": "company",
+        "seq_id": "3"
+      }
+    }
+  }
+}

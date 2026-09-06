@@ -575,6 +575,17 @@ class WallTile(BaseModel):
     offer_target_id: int
     offer_name: str | None = None
     offer_icon_url: str | None = None
+    # The tile's OWN signed code (v3, `KIND_WALL`), carrying the origin wall as
+    # `origin_flow_id`. Per-tile because each names a different offer/target —
+    # `expires_at` is on the response instead, since every tile of one answer is
+    # minted in the same instant with the same TTL and N copies of one number
+    # would be N chances to disagree.
+    #
+    # `None` when the codec ring is not armed, or when the wall's own id could
+    # not be read: minting an UNBINDABLE code would be the defect, while minting
+    # nothing degrades to ordinary routing — the feature simply not applying.
+    # The same choice the preview path makes when it cannot identify a campaign.
+    route_code: str | None = None
 
 
 class WallResponse(BaseModel):
@@ -584,16 +595,27 @@ class WallResponse(BaseModel):
     and a landing page asking about one must be able to tell "no wall here" from
     "something went wrong". `reason` names which shape it was.
 
-    🔴 NO TILE CODES YET. `CODE_VERSION 3` carries the signed origin `flow_id`
-    that per-tile codes need, and it is a separate open lane; minting them here
-    before that lands would put an unverifiable claim on the wire. When it does,
-    each tile gains its own code and this docstring loses this paragraph.
+    TILE CODES: each tile carries its own `route_code`, and `expires_at` covers
+    them all. 🔴 THIS DOCSTRING SAID "NO TILE CODES YET" UNTIL 2026-09-06, and
+    the paragraph named its own retirement condition — *"`CODE_VERSION 3` carries
+    the signed origin `flow_id` that per-tile codes need, and it is a separate
+    open lane … when it does, each tile gains its own code and this docstring
+    loses this paragraph."* v3 landed (PR #4044) and the note did not move, so
+    for a while the code said the blocker was live while it was gone. That is the
+    THIRD stale blocker of this shape found in one day — a note that was true
+    when written, waiting on something that arrived, with nobody sent back to it.
+    A retirement condition written into a comment is not a mechanism; only
+    someone re-reading it is.
     """
 
     matched: bool
     wall_id: int | None = None
     tiles: list[WallTile] = Field(default_factory=list)
     reason: str | None = None
+    # Unix seconds. Present only alongside minted codes; `None` when the ring is
+    # not armed, so a caller can tell "no codes in this answer" from "codes that
+    # never expire", which would be a far more dangerous reading.
+    expires_at: int | None = None
 
 
 class PreviewResponse(BaseModel):

@@ -786,6 +786,55 @@ class Settings(BaseSettings):
     # (docs/.../01-PLAN.md §3 I-2).
     route_preview_enabled: bool = False
 
+    # ----------------------------------------------------------------- #
+    # Offer wall (G5) — the node's READ side of the catalogue            #
+    # ----------------------------------------------------------------- #
+    # The master switch for serving a wall from this node. OFF ⇒ `/wall`
+    # answers 404 (not 403 — no existence oracle, the same posture
+    # `route_preview_enabled` takes), so a node that has not been armed is
+    # byte-identical to one that has never heard of the feature.
+    #
+    # SEPARATE from `offerwall_publish_enabled` in admin-api, deliberately.
+    # That one decides whether walls are WRITTEN into a node's Redis; this one
+    # decides whether this node will SERVE one. Two planes, two switches: a
+    # publisher flag that also armed serving would make "stop publishing" and
+    # "stop serving" the same act, and they are not — keys already on a node
+    # outlive the publisher being turned off (see that flag's own note).
+    offerwall_serve_enabled: bool = False
+
+    # THE WALL'S OWN ADMISSION BUDGET, counted in TILES rather than requests,
+    # and deliberately NOT a share of `preview_max_concurrency`.
+    #
+    # 🔴 WHY NOT REQUESTS (risk A19). The preview cap was calibrated when one
+    # admitted request ≈ one target resolution. A wall request is N target
+    # resolutions plus N per-target Redis reads, so 8 concurrent 5-tile walls is
+    # 40 resolutions where 8 previews are 8 — the counter would read "at cap"
+    # while the loop did five times the work the cap was sized for. Bounding
+    # TILES bounds the work.
+    #
+    # WHY NOT A SHARE of the preview counter: two products with different unit
+    # costs must not draw on one budget, or tuning either one silently retunes
+    # the other. Per WORKER PROCESS, like every counter in this service — the
+    # node-wide budget is this value x WEB_CONCURRENCY.
+    #
+    # 480 = 20 fully-loaded walls at the contract's 24-tile ceiling. Chosen to
+    # match the loader's own `MAX_WALL_TILES_PER_REQUEST`, so a single admitted
+    # request can never exceed the whole budget by construction.
+    offerwall_max_tiles_inflight: int = 480
+
+    # What one wall request is CHARGED on admission, before anything is read.
+    #
+    # The honest tension: a work budget wants the real cost, and the real cost
+    # is unknown until Redis has been read — which is the work the budget exists
+    # to gate. So admission charges a PRESUMPTIVE cost (one full wall at the
+    # contract ceiling) and the charge is RECONCILED to the actual tile count
+    # once the loader returns. Overshoot within one request is bounded by
+    # `MAX_WALL_TILES_PER_REQUEST`; the next request sees the true load.
+    #
+    # Charging the worst case instead (480) would admit exactly one request at a
+    # time, which is a queue, not a bulkhead.
+    offerwall_admission_charge_tiles: int = 24
+
     model_config = {"env_prefix": "TDS_"}
 
     @model_validator(mode="after")

@@ -50,6 +50,9 @@ from app.models import (
     HealthResponse,
     PreviewRequest,
     PreviewResponse,
+    WallRequest,
+    WallResponse,
+    WallTile,
 )
 from app.redis_client import (
     get_redis,
@@ -59,7 +62,19 @@ from app.redis_client import (
     close_identity_redis,
     close_shipper_redis,
 )
-from app.router import route, get_full_ua_info, parse_accept_language, coerce_cost
+from app.offerwall import load_wall_candidates, select_wall
+from app.router import (
+    _allowed_availability,
+    _audience_routing,
+    _build_campaign_attribution,
+    _seen_before,
+    build_click_attrs,
+    coerce_cost,
+    get_full_ua_info,
+    parse_accept_language,
+    resolve_domain_campaign,
+    route,
+)
 from app.resolution import BINDING_SELECTOR_KEY
 from app.ua_parser import warmup as warmup_ua_parser
 from app.shipper import assert_shipper_ready, run_shipper
@@ -2303,6 +2318,272 @@ def _to_int_or_none(value) -> int | None:
     except (TypeError, ValueError):
         return None
     return out if out > 0 else None
+
+
+# --------------------------------------------------------------------------- #
+# G5 — the offer wall's READ side                                              #
+# --------------------------------------------------------------------------- #
+# The wall's own admission counter, in TILES. Module state on purpose (per
+# WORKER PROCESS, like every counter here); the check and the increment sit with
+# no await between them, so the single-threaded loop makes the pair atomic
+# without a lock — the same argument `_preview_inflight` makes.
+#
+# 🔴 SEPARATE FROM `_preview_inflight` BY CONSTRUCTION, not by convention. Two
+# products with different unit costs must not draw on one budget: a wall request
+# is N target resolutions where a preview is one, so sharing the counter would
+# let wall load exhaust the budget that protects click serving from previews,
+# and vice versa. Risk A19.
+_wall_tiles_inflight = 0
+
+
+def _wall_click_levels(attribution: dict) -> dict:
+    """The scope hierarchy `select_wall` picks by — the cascade's own shape.
+
+    Built here rather than passed around so the wall path cannot invent a
+    different level ordering from the one routing uses; `select_wall` compares
+    against exactly these keys.
+    """
+    return {
+        "buyer": attribution.get("buyer_id"),
+        "custom_group": attribution.get("custom_group_id"),
+        "team": attribution.get("team_id"),
+        "department": attribution.get("department_id"),
+        "company": attribution.get("company_id"),
+    }
+
+
+async def _viable_tiles(r, wall: dict, allowed_avail) -> list[WallTile]:
+    """The tiles of ONE wall that can actually be served right now.
+
+    A tile names an `offer_id` and a `target_id` (G4.2 contract §2). A tile
+    whose target is gone, has no url, or is outside this click's availability
+    class cannot be shown — the same three conditions the route-code honour hook
+    checks before serving a pinned target, deliberately identical so a wall
+    cannot advertise something ordinary routing would refuse.
+
+    Returns `[]` when NO tile survives, which is what makes the caller's
+    next-wall loop necessary rather than decorative (contract §2.1: a wall whose
+    pinned targets are all closed is REJECTED, and the next eligible wall
+    serves — one surviving tile is enough to keep it).
+    """
+    try:
+        cfg = json.loads(wall.get("action_config") or "{}")
+    except (ValueError, TypeError):
+        return []
+    tiles = cfg.get("tiles")
+    if not isinstance(tiles, list):
+        return []
+
+    out: list[WallTile] = []
+    for entry in tiles:
+        if not isinstance(entry, dict):
+            continue
+        oid = _to_int_or_none(entry.get("offer_id"))
+        tid = _to_int_or_none(entry.get("target_id"))
+        if oid is None or tid is None:
+            continue
+        target = await r.hgetall(f"offer_target:{tid}")
+        avail = (target.get("availability") if target else None) or "active"
+        if not (target and target.get("url") and avail in allowed_avail):
+            continue
+        # The offer's human-facing half, read from the synced hash. Same two
+        # fields the preview carries and for the same reason — they exist to be
+        # shown to the visitor, unlike everything else on that hash.
+        offer = await r.hgetall(f"offer:{oid}") or {}
+        out.append(WallTile(
+            offer_id=oid,
+            offer_target_id=tid,
+            offer_name=offer.get("name") or None,
+            offer_icon_url=offer.get("icon_url") or None,
+        ))
+    return out
+
+
+@app.post("/wall", response_model=WallResponse)
+async def wall(
+    req: WallRequest,
+    x_tds_key: str = Header("", alias="X-TDS-Key"),
+):
+    """Answer which offer WALL this visitor would be shown, without routing them.
+
+    Programme: ``docs/development/offerwall-2026-09-04/30-IMPLEMENTATION-ANCHOR.md``
+
+    A wall is a CATALOGUE the visitor picks from — never a routing decision. It
+    is reached on the SAME campaign link ordinary traffic uses, by the same
+    method-first discriminator the preview uses, because the owner's ruling is
+    that a wall preview must ride the real link exactly as route preview does.
+
+    🔴 ORDER OF THE THREE GUARDS IS THE CONTRACT:
+      1. the dark gate, BEFORE auth — a disabled feature must not confirm it
+         exists to anyone, authenticated or not. 404, never 403.
+      2. auth — so an unauthenticated prober can neither occupy the admission
+         counter nor observe it.
+      3. the bulkhead — so an over-limit request costs one counter read and
+         nothing else: no Redis, no routing engine, no tile reads.
+    """
+    # (1) DARK GATE FIRST. Flag OFF ⇒ byte-identical to a node that has never
+    # heard of walls.
+    if not settings.offerwall_serve_enabled:
+        raise HTTPException(status_code=404, detail="Not Found")
+
+    # (2) The /admin/sync ladder, identical to /preview: static sync secret
+    # first, then the per-Worker index. No loopback carve-out, for the reason
+    # the comment above `_LOOPBACK_HOSTS` gives.
+    if not _sync_secret_matches(x_tds_key):
+        await _check_tds_key(x_tds_key)
+
+    # (3) THE BULKHEAD, in TILES (risk A19). The charge is PRESUMPTIVE — the
+    # real cost is unknown until Redis has been read, which is the work being
+    # gated — and it is reconciled to the actual tile count below. Overshoot
+    # within one request is bounded by the loader's own per-request ceiling.
+    #
+    # Over-limit answers 503 and NEVER falls through to a click. A wall flood
+    # converted into clicks would be the same defect D149 closed for previews,
+    # reopened through a different door.
+    global _wall_tiles_inflight
+    cap = max(1, settings.offerwall_max_tiles_inflight)
+    charge = max(1, settings.offerwall_admission_charge_tiles)
+    if _wall_tiles_inflight + charge > cap:
+        capture_op_msg_throttled(
+            OP_PREVIEW_CAPACITY_SHED,
+            settings.node_id,
+            "offerwall admission budget exhausted - shedding wall load to "
+            "protect click serving (bounded, by design; the budget is TILES, "
+            "not requests - raise TDS_OFFERWALL_MAX_TILES_INFLIGHT only with "
+            "D149's rig re-run for the wall shape)",
+            node_id=settings.node_id,
+            cap=cap,
+            charged=charge,
+        )
+        raise HTTPException(status_code=503, detail="offerwall_capacity")
+    _wall_tiles_inflight += charge
+    try:
+        return await _wall_body(req, charge)
+    finally:
+        _wall_tiles_inflight -= charge
+
+
+async def _wall_body(req: WallRequest, charged: int) -> WallResponse:
+    """Resolve the campaign, pick the wall, and answer with its viable tiles."""
+    global _wall_tiles_inflight
+
+    r = await get_redis()
+
+    # 🔴 `identity_writes` IS DELIBERATELY LEFT AT ITS DEFAULT (True), and the
+    # first draft of this handler set it False — which was wrong, and wrong in
+    # the way risk A34 predicts.
+    #
+    # That flag does not merely block writes: `router.py:622` gates the ENTIRE
+    # resolver block on `settings.returning_resolver_enabled and
+    # req.identity_writes`, history READ included. Setting it False would have
+    # cost the wall `is_returning`, `is_roaming` and the three `prev_*` sets, so
+    # a wall targeting a returning visitor would evaluate those criteria against
+    # ABSENT dims — which is A33, reached by the naive cure for A34.
+    #
+    # The write is stopped one level down instead, by `commit_identity=False`.
+    # Found by a mutation that stayed GREEN: flipping that argument to True
+    # changed nothing, because with the resolver switched off there was no write
+    # to prevent. A guarantee whose mutation cannot go red is not a guarantee.
+    click_req = ClickRequest(
+        click_id=f"wall{secrets.token_hex(8)}",
+        hostname=req.hostname,
+        path=req.path,
+        query_params=req.query_params or {},
+        ip=req.ip,
+        country=req.country,
+        city=req.city,
+        region=req.region,
+        continent=req.continent,
+        timezone=req.timezone,
+        user_agent=req.user_agent,
+        accept_language=req.accept_language,
+        referer=req.referer,
+        is_bot=req.is_bot,
+        is_proxy=req.is_proxy,
+        asn=req.asn,
+        arrival_ts=req.arrival_ts or None,
+    )
+
+    resolution = await resolve_domain_campaign(r, click_req)
+    if resolution.blocked or not resolution.campaign_id:
+        return WallResponse(matched=False, reason="no_campaign")
+
+    campaign_id = str(resolution.campaign_id)
+    campaign = await r.hgetall(f"campaign:{campaign_id}")
+    if not campaign:
+        return WallResponse(matched=False, reason="no_campaign")
+    campaign["_id"] = campaign_id
+
+    # 🔴 `commit_identity=False` — the single most important argument on this
+    # path. Its default is True, and identity resolution then schedules a
+    # persist off the critical path; a catalogue fetch that stamped an identity
+    # would let a page RENDER pin a visitor, which is the class the preview
+    # programme closed. The commit=False path documents itself as
+    # side-effect-free: the new-user uid is not minted and persist is not
+    # scheduled. Risk A34.
+    _src, _camp, attribution = await _build_campaign_attribution(
+        r, campaign, campaign_id, click_req,
+        binding_id=resolution.binding_id,
+        commit_identity=False,
+    )
+
+    # The SAME attribute dict routing builds — not a narrower one. Omitting a
+    # dim is not conservative: the matcher reads a missing dim as "" and the
+    # `empty` operator is SATISFIED by that, so a partial dict ADMITS walls the
+    # full dict rejects (risk A33).
+    audience_routing = _audience_routing(campaign)
+    seen_before = _seen_before(attribution)
+    click_attrs = build_click_attrs(
+        click_req,
+        attribution,
+        attribution,
+        audience_routing=audience_routing,
+        seen_before=seen_before,
+    )
+
+    eligible, stats = await load_wall_candidates(
+        r,
+        campaign_id=campaign_id,
+        company_id=attribution.get("company_id"),
+        buyer_id=attribution.get("buyer_id"),
+        team_id=attribution.get("team_id"),
+        department_id=attribution.get("department_id"),
+        custom_group_id=attribution.get("custom_group_id"),
+        click_attrs=click_attrs,
+    )
+
+    # RECONCILE the presumptive admission charge to what this request actually
+    # costs, so the NEXT request sees the true load rather than a guess. Only
+    # the delta moves; the `finally` above still releases exactly `charged`.
+    global _wall_tiles_inflight
+    _wall_tiles_inflight += max(0, int(stats.get("tiles") or 0) - charged)
+
+    if not eligible:
+        return WallResponse(matched=False, reason="no_wall")
+
+    allowed_avail = _allowed_availability(campaign, attribution)
+    click_levels = _wall_click_levels(attribution)
+
+    # THE VIABILITY LOOP (contract §2.1). A wall whose pinned targets are all
+    # closed is REJECTED and the next eligible wall serves; one surviving tile
+    # is enough to keep it. Without this a perfectly-targeted wall of dead
+    # offers would win and render nothing, and the visitor would see an empty
+    # catalogue rather than the wall behind it.
+    remaining = list(eligible)
+    while remaining:
+        winner = select_wall(remaining, click_levels)
+        if winner is None:
+            break
+        tiles = await _viable_tiles(r, winner, allowed_avail)
+        if tiles:
+            return WallResponse(
+                matched=True,
+                wall_id=_to_int_or_none(winner.get("_id")),
+                tiles=tiles,
+            )
+        remaining = [w for w in remaining if w is not winner]
+
+    return WallResponse(matched=False, reason="no_viable_wall")
 
 
 @app.post("/preview", response_model=PreviewResponse)

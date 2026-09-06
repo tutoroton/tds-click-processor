@@ -6,7 +6,10 @@ The owner's D3, quoted rather than paraphrased:
      потрапляє на конкретний офер.»
     «…переходи по ось такому форматом URL не діє прив'язка.»
 
-🔴 `ADR-0454` IS NOT SUPERSEDED, and the pair of tests below is what says so.
+🔴 `ADR-0454-route-code-yields-to-the-sticky-pin-and-never-writes-the-returning-system-outranks-a-guess-about-an-anonymous-visitor` IS NOT SUPERSEDED, and the pair of tests below
+is what says so. (The full slug, once, because the NUMBER alone is ambiguous here: `ADR-0454`
+also names `…-the-brocard-users-walk-lives-in-process-service-…`, an unrelated finance
+decision. The later short references in this file resolve against this line.)
 Its title reads *"the returning system outranks a guess about an anonymous
 visitor"* — and a tile click is not a guess. A preview code is a PREDICTION the
 landing page made; a tile code is a CHOICE the visitor made one click ago, from

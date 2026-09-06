@@ -105,7 +105,7 @@ def _plant_foreign_wall(store) -> None:
 
 
 class TestAForeignWallIsNotServed:
-    def test_a_wall_owned_by_another_company_never_reaches_the_answer(self, armed):
+    def test_a_wall_owned_by_another_company_never_reaches_the_answer(self, armed):  # noqa: F811
         store = _fake()
         asyncio.run(_seed(store.client()))
         _plant_foreign_wall(store)
@@ -121,7 +121,7 @@ class TestAForeignWallIsNotServed:
             % (FOREIGN_COMPANY, COMPANY)
         )
 
-    def test_the_legitimate_wall_still_serves_the_calibration(self, armed):
+    def test_the_legitimate_wall_still_serves_the_calibration(self, armed):  # noqa: F811
         # Without this, the assertion above is satisfied by an endpoint that
         # serves NO wall at all, which would be a different defect wearing the
         # shape of a passing isolation test.
@@ -131,7 +131,7 @@ class TestAForeignWallIsNotServed:
         assert body["matched"] is True
         assert body["wall_id"] == int(WALL_A)
 
-    def test_a_foreign_wall_ALONE_serves_nothing(self, armed):
+    def test_a_foreign_wall_ALONE_serves_nothing(self, armed):  # noqa: F811
         # The sharpest form: no legitimate wall to hide behind. If the reader
         # has no tenant check, this answers `matched: true` with the foreign
         # wall's tiles — the leak, undisguised.
@@ -195,7 +195,7 @@ def _plant_scope_matching_foreign_wall(store) -> None:
 
 
 class TestWhatTheProtectionActuallyIS:
-    def test_scope_is_the_mechanism_and_the_company_field_is_not_read(self, armed):
+    def test_scope_is_the_mechanism_and_the_company_field_is_not_read(self, armed):  # noqa: F811
         """PINS THE MECHANISM. It does not endorse it.
 
         A wall whose scope matches the click is served even though its own

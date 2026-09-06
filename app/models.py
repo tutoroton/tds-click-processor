@@ -554,6 +554,26 @@ class WallRequest(BaseModel):
     # omitted the field die in validation INSIDE the handler. Mirrors
     # `PreviewRequest`, which types it the same way for the same reason.
     arrival_ts: str | None = None
+    # 🔴 THE PER-TENANT CREDENTIAL. Added 2026-09-06; its ABSENCE was the gap.
+    #
+    # `X-TDS-Key` authenticates the WORKER, not the tenant: `_check_tds_key`
+    # returns a worker_id and its own docstring calls the return "advisory",
+    # and this handler discarded it. So before this field existed, ANY caller
+    # holding the shared edge secret could ask for ANY company's catalogue -
+    # while the sibling `/preview` required a second, tenant-scoped key on top.
+    #
+    # This was never a design decision. The programme's own change-surface
+    # document says the two SHOULD share "the key mechanism
+    # (`route_preview_keys`, its Redis resolution and the cross-tenant guard)"
+    # (`docs/development/offerwall-2026-09-04/02-CHANGE-SURFACE.md`), and no ADR
+    # says otherwise. The endpoint simply shipped without it, and nothing was
+    # reachable enough to notice: the wall is dark, and until the edge gained a
+    # `tds_wall` branch no request could arrive at all.
+    #
+    # Optional, exactly as on `PreviewRequest`: a node must still answer an
+    # unkeyed internal caller rather than 422, and the cross-tenant guard is
+    # what a PRESENTED key buys.
+    preview_key_hash: str | None = None
 
 
 class WallTile(BaseModel):
@@ -612,6 +632,21 @@ class WallResponse(BaseModel):
     wall_id: int | None = None
     tiles: list[WallTile] = Field(default_factory=list)
     reason: str | None = None
+    # The in-band verdict the WORKER consumes and the public never sees, and
+    # the R25 echo that makes deploy order structural instead of remembered.
+    # Both mirror `PreviewResponse` deliberately - the wall answers the same
+    # three outcomes for a presented key, so inventing a different vocabulary
+    # would only give the two paths a way to disagree.
+    #
+    # `wall_denied` (not `preview_denied`): the entity is its own, and a worker
+    # reading one field for two products is one refactor away from applying a
+    # preview's refusal to a wall.
+    #
+    # `tenant_checked=None` is NOT "not refused" - it is "this node could not
+    # validate", which an older node also produces by ignoring an unknown field.
+    # A caller must read the absence as could-not-validate and never as a pass.
+    wall_denied: str | None = None
+    tenant_checked: bool | None = None
     # Unix seconds. Present only alongside minted codes; `None` when the ring is
     # not armed, so a caller can tell "no codes in this answer" from "codes that
     # never expire", which would be a far more dangerous reading.

@@ -2522,6 +2522,35 @@ async def _wall_body(req: WallRequest, charged: int) -> WallResponse:
 
     r = await get_redis()
 
+    # 🔴 THE TENANT LADDER, and it runs BEFORE any resolution work. Three
+    # outcomes for a presented key, identical to `/preview`'s (R25):
+    #
+    #   * hit                  -> remember the company, check it below;
+    #   * miss + index PRESENT -> the dead-catalogue shape PLUS the in-band
+    #                             `wall_denied` verdict, so the worker can fall
+    #                             through to an ordinary click;
+    #   * miss + index ABSENT  -> plain "no wall", NO verdict and NO
+    #                             `tenant_checked`. A degraded node must never
+    #                             claim "refused": if it did, a sync outage
+    #                             would silently convert every wall request
+    #                             into a click.
+    #
+    # Placed here rather than after resolution because a refused key should
+    # cost one Redis GET, not a full campaign resolution - the same argument
+    # the admission bulkhead above makes one level up.
+    key_company: str | None = None
+    tenant_checked: bool | None = None
+    if req.preview_key_hash:
+        key_company = await r.get(f"preview_key:{req.preview_key_hash}")
+        if key_company is None:
+            if not await r.exists("preview_keys:synced"):
+                return WallResponse(matched=False, reason="no_wall")
+            return WallResponse(
+                matched=False, reason="no_wall",
+                wall_denied="key_refused", tenant_checked=True,
+            )
+        tenant_checked = True
+
     # 🔴 `identity_writes` IS DELIBERATELY LEFT AT ITS DEFAULT (True), and the
     # first draft of this handler set it False — which was wrong, and wrong in
     # the way risk A34 predicts.
@@ -2557,14 +2586,21 @@ async def _wall_body(req: WallRequest, charged: int) -> WallResponse:
         arrival_ts=req.arrival_ts or None,
     )
 
+    # Every answer produced under a PRESENT index for a presented hash carries
+    # the echo - these two included. Omitting it here would be a live defect,
+    # not a cosmetic one: the worker treats a missing `tenant_checked` as "an
+    # older node ignored the field" and answers 503, so a keyed caller probing a
+    # domain with no campaign would get an outage shape instead of "no wall".
     resolution = await resolve_domain_campaign(r, click_req)
     if resolution.blocked or not resolution.campaign_id:
-        return WallResponse(matched=False, reason="no_campaign")
+        return WallResponse(matched=False, reason="no_campaign",
+                            tenant_checked=tenant_checked)
 
     campaign_id = str(resolution.campaign_id)
     campaign = await r.hgetall(f"campaign:{campaign_id}")
     if not campaign:
-        return WallResponse(matched=False, reason="no_campaign")
+        return WallResponse(matched=False, reason="no_campaign",
+                            tenant_checked=tenant_checked)
     campaign["_id"] = campaign_id
 
     # 🔴 `commit_identity=False` — the single most important argument on this
@@ -2611,8 +2647,24 @@ async def _wall_body(req: WallRequest, charged: int) -> WallResponse:
     global _wall_tiles_inflight
     _wall_tiles_inflight += max(0, int(stats.get("tiles") or 0) - charged)
 
+    # 🔴 THE CROSS-TENANT REFUSAL. A VALID key for someone ELSE's campaign gets
+    # the dead-catalogue shape - byte-identical to a link that has no wall - so
+    # a caller holding another tenant's key learns exactly what probing a random
+    # URL would have told them. No existence oracle, the same posture `/preview`
+    # takes, and the reason string is the one an ordinary miss produces.
+    #
+    # Compared as STRINGS against the redis value, exactly as the preview does:
+    # the stored value is text, and int-coercing it here would introduce a
+    # second parse that could disagree with the sibling path.
+    if key_company is not None and key_company != str(
+        attribution.get("company_id") or ""
+    ):
+        return WallResponse(matched=False, reason="no_wall",
+                            tenant_checked=tenant_checked)
+
     if not eligible:
-        return WallResponse(matched=False, reason="no_wall")
+        return WallResponse(matched=False, reason="no_wall",
+                            tenant_checked=tenant_checked)
 
     allowed_avail = _allowed_availability(campaign, attribution)
     click_levels = _wall_click_levels(attribution)
@@ -2641,10 +2693,12 @@ async def _wall_body(req: WallRequest, charged: int) -> WallResponse:
                 wall_id=wall_id,
                 tiles=tiles,
                 expires_at=expires_at,
+                tenant_checked=tenant_checked,
             )
         remaining = [w for w in remaining if w is not winner]
 
-    return WallResponse(matched=False, reason="no_viable_wall")
+    return WallResponse(matched=False, reason="no_viable_wall",
+                        tenant_checked=tenant_checked)
 
 
 @app.post("/preview", response_model=PreviewResponse)

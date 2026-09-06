@@ -2463,6 +2463,59 @@ async def wall(
         _wall_tiles_inflight -= charge
 
 
+def _mint_tile_codes(
+    tiles: list[WallTile],
+    *,
+    company_id: int | None,
+    campaign_id: int,
+    wall_id: int | None,
+) -> int | None:
+    """Give every tile its own signed code. Returns the shared `expires_at`.
+
+    🔴 ALL-OR-NOTHING, and that is the whole design. A wall answered with codes
+    on SOME tiles would be worse than one with none: the visitor picks a tile,
+    and whether their choice survives the click would depend on which tile they
+    happened to pick — a coin-flip the operator cannot see, explain or debug.
+    So the preconditions are checked ONCE, before any tile is touched.
+
+    Preconditions, and each is the preview path's own rule applied here:
+
+    * the ring must be armed (`route_code.is_enabled()`);
+    * the tenant must be known — the code binds `company_id`, and a code that
+      cannot be tenant-checked on the way back is exactly the cross-campaign
+      override v2 was minted to close;
+    * the WALL's id must be known, because it becomes `origin_flow_id`. `sign()`
+      refuses a v3 whose origin is 0, so this is not merely tidy — an unknown
+      wall id has no honest v3 to mint.
+
+    When any fails we mint NOTHING and the answer degrades to a catalogue whose
+    tiles route ordinarily. **That is the feature not applying, which is a state
+    the system already handles; an unbindable code would be a defect.**
+
+    ⚠️ NO WRITES, by construction rather than by care: this function calls
+    `route_code.sign`, which is pure over the keyring, and touches no Redis. The
+    wall path's zero-write property (pinned by
+    `test_wall_endpoint.py::TestTheWallPathIsSideEffectFree`, with its own
+    detectors proven able to fire) is therefore unchanged by this addition.
+    """
+    if not route_code.is_enabled():
+        return None
+    if company_id is None or not wall_id:
+        return None
+
+    ttl = settings.route_code_ttl_seconds
+    for tile in tiles:
+        tile.route_code = route_code.sign(
+            company_id=company_id,
+            campaign_id=campaign_id,
+            offer_id=tile.offer_id,
+            offer_target_id=tile.offer_target_id,
+            ttl_seconds=ttl,
+            origin_flow_id=wall_id,
+        )
+    return int(time.time()) + ttl
+
+
 async def _wall_body(req: WallRequest, charged: int) -> WallResponse:
     """Resolve the campaign, pick the wall, and answer with its viable tiles."""
     global _wall_tiles_inflight
@@ -2576,10 +2629,18 @@ async def _wall_body(req: WallRequest, charged: int) -> WallResponse:
             break
         tiles = await _viable_tiles(r, winner, allowed_avail)
         if tiles:
+            wall_id = _to_int_or_none(winner.get("_id"))
+            expires_at = _mint_tile_codes(
+                tiles,
+                company_id=_to_int_or_none(attribution.get("company_id")),
+                campaign_id=int(campaign_id),
+                wall_id=wall_id,
+            )
             return WallResponse(
                 matched=True,
-                wall_id=_to_int_or_none(winner.get("_id")),
+                wall_id=wall_id,
                 tiles=tiles,
+                expires_at=expires_at,
             )
         remaining = [w for w in remaining if w is not winner]
 

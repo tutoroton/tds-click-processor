@@ -36,7 +36,14 @@ from typing import Any, Final, NamedTuple
 
 import redis  # F4 — for the BASE `redis.RedisError` exception class only.
 import sentry_sdk
-from app import action_executor, cascade, identity, route_code, sticky
+from app import (
+    action_executor,
+    cascade,
+    identity,
+    offerwall,
+    route_code,
+    sticky,
+)
 from app.config import settings
 from app.diag import get_test_id
 from app.enrichment import enrich_buyer
@@ -1468,6 +1475,34 @@ async def _route_code_target(
         # names, so a tampered or stale pairing cannot be served.
         if str(target.get("offer_id") or "") != str(decoded.offer_id):
             return None
+
+        # G6.3 — PER-WALL MEMBERSHIP. A v3 code claiming a WALL origin only acts
+        # as a tile if that wall STILL carries this exact (offer, target) pair.
+        # Owner decision D3-OPEN-3, verbatim: an offer removed from a wall while
+        # a visitor holds its link *"falls back to the DEFAULT scenario, not an
+        # error"* — so a stale tile is simply not honoured and the click routes
+        # normally, which is what returning None does here.
+        #
+        # 🔴 GATED ON `is_wall_claim`, which asks about KIND **and** origin
+        # together, rather than on `origin_flow_id is not None`. The codec
+        # exposes that property precisely so the two conditions cannot drift
+        # apart at a call site, and re-deriving it here would be one more site
+        # to drift. A v2 preview code is unaffected: `is_wall_claim` is False by
+        # construction, so this block is invisible to every code minted before
+        # walls existed.
+        #
+        # ⚠️ ORIGIN IS NOT DELIVERY. This compares the code's origin wall
+        # against THAT WALL'S OWN membership — never against the flow that wins
+        # routing for this click. The two share the word `flow_id` and are
+        # different concepts; comparing them because of the shared word is the
+        # substitution rule `entity-boundaries` exists to stop, and the anchor
+        # warns about exactly that at this box.
+        if decoded.is_wall_claim:
+            wall = await r.hgetall(f"flow:{decoded.origin_flow_id}")
+            if not offerwall.wall_contains_tile(
+                wall, decoded.offer_id, decoded.offer_target_id,
+            ):
+                return None
 
         result = action_executor.pinned_target_result(
             target, tid, req, campaign_id, build_url_fn,

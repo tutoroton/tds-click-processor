@@ -510,6 +510,92 @@ class PreviewRequest(BaseModel):
     )
 
 
+class WallRequest(BaseModel):
+    """Ask which OFFER WALL this visitor would be shown, without routing them.
+
+    Deliberately the SAME field set as :class:`PreviewRequest`, and that is a
+    contract rather than convenience: a wall's criteria are drawn from the same
+    vocabulary as a flow's, so anything a flow can target on, a wall can target
+    on — and a request that could not carry one of those dims would make the two
+    silently disagree about the same stored criterion (risk A33).
+
+    🔴 THE IDENTITY FIELDS ARE ABSENT, and — exactly as for a preview — that is
+    NOT what makes this side-effect-free. The gate is `commit_identity=False` at
+    the attribution call, which is documented as side-effect-free at its own
+    definition: the new-user uid is not minted and no persist is scheduled.
+
+    ⚠️ It is NOT `identity_writes=False`, and the difference is risk A34. That
+    flag gates the WHOLE resolver block including the history READ, so using it
+    would leave the wall without `is_returning` / `is_roaming` / `prev_*` and
+    evaluating returning criteria against absent dims — which is A33. The first
+    draft of the handler made exactly that mistake; a mutation that stayed green
+    is what surfaced it.
+    """
+
+    hostname: str = Field(min_length=1, max_length=255)
+    path: str = "/"
+    query_params: dict[str, str] = Field(default_factory=dict)
+
+    ip: str = ""
+    country: str = ""
+    city: str = ""
+    region: str = ""
+    continent: str = ""
+    timezone: str = ""
+    user_agent: str = ""
+    accept_language: str = ""
+    referer: str = ""
+    is_bot: bool = False
+    is_proxy: bool = False
+    asn: int = 0
+    # `str | None`, NOT `str = ""`, and the difference is not cosmetic:
+    # `ClickRequest.arrival_ts` carries a strict ISO-8601-Z pattern that the
+    # empty string fails, so a `""` default would make every request that
+    # omitted the field die in validation INSIDE the handler. Mirrors
+    # `PreviewRequest`, which types it the same way for the same reason.
+    arrival_ts: str | None = None
+
+
+class WallTile(BaseModel):
+    """One offer on the wall, as a VISITOR may see it.
+
+    🔴 THE SAME FORBIDDEN LIST AS `PreviewResponse`, and for the same reason:
+    `url_template`, `payout_value`, `criteria`, the partner and the offer's
+    `settings` are all within arm's reach of the code that built this answer, so
+    leaving them out has to be deliberate. A wall makes the omission MORE
+    load-bearing, not less — a preview exposes one offer, a wall exposes the
+    whole catalogue at once, so a leak here is N leaks.
+
+    `offer_name` / `offer_icon_url` ARE here, and they are the opposite kind of
+    field: they exist to be shown to the visitor. A tile the visitor cannot read
+    is not a catalogue.
+    """
+
+    offer_id: int
+    offer_target_id: int
+    offer_name: str | None = None
+    offer_icon_url: str | None = None
+
+
+class WallResponse(BaseModel):
+    """The wall this visitor would be shown, or a plain "no wall".
+
+    `matched=False` is a NORMAL answer, not an error — most links have no wall,
+    and a landing page asking about one must be able to tell "no wall here" from
+    "something went wrong". `reason` names which shape it was.
+
+    🔴 NO TILE CODES YET. `CODE_VERSION 3` carries the signed origin `flow_id`
+    that per-tile codes need, and it is a separate open lane; minting them here
+    before that lands would put an unverifiable claim on the wire. When it does,
+    each tile gains its own code and this docstring loses this paragraph.
+    """
+
+    matched: bool
+    wall_id: int | None = None
+    tiles: list[WallTile] = Field(default_factory=list)
+    reason: str | None = None
+
+
 class PreviewResponse(BaseModel):
     """The predicted destination — ids and a signed code, nothing else.
 

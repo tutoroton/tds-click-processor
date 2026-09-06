@@ -130,6 +130,81 @@ def select_wall(
     )
 
 
+def parse_tiles(wall: dict[str, Any]) -> list[dict[str, Any]] | None:
+    """This wall's tiles, or `None` when the config cannot be read.
+
+    🔴 `None` AND `[]` ARE DIFFERENT ANSWERS and the callers need both. `[]` is
+    "this wall has no tiles", a readable fact; `None` is "we do not know what
+    this wall carries". Collapsing them would let a corrupt row present as an
+    empty one, and the two callers below want OPPOSITE defaults on it — the
+    budget treats unknown as expensive, the membership check treats unknown as
+    unproven. A single fused return could not serve both.
+
+    Extracted at the SECOND use (`reusability-discipline`): `_tile_count`
+    parsed this and threw the list away, and `wall_contains_tile` needs the
+    list itself.
+    """
+    import json
+
+    raw = wall.get("action_config")
+    if not raw:
+        return None
+    try:
+        cfg = json.loads(raw) if isinstance(raw, str) else raw
+        tiles = cfg.get("tiles")
+    except (ValueError, AttributeError, TypeError):
+        return None
+    if not isinstance(tiles, list):
+        return None
+    return [t for t in tiles if isinstance(t, dict)]
+
+
+def wall_contains_tile(
+    wall: dict[str, Any], offer_id: int, offer_target_id: int,
+) -> bool:
+    """Does this wall carry exactly this (offer, target) pair RIGHT NOW?
+
+    The question a tile's route code has to answer before it may act as one.
+    G6.3, and it implements owner decision D3-OPEN-3 verbatim: an offer REMOVED
+    from a wall while a visitor still holds its link *"falls back to the DEFAULT
+    scenario, not an error"* — so a stale tile is simply not honoured and the
+    click routes normally.
+
+    🔴 FAIL-CLOSED, unlike its sibling `_tile_count`, and the asymmetry is the
+    point. An unreadable wall means the claim is UNPROVEN, and an unproven claim
+    must not buy precedence over ordinary routing. `_tile_count` fails the other
+    way for the same reason inverted: there, treating unknown as cheap would let
+    a corrupt row buy unlimited admission.
+
+    Both ids are compared as INTs. ⚠️ **And that choice is NOT load-bearing, a
+    correction to this docstring's own first draft.** It claimed a string
+    compare "would refuse a legitimate tile" — a mutation swapping `int()` for
+    `str()` was predicted RED and came back GREEN, because for every shape that
+    actually occurs the two agree: `int("21") == int(21)` and
+    `str("21") == str(21)` are both True. They diverge only on inputs no JSON
+    writer emits (`"021"`, `21.0`).
+
+    So the int compare is kept for SEMANTICS — these are numeric ids and should
+    be compared as numbers — and this paragraph records that no test
+    discriminates it from the alternative, rather than pretending one does. The
+    calibration is what found it; a justification that survives review by
+    sounding load-bearing is worse than none.
+    """
+    tiles = parse_tiles(wall)
+    if tiles is None:
+        return False
+    for tile in tiles:
+        try:
+            if (int(tile.get("offer_id")) == int(offer_id)
+                    and int(tile.get("target_id")) == int(offer_target_id)):
+                return True
+        except (TypeError, ValueError):
+            # A malformed ENTRY is skipped, never fatal: one bad tile must not
+            # invalidate a wall whose other tiles are fine.
+            continue
+    return False
+
+
 def _tile_count(wall: dict[str, Any]) -> int:
     """How many tiles this wall carries, for the WORK budget.
 
@@ -137,19 +212,8 @@ def _tile_count(wall: dict[str, Any]) -> int:
     rather than as zero: a corrupt row must not be able to buy unlimited
     admission by being corrupt.
     """
-    import json
-
-    raw = wall.get("action_config")
-    if not raw:
-        return _ASSUMED_TILES_ON_UNREADABLE
-    try:
-        cfg = json.loads(raw) if isinstance(raw, str) else raw
-        tiles = cfg.get("tiles")
-    except (ValueError, AttributeError, TypeError):
-        return _ASSUMED_TILES_ON_UNREADABLE
-    if not isinstance(tiles, list):
-        return _ASSUMED_TILES_ON_UNREADABLE
-    return len(tiles)
+    tiles = parse_tiles(wall)
+    return _ASSUMED_TILES_ON_UNREADABLE if tiles is None else len(tiles)
 
 
 async def load_wall_candidates(

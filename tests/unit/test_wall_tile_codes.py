@@ -49,7 +49,7 @@ KEY = "wall-tile-code-test-key-aaaaaaaaaaaaaaaaaaaa"
 
 
 @pytest.fixture
-def coded(armed, monkeypatch):
+def coded(armed, monkeypatch):  # noqa: F811
     """`armed`, PLUS a live signing ring — the only difference."""
     monkeypatch.setattr(settings, "route_code_keys", f"1:{KEY}")
     monkeypatch.setattr(settings, "route_code_active_kid", "1")
@@ -63,7 +63,7 @@ def _served(store) -> dict:
 
 
 class TestTheRingDecidesWhetherCodesExistAtAll:
-    def test_ring_OFF_mints_nothing_and_says_so(self, armed):
+    def test_ring_OFF_mints_nothing_and_says_so(self, armed):  # noqa: F811
         # `armed` alone leaves the ring empty. Every tile still serves — the
         # catalogue is the product; the code is an enhancement on top of it.
         body = _served(_fake())

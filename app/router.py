@@ -1405,12 +1405,22 @@ async def _route_code_target(
     🔴 **This function performs NO writes** (anchor §21.2): no `repin`, no
     `set_sticky_nx`, nothing. The route code never mutates returning-user state.
 
-    KNOWN, BOUNDED LIMITATION — no flow-membership bind. A code minted for
-    campaign X can be replayed on campaign Y of the SAME company, serving X's
-    target under Y's flow. It cannot cross a tenant. This is the same property
-    the sticky pin already has (a pin minted under one flow serves under
-    another), and binding the campaign would need `campaign_id` in the payload,
-    i.e. `CODE_VERSION` 2. Recorded rather than silently inherited.
+    🔴 THIS PARAGRAPH DESCRIBED A CLOSED HOLE AS IF IT WERE OPEN, until
+    2026-09-06. It said a code minted for campaign X "can be replayed on
+    campaign Y of the SAME company", and that binding the campaign "would need
+    `campaign_id` in the payload, i.e. `CODE_VERSION` 2". v2 SHIPPED, and the
+    campaign bind is enforced a few lines below — the replay it warned about has
+    not been possible since. Corrected rather than deleted, so the next reader
+    can tell a live limitation from a superseded one.
+
+    WHAT IS STILL TRUE, and it is the narrower half: there is no FLOW-membership
+    bind at this site. `CODE_VERSION` 3 now carries a signed `kind` and a signed
+    origin `flow_id` (`route_code.KIND_WALL`), so a wall tile's code can finally
+    say WHICH wall it came from — two walls in one campaign holding the same
+    offer previously minted identical codes. Carrying the claim is not the same
+    as checking it: re-validating membership against current config belongs with
+    the wall SERVING path, and until that exists this hook sees only v2 preview
+    codes, for which `is_wall_claim` is False by construction.
 
     FAIL-OPEN by construction: any fault at all returns None and the click
     routes normally. An optional enhancement must never be able to break a

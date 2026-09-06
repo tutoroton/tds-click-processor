@@ -1666,41 +1666,45 @@ async def _resolve_action_with_sticky(
     return result, "minted"
 
 
-async def _try_flow_cascade(
-    r,
-    campaign: dict[str, Any],
-    campaign_id: str,
+def build_click_attrs(
     req: ClickRequest,
-    *,
-    source_mappings,
-    campaign_mappings,
-    buyer_chain: dict[str, int | None],
+    buyer_chain: dict[str, Any],
     attribution: dict[str, Any],
-    allowed_avail=frozenset({"active"}),
-    rng=random,
-) -> dict[str, Any] | None:
-    """Run scope cascade + action execution. Returns None if no flow.
+    *,
+    audience_routing: bool,
+    seen_before: bool,
+) -> dict[str, Any]:
+    """The criterion attributes a candidate is evaluated against.
 
-    Steps:
-      a. Resolve canonical slots from query_params + mappings (cheap,
-         pure Python). Used to extract `buyer_id` for enrichment.
-      b. Enrich `buyer_id` → org-hierarchy chain via single Redis
-         HGETALL (`enrich_buyer`). When buyer slot is missing or
-         non-numeric, the chain is empty — cascade falls back to
-         company-level scope (resolved from campaign.company_id).
-      c. Resolve winning flow via `cascade.resolve_flow`.
-      d. Execute action via `action_executor.execute_action`.
+    Extracted VERBATIM from `_try_flow_cascade` so that a second reader of the
+    same criteria — the offerwall read endpoint (G5) — evaluates against exactly
+    this dict rather than a plausible-looking subset of it.
 
-    Per `architecture.md` Latency Budgets: this branch adds at most
-    1 enrich + 2 cascade pipelines + 1-2 action HGETALLs ≈ 4-5ms in
-    the cascade-hit shape. Within the per-click 10ms total budget on
-    healthy Redis.
+    🔴 WHY A NARROWER DICT IS NOT A SAFE SIMPLIFICATION. Omitting a dim is not
+    conservative: the matcher reads a missing dim as `""`
+    (`cascade._filter_by_criteria`) and one operator is explicitly SATISFIED by
+    that — `cascade._OPS_SATISFIED_BY_MISSING_VALUE == {"empty"}`. So a candidate
+    whose criterion is `<dim> empty` MATCHES when the dim is absent and does NOT
+    match when it carries a value. A partial dict does not merely hide
+    candidates, it ADMITS ones the full dict rejects. Risk A33,
+    `docs/development/offerwall-2026-09-04/27-RISK-REGISTER-PART-A.md`.
+
+    🔴 THE GATES ARRIVE AS ARGUMENTS AND ARE NEVER RE-DERIVED HERE. This function
+    deliberately does NOT take `campaign`, which is what makes that structural
+    rather than a promise: with no campaign in scope it cannot recompute
+    `audience_routing` or `seen_before` and drift from the values its caller
+    passes to `cascade.resolve_flow` in the same breath. The caller keeps
+    `returning_live` and `campaign_mode` for itself — they are routing state,
+    consumed after the cascade returns (the sticky-pin block), and they are not
+    this function's business.
+
+    TYPES ARE PART OF THE CONTRACT. Every dim is a `str` except the three history
+    dims, which are `frozenset`s matched by an intersection branch. `str(None)` is
+    `"None"` and compares equal to nothing, so a "normalise everything" cleanup
+    would look right and silently break matching. The boundary is pinned by
+    `tests/unit/test_cascade_boundary_oracle.py`, whose golden was captured
+    BEFORE this extraction existed.
     """
-    # `buyer_chain` is resolved once by the caller (`_route_via_campaign`)
-    # and passed in — see the latency-neutral rationale there. Steps a/b
-    # (slot resolve + buyer enrich) happen there now; this function owns
-    # steps c (cascade) + d (action) and records the routing-decision ids
-    # it discovers into the shared `attribution` dict (Phase 3).
     # F.17 (2026-05-03) + CF-3 (2026-06-07): 10-dim base click_attrs (the 7 UA/geo
     # dims + isp_asn / time_of_day / day_of_week). Each value's casing matches what
     # admin-api validates — see `cascade._CASE_PRESERVE` for which dims preserve
@@ -1769,6 +1773,62 @@ async def _try_flow_cascade(
     for _id_slot in cascade.IDENTIFIER_SLOTS:
         click_attrs[f"param:{_id_slot}"] = _slots.get(_id_slot) or ""
 
+    # Returning-flow criterion palette (flow-level only, v1). Injected ONLY for
+    # a seen_before user under segmented routing — first-pool flows never carry
+    # these dims (palette-guard), and the offer_target inline matcher (which
+    # uses its own base-dim click_attrs) never sees them.
+    if audience_routing and seen_before:
+        click_attrs["is_returning"] = (
+            "true" if attribution.get("is_returning") else "false"
+        )
+        # v2 Phase A — is_roaming joins the returning-flow criterion palette
+        # (Phase-R handoff: the dim is now computed + a valid criterion, and
+        # the cascade matches on it here). Same gate as is_returning.
+        click_attrs["is_roaming"] = (
+            "true" if attribution.get("is_roaming") else "false"
+        )
+        click_attrs["prev_offer"] = attribution.get("prev_offers") or frozenset()
+        click_attrs["prev_offer_target"] = attribution.get("prev_targets") or frozenset()
+        click_attrs["prev_sub"] = attribution.get("prev_subs") or frozenset()
+
+    return click_attrs
+
+
+async def _try_flow_cascade(
+    r,
+    campaign: dict[str, Any],
+    campaign_id: str,
+    req: ClickRequest,
+    *,
+    source_mappings,
+    campaign_mappings,
+    buyer_chain: dict[str, int | None],
+    attribution: dict[str, Any],
+    allowed_avail=frozenset({"active"}),
+    rng=random,
+) -> dict[str, Any] | None:
+    """Run scope cascade + action execution. Returns None if no flow.
+
+    Steps:
+      a. Resolve canonical slots from query_params + mappings (cheap,
+         pure Python). Used to extract `buyer_id` for enrichment.
+      b. Enrich `buyer_id` → org-hierarchy chain via single Redis
+         HGETALL (`enrich_buyer`). When buyer slot is missing or
+         non-numeric, the chain is empty — cascade falls back to
+         company-level scope (resolved from campaign.company_id).
+      c. Resolve winning flow via `cascade.resolve_flow`.
+      d. Execute action via `action_executor.execute_action`.
+
+    Per `architecture.md` Latency Budgets: this branch adds at most
+    1 enrich + 2 cascade pipelines + 1-2 action HGETALLs ≈ 4-5ms in
+    the cascade-hit shape. Within the per-click 10ms total budget on
+    healthy Redis.
+    """
+    # `buyer_chain` is resolved once by the caller (`_route_via_campaign`)
+    # and passed in — see the latency-neutral rationale there. Steps a/b
+    # (slot resolve + buyer enrich) happen there now; this function owns
+    # steps c (cascade) + d (action) and records the routing-decision ids
+    # it discovers into the shared `attribution` dict (Phase 3).
     # P4 — returning-user segmented routing. `seen_before` = the uid existed
     # BEFORE this click (= B∪C; NOT the is_returning flag, which is B-only —
     # conflating them silently drops segment C, R4 G1). Only meaningful when the
@@ -1792,23 +1852,23 @@ async def _try_flow_cascade(
     campaign_mode = (campaign.get("returning_mode") or "fresh").strip().lower()
     audience_routing = _audience_routing(campaign)
     seen_before = _seen_before(attribution)
-    # Returning-flow criterion palette (flow-level only, v1). Injected ONLY for
-    # a seen_before user under segmented routing — first-pool flows never carry
-    # these dims (palette-guard), and the offer_target inline matcher (which
-    # uses its own base-dim click_attrs) never sees them.
-    if audience_routing and seen_before:
-        click_attrs["is_returning"] = (
-            "true" if attribution.get("is_returning") else "false"
-        )
-        # v2 Phase A — is_roaming joins the returning-flow criterion palette
-        # (Phase-R handoff: the dim is now computed + a valid criterion, and
-        # the cascade matches on it here). Same gate as is_returning.
-        click_attrs["is_roaming"] = (
-            "true" if attribution.get("is_roaming") else "false"
-        )
-        click_attrs["prev_offer"] = attribution.get("prev_offers") or frozenset()
-        click_attrs["prev_offer_target"] = attribution.get("prev_targets") or frozenset()
-        click_attrs["prev_sub"] = attribution.get("prev_subs") or frozenset()
+
+    # The criterion attributes for this click. Built by a SHARED function so the
+    # offerwall read endpoint evaluates wall criteria against exactly this dict —
+    # see `build_click_attrs` for why a narrower one would ADMIT candidates
+    # rather than hide them.
+    #
+    # The gates above are PASSED IN rather than recomputed inside: the builder
+    # never sees `campaign`, so it cannot derive a second, drifting answer to
+    # "is the partition on for this click". `returning_live` and `campaign_mode`
+    # stay here — they are consumed after the cascade returns.
+    click_attrs = build_click_attrs(
+        req,
+        buyer_chain,
+        attribution,
+        audience_routing=audience_routing,
+        seen_before=seen_before,
+    )
 
     # v2 Phase A2 — routing_trace (compact, always). The cascade populates it
     # by-reference with scope_walk + candidate/loaded/availability-excluded

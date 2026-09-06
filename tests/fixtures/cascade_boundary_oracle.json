@@ -1,0 +1,1492 @@
+{
+  "casing_and_time": {
+    "click_attrs": {
+      "browser": [
+        "str",
+        "Chrome"
+      ],
+      "buyer_id": [
+        "str",
+        ""
+      ],
+      "city": [
+        "str",
+        "new york"
+      ],
+      "custom_group_id": [
+        "str",
+        ""
+      ],
+      "day_of_week": [
+        "str",
+        "sun"
+      ],
+      "department_id": [
+        "str",
+        ""
+      ],
+      "device_type": [
+        "str",
+        "desktop"
+      ],
+      "geo": [
+        "str",
+        "US"
+      ],
+      "isp_asn": [
+        "str",
+        "13335"
+      ],
+      "language": [
+        "str",
+        "en-GB"
+      ],
+      "os": [
+        "str",
+        "windows"
+      ],
+      "param:ad_campaign_id": [
+        "str",
+        ""
+      ],
+      "param:ad_id": [
+        "str",
+        ""
+      ],
+      "param:adset_id": [
+        "str",
+        ""
+      ],
+      "param:app_id": [
+        "str",
+        ""
+      ],
+      "param:creative_id": [
+        "str",
+        ""
+      ],
+      "param:external_id": [
+        "str",
+        ""
+      ],
+      "param:funnel_id": [
+        "str",
+        ""
+      ],
+      "param:funnel_type": [
+        "str",
+        ""
+      ],
+      "param:host": [
+        "str",
+        ""
+      ],
+      "param:keyword": [
+        "str",
+        ""
+      ],
+      "param:landing_id": [
+        "str",
+        ""
+      ],
+      "param:pixel_id": [
+        "str",
+        ""
+      ],
+      "param:placement": [
+        "str",
+        ""
+      ],
+      "param:source": [
+        "str",
+        ""
+      ],
+      "param:sub1": [
+        "str",
+        ""
+      ],
+      "param:sub10": [
+        "str",
+        ""
+      ],
+      "param:sub11": [
+        "str",
+        ""
+      ],
+      "param:sub12": [
+        "str",
+        ""
+      ],
+      "param:sub13": [
+        "str",
+        ""
+      ],
+      "param:sub14": [
+        "str",
+        ""
+      ],
+      "param:sub15": [
+        "str",
+        ""
+      ],
+      "param:sub16": [
+        "str",
+        ""
+      ],
+      "param:sub17": [
+        "str",
+        ""
+      ],
+      "param:sub18": [
+        "str",
+        ""
+      ],
+      "param:sub19": [
+        "str",
+        ""
+      ],
+      "param:sub2": [
+        "str",
+        ""
+      ],
+      "param:sub20": [
+        "str",
+        ""
+      ],
+      "param:sub3": [
+        "str",
+        ""
+      ],
+      "param:sub4": [
+        "str",
+        ""
+      ],
+      "param:sub5": [
+        "str",
+        ""
+      ],
+      "param:sub6": [
+        "str",
+        ""
+      ],
+      "param:sub7": [
+        "str",
+        ""
+      ],
+      "param:sub8": [
+        "str",
+        ""
+      ],
+      "param:sub9": [
+        "str",
+        ""
+      ],
+      "region": [
+        "str",
+        "New York"
+      ],
+      "team_id": [
+        "str",
+        ""
+      ],
+      "time_of_day": [
+        "str",
+        "14"
+      ]
+    },
+    "other": {
+      "audience_routing": [
+        "bool",
+        false
+      ],
+      "returning_visitor": [
+        "bool",
+        false
+      ],
+      "seen_before": [
+        "bool",
+        false
+      ]
+    }
+  },
+  "identifier_mapped_but_unresolved": {
+    "click_attrs": {
+      "browser": [
+        "str",
+        "Mobile Safari"
+      ],
+      "buyer_id": [
+        "str",
+        ""
+      ],
+      "city": [
+        "str",
+        ""
+      ],
+      "custom_group_id": [
+        "str",
+        ""
+      ],
+      "day_of_week": [
+        "str",
+        ""
+      ],
+      "department_id": [
+        "str",
+        ""
+      ],
+      "device_type": [
+        "str",
+        "mobile"
+      ],
+      "geo": [
+        "str",
+        "US"
+      ],
+      "isp_asn": [
+        "str",
+        "0"
+      ],
+      "language": [
+        "str",
+        ""
+      ],
+      "os": [
+        "str",
+        "ios"
+      ],
+      "param:ad_campaign_id": [
+        "str",
+        ""
+      ],
+      "param:ad_id": [
+        "str",
+        ""
+      ],
+      "param:adset_id": [
+        "str",
+        ""
+      ],
+      "param:app_id": [
+        "str",
+        ""
+      ],
+      "param:creative_id": [
+        "str",
+        ""
+      ],
+      "param:external_id": [
+        "str",
+        ""
+      ],
+      "param:funnel_id": [
+        "str",
+        ""
+      ],
+      "param:funnel_type": [
+        "str",
+        ""
+      ],
+      "param:host": [
+        "str",
+        ""
+      ],
+      "param:keyword": [
+        "str",
+        ""
+      ],
+      "param:landing_id": [
+        "str",
+        ""
+      ],
+      "param:pixel_id": [
+        "str",
+        ""
+      ],
+      "param:placement": [
+        "str",
+        ""
+      ],
+      "param:source": [
+        "str",
+        "fb"
+      ],
+      "param:sub1": [
+        "str",
+        ""
+      ],
+      "param:sub10": [
+        "str",
+        ""
+      ],
+      "param:sub11": [
+        "str",
+        ""
+      ],
+      "param:sub12": [
+        "str",
+        ""
+      ],
+      "param:sub13": [
+        "str",
+        ""
+      ],
+      "param:sub14": [
+        "str",
+        ""
+      ],
+      "param:sub15": [
+        "str",
+        ""
+      ],
+      "param:sub16": [
+        "str",
+        ""
+      ],
+      "param:sub17": [
+        "str",
+        ""
+      ],
+      "param:sub18": [
+        "str",
+        ""
+      ],
+      "param:sub19": [
+        "str",
+        ""
+      ],
+      "param:sub2": [
+        "str",
+        ""
+      ],
+      "param:sub20": [
+        "str",
+        ""
+      ],
+      "param:sub3": [
+        "str",
+        ""
+      ],
+      "param:sub4": [
+        "str",
+        ""
+      ],
+      "param:sub5": [
+        "str",
+        ""
+      ],
+      "param:sub6": [
+        "str",
+        ""
+      ],
+      "param:sub7": [
+        "str",
+        ""
+      ],
+      "param:sub8": [
+        "str",
+        ""
+      ],
+      "param:sub9": [
+        "str",
+        ""
+      ],
+      "region": [
+        "str",
+        ""
+      ],
+      "team_id": [
+        "str",
+        ""
+      ],
+      "time_of_day": [
+        "str",
+        ""
+      ]
+    },
+    "other": {
+      "audience_routing": [
+        "bool",
+        false
+      ],
+      "returning_visitor": [
+        "bool",
+        false
+      ],
+      "seen_before": [
+        "bool",
+        false
+      ]
+    }
+  },
+  "identifier_resolved": {
+    "click_attrs": {
+      "browser": [
+        "str",
+        "Mobile Safari"
+      ],
+      "buyer_id": [
+        "str",
+        ""
+      ],
+      "city": [
+        "str",
+        ""
+      ],
+      "custom_group_id": [
+        "str",
+        ""
+      ],
+      "day_of_week": [
+        "str",
+        ""
+      ],
+      "department_id": [
+        "str",
+        ""
+      ],
+      "device_type": [
+        "str",
+        "mobile"
+      ],
+      "geo": [
+        "str",
+        "US"
+      ],
+      "isp_asn": [
+        "str",
+        "0"
+      ],
+      "language": [
+        "str",
+        ""
+      ],
+      "os": [
+        "str",
+        "ios"
+      ],
+      "param:ad_campaign_id": [
+        "str",
+        ""
+      ],
+      "param:ad_id": [
+        "str",
+        ""
+      ],
+      "param:adset_id": [
+        "str",
+        ""
+      ],
+      "param:app_id": [
+        "str",
+        ""
+      ],
+      "param:creative_id": [
+        "str",
+        "AdVariant_A"
+      ],
+      "param:external_id": [
+        "str",
+        ""
+      ],
+      "param:funnel_id": [
+        "str",
+        ""
+      ],
+      "param:funnel_type": [
+        "str",
+        ""
+      ],
+      "param:host": [
+        "str",
+        ""
+      ],
+      "param:keyword": [
+        "str",
+        ""
+      ],
+      "param:landing_id": [
+        "str",
+        ""
+      ],
+      "param:pixel_id": [
+        "str",
+        ""
+      ],
+      "param:placement": [
+        "str",
+        ""
+      ],
+      "param:source": [
+        "str",
+        "fb"
+      ],
+      "param:sub1": [
+        "str",
+        ""
+      ],
+      "param:sub10": [
+        "str",
+        ""
+      ],
+      "param:sub11": [
+        "str",
+        ""
+      ],
+      "param:sub12": [
+        "str",
+        ""
+      ],
+      "param:sub13": [
+        "str",
+        ""
+      ],
+      "param:sub14": [
+        "str",
+        ""
+      ],
+      "param:sub15": [
+        "str",
+        ""
+      ],
+      "param:sub16": [
+        "str",
+        ""
+      ],
+      "param:sub17": [
+        "str",
+        ""
+      ],
+      "param:sub18": [
+        "str",
+        ""
+      ],
+      "param:sub19": [
+        "str",
+        ""
+      ],
+      "param:sub2": [
+        "str",
+        ""
+      ],
+      "param:sub20": [
+        "str",
+        ""
+      ],
+      "param:sub3": [
+        "str",
+        ""
+      ],
+      "param:sub4": [
+        "str",
+        ""
+      ],
+      "param:sub5": [
+        "str",
+        ""
+      ],
+      "param:sub6": [
+        "str",
+        ""
+      ],
+      "param:sub7": [
+        "str",
+        ""
+      ],
+      "param:sub8": [
+        "str",
+        ""
+      ],
+      "param:sub9": [
+        "str",
+        ""
+      ],
+      "region": [
+        "str",
+        ""
+      ],
+      "team_id": [
+        "str",
+        ""
+      ],
+      "time_of_day": [
+        "str",
+        ""
+      ]
+    },
+    "other": {
+      "audience_routing": [
+        "bool",
+        false
+      ],
+      "returning_visitor": [
+        "bool",
+        false
+      ],
+      "seen_before": [
+        "bool",
+        false
+      ]
+    }
+  },
+  "minimal": {
+    "click_attrs": {
+      "browser": [
+        "str",
+        "Mobile Safari"
+      ],
+      "buyer_id": [
+        "str",
+        ""
+      ],
+      "city": [
+        "str",
+        ""
+      ],
+      "custom_group_id": [
+        "str",
+        ""
+      ],
+      "day_of_week": [
+        "str",
+        ""
+      ],
+      "department_id": [
+        "str",
+        ""
+      ],
+      "device_type": [
+        "str",
+        "mobile"
+      ],
+      "geo": [
+        "str",
+        "US"
+      ],
+      "isp_asn": [
+        "str",
+        "0"
+      ],
+      "language": [
+        "str",
+        ""
+      ],
+      "os": [
+        "str",
+        "ios"
+      ],
+      "param:ad_campaign_id": [
+        "str",
+        ""
+      ],
+      "param:ad_id": [
+        "str",
+        ""
+      ],
+      "param:adset_id": [
+        "str",
+        ""
+      ],
+      "param:app_id": [
+        "str",
+        ""
+      ],
+      "param:creative_id": [
+        "str",
+        ""
+      ],
+      "param:external_id": [
+        "str",
+        ""
+      ],
+      "param:funnel_id": [
+        "str",
+        ""
+      ],
+      "param:funnel_type": [
+        "str",
+        ""
+      ],
+      "param:host": [
+        "str",
+        ""
+      ],
+      "param:keyword": [
+        "str",
+        ""
+      ],
+      "param:landing_id": [
+        "str",
+        ""
+      ],
+      "param:pixel_id": [
+        "str",
+        ""
+      ],
+      "param:placement": [
+        "str",
+        ""
+      ],
+      "param:source": [
+        "str",
+        ""
+      ],
+      "param:sub1": [
+        "str",
+        ""
+      ],
+      "param:sub10": [
+        "str",
+        ""
+      ],
+      "param:sub11": [
+        "str",
+        ""
+      ],
+      "param:sub12": [
+        "str",
+        ""
+      ],
+      "param:sub13": [
+        "str",
+        ""
+      ],
+      "param:sub14": [
+        "str",
+        ""
+      ],
+      "param:sub15": [
+        "str",
+        ""
+      ],
+      "param:sub16": [
+        "str",
+        ""
+      ],
+      "param:sub17": [
+        "str",
+        ""
+      ],
+      "param:sub18": [
+        "str",
+        ""
+      ],
+      "param:sub19": [
+        "str",
+        ""
+      ],
+      "param:sub2": [
+        "str",
+        ""
+      ],
+      "param:sub20": [
+        "str",
+        ""
+      ],
+      "param:sub3": [
+        "str",
+        ""
+      ],
+      "param:sub4": [
+        "str",
+        ""
+      ],
+      "param:sub5": [
+        "str",
+        ""
+      ],
+      "param:sub6": [
+        "str",
+        ""
+      ],
+      "param:sub7": [
+        "str",
+        ""
+      ],
+      "param:sub8": [
+        "str",
+        ""
+      ],
+      "param:sub9": [
+        "str",
+        ""
+      ],
+      "region": [
+        "str",
+        ""
+      ],
+      "team_id": [
+        "str",
+        ""
+      ],
+      "time_of_day": [
+        "str",
+        ""
+      ]
+    },
+    "other": {
+      "audience_routing": [
+        "bool",
+        false
+      ],
+      "returning_visitor": [
+        "bool",
+        false
+      ],
+      "seen_before": [
+        "bool",
+        false
+      ]
+    }
+  },
+  "returning_off": {
+    "click_attrs": {
+      "browser": [
+        "str",
+        "Mobile Safari"
+      ],
+      "buyer_id": [
+        "str",
+        ""
+      ],
+      "city": [
+        "str",
+        ""
+      ],
+      "custom_group_id": [
+        "str",
+        ""
+      ],
+      "day_of_week": [
+        "str",
+        ""
+      ],
+      "department_id": [
+        "str",
+        ""
+      ],
+      "device_type": [
+        "str",
+        "mobile"
+      ],
+      "geo": [
+        "str",
+        "US"
+      ],
+      "isp_asn": [
+        "str",
+        "0"
+      ],
+      "language": [
+        "str",
+        ""
+      ],
+      "os": [
+        "str",
+        "ios"
+      ],
+      "param:ad_campaign_id": [
+        "str",
+        ""
+      ],
+      "param:ad_id": [
+        "str",
+        ""
+      ],
+      "param:adset_id": [
+        "str",
+        ""
+      ],
+      "param:app_id": [
+        "str",
+        ""
+      ],
+      "param:creative_id": [
+        "str",
+        ""
+      ],
+      "param:external_id": [
+        "str",
+        ""
+      ],
+      "param:funnel_id": [
+        "str",
+        ""
+      ],
+      "param:funnel_type": [
+        "str",
+        ""
+      ],
+      "param:host": [
+        "str",
+        ""
+      ],
+      "param:keyword": [
+        "str",
+        ""
+      ],
+      "param:landing_id": [
+        "str",
+        ""
+      ],
+      "param:pixel_id": [
+        "str",
+        ""
+      ],
+      "param:placement": [
+        "str",
+        ""
+      ],
+      "param:source": [
+        "str",
+        ""
+      ],
+      "param:sub1": [
+        "str",
+        ""
+      ],
+      "param:sub10": [
+        "str",
+        ""
+      ],
+      "param:sub11": [
+        "str",
+        ""
+      ],
+      "param:sub12": [
+        "str",
+        ""
+      ],
+      "param:sub13": [
+        "str",
+        ""
+      ],
+      "param:sub14": [
+        "str",
+        ""
+      ],
+      "param:sub15": [
+        "str",
+        ""
+      ],
+      "param:sub16": [
+        "str",
+        ""
+      ],
+      "param:sub17": [
+        "str",
+        ""
+      ],
+      "param:sub18": [
+        "str",
+        ""
+      ],
+      "param:sub19": [
+        "str",
+        ""
+      ],
+      "param:sub2": [
+        "str",
+        ""
+      ],
+      "param:sub20": [
+        "str",
+        ""
+      ],
+      "param:sub3": [
+        "str",
+        ""
+      ],
+      "param:sub4": [
+        "str",
+        ""
+      ],
+      "param:sub5": [
+        "str",
+        ""
+      ],
+      "param:sub6": [
+        "str",
+        ""
+      ],
+      "param:sub7": [
+        "str",
+        ""
+      ],
+      "param:sub8": [
+        "str",
+        ""
+      ],
+      "param:sub9": [
+        "str",
+        ""
+      ],
+      "region": [
+        "str",
+        ""
+      ],
+      "team_id": [
+        "str",
+        ""
+      ],
+      "time_of_day": [
+        "str",
+        ""
+      ]
+    },
+    "other": {
+      "audience_routing": [
+        "bool",
+        false
+      ],
+      "returning_visitor": [
+        "bool",
+        false
+      ],
+      "seen_before": [
+        "bool",
+        false
+      ]
+    }
+  },
+  "returning_on_seen_before": {
+    "click_attrs": {
+      "browser": [
+        "str",
+        "Mobile Safari"
+      ],
+      "buyer_id": [
+        "str",
+        ""
+      ],
+      "city": [
+        "str",
+        ""
+      ],
+      "custom_group_id": [
+        "str",
+        ""
+      ],
+      "day_of_week": [
+        "str",
+        ""
+      ],
+      "department_id": [
+        "str",
+        ""
+      ],
+      "device_type": [
+        "str",
+        "mobile"
+      ],
+      "geo": [
+        "str",
+        "US"
+      ],
+      "is_returning": [
+        "str",
+        "true"
+      ],
+      "is_roaming": [
+        "str",
+        "false"
+      ],
+      "isp_asn": [
+        "str",
+        "0"
+      ],
+      "language": [
+        "str",
+        ""
+      ],
+      "os": [
+        "str",
+        "ios"
+      ],
+      "param:ad_campaign_id": [
+        "str",
+        ""
+      ],
+      "param:ad_id": [
+        "str",
+        ""
+      ],
+      "param:adset_id": [
+        "str",
+        ""
+      ],
+      "param:app_id": [
+        "str",
+        ""
+      ],
+      "param:creative_id": [
+        "str",
+        ""
+      ],
+      "param:external_id": [
+        "str",
+        ""
+      ],
+      "param:funnel_id": [
+        "str",
+        ""
+      ],
+      "param:funnel_type": [
+        "str",
+        ""
+      ],
+      "param:host": [
+        "str",
+        ""
+      ],
+      "param:keyword": [
+        "str",
+        ""
+      ],
+      "param:landing_id": [
+        "str",
+        ""
+      ],
+      "param:pixel_id": [
+        "str",
+        ""
+      ],
+      "param:placement": [
+        "str",
+        ""
+      ],
+      "param:source": [
+        "str",
+        ""
+      ],
+      "param:sub1": [
+        "str",
+        ""
+      ],
+      "param:sub10": [
+        "str",
+        ""
+      ],
+      "param:sub11": [
+        "str",
+        ""
+      ],
+      "param:sub12": [
+        "str",
+        ""
+      ],
+      "param:sub13": [
+        "str",
+        ""
+      ],
+      "param:sub14": [
+        "str",
+        ""
+      ],
+      "param:sub15": [
+        "str",
+        ""
+      ],
+      "param:sub16": [
+        "str",
+        ""
+      ],
+      "param:sub17": [
+        "str",
+        ""
+      ],
+      "param:sub18": [
+        "str",
+        ""
+      ],
+      "param:sub19": [
+        "str",
+        ""
+      ],
+      "param:sub2": [
+        "str",
+        ""
+      ],
+      "param:sub20": [
+        "str",
+        ""
+      ],
+      "param:sub3": [
+        "str",
+        ""
+      ],
+      "param:sub4": [
+        "str",
+        ""
+      ],
+      "param:sub5": [
+        "str",
+        ""
+      ],
+      "param:sub6": [
+        "str",
+        ""
+      ],
+      "param:sub7": [
+        "str",
+        ""
+      ],
+      "param:sub8": [
+        "str",
+        ""
+      ],
+      "param:sub9": [
+        "str",
+        ""
+      ],
+      "prev_offer": [
+        "frozenset",
+        []
+      ],
+      "prev_offer_target": [
+        "frozenset",
+        []
+      ],
+      "prev_sub": [
+        "frozenset",
+        []
+      ],
+      "region": [
+        "str",
+        ""
+      ],
+      "team_id": [
+        "str",
+        ""
+      ],
+      "time_of_day": [
+        "str",
+        ""
+      ]
+    },
+    "other": {
+      "audience_routing": [
+        "bool",
+        true
+      ],
+      "returning_visitor": [
+        "bool",
+        true
+      ],
+      "seen_before": [
+        "bool",
+        true
+      ]
+    }
+  },
+  "structural_buyer": {
+    "click_attrs": {
+      "browser": [
+        "str",
+        "Mobile Safari"
+      ],
+      "buyer_id": [
+        "str",
+        "7"
+      ],
+      "city": [
+        "str",
+        ""
+      ],
+      "custom_group_id": [
+        "str",
+        ""
+      ],
+      "day_of_week": [
+        "str",
+        ""
+      ],
+      "department_id": [
+        "str",
+        ""
+      ],
+      "device_type": [
+        "str",
+        "mobile"
+      ],
+      "geo": [
+        "str",
+        "US"
+      ],
+      "isp_asn": [
+        "str",
+        "0"
+      ],
+      "language": [
+        "str",
+        ""
+      ],
+      "os": [
+        "str",
+        "ios"
+      ],
+      "param:ad_campaign_id": [
+        "str",
+        ""
+      ],
+      "param:ad_id": [
+        "str",
+        ""
+      ],
+      "param:adset_id": [
+        "str",
+        ""
+      ],
+      "param:app_id": [
+        "str",
+        ""
+      ],
+      "param:creative_id": [
+        "str",
+        ""
+      ],
+      "param:external_id": [
+        "str",
+        ""
+      ],
+      "param:funnel_id": [
+        "str",
+        ""
+      ],
+      "param:funnel_type": [
+        "str",
+        ""
+      ],
+      "param:host": [
+        "str",
+        ""
+      ],
+      "param:keyword": [
+        "str",
+        ""
+      ],
+      "param:landing_id": [
+        "str",
+        ""
+      ],
+      "param:pixel_id": [
+        "str",
+        ""
+      ],
+      "param:placement": [
+        "str",
+        ""
+      ],
+      "param:source": [
+        "str",
+        "fb"
+      ],
+      "param:sub1": [
+        "str",
+        ""
+      ],
+      "param:sub10": [
+        "str",
+        ""
+      ],
+      "param:sub11": [
+        "str",
+        ""
+      ],
+      "param:sub12": [
+        "str",
+        ""
+      ],
+      "param:sub13": [
+        "str",
+        ""
+      ],
+      "param:sub14": [
+        "str",
+        ""
+      ],
+      "param:sub15": [
+        "str",
+        ""
+      ],
+      "param:sub16": [
+        "str",
+        ""
+      ],
+      "param:sub17": [
+        "str",
+        ""
+      ],
+      "param:sub18": [
+        "str",
+        ""
+      ],
+      "param:sub19": [
+        "str",
+        ""
+      ],
+      "param:sub2": [
+        "str",
+        ""
+      ],
+      "param:sub20": [
+        "str",
+        ""
+      ],
+      "param:sub3": [
+        "str",
+        ""
+      ],
+      "param:sub4": [
+        "str",
+        ""
+      ],
+      "param:sub5": [
+        "str",
+        ""
+      ],
+      "param:sub6": [
+        "str",
+        ""
+      ],
+      "param:sub7": [
+        "str",
+        ""
+      ],
+      "param:sub8": [
+        "str",
+        ""
+      ],
+      "param:sub9": [
+        "str",
+        ""
+      ],
+      "region": [
+        "str",
+        ""
+      ],
+      "team_id": [
+        "str",
+        ""
+      ],
+      "time_of_day": [
+        "str",
+        ""
+      ]
+    },
+    "other": {
+      "audience_routing": [
+        "bool",
+        false
+      ],
+      "returning_visitor": [
+        "bool",
+        false
+      ],
+      "seen_before": [
+        "bool",
+        false
+      ]
+    }
+  }
+}

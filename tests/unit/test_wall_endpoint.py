@@ -23,13 +23,15 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import fakeredis.aioredis
 import pytest
 from fastapi.testclient import TestClient
 
-from app import identity, main, router, sticky
+from app import identity, main, redis_client as rc, router, sticky
 from app.config import settings
 
 HOST = "wall.test"
@@ -486,6 +488,39 @@ class TestASheddedWallIsNeverAClick:
 # --------------------------------------------------------------------------- #
 # A34 — a catalogue fetch WRITES NOTHING                                       #
 # --------------------------------------------------------------------------- #
+def test_the_WALL_recorder_covers_every_pool_a_request_can_reach():
+    """The ratchet behind `_post`'s "BOTH request-reachable pools" comment.
+
+    `test_a_served_wall_performs_zero_writes` is only as wide as the set of
+    clients `_post` wraps, and today that set is asserted by a COMMENT. A
+    comment cannot notice a fourth `get_*_redis` factory being added, and the
+    failure mode recorded when route preview was nearly shipped is exactly an
+    instrument that wrapped one pool of N and reported purity while another was
+    written.
+
+    A twin of this test already exists in `test_route_preview_endpoint.py`
+    (`test_the_recorder_still_covers_every_pool_a_request_can_reach`), and this
+    file needs its own for a reason worth stating rather than assuming: THAT
+    ratchet's docstring says the new factory must be added "to `_post`" in the
+    singular, written when there was one recorder. There are now TWO, in two
+    files. A fourth factory would turn the preview ratchet red, whoever repairs
+    it would wrap the preview's `_post`, and the WALL recorder would be left
+    behind silently - still green, still reporting purity, and narrower than
+    the app it measures.
+
+    If this goes red, do NOT widen the set to make it pass. Decide first
+    whether a REQUEST can reach the new pool. If it can, `_post` in THIS file
+    must wrap it too; if it cannot - as with `get_shipper_redis`, whose only
+    caller is the app lifespan - say so here, name the caller, then extend.
+    """
+    factories = set(re.findall(
+        r"^async def (get_\w*redis)\(", Path(rc.__file__).read_text("utf-8"), re.M))
+    assert factories == {"get_redis", "get_identity_redis", "get_shipper_redis"}, (
+        "the set of Redis client factories changed; read this test's docstring "
+        f"before touching it. Found: {sorted(factories)}"
+    )
+
+
 class TestTheWallPathIsSideEffectFree:
     def test_a_served_wall_performs_zero_writes(self, armed):
         """A wall answer must not stamp an identity: a page RENDER that pinned a

@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import pytest
 
-from app.cascade import _partition_audience
+from app.cascade import SCOPE_PRIORITY, _partition_audience
 from app.offerwall import select_wall
 
 
@@ -149,3 +149,73 @@ def test_an_empty_specific_wall_yields_to_a_populated_broader_one():
     narrow_empty = {**_wall(seq=1, scope_type="team", scope_id=5), "tiles": []}
     broad_full = {**_wall(seq=2, scope_type="company", scope_id=1), "tiles": [{"o": 1}]}
     assert select_wall([narrow_empty, broad_full], _LEVELS)["flow_id"] == "w2"
+
+
+# ---------------------------------------------------------------------------
+# The scope TYPE term — a same-number, different-LEVEL collision
+#
+# `_pick_winner` buckets on the PAIR `(scope_type, scope_id)`. The three tests
+# below isolate the type half, because a fixture whose scope numbers collide at
+# no level cannot show it doing anything, and an earlier reading of exactly such
+# a fixture concluded the term was dead weight. It is not.
+# ---------------------------------------------------------------------------
+
+
+def test_a_wall_whose_scope_id_collides_at_ANOTHER_level_is_not_selected():
+    """The wall's NUMBER equals the click's team id; its TYPE says buyer.
+
+    `_LEVELS` gives the click `buyer=7` and `team=5`. The wall is `buyer:5`:
+
+      buyer level -> click_id 7, wall scope_id 5   -> no match on the id
+      team  level -> click_id 5, wall type 'buyer' -> no match on the type
+
+    Refused twice, for two different reasons, so nothing is served. Delete the
+    `scope_type` comparison from `_pick_winner` and the team level matches on
+    the number alone and the wall IS served -- that mutation is what makes this
+    test discriminate rather than merely pass.
+
+    WHY IT EXISTS. A cross-tenant experiment on this path deleted the type term,
+    saw nothing break, and concluded the term carried nothing. It broke nothing
+    *in that fixture*, whose foreign wall carried a number matching none of the
+    click's levels -- a statement about the fixture, not about the mechanism.
+    Constructed after an adversarial review named the missing shape
+    (Codex consult 20260906-155453-892afb).
+    """
+    colliding = _wall(seq=1, scope_type="buyer", scope_id=5, campaign_id="0")
+    assert select_wall([colliding], _LEVELS) is None
+
+
+def test_the_SAME_wall_one_level_over_IS_selected():
+    """Negative control. Without it the assertion above is equally satisfied by
+    a selector that returns None for everything.
+
+    Identical record, `team:5` instead of `buyer:5`. The click's team id IS 5,
+    so the pair matches and the wall is served. The ONLY difference between the
+    two tests is the type string, which is what pins the type term as the thing
+    doing the work.
+    """
+    reachable = _wall(seq=1, scope_type="team", scope_id=5, campaign_id="0")
+    assert select_wall([reachable], _LEVELS)["flow_id"] == "w1"
+
+
+def test_the_collision_is_refused_at_EVERY_level_not_just_buyer():
+    """The sweep, and the tenancy-relevant shape.
+
+    For every scope level except the one the number legitimately belongs to, a
+    wall numbered 5 is refused. Were the type term absent, each of these would
+    fall into the TEAM bucket on the number alone -- so a wall from another
+    tenant would need only a scope number equal to one of the click's hierarchy
+    ids AT ANY LEVEL to become a candidate.
+
+    Tenancy on the campaign-bound path is therefore carried by the PAIR, not by
+    `scope_id` alone. Each is a single-candidate world, so no other wall can be
+    the reason nothing was served.
+    """
+    for level in SCOPE_PRIORITY:
+        if level == "team":
+            continue
+        wall = _wall(seq=1, scope_type=level, scope_id=5, campaign_id="0")
+        assert select_wall([wall], _LEVELS) is None, (
+            f"a wall scoped {level}:5 was served to a click whose {level} id is "
+            f"{_LEVELS.get(level)!r} -- the scope_type term is not being applied"
+        )

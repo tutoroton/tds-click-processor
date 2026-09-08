@@ -1387,6 +1387,7 @@ async def _route_code_target(
     source_mappings,
     campaign_mappings,
     wall_only: bool = False,
+    trace: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Return the coded target's result, or None to route normally.
 
@@ -1528,6 +1529,25 @@ async def _route_code_target(
         # Provenance: an existing free-text column (anchor §21.3) -> analytics
         # can answer "how many clicks followed a preview" with no migration.
         result["target_selection_path"] = "route_code"
+        # G8.5 — the ORIGIN dimension, which `target_selection_path` cannot carry.
+        # G8.2 measured that origin-wall and delivering-flow are two dimensions on
+        # one click fact and that the click fact stores neither; it also named the
+        # seam (`routing_trace` is String/compact JSON, so this costs no migration)
+        # and said writing it is its own lane. This is that lane.
+        #
+        # 🔴 GATED ON `is_wall_claim`, the same property the membership check above
+        # uses, NOT on `origin_flow_id is not None`. A v2 preview code carries no
+        # wall claim by construction, so it never takes this branch and its trace is
+        # byte-identical to before — the key is ABSENT, never null. That absence is
+        # what lets a query distinguish "not a wall" from "a wall we failed to name".
+        #
+        # ⚠️ Deliberately NOT folded into `target_selection_path` as
+        # "route_code:wall:797": that column is LowCardinality, and two facts in one
+        # column is the substitution `entity-boundaries` forbids. G8.2 names this
+        # exact wrong move; it is written here too because the tempting version is
+        # one line shorter and this is where someone would reach for it.
+        if decoded.is_wall_claim and trace is not None:
+            trace["origin_wall_id"] = decoded.origin_flow_id
         return result
     except Exception as exc:  # pragma: no cover - fail-open, never break a click
         logger.warning("route code honouring failed (%s) - routing normally", exc)
@@ -1657,6 +1677,7 @@ async def _resolve_action_with_sticky(
                 build_url_fn=_build_url,
                 source_mappings=source_mappings,
                 campaign_mappings=campaign_mappings,
+                trace=trace,
             )
         if result is None:
             result = await _normal()
@@ -1717,6 +1738,7 @@ async def _resolve_action_with_sticky(
             source_mappings=source_mappings,
             campaign_mappings=campaign_mappings,
             wall_only=True,
+            trace=trace,
         )
         if wall_result is not None:
             # No write, deliberately: the pin keeps exactly ONE writer (the

@@ -15,7 +15,18 @@ because EVERY existing wall test calls `router._resolve_action_with_sticky`
 DIRECTLY and is HANDED `wall_pin_eligible` as an argument. A test that receives
 the gate cannot see the gate being built wrongly one frame up.
 
-This file drives `router._route_via_campaign`, which composes the gate itself.
+This file drives `router._route_via_campaign`, which reaches the composing
+frame for real: `_try_flow_cascade` (router.py:2028) is what BUILDS the gate at
+:2230 and passes it at :2249, and `_route_via_campaign:1119` calls it. Entering
+one frame higher is deliberate — it also exercises the wiring between them, which
+a test entering at `_try_flow_cascade` would take on trust.
+
+⚠️ An earlier draft of this docstring said `_route_via_campaign` composes the
+gate. It does not; `_try_flow_cascade` does. The tests were always correct — the
+mutation proves they reach it — but the SENTENCE was wrong, which is the
+"a name is not a mechanism" error this repo has paid for before. Corrected after
+an independent reviewer read the frames rather than the prose.
+
 The mutation kills the first test here; the rest are its calibration.
 
 ⚠️ The instrument is the WRITE COUNT on the identity pool, not a value. Under

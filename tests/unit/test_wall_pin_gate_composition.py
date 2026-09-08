@@ -52,6 +52,7 @@ from app.models import ClickRequest
 
 from tests.unit.test_route_code_honoured import (
     _ACTIVE_KID,
+    _sign,
     _CAMPAIGN,
     _CODED_TARGET,
     _COMPANY,
@@ -65,7 +66,8 @@ from tests.unit.test_wall_tile_membership import WALL_ID, _sign_wall
 _RETURNING_FLOW = 500
 
 
-async def _seed(r, *, returning_mode: str, wall_present: bool = True) -> dict:
+async def _seed(r, *, returning_mode: str, wall_present: bool = True,
+                audience: str = "returning") -> dict:
     """One campaign, one RETURNING-audience offer flow, and the wall the code
     was minted from. `returning_mode` is the ONLY thing that varies between the
     subject and its FRESH calibration."""
@@ -79,7 +81,7 @@ async def _seed(r, *, returning_mode: str, wall_present: bool = True) -> dict:
     await r.hset("flow:%d" % _RETURNING_FLOW, mapping={
         "campaign_id": str(_CAMPAIGN), "company_id": str(_COMPANY),
         "scope_type": "company", "scope_id": str(_COMPANY),
-        "audience": "returning",           # the D35 term's subject
+        "audience": audience,              # the D35 term's subject
         "action_type": "offer",
         "action_config": json.dumps(
             {"offer_id": _OFFER, "target_id": int(_NORMAL_TARGET)}),
@@ -103,7 +105,8 @@ async def _seed(r, *, returning_mode: str, wall_present: bool = True) -> dict:
     return campaign
 
 
-def _run(*, returning_mode: str, code: str | None, wall_present: bool = True):
+def _run(*, returning_mode: str, code: str | None, wall_present: bool = True,
+         audience: str = "returning"):
     """Drive the REAL caller so the gate is COMPOSED, never injected.
 
     Returns (result, ident) — `ident.set_calls` is the discriminator.
@@ -125,7 +128,7 @@ def _run(*, returning_mode: str, code: str | None, wall_present: bool = True):
     async def _inner():
         r = fakeredis.aioredis.FakeRedis(decode_responses=True)
         campaign = await _seed(r, returning_mode=returning_mode,
-                               wall_present=wall_present)
+                               wall_present=wall_present, audience=audience)
         # 🔴 `query_params`, and the param NAME read from the module rather
         # than typed as a literal — both were guessed first, and the guess
         # produced a red that looked exactly like the defect under test.
@@ -149,6 +152,17 @@ def _run(*, returning_mode: str, code: str | None, wall_present: bool = True):
 
     result = asyncio.run(_inner())
     return result, ident
+
+
+def _served(result) -> str:
+    """The target actually served, read from where it LIVES at this frame.
+
+    🔴 Third guess-instead-of-read of this session: `result["target_id"]` is
+    None here — the served target is `result["attribution"]["offer_target_id"]`
+    (and `result["url"]` corroborates it). A test asserting on the absent key
+    fails against CORRECT behaviour, which is the most expensive kind of red.
+    """
+    return str(((result or {}).get("attribution") or {}).get("offer_target_id"))
 
 
 class TestTheGateIsComposedCorrectlyOneFrameUp:
@@ -183,4 +197,62 @@ class TestTheGateIsComposedCorrectlyOneFrameUp:
         assert not ident.set_calls, (
             "a plain click by a returning-flow winner must not write a wall "
             "pin: there was no tile choice to remember"
+        )
+
+
+class TestTheOtherCallerBoundaryTheSameShapeFoundIt:
+    """🔴 A SECOND undefended composition, and the more dangerous of the two.
+
+    Found the same way, after an independent reviewer asked "are there OTHER
+    compositions of this shape you have not noticed?" — the one question worth
+    more than his three verdicts.
+
+    `_try_flow_cascade` computes `returning_flow_won` at router.py:2247, passes
+    it as `wall_only` at :1713, and `_route_code_target` checks it at :1461
+    (`if wall_only and not decoded.is_wall_claim: ...`). That chain is the ONLY
+    thing stopping a v2 PREVIEW code from beating a matching returning flow —
+    the defect measured 10/10 on staging 2026-09-03 (campaign 333, /pvret) and
+    the one ADR-0515 names explicitly when it says the guard must be NARROWED
+    by kind, never deleted.
+
+    MEASURED 2026-09-09: mutating :2247 to `returning_flow_won=False` left
+    **131 of 131** wall tests green. Every one of them is handed `wall_only`.
+    """
+
+    def test_a_PREVIEW_code_does_NOT_beat_a_matching_returning_flow(self):
+        result, _ident = _run(returning_mode="sticky", code=_sign())
+        assert result is not None, "the click must route at all"
+        assert _served(result) == str(_NORMAL_TARGET), (
+            "a v2 PREVIEW code won against a RETURNING flow. ADR-0454 puts the "
+            "returning pick above an anonymous guess, and ADR-0515 grants the "
+            "exception to a WALL claim ONLY. If this went red after an edit to "
+            "`returning_flow_won` (router.py:2247) or to how it reaches "
+            "`wall_only` (:1713), that edit handed preview the wall's victory."
+        )
+
+    def test_the_WALL_code_in_the_IDENTICAL_fixture_DOES_win(self):
+        """The calibration. Without it the assertion above is satisfied by a
+        resolver that refuses every code, which would prove nothing."""
+        result, _ident = _run(returning_mode="sticky", code=_sign_wall())
+        assert _served(result) == str(_CODED_TARGET), (
+            "the wall tile must still win — same fixture, only the code KIND "
+            "differs, so this is the discriminator for kind-narrowing"
+        )
+
+    def test_with_NO_returning_winner_the_preview_code_works_as_designed(self):
+        """Second calibration: the refusal above is caused by the RETURNING
+        winner, not by previews being broken.
+
+        🔴 FRESH mode, deliberately, and the first draft of this test got it
+        wrong. Under STICKY with a FIRST-audience winner every term of
+        `sticky_active` holds, so the click takes the STICKY path where a v2
+        code is never consulted at all (`if not sticky_active` is False) — it
+        served the flow's own target and the test went red against CORRECT
+        behaviour. `fresh` keeps `sticky_active` False, which is the state this
+        calibration is actually about."""
+        result, _ident = _run(returning_mode="fresh", code=_sign(),
+                              audience="first")
+        assert _served(result) == str(_CODED_TARGET), (
+            "with no returning winner a preview code is honoured — that is "
+            "ADR-0454's designed behaviour and must not regress either"
         )

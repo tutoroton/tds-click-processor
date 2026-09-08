@@ -1034,6 +1034,28 @@ def _decision_reason(result: dict, timing: dict, attr: dict) -> str:
             return "sticky_pin_hit"
         if sticky_status == "invalid_closed":
             return "fresh_repin"
+        # 🔴 ADR-0515 — A WALL TILE DECIDED THIS CLICK, so it must not be
+        # attributed to the returning flow that merely matched. Before that ADR
+        # a returning-flow winner could not reach a tile at all, so every wall
+        # click had `audience_pool == "first"` and already reported
+        # `matched_flow`; this branch therefore changes NOTHING for traffic that
+        # exists today and only prevents the new lie the ADR makes possible.
+        #
+        # It resolves to `matched_flow` rather than a new value on purpose:
+        # `decision_reason` is a CLOSED enum shared with admin-api
+        # (`filter_fields.DECISION_REASONS`) and stats-service, so a new member
+        # is a cross-service contract change — and it would buy nothing, because
+        # the discriminating fact already exists as `routing_trace.origin_wall_id`
+        # (G8.5), which is the dimension that actually answers "did a wall decide
+        # this click". `matched_flow` stays true: a flow did match; the tile then
+        # overrode the target.
+        #
+        # Same shape as the `domain_blocked` branch above, which exists because
+        # without it a click "would fall to `blocked_by_flow` below and claim a
+        # FLOW blocked it — a false statement about which mechanism refused the
+        # click". This is that statement about which mechanism DECIDED it.
+        if (attr.get("routing_trace") or {}).get("origin_wall_id") is not None:
+            return "matched_flow"
         if attr.get("audience_pool") == "returning":
             # A flow from the RETURNING pool won. MODEL V3 — the partition is now
             # existence-driven (no `override` mode); the `override_returning_flow`

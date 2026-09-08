@@ -1546,8 +1546,20 @@ async def _route_code_target(
         # column is the substitution `entity-boundaries` forbids. G8.2 names this
         # exact wrong move; it is written here too because the tempting version is
         # one line shorter and this is where someone would reach for it.
-        if decoded.is_wall_claim and trace is not None:
-            trace["origin_wall_id"] = decoded.origin_flow_id
+        if decoded.is_wall_claim:
+            # ADR-0516 — the pin write below is authorised by the VERIFIED kind
+            # and nothing else. NOT by `target_selection_path` (both kinds
+            # collapse to "route_code" three lines up, so that marker cannot
+            # tell them apart) and NOT by the presence of a parameter, which a
+            # caller controls. `decoded` came out of a MAC check.
+            #
+            # PRIVATE and popped by the caller before the result travels: the
+            # leading underscore says so, and both call sites pop it. It must
+            # never reach the click record, where an unknown key is a silent
+            # contract change nobody asked for.
+            result["_wall_claim"] = True
+            if trace is not None:
+                trace["origin_wall_id"] = decoded.origin_flow_id
         return result
     except Exception as exc:  # pragma: no cover - fail-open, never break a click
         logger.warning("route code honouring failed (%s) - routing normally", exc)
@@ -1578,6 +1590,15 @@ async def _resolve_action_with_sticky(
     param_fills: dict[str, str] | None = None,
     trace: dict[str, Any] | None = None,
     fresh_track: bool = False,
+    # ADR-0516 — "under a STICKY campaign a wall tile landing becomes the
+    # visitor's last destination". Deliberately NOT `sticky_active`: that
+    # carries the D35 exclusion (`audience != "returning"`) and is therefore
+    # False for exactly the returning visitor the ruling is about, so keying
+    # the write on it would silently skip the case. Deliberately NOT
+    # `_audience_routing()` either: that is the returning PARTITION switch, so
+    # it would suppress required writes whenever returning flows are disabled.
+    # It is the CAMPAIGN MODE, computed beside its two siblings.
+    wall_pin_eligible: bool = False,
     rng=random,
 ) -> tuple[dict[str, Any] | None, str]:
     """v2 Phase S — resolve the destination, applying the sticky pin when active.
@@ -1667,20 +1688,34 @@ async def _resolve_action_with_sticky(
         # line ~1831 exists to prevent. Caught by
         # `test_d35_returning_flow_winner_not_overridden_by_sticky_pin`, which
         # went red on the first attempt at this fix.
-        result = None
-        if not returning_flow_won:
-            result = await _route_code_target(
-                r, req, campaign_id,
-                company_id=company_id,
-                flow_id=flow_id,
-                allowed_avail=allowed_avail,
-                build_url_fn=_build_url,
-                source_mappings=source_mappings,
-                campaign_mappings=campaign_mappings,
-                trace=trace,
-            )
-        if result is None:
-            result = await _normal()
+        #
+        # 🔴 ADR-0515 (2026-09-08) — THE GUARD IS NARROWED BY KIND, NEVER
+        # DELETED. The owner ruled «Плитка виграє»: an authenticated v3 WALL
+        # claim outranks a matching returning flow, because a tile is the
+        # visitor's own explicit choice and a returning flow is our inference
+        # about them. A v2 PREVIEW code gains NOTHING — it is still the
+        # anonymous guess ADR-0454 subordinated, and DELETING this guard
+        # instead of narrowing it hands PREVIEW the same victory: the exact
+        # defect measured 10/10 on staging 2026-09-03 (campaign 333, /pvret).
+        #
+        # `wall_only` is enforced inside the resolver against the MAC-verified
+        # payload (`if wall_only and not decoded.is_wall_claim`), so the kind
+        # cannot be spoofed by a caller. With no returning winner the argument
+        # is False and this is byte-identical to before.
+        code_result = await _route_code_target(
+            r, req, campaign_id,
+            company_id=company_id,
+            flow_id=flow_id,
+            allowed_avail=allowed_avail,
+            build_url_fn=_build_url,
+            source_mappings=source_mappings,
+            campaign_mappings=campaign_mappings,
+            wall_only=returning_flow_won,
+            trace=trace,
+        )
+        # Pop BEFORE the result travels anywhere (see the stamp site).
+        wall_decided = bool(code_result.pop("_wall_claim", False)) if code_result else False
+        result = code_result if code_result is not None else await _normal()
         # B-track — fresh-mode pin tracking: overwrite the pin with the target
         # this click ACTUALLY served (available by construction — it was just
         # picked under the availability floor). `repin` = SET EX (sliding TTL,
@@ -1693,6 +1728,27 @@ async def _resolve_action_with_sticky(
                     company_id, uid, campaign_id, tid,
                     settings.returning_uid_ttl_seconds,
                 )
+        # 🔴 ADR-0516 — THE SECOND WRITE SITE, and the one that is easy to miss.
+        # A visitor a RETURNING flow captured has `sticky_active` False by
+        # construction (the D35 exclusion), so they never reach the sticky-path
+        # wall block below — they land HERE. Writing only at that block would
+        # miss exactly the visitor the owner's ruling is about.
+        #
+        # Disjoint from `fresh_track` above by construction, not by luck:
+        # `fresh_track` needs mode == "fresh", `wall_pin_eligible` needs
+        # mode == "sticky". One variable, two exclusive values ⇒ no double
+        # write is reachable. Disjoint from the site below for the same
+        # reason in the other direction: reaching this block at all means
+        # `sticky_active` was False.
+        if wall_pin_eligible and wall_decided:
+            tid = result.get("target_id") if result else None
+            if tid:
+                await sticky.repin(
+                    company_id, uid, campaign_id, tid,
+                    settings.returning_uid_ttl_seconds,
+                )
+                if trace is not None:
+                    trace["wall_pin"] = tid
         return result, "na"
 
     # ── G7.2 — A TILE OUTRANKS THE PIN ──────────────────────────────────────
@@ -1741,10 +1797,52 @@ async def _resolve_action_with_sticky(
             trace=trace,
         )
         if wall_result is not None:
-            # No write, deliberately: the pin keeps exactly ONE writer (the
-            # ordinary path), and D3's third row — the plain URL later returns
-            # the visitor to the last offer they were on — depends on that
-            # writer being the one that recorded it.
+            # 🔴 ADR-0516 (2026-09-08) SUPERSEDES THE NO-WRITE RULE HERE, and
+            # only here. What this comment used to say — "the pin keeps exactly
+            # ONE writer" — was correct reasoning for the v2 PREVIEW code
+            # ADR-0454 was written about: a landing page's guess about an
+            # anonymous visitor must not mutate returning-user state. A v3 WALL
+            # claim is not a guess; it records that a human chose a tile.
+            #
+            # The owner ruled «Має пам'ятати»: under a sticky campaign the tile
+            # landing IS the visitor's last destination, so the plain URL later
+            # returns them to it. Measured before the ruling (node 55,
+            # 2026-09-07, uid 5e63d939): the tile click minted NO pin
+            # (`sticky_status=na`) and the next plain click reported MISS and
+            # pinned the DEFAULT target — the choice left no trace at all.
+            #
+            # PREVIEW is untouched: `wall_only=True` above means a v2 code
+            # never reaches this line. FRESH is untouched: `wall_pin_eligible`
+            # requires mode == "sticky", and the B-track already records the
+            # served target under fresh.
+            #
+            # `sticky.repin` and not a raw client call: it swallows its own
+            # Redis errors, so a persistence fault can never turn a valid
+            # explicit choice back into ordinary selection. That matters here
+            # specifically — this block sits OUTSIDE `_route_code_target`'s
+            # try/except, so an exception raised here would reach the endpoint
+            # catch-all and become `fallback_reason="error"`.
+            if wall_pin_eligible:
+                tid = wall_result.get("target_id")
+                if tid:
+                    await sticky.repin(
+                        company_id, uid, campaign_id, tid,
+                        settings.returning_uid_ttl_seconds,
+                    )
+                    if trace is not None:
+                        # Recorded in the TRACE, not in `sticky_status`.
+                        # `sticky_status` is a CLOSED enum in BOTH admin-api
+                        # (`filter_fields.STICKY_STATUSES`) and stats-service,
+                        # and a value outside it can 422 a report — so a new
+                        # status would be a cross-service contract change. The
+                        # trace is the seam G8.5 already established for wall
+                        # facts the closed columns cannot carry, and it costs
+                        # no migration. `sticky_status` stays "na" and remains
+                        # TRUE: it answers "how did the pin affect THIS click's
+                        # destination", and the answer is that it did not —
+                        # the tile did.
+                        trace["wall_pin"] = tid
+            wall_result.pop("_wall_claim", None)
             return wall_result, "na"
 
     ttl = settings.returning_uid_ttl_seconds
@@ -2109,6 +2207,32 @@ async def _try_flow_cascade(
         and (flow.get("action_type") or "") in ("offer", "split")
         and (flow.get("audience") or "first") != "returning"
     )
+    # ADR-0516 — the gate for the WALL pin write. The deliberate MIRROR of the
+    # two predicates above, minus ONE term, and the omission is the whole point.
+    #
+    #   * `effective_mode == "sticky"` — the ruling is explicitly mode-scoped:
+    #     «стіки … ми запам'ятовуємо його останній пункт призначення», and
+    #     «fresh … ми не запам'ятовуємо». Being the exclusive complement of
+    #     `fresh_track`'s mode term is also what makes a double write
+    #     unreachable rather than merely unlikely.
+    #   * `action_type in ("offer", "split")` — KEPT, and not by copying: the
+    #     pin's only reader sits behind `sticky_active`, which carries the same
+    #     term, so a pin written outside it could never be read as intended and
+    #     would only wait to activate if the flow later changed type. The
+    #     B-track states the principle it follows — "the pin only ever records
+    #     what sticky could later legitimately serve".
+    #   * 🔴 NO `audience != "returning"` — DELIBERATELY OMITTED. That is the
+    #     D35 exclusion, and it is exactly what makes `sticky_active` False for
+    #     a returning visitor. Including it here would skip the very case the
+    #     owner ruled on. This is the ONE term that separates this predicate
+    #     from its two siblings, so it is the one a future edit must not
+    #     "harmonise" back in.
+    wall_pin_eligible = (
+        returning_live
+        and effective_mode == "sticky"
+        and bool(uid)
+        and (flow.get("action_type") or "") in ("offer", "split")
+    )
     company_id = buyer_chain["company_id"]
     flow_id_str = str(flow.get("_id")) if flow.get("_id") else None
 
@@ -2122,6 +2246,7 @@ async def _try_flow_cascade(
         # is exactly that exclusion which makes this term necessary.
         returning_flow_won=(flow.get("audience") or "first") == "returning",
         fresh_track=fresh_track,
+        wall_pin_eligible=wall_pin_eligible,
         rng=rng,
         uid=uid,
         company_id=company_id,

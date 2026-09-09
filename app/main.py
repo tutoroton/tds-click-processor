@@ -1157,6 +1157,29 @@ def _phase3_attribution_fields(
         # "" = an edge that predates D1 — NOT the same as "no method"
         # (every HTTP request has one), and no read may conflate them.
         "http_method": (req.http_method or "").upper(),
+        # origin_wall_id (2026-09-09) — the ORIGIN dimension as a first-class
+        # column, so a wall's statistics do not depend on a diagnostic string.
+        #
+        # 🔴 READ FROM THE TRACE, WHICH IS THE STRUCTURED OBJECT AT THIS POINT,
+        # not from its serialization below. The honour hook put it there after a
+        # verified MAC check (`router.py`, gated on `decoded.is_wall_claim`), and
+        # here it is still a dict — so this value cannot be affected by the
+        # `[:4000]` slice that the neighbouring `routing_trace` field applies to
+        # the JSON text. That slice is why the fact needed a column of its own:
+        # measured 2026-09-09 the largest trace on staging is 498 chars against
+        # that 4000 cap, so the loss is not reachable TODAY, but a money-bearing
+        # dimension must not depend on headroom nobody watches.
+        #
+        # The trace KEEPS its copy deliberately: it is the diagnostic record, it
+        # costs nothing, and while both exist the column can be cross-checked
+        # against it on live rows.
+        #
+        # 0 means "not a wall", and it is unambiguous: the codec refuses an
+        # origin outside 1..UINT32_MAX (`route_code.py`), so zero can never be a
+        # real wall id.
+        "origin_wall_id": int(
+            (attr.get("routing_trace") or {}).get("origin_wall_id") or 0
+        ),
         "hostname": req.hostname or "",
         "path": req.path or "",
         "language": parse_accept_language(req.accept_language) or "",

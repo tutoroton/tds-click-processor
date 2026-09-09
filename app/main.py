@@ -33,6 +33,9 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
 
+from collections.abc import Callable
+
+from app.bulkhead import Budget, NoCapacity
 from app.config import _LOCAL_ENVIRONMENTS, settings
 from app.diag import (
     before_send as diag_before_send,
@@ -2355,6 +2358,12 @@ def _to_int_or_none(value) -> int | None:
 # is N target resolutions where a preview is one, so sharing the counter would
 # let wall load exhaust the budget that protects click serving from previews,
 # and vice versa. Risk A19.
+_wall_budget = Budget()
+
+# 🔴 Kept ONLY so that an operator's `main._wall_tiles_inflight` habit reads a
+# frozen 0 rather than a plausible-looking number that no longer governs
+# anything. The live figure is `_wall_budget.used`, DERIVED from open
+# reservations rather than accumulated.
 _wall_tiles_inflight = 0
 
 
@@ -2462,27 +2471,40 @@ async def wall(
     # Over-limit answers 503 and NEVER falls through to a click. A wall flood
     # converted into clicks would be the same defect D149 closed for previews,
     # reopened through a different door.
-    global _wall_tiles_inflight
     cap = max(1, settings.offerwall_max_tiles_inflight)
     charge = max(1, settings.offerwall_admission_charge_tiles)
-    if _wall_tiles_inflight + charge > cap:
-        capture_op_msg_throttled(
-            OP_PREVIEW_CAPACITY_SHED,
-            settings.node_id,
-            "offerwall admission budget exhausted - shedding wall load to "
-            "protect click serving (bounded, by design; the budget is TILES, "
-            "not requests - raise TDS_OFFERWALL_MAX_TILES_INFLIGHT only with "
-            "D149's rig re-run for the wall shape)",
-            node_id=settings.node_id,
-            cap=cap,
-            charged=charge,
-        )
-        raise HTTPException(status_code=503, detail="offerwall_capacity")
-    _wall_tiles_inflight += charge
     try:
-        return await _wall_body(req, charge)
-    finally:
-        _wall_tiles_inflight -= charge
+        with _wall_budget.hold(cap=cap, charge=charge) as reconcile:
+            return await _wall_body(req, reconcile)
+    except NoCapacity:
+        # 🔴 TELEMETRY IS BEST-EFFORT HERE; THE 503 IS NOT. If the reporting
+        # helper ever raised, an exception escaping this branch would replace a
+        # deliberate capacity refusal with a 500 — the observability of the shed
+        # destroying the shed's own contract. Whether the installed SDK can
+        # raise in some condition is unverified, which is exactly why this does
+        # not depend on the answer.
+        try:
+            capture_op_msg_throttled(
+                OP_PREVIEW_CAPACITY_SHED,
+                # 🔴 The dedup key carries the PRODUCT, not just the node. Both
+                # bulkheads report under `OP_PREVIEW_CAPACITY_SHED`, and the
+                # throttle keys on `(op_name, str(dedup_key))` — so with the bare
+                # node id, wall shedding SUPPRESSED preview shedding reports and
+                # vice versa. Separate budgets did not imply separate visibility.
+                (settings.node_id, "wall"),
+                "offerwall admission budget exhausted - shedding wall load to "
+                "protect click serving (bounded, by design; the budget is TILES, "
+                "not requests - raise TDS_OFFERWALL_MAX_TILES_INFLIGHT only with "
+                "D149's rig re-run for the wall shape)",
+                node_id=settings.node_id,
+                cap=cap,
+                charged=charge,
+            )
+        except Exception:  # pragma: no cover - reporting must never gate the 503
+            pass
+        raise HTTPException(
+            status_code=503, detail="offerwall_capacity"
+        ) from None
 
 
 def _mint_tile_codes(
@@ -2538,9 +2560,16 @@ def _mint_tile_codes(
     return int(time.time()) + ttl
 
 
-async def _wall_body(req: WallRequest, charged: int) -> WallResponse:
-    """Resolve the campaign, pick the wall, and answer with its viable tiles."""
-    global _wall_tiles_inflight
+async def _wall_body(
+    req: WallRequest, reconcile: Callable[[int], None]
+) -> WallResponse:
+    """Resolve the campaign, pick the wall, and answer with its viable tiles.
+
+    `reconcile` REPLACES this request's reservation weight once the real tile
+    cost is known. It is a capability, not a number: the body can no longer
+    reach the budget total, so it cannot take budget that the caller's scope
+    will not give back.
+    """
 
     r = await get_redis()
 
@@ -2664,10 +2693,18 @@ async def _wall_body(req: WallRequest, charged: int) -> WallResponse:
     )
 
     # RECONCILE the presumptive admission charge to what this request actually
-    # costs, so the NEXT request sees the true load rather than a guess. Only
-    # the delta moves; the `finally` above still releases exactly `charged`.
-    global _wall_tiles_inflight
-    _wall_tiles_inflight += max(0, int(stats.get("tiles") or 0) - charged)
+    # costs, so the NEXT request sees the true load rather than a guess.
+    #
+    # 🔴 REPLACES the reservation's weight; it does not ADD to a total. The
+    # previous form was `_wall_tiles_inflight += max(0, actual - charged)`
+    # against a `finally` that released only `charged`, so every request costing
+    # more than the presumptive charge retained the difference FOREVER. Measured:
+    # a 31-tile candidate set left 7, 14, 21 held across three successful
+    # requests; 61 tiles reached the 480 cap in thirteen and then answered 503
+    # for the life of the process. Replacing is idempotent, so calling this twice
+    # cannot accumulate, and the release below deletes the reservation whatever
+    # it weighs.
+    reconcile(int(stats.get("tiles") or 0))
 
     # 🔴 THE CROSS-TENANT REFUSAL. A VALID key for someone ELSE's campaign gets
     # the dead-catalogue shape - byte-identical to a link that has no wall - so
@@ -2816,15 +2853,26 @@ async def preview(
     # `finally` makes leak-on-exception structurally impossible.
     global _preview_inflight
     if _preview_inflight >= max(1, settings.preview_max_concurrency):
-        capture_op_msg_throttled(
-            OP_PREVIEW_CAPACITY_SHED,
-            settings.node_id,
-            "preview admission cap reached — shedding preview load to protect "
-            "click serving (bounded, by design; raise "
-            "TDS_PREVIEW_MAX_CONCURRENCY only with D149's rig re-run)",
-            node_id=settings.node_id,
-            cap=max(1, settings.preview_max_concurrency),
-        )
+        # 🔴 Reporting is BEST-EFFORT; the 503 is not. Same reasoning as the
+        # wall branch: an exception escaping the helper would turn a deliberate
+        # capacity refusal into a 500.
+        try:
+            capture_op_msg_throttled(
+                OP_PREVIEW_CAPACITY_SHED,
+                # 🔴 The dedup key carries the PRODUCT. Both bulkheads report
+                # under this same op name and the throttle keys on
+                # `(op_name, str(dedup_key))`, so with the bare node id a wall
+                # shed SUPPRESSED the preview shed report and vice versa —
+                # separate budgets without separate visibility.
+                (settings.node_id, "preview"),
+                "preview admission cap reached — shedding preview load to protect "
+                "click serving (bounded, by design; raise "
+                "TDS_PREVIEW_MAX_CONCURRENCY only with D149's rig re-run)",
+                node_id=settings.node_id,
+                cap=max(1, settings.preview_max_concurrency),
+            )
+        except Exception:  # pragma: no cover - reporting must never gate the 503
+            pass
         raise HTTPException(status_code=503, detail="preview_capacity")
     _preview_inflight += 1
     try:

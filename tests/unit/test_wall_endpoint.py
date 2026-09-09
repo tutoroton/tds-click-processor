@@ -183,10 +183,42 @@ def _counter_reset():
     Autouse and both-ended on purpose — a leak would make the failure appear in
     whichever test happened to run afterwards, which is the hardest kind to read.
     """
-    main._wall_tiles_inflight = 0
+    _release_occupants()
+    main._wall_budget._reset_for_tests()
     yield
-    main._wall_tiles_inflight = 0
+    _release_occupants()
+    main._wall_budget._reset_for_tests()
 
+
+_OCCUPANTS: list = []
+
+
+def _release_occupants() -> None:
+    while _OCCUPANTS:
+        _OCCUPANTS.pop().__exit__(None, None, None)
+
+
+def _occupy(units: int) -> None:
+    """Fill the wall budget with a REAL reservation of `units` tiles.
+
+    Assigning `main._wall_tiles_inflight` fills NOTHING since the bulkhead moved
+    to owned reservations (`app/bulkhead.py`): that module integer is retired and
+    frozen at 0. A test that still assigned it went on passing while asserting
+    against a value the subject no longer reads — green, and measuring nothing.
+
+    🔴 The context manager is STASHED, not dropped. `hold` is a
+    `@contextmanager` generator, so one that is entered and then loses its last
+    reference is closed by the garbage collector — which runs the `finally` and
+    releases the reservation immediately. Measured: without the stash the budget
+    read 0 again by the time the request arrived and the shed tests saw 200
+    instead of 503. `_counter_reset` releases what is stashed here.
+    """
+    # Its own cap is deliberately generous: this helper FILLS the budget, it
+    # does not test admission, so a second call in the same test must not be
+    # refused by the first one it just placed.
+    cm = main._wall_budget.hold(cap=main._wall_budget.used + units, charge=units)
+    cm.__enter__()
+    _OCCUPANTS.append(cm)
 
 def _post(store, body=None, key=SECRET, log=None, path="/wall"):
     payload = {"hostname": HOST, "path": "/", "country": "US",
@@ -340,7 +372,7 @@ class TestTheAdmissionBudget:
     def test_over_budget_answers_503(self, armed, monkeypatch):
         monkeypatch.setattr(settings, "offerwall_max_tiles_inflight", 24)
         monkeypatch.setattr(settings, "offerwall_admission_charge_tiles", 24)
-        main._wall_tiles_inflight = 24  # one wall already in flight
+        _occupy(24)  # one wall already in flight
         store = _fake()
         asyncio.run(_seed(store.client()))
         assert _post(store).status_code == 503
@@ -350,7 +382,7 @@ class TestTheAdmissionBudget:
         request succeeds, so the 503 is the BUDGET and not the fixture."""
         monkeypatch.setattr(settings, "offerwall_max_tiles_inflight", 24)
         monkeypatch.setattr(settings, "offerwall_admission_charge_tiles", 24)
-        main._wall_tiles_inflight = 0
+        main._wall_budget._reset_for_tests()
         store = _fake()
         asyncio.run(_seed(store.client()))
         assert _post(store).status_code == 200
@@ -372,7 +404,7 @@ class TestTheAdmissionBudget:
         # shed. The numbers below are chosen so the two answers DIFFER — one
         # budget, one in-flight figure, and only the CHARGE moves the verdict.
         monkeypatch.setattr(settings, "offerwall_max_tiles_inflight", 30)
-        main._wall_tiles_inflight = 10
+        _occupy(10)
 
         monkeypatch.setattr(settings, "offerwall_admission_charge_tiles", 24)
         assert _post(store).status_code == 503, (
@@ -380,7 +412,7 @@ class TestTheAdmissionBudget:
             "request-counting cap would have admitted this"
         )
 
-        main._wall_tiles_inflight = 10
+        _occupy(10)
         monkeypatch.setattr(settings, "offerwall_admission_charge_tiles", 1)
         assert _post(store).status_code == 200, (
             "the same request under a 1-tile charge fits — so the verdict is "
@@ -401,8 +433,8 @@ class TestTheAdmissionBudget:
         with patch.object(main, "resolve_domain_campaign", _boom):
             with pytest.raises(Exception):
                 _post(store)
-        assert main._wall_tiles_inflight == 0, (
-            f"charge leaked: counter is {main._wall_tiles_inflight}"
+        assert main._wall_budget.used == 0, (
+            f"charge leaked: budget holds {main._wall_budget.used}"
         )
 
 
@@ -418,7 +450,7 @@ class TestASheddedWallIsNeverAClick:
         every mutating verb on both pools."""
         monkeypatch.setattr(settings, "offerwall_max_tiles_inflight", 24)
         monkeypatch.setattr(settings, "offerwall_admission_charge_tiles", 24)
-        main._wall_tiles_inflight = 24
+        _occupy(24)
         store = _fake()
         asyncio.run(_seed(store.client()))
         log: list[str] = []
@@ -432,7 +464,7 @@ class TestASheddedWallIsNeverAClick:
         wall flood would shed previews — and a preview flood would shed walls."""
         monkeypatch.setattr(settings, "offerwall_max_tiles_inflight", 24)
         monkeypatch.setattr(settings, "offerwall_admission_charge_tiles", 24)
-        main._wall_tiles_inflight = 24
+        _occupy(24)
         before = main._preview_inflight
         store = _fake()
         asyncio.run(_seed(store.client()))
@@ -446,7 +478,7 @@ class TestASheddedWallIsNeverAClick:
         rather than as a counter value: wall load must not cost a redirect."""
         monkeypatch.setattr(settings, "offerwall_max_tiles_inflight", 24)
         monkeypatch.setattr(settings, "offerwall_admission_charge_tiles", 24)
-        main._wall_tiles_inflight = 24
+        _occupy(24)
         store = _fake()
 
         async def _seed_click(r):

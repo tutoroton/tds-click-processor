@@ -30,6 +30,7 @@ import pytest
 from unittest.mock import patch
 
 from app import main
+from app.bulkhead import Budget, NoCapacity
 from app.config import settings
 
 from tests.unit import test_wall_endpoint as W
@@ -80,17 +81,22 @@ class TestTheWallBudgetReturnsToZero:
         with every response a 200. So a bulkhead can be leaking its whole budget
         away while every single response looks perfect.
         """
-        main._wall_tiles_inflight = 0
+        # ⚠️ Assert on the LIVE budget, never on `main._wall_tiles_inflight`.
+        # That module integer is retired and frozen at 0, so asserting it equals
+        # 0 is true by construction — a green that measures nothing. This suite
+        # passed 16/16 that way for one run before the substitution was caught.
+        main._wall_budget._reset_for_tests()
         store = _seeded_store(tiles=tiles)
 
         for i in range(3):
             resp = W._post(store)
             assert resp.status_code == 200, f"request {i} did not complete"
-            assert main._wall_tiles_inflight == 0, (
+            assert main._wall_budget.used == 0, (
                 f"after request {i + 1} of a {tiles}-tile wall the bulkhead still "
-                f"holds {main._wall_tiles_inflight} tiles of budget. Nothing is in "
-                f"flight — the request is over — so this budget is never coming "
-                f"back, and enough of these permanently wedge the worker at 503."
+                f"holds {main._wall_budget.used} tiles across "
+                f"{main._wall_budget.live} reservation(s). Nothing is in flight — "
+                f"the request is over — so this budget is never coming back, and "
+                f"enough of these permanently wedge the worker at 503."
             )
 
     def test_an_exception_inside_the_body_retains_no_budget(self, wall_armed):
@@ -99,20 +105,21 @@ class TestTheWallBudgetReturnsToZero:
         Pinned rather than assumed: this is the property a future refactor is
         most likely to break by moving the release out of the `finally`.
         """
-        main._wall_tiles_inflight = 0
+        main._wall_budget._reset_for_tests()
         store = _seeded_store(tiles=30)
 
-        async def _boom(req, charged):
+        async def _boom(req, reconcile):
             raise RuntimeError("deliberate")
 
         with patch.object(main, "_wall_body", _boom):
             with pytest.raises(Exception):
                 W._post(store)
 
-        assert main._wall_tiles_inflight == 0, (
+        assert main._wall_budget.used == 0, (
             "a request that raised still holds budget — the release is not on "
             "the exception path"
         )
+        assert main._wall_budget.live == 0, "the reservation itself outlived the request"
 
     def test_a_shed_request_consumes_nothing(self, wall_armed, monkeypatch):
         """A refusal must not charge. Otherwise a flood of 503s is itself the
@@ -121,13 +128,23 @@ class TestTheWallBudgetReturnsToZero:
         """
         monkeypatch.setattr(settings, "offerwall_max_tiles_inflight", 24)
         monkeypatch.setattr(settings, "offerwall_admission_charge_tiles", 24)
-        main._wall_tiles_inflight = 24  # already full
         store = _seeded_store(tiles=30)
 
-        assert W._post(store).status_code == 503
-        assert main._wall_tiles_inflight == 24, (
-            "a shed request moved the counter; a refusal must be free"
-        )
+        # Fill the budget with a REAL reservation. Setting the retired module
+        # integer would fill nothing — it no longer governs admission, and this
+        # assertion passed against it only because the probe and the subject had
+        # quietly stopped being the same object.
+        main._wall_budget._reset_for_tests()
+        occupant = main._wall_budget.hold(cap=24, charge=24)
+        occupant.__enter__()
+        try:
+            assert W._post(store).status_code == 503
+            assert main._wall_budget.used == 24, (
+                "a shed request moved the budget; a refusal must be free"
+            )
+        finally:
+            occupant.__exit__(None, None, None)
+        assert main._wall_budget.used == 0, "the occupant did not release"
 
 
 # --------------------------------------------------------------------------- #
@@ -160,20 +177,127 @@ class TestThePreviewBudgetReturnsToZero:
             f"sites; symmetry is what makes this bulkhead leak-proof"
         )
 
-    def test_the_wall_counter_is_symmetric_by_construction(self):
-        """The same count for the wall — this is the structural statement of
+    def test_the_wall_takes_budget_only_through_a_reservation(self):
+        """The structural statement of the fix.
 
-        the defect, and the fix must make it true rather than merely make the
-        numbers work out on today's inputs.
+        ⚠️ Written as a POSITIVE requirement on purpose. The obvious form —
+        "acquire sites == release sites" — became `0 == 0` the moment the bare
+        counter stopped being mutated, i.e. it would pass vacuously and keep
+        passing if someone deleted the bulkhead outright. A guard whose only
+        assertion is a set difference is green on an empty set.
+
+        So this asserts what must BE there, not merely what must be absent:
+        exactly one admission site, going through the reservation primitive.
         """
         import inspect
 
-        src = inspect.getsource(main)
-        acquires = src.count("_wall_tiles_inflight += ")
-        releases = src.count("_wall_tiles_inflight -= ")
-        assert acquires == releases, (
-            f"_wall_tiles_inflight has {acquires} acquire site(s) against "
-            f"{releases} release site(s). Every path that TAKES budget must have "
-            f"a path that GIVES IT BACK; an unmatched increment is a permanent "
-            f"leak no matter how small the delta looks."
+        # 🔴 Strip comments before counting. The comment that EXPLAINS the old
+        # defect necessarily quotes it, so a naive text probe counts the
+        # documentation as the subject and reports a leak that is only prose.
+        # Measured: this exact assertion failed at 1 with zero live mutations.
+        src = "\n".join(
+            line.split("#", 1)[0]
+            for line in inspect.getsource(main).splitlines()
         )
+        direct = src.count("_wall_tiles_inflight += ") + src.count(
+            "_wall_tiles_inflight -= "
+        )
+        assert direct == 0, (
+            f"{direct} site(s) still mutate the wall budget as a bare number. "
+            f"That is the shape that leaked: a released amount is REMEMBERED, "
+            f"so a second acquisition has nothing matching it."
+        )
+        holds = src.count("_wall_budget.hold(")
+        assert holds == 1, (
+            f"expected exactly one wall admission site through the reservation "
+            f"primitive, found {holds}. More than one means two ways in; zero "
+            f"means the bulkhead is gone and this file would otherwise go green "
+            f"about it."
+        )
+
+
+# --------------------------------------------------------------------------- #
+# the primitive itself                                                         #
+# --------------------------------------------------------------------------- #
+class TestTheReservationPrimitive:
+    """Direct tests of `Budget`, because the endpoint tests above can only
+
+    exercise the paths the endpoint happens to take. These pin the contract the
+    endpoint relies on.
+    """
+
+    def test_a_reservation_is_released_even_when_the_scope_raises(self):
+        b = Budget()
+        with pytest.raises(RuntimeError):
+            with b.hold(cap=100, charge=10):
+                raise RuntimeError("boom")
+        assert b.used == 0 and b.live == 0
+
+    def test_reconciling_replaces_rather_than_accumulates(self):
+        """The whole defect in one assertion: calling reconcile repeatedly must
+
+        not grow the held amount. The old code ADDED a delta each time.
+        """
+        b = Budget()
+        with b.hold(cap=100, charge=10) as reconcile:
+            reconcile(40)
+            assert b.used == 40
+            reconcile(40)
+            reconcile(40)
+            assert b.used == 40, "repeated reconciliation accumulated"
+        assert b.used == 0
+
+    def test_the_reconciled_weight_never_drops_below_the_admission_charge(self):
+        """A cheaper-than-expected request must not buy extra admission capacity
+
+        for its neighbours — the floor the previous `max(0, actual - charge)`
+        produced by accident, kept deliberately so the CAP semantics are
+        unchanged by the refactor.
+        """
+        b = Budget()
+        with b.hold(cap=100, charge=10) as reconcile:
+            reconcile(1)
+            assert b.used == 10
+
+    def test_a_closed_reservation_cannot_be_resurrected(self):
+        """Reconciling after the scope exits would re-insert an entry that
+
+        nothing will ever remove — the exact leak, through a new door.
+        """
+        b = Budget()
+        with b.hold(cap=100, charge=10) as reconcile:
+            pass
+        with pytest.raises(RuntimeError):
+            reconcile(50)
+        assert b.used == 0
+
+    def test_overlapping_reservations_release_only_their_own(self):
+        b = Budget()
+        with b.hold(cap=100, charge=10) as first:
+            first(30)
+            with b.hold(cap=100, charge=10) as second:
+                second(20)
+                assert b.used == 50
+            assert b.used == 30, "the inner scope released more than its own"
+        assert b.used == 0
+
+    def test_saturation_then_full_drain_then_fresh_admission(self):
+        """The owner's property, at the primitive level: a fuse that trips must
+
+        RE-OPEN once the load is gone.
+        """
+        b = Budget()
+        held = []
+        for _ in range(5):
+            cm = b.hold(cap=50, charge=10)
+            cm.__enter__()
+            held.append(cm)
+        assert b.used == 50
+        with pytest.raises(NoCapacity):
+            with b.hold(cap=50, charge=10):
+                pass
+        for cm in held:
+            cm.__exit__(None, None, None)
+        assert b.used == 0
+        with b.hold(cap=50, charge=10):
+            pass  # admitted again — the fuse re-opened

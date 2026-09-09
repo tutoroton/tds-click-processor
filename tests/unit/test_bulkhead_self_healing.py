@@ -12,11 +12,21 @@ already covered by `test_wall_endpoint.py` and `test_preview_bulkhead.py` — it
 
 🔴 WHY THIS FILE EXISTS SEPARATELY, and why it must never grow an autouse reset.
 `test_wall_endpoint.py` carries a deliberate `_counter_reset` autouse fixture that
-zeroes `main._wall_tiles_inflight` before AND after every test. Its purpose is
-legitimate (a test that 503s must not poison the next one) and its side effect is
-total: **that suite is structurally incapable of observing budget retained across
-requests.** The instrument resets the very quantity it would need to measure. This
-file measures it, so it resets ONLY at the start of a test and never at the end.
+zeroes the wall budget before AND after every test. Its purpose is legitimate — a
+test that 503s must not poison the next one — and its cost is that accumulation
+can never surface as a failure in some LATER test, which is how this class of
+defect is usually stumbled upon.
+
+⚠️ An earlier draft of this docstring said that suite was "structurally incapable
+of observing" the leak. That is FALSE, and the reviewer was right to refuse it:
+the reset is per-test, so several requests inside ONE test accumulate normally —
+which is exactly what the cases below do. The accurate statement is narrower and
+duller: the old suite never asserted it. The reset removed the accidental
+discovery path, not the possibility. Overstating a mechanism makes it sound
+inevitable that nobody caught this; it was not inevitable, it was missed.
+
+This file resets ONLY at the start of a test and never at the end, so an assertion
+that runs after the requests sees what they left behind.
 
 CALIBRATION, so an all-red run can never be mistaken for a broken file: the
 preview cases below PASS on the code as it stands. If they ever go red together
@@ -121,6 +131,58 @@ class TestTheWallBudgetReturnsToZero:
         )
         assert main._wall_budget.live == 0, "the reservation itself outlived the request"
 
+    def test_the_endpoint_charges_the_REAL_tile_cost_not_the_flat_charge(self, wall_armed):
+        """🔴 THE HOLE THE REST OF THIS FILE COULD NOT SEE.
+
+        Measured, not argued: comment out `reconcile(...)` at the endpoint and
+        every other test here — all 16, plus all 22 in `test_wall_endpoint.py` —
+        stays GREEN. The bulkhead would then charge a flat 24 for a request of
+        any real size, the variable tile budget would be gone entirely, and the
+        suite would report perfect health. Clean release was proven; the WEIGHT
+        never was.
+
+        The reason is structural: every other case reads the budget when the
+        request is OVER, and by then a correct release has erased the difference
+        between a reconciled reservation and one that was never reconciled. This
+        one looks while the request is still in flight.
+
+        The gating half — that a larger held weight actually refuses the next
+        arrival — is the primitive's contract and is pinned separately by
+        `TestTheReservationPrimitive`. Together they close the chain.
+        """
+        main._wall_budget._reset_for_tests()
+        store = _seeded_store(tiles=30)  # wall A 30 + wall B 1 = 31 candidates
+
+        seen: dict = {}
+        original = main._wall_body
+
+        async def spy(req, reconcile):
+            def watched(weight):
+                reconcile(weight)
+                seen["weight"] = weight
+                seen["used"] = main._wall_budget.used
+                seen["live"] = main._wall_budget.live
+
+            return await original(req, watched)
+
+        with patch.object(main, "_wall_body", spy):
+            assert W._post(store).status_code == 200
+
+        assert seen, (
+            "the endpoint never called reconcile at all — the reservation kept "
+            "its presumptive charge, so the budget no longer tracks real work"
+        )
+        assert seen["weight"] == 31, (
+            f"reconciled with {seen['weight']} for a 31-tile candidate set; the "
+            f"weight must be the REAL cost, not the flat admission charge"
+        )
+        assert seen["used"] == 31, (
+            f"in flight the budget held {seen['used']}, not the reconciled 31 — "
+            f"reconciliation ran but did not reach the budget"
+        )
+        assert seen["live"] == 1, "one request, one reservation"
+        assert main._wall_budget.used == 0, "and it still released afterwards"
+
     def test_a_shed_request_consumes_nothing(self, wall_armed, monkeypatch):
         """A refusal must not charge. Otherwise a flood of 503s is itself the
 
@@ -175,6 +237,20 @@ class TestThePreviewBudgetReturnsToZero:
         assert acquires == releases == 1, (
             f"_preview_inflight has {acquires} acquire and {releases} release "
             f"sites; symmetry is what makes this bulkhead leak-proof"
+        )
+
+    def test_the_retired_counter_name_raises_instead_of_reading_a_dead_zero(self):
+        """A number that lies quietly is worse than a name that is absent loudly.
+
+        `_wall_tiles_inflight` was briefly kept, frozen at 0, so an operator's
+        habit would not break. That is the wrong trade: a stale tool reading it
+        during saturation gets `0`, which is indistinguishable from healthy. It
+        is now gone, and the module's `__getattr__` answers with the replacement.
+        """
+        with pytest.raises(AttributeError) as excinfo:
+            main._wall_tiles_inflight  # noqa: B018 - the raise IS the assertion
+        assert "_wall_budget.used" in str(excinfo.value), (
+            "the signpost must name what to read instead, or it is just a crash"
         )
 
     def test_the_wall_takes_budget_only_through_a_reservation(self):
@@ -280,6 +356,85 @@ class TestTheReservationPrimitive:
                 assert b.used == 50
             assert b.used == 30, "the inner scope released more than its own"
         assert b.used == 0
+
+    def test_a_reservation_releases_its_OWN_weight_when_it_finishes_out_of_order(self):
+        """🔴 The second hole, and it was invisible for the same reason.
+
+        Measured: replace `self._holds.pop(token, None)` with `popitem()` — drop
+        the NEWEST reservation instead of the one that finished — and all 38
+        tests stay green. Every ownership case here closed in nested LIFO order
+        or used equal charges, and under both of those a wrong-owner release is
+        arithmetically indistinguishable from a right one.
+
+        So this one uses UNEQUAL weights and finishes the OLDEST first.
+        """
+        b = Budget()
+        first = b.hold(cap=100, charge=10)
+        r1 = first.__enter__()
+        r1(40)
+        second = b.hold(cap=100, charge=10)
+        r2 = second.__enter__()
+        r2(25)
+        assert b.used == 65
+
+        first.__exit__(None, None, None)  # the OLDEST leaves first
+        assert b.used == 25, (
+            f"released to {b.used}: the departing reservation took someone "
+            f"else's weight with it. 40 would mean it dropped the survivor."
+        )
+
+        r2(30)  # the survivor's own callback must still work afterwards
+        assert b.used == 30, "the surviving reservation lost its identity"
+        second.__exit__(None, None, None)
+        assert b.used == 0 and b.live == 0
+
+    def test_the_reservation_is_inserted_INSIDE_the_protected_block(self):
+        """Ordering, asserted on the source, because no test can inject a
+        MemoryError at the one instruction where it would matter.
+
+        If the insert happens before `try:`, anything raised between the two —
+        an allocation failure while building the closure is the realistic one —
+        strands the entry with no cleanup registered. Narrow, and free to close,
+        so it should stay closed.
+        """
+        import inspect
+
+        lines = [
+            ln.split("#", 1)[0]
+            for ln in inspect.getsource(Budget.hold).splitlines()
+        ]
+        try_at = next(i for i, ln in enumerate(lines) if ln.strip() == "try:")
+        insert_at = next(
+            i for i, ln in enumerate(lines) if "self._holds[token] = charge" in ln
+        )
+        assert try_at < insert_at, (
+            "the reservation is inserted before the `try` that removes it — "
+            "a raise in between strands it with nothing registered to clean up"
+        )
+
+    def test_reconciling_normalises_before_it_checks_membership(self):
+        """`int(weight)` can run user code, and user code can close this scope.
+
+        Checking membership first and converting second lets that conversion
+        delete the entry and the assignment then RESURRECT it — the original leak
+        through a new door. Converting first makes the check and the write see
+        one world.
+        """
+        b = Budget()
+        reservation = b.hold(cap=100, charge=10)
+        reconcile = reservation.__enter__()
+
+        class ClosesWhileConverting(int):
+            def __int__(self):
+                reservation.__exit__(None, None, None)
+                return 40
+
+        with pytest.raises(RuntimeError):
+            reconcile(ClosesWhileConverting(40))
+        assert b.used == 0 and b.live == 0, (
+            f"conversion closed the reservation and the write brought it back: "
+            f"used={b.used}, live={b.live}"
+        )
 
     def test_saturation_then_full_drain_then_fresh_admission(self):
         """The owner's property, at the primitive level: a fuse that trips must

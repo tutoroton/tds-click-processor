@@ -119,17 +119,28 @@ class Budget:
             raise NoCapacity
 
         token = object()
-        self._holds[token] = charge
 
         def reconcile(weight: int) -> None:
+            # 🔴 NORMALISE BEFORE THE MEMBERSHIP TEST. `int(weight)` can run
+            # user-defined `__int__`, and code reached from there can close this
+            # reservation — after which the assignment below would RESURRECT the
+            # entry with nothing left to remove it. Doing the conversion first
+            # means the check and the write see the same world.
+            actual = max(charge, int(weight))
             # A closed reservation cannot be resurrected: reconciling after the
             # scope has exited would re-insert an entry nobody will ever remove,
             # which is precisely the leak this module exists to make unavailable.
             if token not in self._holds:
                 raise RuntimeError("this reservation is already closed")
-            self._holds[token] = max(charge, int(weight))
+            self._holds[token] = actual
 
+        # 🔴 THE INSERT LIVES INSIDE THE `try`, and the callable is built BEFORE
+        # it. Inserting first and building the closure afterwards leaves a window
+        # in which the entry exists but its cleanup does not yet: an allocation
+        # failure while constructing the function would exit before the `try` and
+        # strand the reservation permanently. Narrow, and free to close.
         try:
+            self._holds[token] = charge
             yield reconcile
         finally:
             # Deletes the RESERVATION, not a remembered amount. Runs on every

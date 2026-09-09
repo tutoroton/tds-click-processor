@@ -2360,11 +2360,27 @@ def _to_int_or_none(value) -> int | None:
 # and vice versa. Risk A19.
 _wall_budget = Budget()
 
-# 🔴 Kept ONLY so that an operator's `main._wall_tiles_inflight` habit reads a
-# frozen 0 rather than a plausible-looking number that no longer governs
-# anything. The live figure is `_wall_budget.used`, DERIVED from open
-# reservations rather than accumulated.
-_wall_tiles_inflight = 0
+# 🔴 `_wall_tiles_inflight` IS GONE, and it is gone deliberately rather than
+# frozen at 0. Keeping it as a dead zero was the first instinct and it is the
+# wrong one: a stale tool reading it during saturation gets `0`, which is
+# indistinguishable from healthy. A number that lies quietly is worse than a name
+# that is absent loudly. The signpost below turns the absence into an answer.
+def __getattr__(name: str):
+    """Module-level fallback — fires only for names that do NOT exist here.
+
+    Its whole job is that `main._wall_tiles_inflight` raises something a human
+    can act on instead of returning a plausible zero. Raising `AttributeError`
+    (never anything else) keeps `hasattr` / `getattr(..., default)` behaving
+    normally for every other missing name.
+    """
+    if name == "_wall_tiles_inflight":
+        raise AttributeError(
+            "_wall_tiles_inflight was retired: the wall bulkhead now holds owned "
+            "reservations, not an accumulated integer. The live figure is "
+            "`main._wall_budget.used` (tiles held) and `main._wall_budget.live` "
+            "(open reservations). See app/bulkhead.py."
+        )
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def _wall_click_levels(attribution: dict) -> dict:

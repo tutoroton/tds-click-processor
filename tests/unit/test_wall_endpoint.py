@@ -201,10 +201,12 @@ def _release_occupants() -> None:
 def _occupy(units: int) -> None:
     """Fill the wall budget with a REAL reservation of `units` tiles.
 
-    Assigning `main._wall_tiles_inflight` fills NOTHING since the bulkhead moved
-    to owned reservations (`app/bulkhead.py`): that module integer is retired and
-    frozen at 0. A test that still assigned it went on passing while asserting
-    against a value the subject no longer reads — green, and measuring nothing.
+    `main._wall_tiles_inflight` no longer EXISTS — the bulkhead moved to owned
+    reservations (`app/bulkhead.py`), and the retired name now raises
+    `AttributeError` naming its replacement. It was briefly kept frozen at 0
+    instead, and that was worse: a test that assigned it went on passing while
+    asserting against a value the subject no longer read — green, and measuring
+    nothing. A dead zero reads exactly like a healthy one.
 
     🔴 The context manager is STASHED, not dropped. `hold` is a
     `@contextmanager` generator, so one that is entered and then loses its last
@@ -412,7 +414,12 @@ class TestTheAdmissionBudget:
             "request-counting cap would have admitted this"
         )
 
-        _occupy(10)
+        # ⚠️ NO second `_occupy(10)` here, and its absence is the point. There
+        # used to be one, which silently started this probe at 20 in flight
+        # rather than the 10 the comment above describes — the verdict still
+        # came out right (20 + 1 <= 30) from a baseline nobody had stated.
+        # Staying at 10 also makes this line assert something extra for free:
+        # the refused request above charged NOTHING.
         monkeypatch.setattr(settings, "offerwall_admission_charge_tiles", 1)
         assert _post(store).status_code == 200, (
             "the same request under a 1-tile charge fits — so the verdict is "

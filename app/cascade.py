@@ -605,10 +605,18 @@ def _partition_audience(
                 # a metric label anywhere: an unknown value is unbounded in
                 # cardinality by definition, which is how one bad row becomes a
                 # monitoring outage.
+                # 🔴 THE REASON NAMES THE FAMILY, and it has to. Since B3 the
+                # admissible set is family-dependent, so the same audience is
+                # excluded HERE and admitted on the next campaign — and the old
+                # wording, "is not evaluated by the ordinary cascade", is
+                # FALSE for the commonest new case: an ordinary 'first' flow on
+                # a wall campaign, which every standard campaign does evaluate.
+                # An operator reading it would go looking for a broken flow
+                # instead of finding the campaign setting that excluded it.
                 rejected_sink.append({
                     "flow_id": f.get("_id"),
-                    "failed": f"audience {audience[:24]!r} is not evaluated by "
-                              f"the ordinary cascade",
+                    "failed": f"audience {audience[:24]!r} is not in the "
+                              f"candidate pool of a {flow_family!r} campaign",
                 })
             continue
         if audience == "returning":

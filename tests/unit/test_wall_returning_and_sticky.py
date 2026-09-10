@@ -84,7 +84,8 @@ _UID = "U"
 
 async def _seed(r, *, family: str, returning_mode: str,
                 with_ordinary: bool = False,
-                with_returning_flow: bool = False) -> dict:
+                with_returning_flow: bool = False,
+                ordinary_wins_ties: bool = False) -> dict:
     """One campaign; the wall, and optionally the ordinary/returning flows.
 
     `family` is the ONLY difference between a subject and its control:
@@ -113,8 +114,16 @@ async def _seed(r, *, family: str, returning_mode: str,
         await r.hset("flow:%d" % _ORDINARY_FLOW, mapping={
             "campaign_id": str(_CAMPAIGN), "company_id": str(_COMPANY),
             "scope_type": "company", "scope_id": str(_COMPANY),
-            "audience": "first", "action_type": "offer",
-            "criteria": "[]", "seq_id": "2", "is_default": "1",
+            # 🔴 `ordinary_wins_ties` exists because the default fixture CANNOT
+            # discriminate. The winner sort key is (is_default ASC, bound DESC,
+            # seq_id ASC), so an `is_default=1` flow sorts LAST and the wall wins
+            # whether or not the partition admitted it — a test asserting "the
+            # wall served" is then green by construction. With this knob the
+            # ordinary flow would BEAT the wall if it were admitted, so its
+            # absence measures the exclusion instead of the sort order.
+            "audience": "first", "action_type": "offer", "criteria": "[]",
+            "seq_id": "0" if ordinary_wins_ties else "2",
+            "is_default": "0" if ordinary_wins_ties else "1",
             "action_config": json.dumps(
                 {"offer_id": _OFFER, "target_id": int(_NORMAL_TARGET)}),
         })
@@ -144,7 +153,7 @@ async def _seed(r, *, family: str, returning_mode: str,
 def _run(*, family: str, returning_mode: str, seen_before: bool = True,
          existing_pin: int | None = None, code: str | None = None,
          with_ordinary: bool = False, with_returning_flow: bool = False,
-         delivery: bool = True):
+         delivery: bool = True, ordinary_wins_ties: bool = False):
     """Drive the REAL caller so the three predicates are COMPOSED, not injected."""
     strings = {}
     if existing_pin is not None:
@@ -167,7 +176,8 @@ def _run(*, family: str, returning_mode: str, seen_before: bool = True,
         r = fakeredis.aioredis.FakeRedis(decode_responses=True)
         campaign = await _seed(r, family=family, returning_mode=returning_mode,
                                with_ordinary=with_ordinary,
-                               with_returning_flow=with_returning_flow)
+                               with_returning_flow=with_returning_flow,
+                               ordinary_wins_ties=ordinary_wins_ties)
         req = ClickRequest(
             click_id="wrs" + "0" * 18, country="US", user_agent="t/1.0",
             query_params={router.ROUTE_CODE_PARAM: code} if code else {},
@@ -431,4 +441,77 @@ class TestR7RollbackIsATrafficDiversionNotADeadEnd:
         assert _served(result) == str(TILE_1), (
             "CONTROL FAILED — this fixture cannot route even with the flag on, "
             "so the dark assertion above is not evidence about the flag"
+        )
+
+
+# ============================================================
+# R8 — A8: a wall campaign EXCLUDES ordinary first flows
+# ============================================================
+
+class TestR8AWallCampaignExcludesOrdinaryFirstFlows:
+    """🔴 THE CLAIM I GOT WRONG IN MY OWN ANCHOR, corrected here (2026-09-11).
+
+    The anchor said, of a wall campaign that also carries an ordinary
+    `first`-audience flow: *"both are now in the first pool and compete by
+    ordinary cascade order"*. They do not. `_partition_audience` makes the
+    admissible set family-dependent:
+
+        standard  : ORDINARY_AUDIENCES        → a WALL is excluded
+        offerwall : {"returning","offerwall"} → an ordinary FIRST is excluded
+
+    So a wall campaign does not run a competition — it SUBSTITUTES the
+    all-visitors slot, which is exactly what the owner asked for: «замість ось
+    цих наших all visitor потоків … вони мають іти до потоків вітрин».
+
+    The error was the same shape as the split-precedent one a day earlier:
+    reasoning from a TRUE fact one frame up ("the dispatcher reads both
+    keyspaces") to a conclusion about a frame I had not re-read (which of the
+    loaded flows the partition then admits). Reading both keyspaces and
+    admitting both audiences are different claims.
+
+    THE OPERATIONAL EDGE this pins, and why it is worth a test rather than a
+    note: switching a live campaign to `flow_family='offerwall'` silently
+    stops its existing all-visitors flows from serving. That is correct and
+    intended — and it is also the kind of correct behaviour an operator
+    experiences as data loss, so the exclusion must be VISIBLE in the trace
+    they already read, with a reason that names the CAUSE.
+    """
+
+    def test_the_wall_serves_and_the_ordinary_first_flow_does_not(self):
+        result, _ident = _run(family="offerwall", returning_mode="fresh",
+                              with_ordinary=True, ordinary_wins_ties=True)
+        assert result is not None, "the click must route"
+        assert _served(result) == str(TILE_1), (
+            "the wall did not take the all-visitors slot on a wall campaign"
+        )
+        assert _served(result) != _NORMAL_TARGET, (
+            "an ordinary first flow served on a wall campaign — the family's "
+            "candidate pool is not being applied"
+        )
+
+    def test_CONTROL_the_same_first_flow_serves_on_a_standard_campaign(self):
+        """Without this, the test above passes on a fixture whose ordinary flow
+        was never loadable in the first place."""
+        result, _ident = _run(family="standard", returning_mode="fresh",
+                              with_ordinary=True, ordinary_wins_ties=True)
+        assert _served(result) == _NORMAL_TARGET, (
+            "CONTROL FAILED — the ordinary flow cannot serve in this fixture "
+            "at all, so its absence above is not evidence about the family"
+        )
+
+    def test_the_exclusion_names_the_FAMILY_not_the_cascade(self):
+        """The reason an operator reads must point at the campaign setting.
+
+        The wording was «audience 'first' is not evaluated by the ordinary
+        cascade» — FALSE for this case, since every standard campaign evaluates
+        exactly that audience. A reason that misnames the cause sends the
+        operator to debug a healthy flow.
+        """
+        result, _ident = _run(family="offerwall", returning_mode="fresh",
+                              with_ordinary=True)
+        rejected = (_trace(result).get("criteria") or {}).get("rejected") or []
+        reasons = " ".join(str(r.get("failed", "")) for r in rejected)
+        assert "offerwall" in reasons and "campaign" in reasons, (
+            "the excluded first flow's reason does not name the campaign "
+            f"family — an operator cannot find the cause. Got: {reasons!r}"
         )

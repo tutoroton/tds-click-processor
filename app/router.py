@@ -784,6 +784,31 @@ def _campaign_returning_flows_disabled(campaign: dict[str, Any]) -> bool:
 FLOW_FAMILIES = ("standard", "offerwall")
 DEFAULT_FLOW_FAMILY = "standard"
 
+# B3.2 — the action types the returning/sticky machinery may act on. ONE name,
+# because three predicates below must move together and a fourth copy lives in
+# `tests/unit/test_fresh_track.py`; a term duplicated four ways is exactly the
+# shape that once let a wrong edit pass 97 of 97 wall tests
+# (`test_wall_pin_gate_composition.py`).
+#
+# 🔴 WHY `offerwall` IS IN HERE. A wall winner used to fall outside all three
+# predicates, so a wall campaign silently lost its sticky pin, its mint and its
+# fresh-mode bookkeeping — nothing went red, the click still routed, and the
+# only symptom was that a sticky campaign stopped being sticky. The owner ruled
+# the opposite, about these flows by name (ADR-0516):
+#
+#     «fresh, він розповсюджується І НА ЦІ ТИПИ ПОТОКІВ також. А стіки, якщо ми
+#      стіки вказуємо, то ми запам'ятовуємо його останній пункт призначення»
+#
+# Nothing downstream needed changing: the sticky machinery works on the served
+# `target_id` and never reads `action_config`, so a wall result travels it the
+# same way an offer result does.
+#
+# INERT UNLESS A WALL WINS, and that is structural rather than promised: a wall
+# can only win when `wall_delivery_enabled` is on AND the campaign is
+# `flow_family='offerwall'`, so on every standard campaign `action_type` is
+# never "offerwall" and this tuple's third member is unreachable.
+PIN_BEARING_ACTION_TYPES = ("offer", "split", "offerwall")
+
 
 def _campaign_flow_family(campaign: dict[str, Any]) -> str:
     """Which FLOW FAMILY serves this campaign — 'standard' or 'offerwall'.
@@ -2252,7 +2277,7 @@ async def _try_flow_cascade(
         returning_live
         and effective_mode == "sticky"
         and bool(uid)
-        and (flow.get("action_type") or "") in ("offer", "split")
+        and (flow.get("action_type") or "") in PIN_BEARING_ACTION_TYPES
         and (flow.get("audience") or "first") != "returning"
     )
     # B-track (2026-06-10, user decision) — under FRESH mode the pin TRACKS
@@ -2266,7 +2291,7 @@ async def _try_flow_cascade(
         returning_live
         and effective_mode == "fresh"
         and bool(uid)
-        and (flow.get("action_type") or "") in ("offer", "split")
+        and (flow.get("action_type") or "") in PIN_BEARING_ACTION_TYPES
         and (flow.get("audience") or "first") != "returning"
     )
     # ADR-0516 — the gate for the WALL pin write. The deliberate MIRROR of the
@@ -2277,7 +2302,7 @@ async def _try_flow_cascade(
     #     «fresh … ми не запам'ятовуємо». Being the exclusive complement of
     #     `fresh_track`'s mode term is also what makes a double write
     #     unreachable rather than merely unlikely.
-    #   * `action_type in ("offer", "split")` — KEPT, and not by copying: the
+    #   * `action_type in PIN_BEARING_ACTION_TYPES` — KEPT, and not by copying: the
     #     pin's only reader sits behind `sticky_active`, which carries the same
     #     term, so a pin written outside it could never be read as intended and
     #     would only wait to activate if the flow later changed type. The
@@ -2293,7 +2318,7 @@ async def _try_flow_cascade(
         returning_live
         and effective_mode == "sticky"
         and bool(uid)
-        and (flow.get("action_type") or "") in ("offer", "split")
+        and (flow.get("action_type") or "") in PIN_BEARING_ACTION_TYPES
     )
     company_id = buyer_chain["company_id"]
     flow_id_str = str(flow.get("_id")) if flow.get("_id") else None

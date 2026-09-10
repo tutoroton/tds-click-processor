@@ -190,7 +190,7 @@ class TestFreshTrackGate:
             returning_live
             and mode == "fresh"
             and bool(uid)
-            and (flow.get("action_type") or "") in ("offer", "split")
+            and (flow.get("action_type") or "") in router.PIN_BEARING_ACTION_TYPES
             and (flow.get("audience") or "first") != "returning"
         )
 

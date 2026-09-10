@@ -802,6 +802,32 @@ class Settings(BaseSettings):
     # outlive the publisher being turned off (see that flag's own note).
     offerwall_serve_enabled: bool = False
 
+    # 🔴 THE WALL AS A ROUTER, not a catalogue (B3). The owner's contract,
+    # 2026-09-10: «фактично вітрина, вона рівносильна потоку all visitor… який
+    # із цих двох типів буде працювати для запитів цієї кампанії, залежить саме
+    # від цього налаштування в кампанії».
+    #
+    # ON ⇒ on a campaign whose `flow_family` is 'offerwall', the WALLS are the
+    # candidate pool: the cascade reads `campaign:{id}:walls` +
+    # `walls:scope:*` instead of the flows keyspace, and the winning WALL
+    # becomes the delivering flow — so `flow_id` names the wall that actually
+    # served the click, which is what makes the statistics stop attributing a
+    # click to a flow that never contained that offer.
+    #
+    # SEPARATE from `offerwall_serve_enabled` above, deliberately, and the
+    # distinction is not cosmetic: that one arms the `/wall` READ endpoint (a
+    # catalogue a visitor is shown), this one arms DELIVERY (which flow decides
+    # where a click goes). A node may legitimately serve catalogues without
+    # routing by them — that is exactly the state the fleet is in today.
+    #
+    # OFF is byte-identical to before this flag existed: `flow_family` is read
+    # and recorded, and the keyspace stays 'flows' for every campaign. Turning
+    # it on is only safe once EVERY node runs code that can read the family —
+    # the transport fails open, so a stale node treats a wall campaign as
+    # standard, and a dedicated wall campaign has no ordinary flows to fall
+    # back to.
+    wall_delivery_enabled: bool = False
+
     # THE WALL'S OWN ADMISSION BUDGET, counted in TILES rather than requests,
     # and deliberately NOT a share of `preview_max_concurrency`.
     #

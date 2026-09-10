@@ -198,6 +198,11 @@ async def execute_action(
         return await _execute_split(r, config, req, campaign_id, build_url_fn,
                                      source_mappings, campaign_mappings, flow_id,
                                      allowed_avail, trace=trace, rng=rng)
+    if action_type == "offerwall":
+        return await _execute_offerwall(r, config, req, campaign_id,
+                                        build_url_fn, source_mappings,
+                                        campaign_mappings, flow_id,
+                                        allowed_avail)
     if action_type == "block":
         return BLOCK_RESULT
 
@@ -273,6 +278,112 @@ async def _execute_offer(
         source_mappings, campaign_mappings,
         flow_id, allowed_avail,
     )
+
+
+async def _execute_offerwall(
+    r,
+    config: dict[str, Any],
+    req: ClickRequest,
+    campaign_id: str,
+    build_url_fn,
+    source_mappings,
+    campaign_mappings,
+    flow_id: str | None,
+    allowed_avail,
+) -> dict[str, Any] | None:
+    """`offerwall` — a WALL delivering a click: the FIRST tile that can serve.
+
+    The owner's rule for a plain campaign link on a wall campaign, verbatim
+    (2026-09-05): «Результат має бути такий, що користувач потрапить на той
+    офер, який є першим» — and 2026-09-10, «для першого користувача тобі
+    відкриється просто перший в списку офер».
+
+    🔴 FIRST ELIGIBLE, not first. Walking past a tile whose target cannot serve
+    this class of traffic is the same rule the cascade's availability floor
+    already applies to a split's entries, and it is what the owner asked for
+    directly: «можемо включити close, тоді буде нет. А можемо включити
+    дрейнінг. І тоді для повторних там буде доступно, для нових уже не буде, і
+    це має впливати». A wall whose first tile is closed must serve the second,
+    not dead-end — `_resolve_offer_url` is the same helper the pinned-offer
+    path uses, so "can this target serve" is decided in ONE place for both.
+
+    Order is the wall's PUBLICATION order, untouched: position 1 is what the
+    operator put first, which is the whole meaning of "the first offer".
+
+    🔴 WHY THIS DIFFERS FROM `_execute_split`, DELIBERATELY. A split does NOT
+    walk past an availability-blocked leg — it returns UNAVAILABLE_RESULT and
+    lets the terminal fallback answer (the C2 drain contract, a few frames
+    down). That rule exists because a split's legs are a WEIGHTED
+    DISTRIBUTION: re-rolling a blocked leg silently redistributes its share and
+    changes the traffic split the operator configured. A wall has no share to
+    corrupt — it is an ORDERED LIST of offers a visitor could equally have
+    picked by hand — so the reason for the split's rule does not transfer, and
+    dead-ending the campaign because position 1 went closed would waste every
+    other offer the operator published.
+
+    (The B3 decision record cited "the split precedent" among its licences for
+    this behaviour. Reading that precedent shows it argues the OTHER way; the
+    behaviour stands on the owner's own rule — «в будь-якому сценарії ми тоді
+    на такий офер не ведемо. Ми тоді йдемо по дефолтному сценарію» — applied to
+    a wall whose default scenario is "the first offer in the list", plus the
+    distribution argument above. The licence is corrected, not the outcome.)
+    """
+    tiles = config.get("tiles")
+    if not isinstance(tiles, list) or not tiles:
+        # A wall with no readable tiles cannot deliver. Returning None lets the
+        # router fall through to the campaign's terminal fallback rather than
+        # inventing a destination — the same posture every other action takes
+        # when its config cannot be executed.
+        logger.warning(
+            "offerwall action on flow %s has no usable tiles — falling back",
+            flow_id,
+        )
+        return None
+
+    blocked = False
+    for tile in tiles:
+        if not isinstance(tile, dict):
+            continue
+        offer_id = tile.get("offer_id")
+        if not _is_positive_int(offer_id):
+            continue
+        result = await _resolve_offer_url(
+            r, str(offer_id), tile.get("target_id"),
+            req, campaign_id, build_url_fn,
+            source_mappings, campaign_mappings,
+            flow_id, allowed_avail,
+            # This tile is not the wall's only chance, so an unresolvable offer
+            # is informational rather than a routing break — the same meaning
+            # the flag carries for a split leg.
+            has_alternate_legs=len(tiles) > 1,
+        )
+        # 🔴 UNAVAILABLE_RESULT IS NOT None, and it is truthy. Testing only
+        # `is not None` here returned the first closed tile's refusal AS the
+        # answer and never looked at tile 2 — caught by
+        # `test_a_closed_first_tile_is_walked_past`, which is the case that
+        # exists to catch exactly this.
+        if result is UNAVAILABLE_RESULT:
+            blocked = True
+            continue
+        if result is not None:
+            result["target_selection_path"] = "offerwall_first_eligible"
+            return result
+
+    # Every tile refused. NOT a dead end invented here — the router's terminal
+    # fallback is the campaign-level answer to "nothing could serve".
+    #
+    # WHICH refusal is reported matters: if any tile was blocked by
+    # availability, this is the drain/close contract answering
+    # (UNAVAILABLE_RESULT ⇒ terminal_fallback), not "the config is broken". A
+    # wall whose offers are merely absent returns a bare None, which reads as
+    # sync drift upstream. Collapsing the two would make a deliberate operator
+    # action look like a defect in the logs.
+    logger.warning(
+        "offerwall action on flow %s: no tile could serve this click "
+        "(%d tile(s) tried, availability-blocked=%s) — falling back",
+        flow_id, len(tiles), blocked,
+    )
+    return UNAVAILABLE_RESULT if blocked else None
 
 
 async def _execute_split(

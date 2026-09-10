@@ -200,8 +200,23 @@ async def resolve_flow(
     returning_visitor: bool = False,
     trace: dict[str, Any] | None = None,
     diagnostic: bool = False,
+    flow_family: str = "standard",
 ) -> dict[str, Any] | None:
     """Resolve the winning flow for a click via scope cascade.
+
+    `flow_family` (B3) says WHICH pool serves this campaign: 'standard' (the
+    default, and every campaign until an operator says otherwise) walks the
+    flows keyspace; 'offerwall' walks the structurally identical walls one, so
+    a WALL becomes the winning flow and every downstream consumer —
+    attribution's `flow_id`, the sticky pin, the action executor — sees a
+    winner of the ordinary shape. That is the owner's «вітрина рівносильна
+    потоку all visitor» expressed where it has to be true: in the selection.
+
+    🔴 The two families never MIX. On a standard campaign the walls keyspace is
+    not read at all, so a wall cannot compete with ordinary flows — the
+    isolation invariant is preserved by construction, not by a filter. On a
+    wall campaign the walls are the only pool, so there is likewise nothing to
+    compete with. Reusing the machinery is not the same as merging the pools.
 
     Returning-user segmented routing (MODEL V3 — existence-driven; DARK unless
     `audience_routing`). The partition is gated upstream by `audience_routing`
@@ -268,6 +283,13 @@ async def resolve_flow(
         custom_group_id=custom_group_id,
         cap=max_flows_per_bucket,
         trace=trace,
+        # A wall campaign reads BOTH pools: 'walls' supplies its first/default
+        # pool (the walls REPLACE all-visitors), 'flows' still supplies its
+        # returning flows, which the owner explicitly keeps working «і для
+        # вітрин, і для all visitors». One pipeline either way.
+        keyspaces=(
+            ("flows", "walls") if flow_family == "offerwall" else ("flows",)
+        ),
     )
     if not candidate_ids:
         return None
@@ -390,7 +412,7 @@ async def resolve_flow(
 
     winner: dict[str, Any] | None
     returning_flows, first_flows = _partition_audience(
-        flows, rejected_sink=rejected_sink,
+        flows, rejected_sink=rejected_sink, flow_family=flow_family,
     )
     if not audience_routing:
         # MODEL V3 — when the partition is OFF (returning routing not live for the
@@ -498,6 +520,7 @@ def _partition_audience(
     flows: list[dict[str, Any]],
     *,
     rejected_sink: list[dict[str, Any]] | None = None,
+    flow_family: str = "standard",
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Split loaded flows into (returning, first) by `flow.audience`.
 
@@ -533,6 +556,30 @@ def _partition_audience(
     NOTE FOR CALLERS: the two returned lists no longer reconstruct the input.
     `len(returning) + len(first)` can be smaller than `len(flows)`.
     """
+    # B3 — WHICH audience fills the first/default pool depends on the campaign's
+    # family, and this is the one place where that difference lives.
+    #
+    #   standard  : first pool = 'first' flows.        A wall is EXCLUDED — the
+    #               guard below is exactly the isolation this function was
+    #               written for, and it is untouched.
+    #   offerwall : first pool = 'offerwall' walls.    An ordinary 'first' flow
+    #               is EXCLUDED instead, because the owner's contract is that
+    #               the walls take the all-visitors slot — «замість ось цих
+    #               наших all visitor потоків… вони мають іти до потоків вітрин».
+    #
+    # 🔴 'returning' is in BOTH sets, deliberately and by instruction:
+    # «ретьорнінг потоки… працюють і для вітрин, і для… all visitors». A wall
+    # campaign that lost returning routing would be a silent deletion of a
+    # behaviour the owner asked to keep, and nothing downstream would report it.
+    #
+    # Still a positive list per family, never a denylist, for the reason the
+    # note above gives: a denylist has to be extended for every future value,
+    # and the one it forgets is the one that ends up serving live traffic.
+    admissible = (
+        frozenset({"returning", "offerwall"})
+        if flow_family == "offerwall"
+        else ORDINARY_AUDIENCES
+    )
     returning: list[dict[str, Any]] = []
     first: list[dict[str, Any]] = []
     for f in flows:
@@ -540,7 +587,7 @@ def _partition_audience(
         # first-flow. It is applied BEFORE the membership test so that an empty
         # value never reaches the exclusion branch below.
         audience = f.get("audience") or "first"
-        if audience not in ORDINARY_AUDIENCES:
+        if audience not in admissible:
             if rejected_sink is not None:
                 # Same sink, same entry shape and the same bounded rendering as
                 # every other drop reason, so an excluded flow is visible in the
@@ -606,10 +653,28 @@ def _referenced_target_ids(flow: dict[str, Any]) -> list[str]:
     the pre-selection view of a flow's targets cannot drift from execution.
     """
     action_type = flow.get("action_type", "")
-    if action_type not in ("offer", "split"):
+    if action_type not in ("offer", "split", "offerwall"):
         return []
     config = _parse_action_config(flow.get("action_config", "{}"))
     out: list[str] = []
+    if action_type == "offerwall":
+        # B3 — a WALL's tiles each pin an explicit `target_id`, so a wall is
+        # the same case this floor already handles for a pinned offer, not the
+        # "not knowable cheaply" exception two paragraphs up. Admitting it here
+        # is what lets a wall's availability ride the SAME pipelined read
+        # (`_load_target_availability`) at zero extra round trips — and it
+        # closes a real hole: before this, a tile pointing at a `closed` or
+        # `draining` target was invisible to the pre-selection floor because
+        # the whole wall returned [].
+        #
+        # Mirrors `offerwall.parse_tiles`'s shape deliberately, rather than
+        # importing it: `offerwall` imports FROM this module, so the reverse
+        # would be a cycle. The one thing that must not drift is the config
+        # key, and a test pins the two readings against each other.
+        for tile in config.get("tiles") or []:
+            if isinstance(tile, dict) and _is_positive_int(tile.get("target_id")):
+                out.append(str(tile["target_id"]))
+        return out
     if action_type == "offer":
         tid = config.get("target_id")
         if _is_positive_int(tid):
@@ -736,8 +801,31 @@ async def _collect_candidate_ids(
     custom_group_id: int | None,
     cap: int,
     trace: dict[str, Any] | None = None,
+    keyspaces: tuple[str, ...] = ("flows",),
 ) -> list[str]:
     """Single pipeline batch — fetch all relevant flow ID lists.
+
+    `keyspaces` says WHICH pools this campaign is served from (B3). The ordinary
+    campaign reads `("flows",)` and that is the default. A wall campaign reads
+    `("flows", "walls")` — BOTH, and the reason is the owner's contract, not
+    symmetry for its own sake:
+
+        «ретьорнінг потоки, якщо вони включені цим налаштуванням, вони працюють
+         і для вітрин, і для… all visitors» (2026-09-10)
+
+    A wall replaces the ALL-VISITORS flows, not the returning ones. So a wall
+    campaign still needs the ordinary keyspace to find its returning flows,
+    while its first/default pool comes from the walls keyspace. Reading only
+    `walls` there would silently delete returning routing for every wall
+    campaign — a whole behaviour the owner explicitly asked to keep.
+
+    The walls keyspace mirrors the flows one exactly — `campaign:{id}:walls`
+    and `walls:scope:{company}:{type}:{id}`, written by the same sync pass in
+    the same shape — so the extra pool costs extra COMMANDS inside the one
+    pipeline, not extra ROUND TRIPS. Round trips are the currency the <10ms
+    budget is spent in, which is why the wall is delivered here rather than
+    through the `/wall` read endpoint, whose per-tile sequential shape cannot
+    fit that budget at all.
 
     Returns concatenated flow IDs from campaign-bound + each present
     scope level. Order follows fetch order: campaign first, then
@@ -775,26 +863,33 @@ async def _collect_candidate_ids(
         fetch_log.clear()
         pipe = r.pipeline()
         # LOW #5: fetch cap+1 (not cap) — see the docstring above for why.
-        pipe.lrange(f"campaign:{campaign_id}:flows", -(cap + 1), -1)
-        fetch_log.append(f"campaign:{campaign_id}")
+        for ks in keyspaces:
+            # The bucket LABEL is unchanged for the ordinary keyspace, on
+            # purpose: it names truncated buckets in an operator-visible
+            # warning, and renaming it for every campaign in order to describe
+            # a case only wall campaigns can reach would be a gratuitous change
+            # to what an operator reads. Only the walls pool is qualified.
+            tag = "" if ks == "flows" else f":{ks}"
+            pipe.lrange(f"campaign:{campaign_id}:{ks}", -(cap + 1), -1)
+            fetch_log.append(f"campaign:{campaign_id}{tag}")
 
-        if company_id is not None:
-            # Each scope level gets ONE LRANGE. Skip levels with no ID since
-            # `flows:scope:{company}:{type}:None` is meaningless.
-            scope_targets = (
-                ("buyer", buyer_id),
-                ("custom_group", custom_group_id),
-                ("team", team_id),
-                ("department", department_id),
-                ("company", company_id),
-            )
-            for scope_type, scope_id in scope_targets:
-                if scope_id is not None:
-                    pipe.lrange(
-                        f"flows:scope:{company_id}:{scope_type}:{scope_id}",
-                        -(cap + 1), -1,
-                    )
-                    fetch_log.append(f"scope:{scope_type}:{scope_id}")
+            if company_id is not None:
+                # Each scope level gets ONE LRANGE. Skip levels with no ID since
+                # `flows:scope:{company}:{type}:None` is meaningless.
+                scope_targets = (
+                    ("buyer", buyer_id),
+                    ("custom_group", custom_group_id),
+                    ("team", team_id),
+                    ("department", department_id),
+                    ("company", company_id),
+                )
+                for scope_type, scope_id in scope_targets:
+                    if scope_id is not None:
+                        pipe.lrange(
+                            f"{ks}:scope:{company_id}:{scope_type}:{scope_id}",
+                            -(cap + 1), -1,
+                        )
+                        fetch_log.append(f"scope{tag}:{scope_type}:{scope_id}")
         return pipe
 
     # F4 (GTD-R173): retry-once → FlowReadError on persistent failure, NOT the

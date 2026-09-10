@@ -781,6 +781,40 @@ def _campaign_returning_flows_disabled(campaign: dict[str, Any]) -> bool:
     )
 
 
+FLOW_FAMILIES = ("standard", "offerwall")
+DEFAULT_FLOW_FAMILY = "standard"
+
+
+def _campaign_flow_family(campaign: dict[str, Any]) -> str:
+    """Which FLOW FAMILY serves this campaign — 'standard' or 'offerwall'.
+
+    The owner's contract (2026-09-10): a campaign setting decides whether
+    ordinary all-visitors flows or showcase flows serve its requests —
+    «фактично вітрина, вона рівносильна потоку all visitor». Written by
+    admin-api (migration 327) onto the campaign HASH by
+    `sync/builders/campaigns.py`.
+
+    🔴 THIS DECIDES NOTHING YET. It is read and recorded, so that "the fleet
+    can read the field" becomes a claim checkable from a click's own trace
+    instead of an assumption about deploy coverage. Switching any campaign to
+    'offerwall' before every node returns 'offerwall' here is the ordering
+    error this exists to make visible.
+
+    FAIL-OPEN: absent / empty / unknown ⇒ 'standard' ⇒ ordinary flows, exactly
+    as today. A node that has never heard of the field is therefore
+    byte-identical to itself before this change — which is what makes shipping
+    the reader ahead of any behaviour safe. It is ALSO why the ordering matters
+    in the other direction: a dedicated wall campaign has no ordinary flows, so
+    a stale node fails open on the transport and dead-ends the visitor.
+
+    Deliberately mirrors `_campaign_returning_flows_disabled` above: same
+    `campaign.get(field, "")` shape, same tolerance of a missing key, so the
+    two cannot disagree about how a campaign HASH field is read.
+    """
+    value = str(campaign.get("flow_family", "")).strip().lower()
+    return value if value in FLOW_FAMILIES else DEFAULT_FLOW_FAMILY
+
+
 def _returning_live(campaign: dict[str, Any]) -> bool:
     """Is segmented returning routing live for THIS campaign's company?
 
@@ -2105,8 +2139,22 @@ async def _try_flow_cascade(
     # by-reference with scope_walk + candidate/loaded/availability-excluded
     # counts + winning scope, EVEN on a miss — so a non-routed click still
     # records WHY no flow won. Stamped onto attribution unconditionally below.
+    # Read ONCE and reused for both the trace and the routing decision below.
+    # Two reads of the same HASH field could not disagree today, but the value
+    # RECORDED and the value ACTED ON must be provably the same one — a trace
+    # describing a different read than the routing performed is worse than no
+    # trace at all.
+    campaign_flow_family = _campaign_flow_family(campaign)
     cascade_trace: dict[str, Any] = {
         "buyer_enrichment": "ok" if buyer_chain.get("buyer_id") else "absent",
+        # Which flow family this node believes serves the campaign. Nothing
+        # branches on it yet — recording it is what turns "every node can read
+        # the new field" into something a click's own trace answers, and it is
+        # the precondition for switching any campaign to 'offerwall'. One
+        # string key on an already-allocated dict: no round trip, no per-click
+        # cost, so it stays outside the Mode-B diagnostic gate like
+        # `buyer_enrichment` beside it.
+        "flow_family": campaign_flow_family,
     }
     # v2 LD-F2 / D22 — a VALID `X-Test-Id` (validated + bound by the /decide
     # middleware via `set_test_id`) flips the trace to Mode-B (heavy): the
@@ -2142,6 +2190,20 @@ async def _try_flow_cascade(
         returning_visitor=seen_before if audience_routing else False,
         trace=cascade_trace,
         diagnostic=diagnostic,
+        # B3 — WHICH pool serves this campaign. Gated by the dark flag: with
+        # `wall_delivery_enabled` off this is 'standard' for EVERY campaign, so
+        # the keyspace stays 'flows' and the audience partition keeps its
+        # original admissible set — byte-identical to before the flag existed,
+        # including on a campaign already marked `flow_family='offerwall'`.
+        #
+        # The family is still READ and recorded in the trace above regardless,
+        # which is what makes "this node can see the field" observable before
+        # anything acts on it.
+        flow_family=(
+            campaign_flow_family
+            if settings.wall_delivery_enabled
+            else "standard"
+        ),
     )
     attribution["routing_trace"] = cascade_trace
     if flow is None:

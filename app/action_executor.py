@@ -310,23 +310,31 @@ async def _execute_offerwall(
     Order is the wall's PUBLICATION order, untouched: position 1 is what the
     operator put first, which is the whole meaning of "the first offer".
 
-    🔴 WHY THIS DIFFERS FROM `_execute_split`, DELIBERATELY. A split does NOT
-    walk past an availability-blocked leg — it returns UNAVAILABLE_RESULT and
-    lets the terminal fallback answer (the C2 drain contract, a few frames
-    down). That rule exists because a split's legs are a WEIGHTED
-    DISTRIBUTION: re-rolling a blocked leg silently redistributes its share and
-    changes the traffic split the operator configured. A wall has no share to
-    corrupt — it is an ORDERED LIST of offers a visitor could equally have
-    picked by hand — so the reason for the split's rule does not transfer, and
-    dead-ending the campaign because position 1 went closed would waste every
-    other offer the operator published.
+    🔴 THE SPLIT PRECEDENT DOES CARRY — and this comment said the opposite
+    until it was checked against the code (2026-09-10). `_execute_split` has
+    TWO availability moments, and only the second one refuses:
 
-    (The B3 decision record cited "the split precedent" among its licences for
-    this behaviour. Reading that precedent shows it argues the OTHER way; the
-    behaviour stands on the owner's own rule — «в будь-якому сценарії ми тоді
-    на такий офер не ведемо. Ми тоді йдемо по дефолтному сценарію» — applied to
-    a wall whose default scenario is "the first offer in the list", plus the
-    distribution argument above. The licence is corrected, not the outcome.)
+      * PRE-SELECTION — a leg whose PINNED target fails `_avail_ok` is dropped
+        from the weighted pool and the survivors' weights are renormalised
+        (this file, the `kept_valid` loop). Pinned by
+        `test_c2_availability_delivery.py::test_closed_leg_excluded_new_visitor`
+        — 200 picks, the closed leg is never chosen and the sibling serves.
+      * POST-SELECTION — once a leg is PICKED, an `UNAVAILABLE_RESULT` from
+        `_resolve_offer_url` is terminal, never re-rolled (the C2 drain
+        contract).
+
+    A wall tile always carries a pinned `target_id` (`offerwall.py:198-199`),
+    so it is the FIRST moment that applies to it, and that moment walks past.
+    A wall has no weighted pick at all, so the second moment has nothing to
+    govern here. The behaviour below is the split's own rule, not an exception
+    to it — which is also what the owner asked for directly.
+
+    Where the two genuinely diverge, said plainly: a split's post-pick refusal
+    is terminal, while this loop keeps walking. That can only differ for a
+    tile with NO pinned target whose offer-default is unavailable — a shape
+    the wall contract does not produce today. Cost of walking: one
+    `hgetall` per skipped tile, bounded by `WALL_TILES_MAX = 24` and one in
+    the common case where position 1 serves.
     """
     tiles = config.get("tiles")
     if not isinstance(tiles, list) or not tiles:

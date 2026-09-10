@@ -371,3 +371,64 @@ class TestR6InertWhileDark:
         assert _served(result) != str(TILE_1), (
             "a wall served the click with the delivery flag OFF"
         )
+
+
+# ============================================================
+# R7 — B12: what a ROLLBACK actually does to a dedicated wall campaign
+# ============================================================
+
+class TestR7RollbackIsATrafficDiversionNotADeadEnd:
+    """🔴 THE ROLLBACK CONTRACT, measured rather than asserted.
+
+    `wall_delivery_enabled` is the rollback lever. On a campaign that carries
+    ORDINARY flows too, flipping it off is harmless — R6 pins that. On a
+    DEDICATED wall campaign (walls and nothing else) it is not harmless, and
+    the anchor's B12 box exists because nobody had measured which of two very
+    different things happens:
+
+      * the visitor dead-ends (a routing failure), or
+      * 100% of the campaign's traffic diverts to the fallback.
+
+    It is the SECOND. The router returns no winner, and `main.py` serves
+    `campaign.fallback_url` (or, absent that, the Worker's own default — the
+    Worker is the single fallback owner). Nothing is lost and nothing errors;
+    every visitor simply stops reaching an offer.
+
+    WHY THAT DISTINCTION IS OPERATIONAL, not academic. A dead end would show up
+    instantly as errors. A silent 100% diversion to a fallback shows up as
+    "traffic still 200s, conversions went to zero" — which is exactly the shape
+    an operator diagnoses as an offer problem for hours before suspecting a
+    flag. So the rollback ORDER is fixed:
+
+        flip campaigns back to flow_family='standard' FIRST — after making sure
+        each has an ordinary all-visitors flow or a fallback_url it is happy to
+        serve — and only THEN turn the flag off.
+
+    Turning the flag off first is not a rollback; it is a 100% traffic
+    diversion with a green health check.
+    """
+
+    def test_flag_off_on_a_DEDICATED_wall_campaign_serves_no_offer(self):
+        # No ordinary flow anywhere: walls are all this campaign has.
+        result, _ident = _run(family="offerwall", returning_mode="fresh",
+                              delivery=False)
+        served = _served(result)
+        assert served != str(TILE_1), (
+            "a wall served a click with the delivery flag OFF — the dark "
+            "default is not dark"
+        )
+        # The discriminator between the two candidate outcomes: no winner at
+        # all, rather than a winner pointing somewhere unexpected.
+        assert result is None or not (result.get("url") or "").startswith("https://land/111"), (
+            "the campaign produced a routed destination from the wall while dark"
+        )
+
+    def test_the_SAME_campaign_with_the_flag_ON_does_serve(self):
+        """The inverse control. Without it the test above passes on any broken
+        fixture that never routes at all."""
+        result, _ident = _run(family="offerwall", returning_mode="fresh",
+                              delivery=True)
+        assert _served(result) == str(TILE_1), (
+            "CONTROL FAILED — this fixture cannot route even with the flag on, "
+            "so the dark assertion above is not evidence about the flag"
+        )

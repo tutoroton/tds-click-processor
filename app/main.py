@@ -1174,9 +1174,32 @@ def _phase3_attribution_fields(
         # costs nothing, and while both exist the column can be cross-checked
         # against it on live rows.
         #
-        # 0 means "not a wall", and it is unambiguous: the codec refuses an
-        # origin outside 1..UINT32_MAX (`route_code.py`), so zero can never be a
-        # real wall id.
+        # 🔴 0 MEANS "NO WALL CLAIM" — IT DOES NOT MEAN "NOT A WALL", and this
+        # comment said the second thing until 2026-09-11. The B3 dispatcher made
+        # them different: a wall now DELIVERS ordinary clicks with no route code
+        # at all, so a click the wall itself served carries `origin_wall_id = 0`.
+        # Measured on that path: flow_id=910 (the wall), action_type='offerwall',
+        # audience_pool='offerwall', origin_wall_id absent from the trace.
+        # A reader that counts wall traffic as `origin_wall_id != 0` therefore
+        # UNDERCOUNTS the new epoch to zero, silently, on a money-bearing
+        # dimension.
+        #
+        # THE TWO DIMENSIONS ARE DELIBERATELY DISTINCT (the Codex invariant,
+        # anchor B11): `flow_id` is DELIVERY IDENTITY — who served this click;
+        # `origin_wall_id` is PROVENANCE — where the visitor's own CHOICE came
+        # from. A dispatcher-delivered click has an identity and no provenance,
+        # because the visitor chose nothing; a tile click has both. Neither may
+        # become an alias of the other.
+        #
+        # THE EPOCH DISCRIMINATOR IS `audience_pool == 'offerwall'`, not
+        # `flow_id == origin_wall_id` as the anchor's B10 first proposed — that
+        # comparison reads 910 == 0 on exactly the rows it was meant to find. The
+        # pool value is safe as a discriminator because the OLD epoch could not
+        # produce it: a wall could never be the cascade WINNER before B3, and the
+        # pool is stamped from the winner's own audience.
+        #
+        # Zero can never collide with a real wall id: the codec refuses an origin
+        # outside 1..UINT32_MAX (`route_code.py`).
         "origin_wall_id": int(
             (attr.get("routing_trace") or {}).get("origin_wall_id") or 0
         ),

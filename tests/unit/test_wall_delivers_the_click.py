@@ -287,3 +287,79 @@ class TestTheKeyspaceChoiceIsExplicit:
         # Fail-open: an unrecognised value must degrade to 'standard', so a
         # typo in the campaign HASH can never silently switch delivery.
         assert router._campaign_flow_family({"flow_family": "wall"}) == "standard"
+
+
+# ============================================================
+# B4/B10/B11 — delivery identity vs provenance, and the epoch discriminator
+# ============================================================
+
+class TestIdentityIsNotProvenance:
+    """🔴 THE CODEX INVARIANT, and the anchor's B10 premise CORRECTED.
+
+    Two wall-shaped dimensions travel on a click and they answer different
+    questions:
+
+      * `flow_id`        — DELIVERY IDENTITY: who served this click.
+      * `origin_wall_id` — PROVENANCE: where the visitor's own CHOICE came
+                           from (a MAC-verified v3 wall claim, `router.py`).
+
+    A dispatcher-delivered click has an identity and NO provenance, because the
+    visitor chose nothing — we picked the first eligible tile for them. A tile
+    click has both. Neither may become an unconditional alias of the other; that
+    is the invariant the anchor calls B11.
+
+    🔴 WHAT THIS CORRECTS. The anchor's B10 proposed `flow_id == origin_wall_id`
+    as the discriminator that separates the two data epochs. Measured on the
+    delivery path, that comparison reads `910 == 0` — FALSE on exactly the rows
+    it was meant to find, because a dispatcher-delivered click carries no claim
+    and the column defaults to 0.
+
+    The discriminator that DOES work is `audience_pool == 'offerwall'`, and it
+    is safe because the OLD epoch cannot produce it: before B3 a wall could
+    never be the cascade winner, and the pool is stamped from the winner's own
+    audience.
+    """
+
+    def test_a_delivered_wall_click_has_identity_and_no_provenance(self, wall_delivery_on):
+        redis = _redis("970", family="offerwall",
+                       tiles=[_tile(55, 77)],
+                       targets={"77": _offer_target("77", "https://first.example/")})
+        result = _route_with(redis, _click())
+        assert result is not None
+        attr = result["attribution"]
+        assert attr["flow_id"] == int(WALL_ID), "delivery identity is not the wall"
+        trace = attr.get("routing_trace") or {}
+        assert trace.get("origin_wall_id") is None, (
+            "a dispatcher-delivered click claimed PROVENANCE it does not have — "
+            "the visitor chose no tile, so origin_wall_id must stay unset"
+        )
+
+    def test_the_epoch_discriminator_is_the_audience_pool(self, wall_delivery_on):
+        """`audience_pool == 'offerwall'` is what says a wall delivered."""
+        redis = _redis("971", family="offerwall",
+                       tiles=[_tile(55, 77)],
+                       targets={"77": _offer_target("77", "https://first.example/")})
+        result = _route_with(redis, _click())
+        attr = result["attribution"]
+        assert attr["audience_pool"] == "offerwall"
+        # And the discriminator the anchor first proposed does NOT hold here —
+        # asserted so nobody reinstates it from the old text.
+        origin = (attr.get("routing_trace") or {}).get("origin_wall_id") or 0
+        assert attr["flow_id"] != origin, (
+            "flow_id == origin_wall_id would have to be FALSE on a delivered "
+            "wall click; if this ever became true the B10 comparison would look "
+            "workable again and would still be wrong for tile clicks"
+        )
+
+    def test_CONTROL_an_ordinary_flow_carries_neither(self):
+        """Flag OFF, ordinary flow serves: no wall identity, no wall provenance.
+        Without this the two assertions above pass on any campaign that simply
+        never sets these fields."""
+        redis = _redis("972", family="offerwall",
+                       tiles=[_tile(55, 77)],
+                       targets={"77": _offer_target("77", "https://first.example/")},
+                       with_ordinary_flow=True)
+        result = _route_with(redis, _click())
+        attr = result["attribution"]
+        assert attr["flow_id"] == int(FLOW_ID)
+        assert attr["audience_pool"] != "offerwall"

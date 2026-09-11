@@ -40,6 +40,7 @@ import logging
 import random
 from typing import Any
 
+from app.config import settings
 from app.models import ClickRequest
 from app.telemetry import (
     OP_OFFER_RESOLVE,
@@ -199,10 +200,49 @@ async def execute_action(
                                      source_mappings, campaign_mappings, flow_id,
                                      allowed_avail, trace=trace, rng=rng)
     if action_type == "offerwall":
-        return await _execute_offerwall(r, config, req, campaign_id,
-                                        build_url_fn, source_mappings,
-                                        campaign_mappings, flow_id,
-                                        allowed_avail)
+        # 🔴 TWO GUARDS, and each closes a hole the other cannot see. Measured
+        # 2026-09-11 with neither of them: a flow carrying `audience='first'`
+        # and `action_type='offerwall'` on a STANDARD campaign served a redirect
+        # to the wall's first tile — with `wall_delivery_enabled` OFF.
+        #
+        #   1. THE FLAG. Selection is gated in the router (which keyspaces are
+        #      read); the EXECUTOR was not. So any flow that reached here by
+        #      another route served tiles regardless, and "dark by default" was
+        #      true of the selector and false of the system. Before the
+        #      dispatcher this action_type had no branch at all and fell through
+        #      to the unknown-action fallback below — which is exactly what the
+        #      flag-off path must keep doing, or the claim "flag OFF is
+        #      byte-identical to before" is not a claim, it is a hope.
+        #
+        #   2. THE IDENTITY. A wall ACTION requires a wall IDENTITY. The pairing
+        #      `(first, offerwall)` is a real misconfiguration this design has
+        #      documented since before delivery existed — no audience guard
+        #      catches it, because `first` is a legitimate audience — and after
+        #      the dispatcher its consequence changed from "renders a catalogue
+        #      where a 302 was expected" to "silently routes to tile 1 on a
+        #      STANDARD campaign", which is the isolation invariant bypassed by
+        #      configuration rather than by code.
+        #
+        # Both fall through to the unknown-action path, which already logs and
+        # returns None so the click reaches the ordinary fallback. Refusing
+        # loudly here would page on an operator's typo; refusing SILENTLY would
+        # hide it. The existing warning does neither — it records it.
+        if not settings.wall_delivery_enabled:
+            logger.warning(
+                "flow %s carries action_type=offerwall but wall delivery is "
+                "OFF — refusing to serve tiles (dark by default)", flow_id,
+            )
+        elif (flow.get("audience") or "first") != "offerwall":
+            logger.warning(
+                "flow %s carries action_type=offerwall with audience=%r — a "
+                "wall ACTION requires a wall IDENTITY; refusing to serve tiles",
+                flow_id, flow.get("audience"),
+            )
+        else:
+            return await _execute_offerwall(r, config, req, campaign_id,
+                                            build_url_fn, source_mappings,
+                                            campaign_mappings, flow_id,
+                                            allowed_avail)
     if action_type == "block":
         return BLOCK_RESULT
 

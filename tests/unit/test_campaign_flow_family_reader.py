@@ -30,6 +30,7 @@ import json
 
 import pytest
 
+from app.config import settings
 from app.router import (
     DEFAULT_FLOW_FAMILY,
     FLOW_FAMILIES,
@@ -154,10 +155,24 @@ class TestTheValueReachesTheRoutingTrace:
         assert result["url"].startswith("https://lp.example.com/")
         assert result["attribution"]["routing_trace"]["flow_family"] == "standard"
 
-    def test_an_offerwall_campaign_still_routes_exactly_as_standard_today(self):
-        # The inert claim, stated as a test: setting the family changes the
-        # DESTINATION of nothing. When the dispatcher lands this must be
-        # revisited deliberately, not silently.
+    def test_an_offerwall_campaign_routes_as_standard_WHEN_DELIVERY_IS_OFF(
+        self, monkeypatch,
+    ):
+        # 🔴 REVISITED DELIBERATELY 2026-09-11, which is what the previous
+        # version of this comment asked for: "when the dispatcher lands this
+        # must be revisited deliberately, not silently."
+        #
+        # It landed, and on that day `wall_delivery_enabled` flipped to default
+        # ON, so the inert claim is no longer true of a default node — it is
+        # true of a node with delivery OFF. The test now SETS that state instead
+        # of inheriting it, because a test that inherits the state it claims to
+        # be testing is measuring the default.
+        #
+        # The opposite half — with delivery ON the family DOES change the
+        # destination — is not asserted here; it is the whole subject of
+        # test_wall_delivers_the_click.py, and duplicating it would add a second
+        # place to update rather than a second measurement.
+        monkeypatch.setattr(settings, "wall_delivery_enabled", False, raising=False)
         standard = _route_with(_redis_with_family("804", "standard"), _click())
         offerwall = _route_with(_redis_with_family("805", "offerwall"), _click())
         assert standard is not None and offerwall is not None

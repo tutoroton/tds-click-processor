@@ -820,13 +820,37 @@ class Settings(BaseSettings):
     # where a click goes). A node may legitimately serve catalogues without
     # routing by them — that is exactly the state the fleet is in today.
     #
-    # OFF is byte-identical to before this flag existed: `flow_family` is read
-    # and recorded, and the keyspace stays 'flows' for every campaign. Turning
-    # it on is only safe once EVERY node runs code that can read the family —
-    # the transport fails open, so a stale node treats a wall campaign as
-    # standard, and a dedicated wall campaign has no ordinary flows to fall
-    # back to.
-    wall_delivery_enabled: bool = False
+    # 🔴 DEFAULT FLIPPED TO ON, 2026-09-11, by the owner's instruction: «треба,
+    # щоб було включене, і щоб воно працювало», and «щоб ми не залежали від цих
+    # env файлів». The env var is now the EMERGENCY OFF, not the required ON.
+    #
+    # WHY THIS IS SAFE, and it is not a relaxation of the guard — it is the
+    # recognition that the guard was never this flag:
+    #
+    #   THE REAL GATE IS THE CAMPAIGN. Walls become the candidate pool only on
+    #   a campaign whose `flow_family` is 'offerwall'. `_campaign_flow_family`
+    #   fails open to 'standard', so a campaign that has not been switched — the
+    #   overwhelming majority, and every campaign that exists by default — is
+    #   byte-identical to before this flag existed. Flipping THIS default
+    #   changes the behaviour of exactly the campaigns an operator has already
+    #   deliberately marked as wall campaigns, which is the behaviour they were
+    #   marked FOR.
+    #
+    # The caution this comment used to carry ("only safe once EVERY node runs
+    # code that can read the family") was a ROLLOUT precaution, and it has been
+    # MEASURED rather than assumed away: 2026-09-11, `SELECT … FROM edge_nodes
+    # WHERE status <> 'archived'` returns exactly ONE row — node 55, running
+    # code that reads the family (proven by a live click whose trace carries
+    # `flow_family:"offerwall"`). There is no fleet that could disagree with
+    # itself. When one exists again, the precaution returns as a DEPLOY-ORDER
+    # question, not as a default: stale nodes fail open to 'standard', which is
+    # the old behaviour rather than a failure.
+    #
+    # OFF is still byte-identical to before this flag existed, and setting
+    # `TDS_WALL_DELIVERY_ENABLED=false` is how an operator gets there in one
+    # step. admin-api can own it fleet-wide through
+    # `wall_delivery_edge_enabled`; that rail is unchanged and still tri-state.
+    wall_delivery_enabled: bool = True
 
     # THE WALL'S OWN ADMISSION BUDGET, counted in TILES rather than requests,
     # and deliberately NOT a share of `preview_max_concurrency`.

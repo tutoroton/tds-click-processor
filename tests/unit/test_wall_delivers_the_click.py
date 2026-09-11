@@ -119,8 +119,27 @@ def wall_delivery_on(monkeypatch):
     yield
 
 
+@pytest.fixture
+def wall_delivery_off(monkeypatch):
+    """Explicitly OFF — and the explicitness is the point.
+
+    🔴 The three tests below that assert the OFF behaviour used to assert it by
+    saying NOTHING, because the default was False. They therefore measured the
+    DEFAULT, not the behaviour, and all three went red the moment the default
+    flipped to True on 2026-09-11 — correctly: they were never testing what
+    their names claimed.
+
+    A test about a state must SET that state. Otherwise a change of default
+    silently reclassifies it from "proves the flag gates this" to "proves the
+    default is what I assumed", and the two are indistinguishable while the
+    assumption holds.
+    """
+    monkeypatch.setattr(settings, "wall_delivery_enabled", False, raising=False)
+    yield
+
+
 class TestTheFlagIsTheOnlySwitch:
-    def test_flag_off_a_wall_campaign_is_untouched(self):
+    def test_flag_off_a_wall_campaign_is_untouched(self, wall_delivery_off):
         # No ordinary flows at all, so if the wall were serving we would get a
         # destination. Flag OFF ⇒ the walls keyspace is never read ⇒ nothing
         # routes, exactly as today.
@@ -130,7 +149,7 @@ class TestTheFlagIsTheOnlySwitch:
         result = _route_with(redis, _click())
         assert result is None or result.get("attribution", {}).get("flow_id") != int(WALL_ID)
 
-    def test_flag_off_still_records_the_family(self):
+    def test_flag_off_still_records_the_family(self, wall_delivery_off):
         # The reader keeps working while the delivery stays dark — that split
         # is what makes "the fleet can read it" checkable before activation.
         redis = _redis("951", family="offerwall", tiles=[_tile(55, 77)],
@@ -351,7 +370,7 @@ class TestIdentityIsNotProvenance:
             "workable again and would still be wrong for tile clicks"
         )
 
-    def test_CONTROL_an_ordinary_flow_carries_neither(self):
+    def test_CONTROL_an_ordinary_flow_carries_neither(self, wall_delivery_off):
         """Flag OFF, ordinary flow serves: no wall identity, no wall provenance.
         Without this the two assertions above pass on any campaign that simply
         never sets these fields."""

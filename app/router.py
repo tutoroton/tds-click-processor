@@ -819,11 +819,26 @@ def _campaign_flow_family(campaign: dict[str, Any]) -> str:
     admin-api (migration 327) onto the campaign HASH by
     `sync/builders/campaigns.py`.
 
-    🔴 THIS DECIDES NOTHING YET. It is read and recorded, so that "the fleet
-    can read the field" becomes a claim checkable from a click's own trace
-    instead of an assumption about deploy coverage. Switching any campaign to
-    'offerwall' before every node returns 'offerwall' here is the ordering
-    error this exists to make visible.
+    🔴 THIS NOW DECIDES — the line above said "DECIDES NOTHING YET" until
+    2026-09-11, and B3 had already made it false. The value is passed to
+    `cascade.route(flow_family=...)` below, where it chooses BOTH the keyspaces
+    the candidate pool is read from (`cascade.py:291` — `("flows", "walls")`
+    for an offerwall campaign) AND the admissible audience set
+    (`cascade.py:578` — `{returning, offerwall}` instead of the ordinary one).
+
+    It decides nothing only while `settings.wall_delivery_enabled` is OFF,
+    which is the default: the call site substitutes 'standard' for EVERY
+    campaign in that state, so a node is byte-identical to itself before the
+    flag existed. That is a property of the CALL SITE, not of this function —
+    which is exactly why the old wording was dangerous. A reader who took
+    "decides nothing" at face value would conclude this field is inert and
+    could be dropped or left unsynced.
+
+    The family is still READ and recorded in the trace regardless of the flag,
+    which is what makes "the fleet can read the field" a claim checkable from a
+    click's own trace instead of an assumption about deploy coverage. Switching
+    any campaign to 'offerwall' before every node returns 'offerwall' here is
+    the ordering error that observability exists to make visible.
 
     FAIL-OPEN: absent / empty / unknown ⇒ 'standard' ⇒ ordinary flows, exactly
     as today. A node that has never heard of the field is therefore

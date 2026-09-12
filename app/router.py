@@ -855,6 +855,32 @@ def _campaign_flow_family(campaign: dict[str, Any]) -> str:
     return value if value in FLOW_FAMILIES else DEFAULT_FLOW_FAMILY
 
 
+def _effective_flow_family(campaign: dict[str, Any]) -> str:
+    """The family that actually DECIDES, with the dark flag applied.
+
+    `_campaign_flow_family` reads what the campaign CLAIMS; this says what the
+    node will act on. With `wall_delivery_enabled` off every campaign is
+    'standard' here, which is what keeps a node byte-identical to itself before
+    the flag existed — including a campaign already marked 'offerwall'.
+
+    🔴 EXTRACTED 2026-09-12 BECAUSE IT WAS ABOUT TO BECOME A SECOND COPY. The
+    expression lived inline at the `cascade.route(flow_family=...)` call site,
+    and U3 needs the same decision inside `_allowed_availability`. Two sites
+    each computing one decision is exactly the failure `_seen_before`'s
+    docstring records: neither copy is individually wrong, so no guard on
+    either side can see them diverge. One definition, two callers.
+
+    The RAW value is still read and recorded in the routing trace separately —
+    that observable is what makes "this node can see the field" provable before
+    anything acts on it, and it must not become gated.
+    """
+    return (
+        _campaign_flow_family(campaign)
+        if settings.wall_delivery_enabled
+        else DEFAULT_FLOW_FAMILY
+    )
+
+
 def _returning_live(campaign: dict[str, Any]) -> bool:
     """Is segmented returning routing live for THIS campaign's company?
 
@@ -870,6 +896,52 @@ def _audience_routing(campaign: dict[str, Any]) -> bool:
     (MODEL V3 - the partition is gated by EXISTENCE, not by a per-campaign mode).
     OFF at either half ⇒ no 2-pass ⇒ byte-identical to non-returning routing."""
     return _returning_live(campaign) and not _campaign_returning_flows_disabled(campaign)
+
+
+def _draining_class_applies(campaign: dict[str, Any], seen_before: bool) -> bool:
+    """May this visitor be served a target in the `draining` class?
+
+    🔴 U3 / DEFECT №3 (`63-THE-LINE-18-DECIDED.md` §3), 2026-09-12. On a WALL
+    campaign the answer follows FRESHNESS — a live resolver plus "this visitor
+    existed before this click" — and NOT the campaign's
+    `disable_returning_flows` flag.
+
+    The owner's rule (П4), quoted rather than paraphrased: «можемо включити
+    дрейнінг, і тоді для повторних там буде доступно… і це має впливати». The
+    input where code and rule visibly disagreed: a wall campaign with
+    `disable_returning_flows=ON`, a REPEAT visitor, and a tile naming a
+    `draining` target. The rule sends them to the offer they chose; the code
+    refused the tile and served the first offer instead. Two destinations, both
+    visible to the visitor — which is what made it a defect, not a fork.
+
+    WHY THAT FLAG IS THE WRONG INPUT HERE. `disable_returning_flows` switches
+    off the returning-audience PARTITION — whether returning FLOWS run. It was
+    never a statement about which availability classes a repeat visitor may be
+    served, and folding the two together is the conflation this repairs. THE
+    PARTITION IS UNCHANGED: with the flag on, returning flows still do not run;
+    only the availability class stops asking about it. That is why the cascade's
+    `seen_before=` argument keeps its original gate while `returning_visitor=`
+    uses this predicate — they look alike and they are two different questions.
+
+    SCOPE, from the decision verbatim: «на ВІТРИННИХ кампаніях… Звичайні
+    кампанії не чіпаємо» (invariant 1). Unpicking the same coupling on the
+    ORDINARY route is a separate item and needs the original draining decision
+    dug up first — deliberately not done here.
+
+    🔴 WHY THIS IS A FUNCTION, and it is not a style preference. The rule was
+    written out TWICE — in `_allowed_availability` and as the cascade's
+    `returning_visitor=` argument — while `_allowed_availability`'s own
+    docstring claimed the two shared it "BY CONSTRUCTION". They did not: they
+    shared an INPUT PATTERN, which is not the same thing and cannot be checked.
+    Fixing only the first copy left a wall whose every tile was `draining`
+    serving nobody while a wall with one draining tile served it — the same
+    visitor, the same flag, two answers. Measured, not reasoned: the first
+    version of this repair did exactly that, and the T3 matrix caught it.
+    One definition, two callers, the way `_seen_before` below already does it.
+    """
+    if _effective_flow_family(campaign) == "offerwall":
+        return _returning_live(campaign) and seen_before
+    return _audience_routing(campaign) and seen_before
 
 
 def _seen_before(attribution: dict[str, Any]) -> bool:
@@ -1023,15 +1095,24 @@ def _allowed_availability(
       returning visitor (seen_before, under live returning routing) → {active, draining}
       everyone else (incl. routing OFF / partition disabled / new visitor) → {active}
 
-    Gated identically to the audience partition (MODEL V3): routing OFF, OR the
-    campaign's `disable_returning_flows` flag set ⇒ `returning_visitor` is False
-    ⇒ {active} ⇒ a 'draining' target blocks all ⇒ TOTAL byte-identical invariant
-    with production dark (all targets 'active' → every class passes). It shares the
-    gate with the main route in `_try_flow_cascade` BY CONSTRUCTION - both call
-    `_audience_routing` - rather than by two copies promising to mirror each other."""
-    returning_visitor = (
-        _seen_before(attribution) if _audience_routing(campaign) else False
-    )
+    🔴 THE GATE IS NOT THE SAME ON BOTH FAMILIES, since 2026-09-12 (U3):
+
+      * ORDINARY campaign — gated identically to the audience partition
+        (MODEL V3): routing OFF, OR the campaign's `disable_returning_flows`
+        flag set ⇒ `returning_visitor` False ⇒ {active}. It shares the gate with
+        the main route in `_try_flow_cascade` BY CONSTRUCTION — both call
+        `_audience_routing` — rather than by two copies promising to mirror
+        each other.
+      * WALL campaign — FRESHNESS decides: a live resolver plus `seen_before`.
+        `disable_returning_flows` no longer speaks here, because it is a
+        statement about whether returning FLOWS run, not about which
+        availability classes a repeat visitor may be served. Defect №3, the
+        owner's rule П4; the reasoning is inline at the branch below.
+
+    Either way the TOTAL byte-identical invariant with production dark holds:
+    when every target is 'active' every class passes, so no split of this gate
+    can be observed."""
+    returning_visitor = _draining_class_applies(campaign, _seen_before(attribution))
     return (
         frozenset({"active", "draining"})
         if returning_visitor
@@ -2256,7 +2337,7 @@ async def _try_flow_cascade(
         # ⇒ a 'draining' target blocks ALL ⇒ TOTAL byte-identical invariant with
         # no exceptions (the "draining keeps returning" semantic activates
         # together with returning routing — one clean switch, no dual meaning).
-        returning_visitor=seen_before if audience_routing else False,
+        returning_visitor=_draining_class_applies(campaign, seen_before),
         trace=cascade_trace,
         diagnostic=diagnostic,
         # B3 — WHICH pool serves this campaign. Gated by the dark flag: with
@@ -2268,11 +2349,7 @@ async def _try_flow_cascade(
         # The family is still READ and recorded in the trace above regardless,
         # which is what makes "this node can see the field" observable before
         # anything acts on it.
-        flow_family=(
-            campaign_flow_family
-            if settings.wall_delivery_enabled
-            else "standard"
-        ),
+        flow_family=_effective_flow_family(campaign),
     )
     attribution["routing_trace"] = cascade_trace
     if flow is None:

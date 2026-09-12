@@ -25,9 +25,29 @@ Consequence, and it is the shape PR #4651 already named as the worst one: not a
 dead end, which shows up as errors — a SILENT 100% diversion to the campaign
 fallback while health stays green and the operator debugs the offer.
 
-⚠️ THIS IS INHERITED ORDINARY-ROUTE BEHAVIOUR, NOT A WALL DEFECT. These tests
-PIN the behaviour as it stands; whether it is what the owner wants for a wall is
-question 5 of the anchor's §6 and is not ours to answer by changing code.
+🔴 THAT PARAGRAPH WAS SUPERSEDED BEFORE IT WAS WRITTEN — corrected 2026-09-12.
+
+It used to read: *"THIS IS INHERITED ORDINARY-ROUTE BEHAVIOUR, NOT A WALL
+DEFECT. These tests PIN the behaviour as it stands; whether it is what the owner
+wants for a wall is question 5 of the anchor's §6 and is not ours to answer by
+changing code."*
+
+The deference was right in principle and wrong in fact: the section it defers to
+(`60-ROUTING-REBUILD-ANCHOR.md` §6) records the eighteen questions as CLOSED on
+2026-09-10 with an EMPTY shortlist to the owner, and lists this one as
+**reclassified into a defect** — №3, adjudicated in `63-THE-LINE-18-DECIDED.md`
+§3 against the owner's rule П4: «можемо включити дрейнінг, і тоді для повторних
+там буде доступно… і це має впливати». The decision predates this file by a day.
+
+So the behaviour below is no longer pinned as-is. On a WALL campaign the
+availability class follows FRESHNESS, not `disable_returning_flows`
+(`router._draining_class_applies`). What the ORDINARY route does is unchanged
+and still pinned — by `test_c2_availability_delivery.py`, which this file's own
+opening measurement notes carries 8 `draining` assertions and no wall.
+
+⚠️ THE CONTROLS HAD TO MOVE WITH THE RULE. `disable_returning` no longer
+discriminates on a wall campaign, so a control built on it would now pass while
+proving nothing. The discriminator is the VISITOR: fresh versus seen-before.
 """
 
 from __future__ import annotations
@@ -169,30 +189,48 @@ class TestT1DrainingIsServedToAReturningVisitor:
         assert _served(result) == str(TILE_2)
 
 
-class TestT2SuppressingReturningRemovesTheCLASS:
-    """🔴 §3.3a — the finding this file was written for.
+class TestT2SuppressingReturningNoLongerRemovesTheCLASS:
+    """🔴 §3.3a — the finding this file was written for, now REPAIRED (U3).
 
-    `disable_returning_flows` is documented as suppressing the returning
-    PARTITION. It also, through `_audience_routing`, removes the returning
-    VISITOR CLASS — so the availability floor collapses to {"active"} for
-    everyone and a `draining` tile becomes unreachable even for a visitor we
-    have seen before. One flag, two effects, and only one of them is named
-    where an operator would look.
+    `disable_returning_flows` suppresses the returning PARTITION. It used to
+    ALSO remove the returning VISITOR CLASS, through `_audience_routing`, so the
+    availability floor collapsed to {"active"} for everyone and a `draining`
+    tile was unreachable even for a visitor we had seen before. One flag, two
+    effects, and only one of them named where an operator would look.
+
+    Defect №3. On a wall campaign the second effect is gone: the class follows
+    freshness. The partition is untouched — returning FLOWS still do not run
+    under the flag; only the availability class stops asking about it.
     """
 
-    def test_a_RETURNING_visitor_no_longer_gets_the_draining_tile(self):
+    def test_a_RETURNING_visitor_DOES_get_the_draining_tile(self):
         result = _run(disable_returning=True, avails={TILE_1: "draining"})
         assert result is not None
-        assert _served(result) != str(TILE_1), (
-            "draining was served although the returning class was suppressed"
+        assert _served(result) == str(TILE_1), (
+            "owner П4: with draining on, a repeat visitor may be served it — "
+            "`disable_returning_flows` speaks about flows, not about which "
+            "availability classes exist"
         )
-        assert _served(result) == str(TILE_2)
 
-    def test_the_SAME_fixture_with_returning_ENABLED_does_serve_it(self):
-        """The control that separates 'the flag did it' from 'this fixture
-        cannot serve a draining tile at all'."""
+    def test_the_SAME_fixture_with_returning_ENABLED_serves_it_too(self):
+        """Both sides of the flag now agree, which IS the repair: the flag is
+        no longer an input to this question."""
         result = _run(disable_returning=False, avails={TILE_1: "draining"})
         assert _served(result) == str(TILE_1)
+
+    def test_the_DISCRIMINATOR_is_the_visitor_a_FRESH_one_is_walked_past_it(self):
+        """🔴 The control that REPLACES the old one, and it has to exist.
+
+        Once the flag stopped deciding, a control built on the flag proves
+        nothing — both its arms pass. Something must still be able to REMOVE
+        the class, or the two tests above are equally satisfied by a wall that
+        serves a draining tile to absolutely everyone. Freshness is that
+        something: same wall, same tiles, same flag, only the visitor differs.
+        """
+        result = _run(disable_returning=True, avails={TILE_1: "draining"},
+                      seen_before=False)
+        assert result is not None
+        assert _served(result) == str(TILE_2)
 
 
 class TestT3EveryTileDrainingDivertsTheWholeCampaign:
@@ -215,10 +253,23 @@ class TestT3EveryTileDrainingDivertsTheWholeCampaign:
     moved, so it is the cause.
     """
 
-    def test_no_winner_when_every_tile_is_draining_and_returning_is_off(self):
-        result = _run(disable_returning=True,
+    def test_no_winner_when_every_tile_is_draining_and_the_visitor_is_FRESH(self):
+        # 🔴 RE-POINTED (U3): what produces the diversion is now a FRESH
+        # visitor, not the `disable_returning_flows` flag. The operational
+        # shape — a silent 100% diversion rather than a loud dead end — is
+        # unchanged, and is exactly why it stays pinned.
+        result = _run(disable_returning=True, seen_before=False,
                       avails={TILE_1: "draining", TILE_2: "draining"})
         assert _served(result) not in (str(TILE_1), str(TILE_2))
+
+    def test_a_REPEAT_visitor_on_that_same_all_draining_wall_IS_served(self):
+        # The half the repair adds: the wall is not dead, it is dead FOR THE
+        # FRESH CLASS. Before U3 it served nobody even here — the silent
+        # diversion the owner's rule refuses.
+        result = _run(disable_returning=True,
+                      avails={TILE_1: "draining", TILE_2: "draining"})
+        assert result is not None
+        assert _served(result) == str(TILE_1)
 
     def test_the_SAME_all_draining_wall_DOES_serve_when_the_class_exists(self):
         """🔴 The discriminating control — the one the first version lacked.
@@ -233,10 +284,15 @@ class TestT3EveryTileDrainingDivertsTheWholeCampaign:
         assert _served(result) == str(TILE_1)
 
     def test_ONE_active_tile_is_enough_to_keep_serving(self):
-        """The second control: the wall still works in this fixture at all."""
+        """The second control: the wall still works in this fixture at all.
+
+        🔴 RE-POINTED (U3): a repeat visitor is now served the DRAINING first
+        tile rather than walked past it to the active one. The control's job —
+        proving the fixture can serve anybody — is unchanged.
+        """
         result = _run(disable_returning=True, avails={TILE_1: "draining"})
         assert result is not None
-        assert _served(result) == str(TILE_2)
+        assert _served(result) == str(TILE_1)
 
 
 class TestT4ATileLinkToAnUnavailableTarget:
@@ -256,12 +312,23 @@ class TestT4ATileLinkToAnUnavailableTarget:
         # …and the visitor lands on the WALL's own default, not nowhere.
         assert _served(result) == str(TILE_2)
 
-    def test_a_tile_code_naming_a_DRAINING_target_does_not_win_either(self):
+    def test_a_tile_code_naming_a_DRAINING_target_DOES_win(self):
+        """🔴 THE HEADLINE CASE OF DEFECT №3, re-pointed 2026-09-12.
+
+        This is the exact input the adjudication quotes: a wall campaign with
+        `disable_returning_flows=ON`, a REPEAT visitor, and a tile naming a
+        `draining` target. The owner's rule sends them to the offer they chose;
+        the code used to refuse the tile and serve the first offer instead.
+        Two different destinations, both visible to the visitor — which is what
+        made this a defect rather than a fork in the road.
+
+        The sibling above keeps it honest: a CLOSED target is still refused.
+        `draining` and `closed` are different classes and only one moved.
+        """
         result = _run(disable_returning=True, avails={TILE_1: "draining"},
                       code=_sign_wall(target_id=TILE_1))
         assert result is not None
-        assert _served(result) != str(TILE_1)
-        assert _served(result) == str(TILE_2)
+        assert _served(result) == str(TILE_1)
 
     def test_the_SAME_code_on_an_ACTIVE_target_DOES_win(self):
         """The control. Without it the two refusals above are equally explained

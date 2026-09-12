@@ -228,9 +228,16 @@ async def execute_action(
         # loudly here would page on an operator's typo; refusing SILENTLY would
         # hide it. The existing warning does neither — it records it.
         if not settings.wall_delivery_enabled:
+            # "(dark by default)" until 2026-09-12, when the default became ON
+            # (`config.py` `wall_delivery_enabled: bool = True`, by the owner's
+            # ruling that removed the env dependency). An operator reading the
+            # old line would conclude this was the shipped state and go looking
+            # for who turned it on; it is now the opposite — someone turned it
+            # OFF, and that is what the message must say.
             logger.warning(
                 "flow %s carries action_type=offerwall but wall delivery is "
-                "OFF — refusing to serve tiles (dark by default)", flow_id,
+                "OFF — refusing to serve tiles (delivery defaults ON, so this "
+                "node was switched off deliberately)", flow_id,
             )
         elif (flow.get("audience") or "first") != "offerwall":
             logger.warning(

@@ -1,10 +1,15 @@
 """Offer-wall SELECTION — which wall a visitor is shown, when several match.
 
-🔴 NOTHING CALLS THIS YET, ON PURPOSE. It is a pure function with no wiring, so
-landing it changes no behaviour on any live path. G5 (the read endpoint, behind
-its own flag defaulting OFF) is what will call it. Shipping the decision logic
-separately from the surface that invokes it is what lets this be reviewed as
-routing logic rather than as one more thing inside an endpoint diff.
+⚠️ THIS MODULE IS NOW CALLED — corrected 2026-09-12. `main.py:68` imports
+`load_wall_candidates` and `select_wall`, and the delivery path reaches them.
+
+It said "🔴 NOTHING CALLS THIS YET, ON PURPOSE… G5 is what will call it" until
+that date, which was true when the selector landed ahead of its surface. Left
+here as history rather than deleted, because the REASON is still the right one:
+shipping decision logic separately from the surface that invokes it is what let
+this be reviewed as routing logic instead of as one more thing inside an
+endpoint diff. But a stale "nothing calls this" is the most expensive kind of
+comment — it tells a reader that editing the file is free.
 
 SoT: `docs/development/offerwall-2026-09-04/34-G4-WALL-SELECTION.md` (selection)
 and `35-G4-WALL-CONTRACT.md` (the wall's own shape). This module implements §0's

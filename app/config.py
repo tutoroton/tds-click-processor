@@ -746,8 +746,17 @@ class Settings(BaseSettings):
     #
     # ROTATION: add the NEW kid as `route_code_active_kid` while keeping the OLD
     # kid(s) in the ring for the overlap window, so codes already handed to
-    # landing pages still verify. Drop a kid only after `route_code_ttl_seconds`
-    # has elapsed since it last signed anything.
+    # landing pages still verify. Drop a kid only after
+    # **max(`route_code_ttl_seconds`, `wall_tile_ttl_seconds`)** has elapsed
+    # since it last signed anything.
+    #
+    # 🔴 THE MAX, NOT THE FIRST ONE. This said `route_code_ttl_seconds` alone
+    # until 2026-09-12, when the wall got its own, much longer TTL. One ring
+    # signs BOTH kinds, so retiring a kid on the preview value would silently
+    # invalidate wall tile links that are still inside their own window — and
+    # the symptom is not an error anywhere: those links simply stop deciding and
+    # degrade to the wall's default scenario, which is indistinguishable from a
+    # visitor who never had a code. Today that is 7 days, not 30 minutes.
     #
     # 🔴 The ring must be IDENTICAL across the fleet: the CF Worker races
     # /decide to every node, so the node that verifies a code is in general NOT
@@ -768,12 +777,50 @@ class Settings(BaseSettings):
     route_code_keys: str = ""
     route_code_active_kid: str = ""
 
-    # How long a minted route code stays honourable. The landing page shows the
-    # advertised offer and the visitor clicks through within one browsing
-    # session, so this is a session-scale value, not a durable one — a longer
-    # window only widens the gap between what was advertised and what is still
-    # true. Expiry is server-anchored (see route_code.sign).
+    # How long a minted route code stays honourable ON THE ROUTE-PREVIEW PATH
+    # (`main.py` `_preview_response`). The landing page shows the advertised
+    # offer and the visitor clicks through within one browsing session, so this
+    # is a session-scale value, not a durable one — a longer window only widens
+    # the gap between what was advertised and what is still true. Expiry is
+    # server-anchored (see route_code.sign).
+    #
+    # 🔴 THIS IS NOT THE WALL'S VALUE. Until 2026-09-12 one setting served both
+    # paths, which made the two requirements fight: see `wall_tile_ttl_seconds`.
     route_code_ttl_seconds: int = 1800
+
+    # How long a WALL TILE link stays honourable (`main.py` `_mint_tile_codes`).
+    #
+    # A separate value because the two use cases have OPPOSITE requirements and
+    # only looked alike — same codec, same ring, same shape. The wall's links are
+    # PUBLISHED: the operator puts them on a page, and the visitor reopens one
+    # from browser history days later. The owner, 2026-09-05, having been asked:
+    #
+    #   «Ми опублікуємо ці посилання на якійсь сторінці, користувач її залишить
+    #    в історії, да? Потім відкриє, клікне, попаде на інший офер… 30 хвилин –
+    #    це дуже мало… але точно довше 30 хвилин»
+    #
+    # and he delegated the number ("тут треба твоє бачення"). Ruled at 7 days:
+    # `docs/development/offerwall-2026-09-04/63-THE-LINE-18-DECIDED.md:112,:186`.
+    #
+    # WHY 7 DAYS COSTS NOTHING TO STORE: a route code is a self-contained signed
+    # blob — `route_code.sign` is pure over the keyring and writes nowhere, and
+    # the expiry travels INSIDE the code (uint32 BE, server-anchored). A longer
+    # window therefore adds no rows, no Redis keys and no lookup; it only widens
+    # the time during which a signed claim is accepted. That is what the owner
+    # conditioned the long value on: «Якщо в цьому обмежень немає… то я би
+    # зберігав це впродовж довшого періоду».
+    #
+    # ⚠️ WHAT IT DOES COST, stated rather than discovered later. The window is
+    # also the REPLAY window (risk A14): a tile link is a bearer claim, so anyone
+    # holding it can use it repeatedly for 7 days, and honouring it re-pins the
+    # holder's identity to that offer. That is not an escalation — a tile code
+    # is MAC-bound to (company, campaign, offer, target, origin wall), so the
+    # worst it can do is land someone on an offer that very wall advertises,
+    # which is what a published wall link is FOR. It becomes a real question only
+    # if wall links are ever treated as personal rather than public; that is
+    # recorded as A13, and it is why the two TTLs must not be re-merged on the
+    # grounds that they "look the same".
+    wall_tile_ttl_seconds: int = 604800
 
     # The master switch for the whole feature on this node. OFF ⇒ /preview
     # returns 404 (not 403 — no existence oracle) AND the click path ignores any

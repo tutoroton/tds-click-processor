@@ -2609,7 +2609,10 @@ def _mint_tile_codes(
     if company_id is None or not wall_id:
         return None
 
-    ttl = settings.route_code_ttl_seconds
+    # The WALL's own TTL, not the preview one. These were a single setting until
+    # 2026-09-12; the two paths need opposite windows and only looked alike.
+    # See `config.wall_tile_ttl_seconds` for the owner's ruling and its cost.
+    ttl = settings.wall_tile_ttl_seconds
     for tile in tiles:
         tile.route_code = route_code.sign(
             company_id=company_id,

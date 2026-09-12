@@ -92,6 +92,7 @@ from app.telemetry import (
     OP_ROUTE_ERROR,
     OP_STREAM_ENTRY_LIMIT,
     OP_STREAM_WRITE_FAILED,
+    OP_WALL_TILE_CODES_UNSIGNED,
     OP_WATERMARK_SPILL,
     capture_op_exc_throttled,
     capture_op_msg,
@@ -2605,6 +2606,19 @@ def _mint_tile_codes(
     detectors proven able to fire) is therefore unchanged by this addition.
     """
     if not route_code.is_enabled():
+        # RAIL 2 IS DOWN, and this is the one line that says so. Serving is
+        # armed (we are here) and honouring is armed by default — but with no
+        # signing ring there is nothing to honour, so every tile silently loses
+        # the visitor's choice. Throttled, warning-level, never an exception:
+        # the wall's own answer is still correct.
+        if tiles:
+            capture_op_msg_throttled(
+                OP_WALL_TILE_CODES_UNSIGNED, campaign_id,
+                "wall served without tile codes: the route_code ring is not "
+                "armed on this node (TDS_ROUTE_CODE_KEYS / "
+                "TDS_ROUTE_CODE_ACTIVE_KID)",
+                campaign_id=campaign_id, wall_id=wall_id, tiles=len(tiles),
+            )
         return None
     if company_id is None or not wall_id:
         return None

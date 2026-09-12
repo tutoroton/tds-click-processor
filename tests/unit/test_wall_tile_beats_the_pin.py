@@ -152,7 +152,16 @@ class TestTheGuardsThatMakeItSafe:
         )
         assert result["target_id"] == _PINNED_TARGET
 
-    def test_the_flag_OFF_makes_the_whole_branch_unreachable(self):
+    def test_the_WALL_flag_OFF_makes_the_whole_branch_unreachable(self):
+        # 🔴 RENAMED AND RE-POINTED 2026-09-12 (U2). This test used to set
+        # `route_preview_enabled=False` alone and assert the tile lost — true
+        # then, because ONE switch gated both kinds, and that coupling was the
+        # U2 defect: an operator who armed the wall alone published tile links
+        # the node silently refused. The PROPERTY it pins (there is a switch
+        # that makes this branch unreachable) is unchanged and still required;
+        # only the switch is corrected. That preview's flag alone no longer
+        # disables a wall tile is pinned in `test_wall_fresh_install_rails.py`,
+        # which flips one flag between two otherwise identical runs.
         ident = FakeIdentRedis()
         r = FakeRoutingRedis(hashes=_hashes())
 
@@ -172,6 +181,7 @@ class TestTheGuardsThatMakeItSafe:
                     patch.object(sticky_mod, "get_sticky", _get_sticky), \
                     patch.object(action_executor, "execute_action", _serve), \
                     patch.object(settings, "route_preview_enabled", False), \
+                    patch.object(settings, "wall_tile_honour_enabled", False), \
                     patch.object(settings, "route_code_keys", _KEYS), \
                     patch.object(settings, "route_code_active_kid", _ACTIVE_KID), \
                     patch.object(settings, "returning_uid_ttl_seconds", 1000):

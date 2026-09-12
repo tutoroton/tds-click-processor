@@ -1516,7 +1516,17 @@ async def _route_code_target(
     routes normally. An optional enhancement must never be able to break a
     redirect.
     """
-    if not settings.route_preview_enabled:
+    # CHEAP EXIT ONLY. With BOTH features off this is byte-identical to the
+    # single gate it replaced (U2, 2026-09-12). The real decision is the
+    # per-CLAIM gate below, and it has to be below because the kind may only be
+    # read from a MAC-checked payload.
+    #
+    # 🔴 IT CANNOT BE GATED BY CALLER. Both call sites can be handed a wall
+    # claim: the non-sticky consult passes `wall_only=returning_flow_won`, which
+    # is False on an ordinary click and therefore admits BOTH kinds. Gating on
+    # `wall_only` would arm route preview on that path and leave the wall
+    # unarmed on it — the exact confusion this split exists to end.
+    if not (settings.route_preview_enabled or settings.wall_tile_honour_enabled):
         return None
 
     raw = (req.query_params or {}).get(ROUTE_CODE_PARAM)
@@ -1533,6 +1543,18 @@ async def _route_code_target(
         # from an unverified parse. A caller asking for wall-only precedence
         # must not be able to be handed a claim nobody signed.
         if wall_only and not decoded.is_wall_claim:
+            return None
+
+        # PER-CLAIM FEATURE GATE (U2). `route_preview_enabled` arms route
+        # PREVIEW; honouring a wall tile is a different feature, with a
+        # different owner ruling and its own switch — see
+        # `config.wall_tile_honour_enabled` for why it defaults ON and why that
+        # is safe. Read from the VERIFIED payload, never from the caller's
+        # intent, for the same reason the kind filter above sits here.
+        if decoded.is_wall_claim:
+            if not settings.wall_tile_honour_enabled:
+                return None
+        elif not settings.route_preview_enabled:
             return None
 
         # Tenant bind — the code's claim, checked against the click's company.
@@ -1854,10 +1876,17 @@ async def _resolve_action_with_sticky(
     # change to how `sticky_active` is computed — the exact drift the comment
     # above the `not sticky_active` branch records as having happened once.
     #
-    # FLAG-OFF IS BYTE-IDENTICAL: `_route_code_target` returns None on its first
-    # line when `route_preview_enabled` is False, and nothing mints a v3 WALL
-    # code until the wall endpoint is armed. With either off this block cannot
+    # FLAG-OFF IS BYTE-IDENTICAL: `_route_code_target` refuses a wall claim when
+    # `wall_tile_honour_enabled` is False, and nothing mints a v3 WALL code
+    # until the wall endpoint is armed. With either off this block cannot
     # produce a result.
+    #
+    # ⚠️ THIS SENTENCE NAMED `route_preview_enabled` UNTIL 2026-09-12, and it was
+    # true then — one switch gated both kinds. That was the U2 defect: the wall
+    # was armed and disarmed by a flag belonging to route preview, so an
+    # operator who armed the wall alone published tile links the node would
+    # silently refuse. The gate is now per-claim; preview's flag no longer
+    # decides anything about walls.
     if not returning_flow_won:
         wall_result = await _route_code_target(
             r, req, campaign_id,

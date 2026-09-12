@@ -96,6 +96,7 @@ def _resolve(
     ident=None,
     action_type="split",
     preview_enabled=True,
+    honour_enabled=True,
 ):
     """Drive the REAL resolver down the NON-STICKY path — the one a visitor
     captured by a returning flow actually takes. Returns (result, status, ident)
@@ -120,6 +121,7 @@ def _resolve(
         with patch.object(sticky_mod, "get_identity_redis", _gir), \
                 patch.object(action_executor, "execute_action", _serve), \
                 patch.object(settings, "route_preview_enabled", preview_enabled), \
+                patch.object(settings, "wall_tile_honour_enabled", honour_enabled), \
                 patch.object(settings, "route_code_keys", _KEYS), \
                 patch.object(settings, "route_code_active_kid", _ACTIVE_KID), \
                 patch.object(settings, "returning_uid_ttl_seconds", 1000):
@@ -171,8 +173,14 @@ class TestRow2TheTileOutranksAReturningFlow:
         )
         assert result["target_id"] == _NORMAL_TARGET
 
-    def test_the_flag_OFF_makes_the_tile_inert(self):
-        result, _s, ident = _resolve(_sign_wall(), preview_enabled=False)
+    def test_the_WALL_flag_OFF_makes_the_tile_inert(self):
+        # 🔴 RE-POINTED 2026-09-12 (U2) — see the same correction in
+        # `test_wall_tile_beats_the_pin.py`. The kill switch is now the wall's
+        # own; `route_preview_enabled` is held False here as well, so this also
+        # shows the two are independent rather than merely renamed.
+        result, _s, ident = _resolve(
+            _sign_wall(), preview_enabled=False, honour_enabled=False,
+        )
         assert result["target_id"] == _NORMAL_TARGET
         assert ident.set_calls == [], "a demoted tile must not pin either"
 

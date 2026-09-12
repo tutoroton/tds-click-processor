@@ -899,6 +899,52 @@ class Settings(BaseSettings):
     # `wall_delivery_edge_enabled`; that rail is unchanged and still tri-state.
     wall_delivery_enabled: bool = True
 
+    # 🔴 HONOURING A WALL TILE — its own switch, split off `route_preview_enabled`
+    # on 2026-09-12 (U2 of the production-readiness proof plan).
+    #
+    # THE DEFECT THIS CLOSES. Three independent rails must all be up before a
+    # tile link does anything, and until today the third one belonged to a
+    # DIFFERENT FEATURE:
+    #
+    #   1. `offerwall_serve_enabled` — this node will answer `/wall` at all;
+    #   2. `route_code_keys` + `route_code_active_kid` — tiles carry a signed code;
+    #   3. this one — the click path will HONOUR such a code.
+    #
+    # An operator arming "the offer wall" reads the offerwall settings, arms
+    # them, and the node then MINTS codes it silently REFUSES: `_mint_tile_codes`
+    # gates on the keyring alone, while the honour hook's first line gated on
+    # `route_preview_enabled`, whose name says nothing about walls. The refusal
+    # is indistinguishable from a visitor who carried no code at all — the click
+    # just routes normally — so the failure mode is a PUBLISHED link with a
+    # seven-day life that is dead on arrival, and nothing anywhere says why.
+    #
+    # It was NAMED and left open, twice: ADR-0516 consequence 4 ("two operator
+    # switches silently change the outcome, and neither announces itself") and
+    # `62-PHASE2-FABLE-CRITIC-AND-THE-TWO-DISAGREEMENTS.md` R9, resolved then as
+    # "named, not a surprise". Naming a silent failure does not make it loud.
+    #
+    # DEFAULT ON, by the same owner ruling that flipped `wall_delivery_enabled`
+    # on 2026-09-11: «треба, щоб було включене, і щоб воно працювало», and «щоб
+    # ми не залежали від цих env файлів». `TDS_WALL_TILE_HONOUR_ENABLED=false`
+    # is the EMERGENCY OFF, not the required ON.
+    #
+    # WHY DEFAULT-ON IS SAFE — and this is not a relaxation of a guard, it is
+    # the recognition that the guard was never this flag:
+    #
+    #   THE SIGNATURE IS THE GATE. This switch decides only whether a v3 WALL
+    #   claim is CONSIDERED. Every bind still applies afterwards, unchanged: a
+    #   MAC over THIS deployment's own ring, the tenant bind, the campaign bind,
+    #   the availability floor, membership. A claim cannot exist unless our own
+    #   keyring signed it, and that happens at exactly one place — a wall this
+    #   deployment served. With `offerwall_serve_enabled` off (the default) no
+    #   wall is served, so no tile code exists, so this flag has nothing to
+    #   admit and the node stays byte-identical to before it existed.
+    #
+    # It does NOT arm route preview. A v2 PREVIEW claim is still gated on
+    # `route_preview_enabled`, per-CLAIM, inside `_route_code_target` — the two
+    # kinds shared one switch only because they share one function.
+    wall_tile_honour_enabled: bool = True
+
     # THE WALL'S OWN ADMISSION BUDGET, counted in TILES rather than requests,
     # and deliberately NOT a share of `preview_max_concurrency`.
     #

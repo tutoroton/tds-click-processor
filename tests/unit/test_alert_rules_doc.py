@@ -60,6 +60,14 @@ _EXCLUDED_OUT_OF_SCOPE = {
     # mandate for the feature). Its alerting posture belongs to the
     # edge-preview programme, same as the tag above.
     "OP_PREVIEW_CAPACITY_SHED",
+    # Offer wall U2 (2026-09-12) — the same class as the two preview tags
+    # above. It fires on the zero-write `/wall` READ surface to say that this
+    # node serves a wall without a signing ring, which is a CONFIGURATION
+    # visibility signal, not a click-loss / shed / pressure one: no click is
+    # at risk, the wall answers correctly, and its tiles route ordinarily.
+    # Its alerting posture belongs to the offerwall programme
+    # (docs/development/offerwall-2026-09-04/), not to this LOSSFIX doc.
+    "OP_WALL_TILE_CODES_UNSIGNED",
 }
 
 

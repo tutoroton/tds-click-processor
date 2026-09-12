@@ -119,6 +119,18 @@ OP_PREVIEW_CAPACITY_SHED = "preview_capacity_shed"
 # on every keyed preview.
 OP_PREVIEW_KEYS_UNSYNCED = "preview_keys_unsynced"
 
+# Offer wall U2 (2026-09-12) — this node SERVED a wall but could not sign its
+# tiles, because the `route_code` ring is not armed here. The wall answers
+# normally and its tiles route ordinarily, which is a state the system handles
+# by design — so this is not an error. It is the ONLY place the second of the
+# wall's three rails becomes visible: without it, an operator who armed
+# `offerwall_serve_enabled` and nothing else sees a perfectly good catalogue
+# whose tiles quietly do not carry the visitor's choice, and nothing anywhere
+# says which rail is down. ADR-0516 consequence 4 named exactly this silence.
+# Dedup on the campaign id, so a single unarmed campaign cannot spam while a
+# second one stays individually visible.
+OP_WALL_TILE_CODES_UNSIGNED = "wall_tile_codes_unsigned"
+
 # LOSSFIX P2 c1 (2026-07-07) — a recovered `.wip` segment (orphan
 # adoption, B1) had a torn tail: the last line was incomplete or failed
 # to parse. Loss-free by construction (see disk_queue._truncate_torn_

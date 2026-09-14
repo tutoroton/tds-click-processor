@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -102,7 +103,8 @@ def _tiles(*pairs):
         {"offer_id": o, "target_id": t} for o, t in pairs]})
 
 
-async def _seed(r, *, walls=("A",), wall_a_tiles=None) -> None:
+async def _seed(r, *, walls=("A",), wall_a_tiles=None,
+                wall_a_criteria="[]") -> None:
     """A domain → campaign → one or two company-scoped WALLS with pinned tiles.
 
     Deliberately NO routing flow: a wall must be reachable on a link that has
@@ -148,7 +150,7 @@ async def _seed(r, *, walls=("A",), wall_a_tiles=None) -> None:
         await r.hset(f"flow:{WALL_A}", mapping={
             "campaign_id": CAMPAIGN, "scope_type": "company",
             "scope_id": str(COMPANY), "seq_id": "1", "is_default": "0",
-            "criteria": "[]", "audience": "offerwall",
+            "criteria": wall_a_criteria, "audience": "offerwall",
             "action_type": "offerwall",
             "action_config": wall_a_tiles or _tiles((OFFER_1, TARGET_1),
                                                     (OFFER_2, TARGET_2)),
@@ -668,3 +670,60 @@ class TestTheWallPathIsSideEffectFree:
         rec = _WriteRecorder(store.client(), log, "routing")
         asyncio.run(rec.hset("probe:1", mapping={"a": "b"}))
         assert log == ["routing:hset"], log
+
+
+# --------------------------------------------------------------------------- #
+# The wall can target TIME — it could not until 2026-09-14                     #
+# --------------------------------------------------------------------------- #
+class TestTheWallEvaluatesTimeCriteria:
+    """`time_of_day` / `day_of_week` are ordinary flow criterion types, and a
+    wall's criteria come from the same vocabulary as a flow's. They were
+    nonetheless DEAD on this path: the handler built its ClickRequest with
+    `arrival_ts=req.arrival_ts or None`, the worker never sends `arrival_ts`,
+    and `_extra_click_dims` derives both dims from that field alone — so both
+    were always "".
+
+    On a missing value only the `empty` operator holds, so the failure had two
+    faces and neither raised: a wall targeting an hour could NEVER serve, and a
+    wall targeting "hour is empty" ALWAYS did.
+
+    MEASURED with a control before the fix — the two handlers, same
+    worker-shaped payload:
+        PREVIEW -> time_of_day='17' day_of_week='mon'
+        WALL    -> time_of_day=''   day_of_week=''
+    The preview arm is what made the wall arm mean anything.
+
+    The two tests below are each other's control: same seed, same request, the
+    ONLY difference is which hour the wall asks for.
+    """
+
+    @staticmethod
+    def _criteria(hour: int) -> str:
+        return json.dumps(
+            [{"type": "time_of_day", "op": "in", "values": [str(hour)]}]
+        )
+
+    def test_a_wall_targeting_THIS_hour_serves(self, armed):
+        now_hour = datetime.now(timezone.utc).hour
+        store = _fake()
+        asyncio.run(_seed(store.client(),
+                          wall_a_criteria=self._criteria(now_hour)))
+        body = _post(store).json()
+        assert body["matched"] is True, (
+            "a wall whose criterion names the CURRENT hour did not serve — "
+            "the handler is not stamping arrival_ts, so time_of_day is ''"
+        )
+        assert body["wall_id"] == int(WALL_A)
+
+    def test_CONTROL_a_wall_targeting_ANOTHER_hour_does_not_serve(self, armed):
+        # Without this, a handler that ignored criteria entirely would pass the
+        # test above just as happily.
+        other_hour = (datetime.now(timezone.utc).hour + 5) % 24
+        store = _fake()
+        asyncio.run(_seed(store.client(),
+                          wall_a_criteria=self._criteria(other_hour)))
+        body = _post(store).json()
+        assert body["matched"] is False, (
+            "a wall whose criterion names a DIFFERENT hour served anyway — "
+            "time criteria are not being evaluated at all"
+        )

@@ -2713,7 +2713,33 @@ async def _wall_body(
         is_bot=req.is_bot,
         is_proxy=req.is_proxy,
         asn=req.asn,
-        arrival_ts=req.arrival_ts or None,
+        # 🔴 STAMP "NOW" WHEN THE CALLER OMITS IT — this line used to read
+        # `req.arrival_ts or None`, and that `None` cost the wall TWO whole
+        # criterion dimensions.
+        #
+        # `_extra_click_dims` derives `time_of_day` and `day_of_week` from
+        # `arrival_ts` alone (router.py). With None it yields "" for both, and
+        # on a missing value only the `empty` operator holds — so a wall
+        # carrying `time_of_day in [...]` could NEVER serve, while one carrying
+        # `time_of_day empty` ALWAYS did. Silently, with nothing red anywhere.
+        #
+        # MEASURED 2026-09-14, with a working control: the two ClickRequests the
+        # two handlers build from the SAME worker-shaped payload (neither
+        # carries arrival_ts — see the payload builders in
+        # `services/worker/src/index.js`) gave
+        #     PREVIEW -> time_of_day='17' day_of_week='mon'
+        #     WALL    -> time_of_day=''   day_of_week=''
+        # The preview arm is what proves the probe worked; without it an empty
+        # wall result would have been indistinguishable from a broken probe.
+        #
+        # This is a straight mirror of the preview handler's own stamp, which
+        # carries the reasoning for the value chosen: "now" is the honest
+        # reading for a catalogue being fetched now. A caller-supplied
+        # `arrival_ts` still wins, on both paths, exactly as before — the only
+        # state that changes is the one where nobody supplied anything.
+        arrival_ts=req.arrival_ts or datetime.now(timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%S.%f"
+        )[:-3] + "Z",
     )
 
     # Every answer produced under a PRESENT index for a presented hash carries

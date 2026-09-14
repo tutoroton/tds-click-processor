@@ -473,6 +473,17 @@ def test_the_response_carries_no_commercially_sensitive_field(enabled):
         # The forbidden set above still holds; these were RULED to cross the
         # public boundary (the sibling admin-api path already returns them).
         "offer_name", "offer_icon_url",
+        # ADR-0542 — the visitor-context echo. RULED to cross the public
+        # boundary deliberately, on the same reasoning `tenant_checked` was:
+        # it names OUR OWN behaviour ("did this node route on the context you
+        # supplied"), never anything about the advertiser, the payout or the
+        # targeting. It has to be public, because the CALLER is the only party
+        # that can catch a STALE WORKER — one that discarded the visitor object
+        # before the node ever saw it — and it can only catch that by noticing
+        # the echo is absent from the answer it got.
+        #
+        # Null on this request, as it must be: nothing asserted `payload`.
+        "visitor_context_applied",
     }
 
 

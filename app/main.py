@@ -2538,7 +2538,7 @@ async def wall(
     charge = max(1, settings.offerwall_admission_charge_tiles)
     try:
         with _wall_budget.hold(cap=cap, charge=charge) as reconcile:
-            return await _wall_body(req, reconcile)
+            return _stamp_visitor_context(await _wall_body(req, reconcile), req)
     except NoCapacity:
         # 🔴 TELEMETRY IS BEST-EFFORT HERE; THE 503 IS NOT. If the reporting
         # helper ever raised, an exception escaping this branch would replace a
@@ -2637,6 +2637,28 @@ def _mint_tile_codes(
             origin_flow_id=wall_id,
         )
     return int(time.time()) + ttl
+
+
+def _stamp_visitor_context(resp, req):
+    """ADR-0542 — the positive echo, stamped at the ONE exit of each handler.
+
+    🔴 WHY HERE AND NOT AT EVERY CONSTRUCTOR. This field must ride EVERY answer
+    produced under `payload` mode — the ladder answers, the dead-link shapes and
+    the matched ones alike — because the WORKER refuses any answer that lacks it
+    and would otherwise convert a perfectly good response into a 503. There are
+    a dozen construction sites between the two handlers, and "remember to pass
+    it at each" is precisely the failure mode an allowlist has: one missed
+    branch, silently. Stamping at the single exit cannot miss a branch.
+
+    ABSENT, never "edge". A node that predates this change emits nothing at all,
+    so an explicit "edge" would be DISTINGUISHABLE from an old build — and the
+    whole point of the echo is that absence means "not applied", uniformly.
+    Mirrors `tenant_checked`, which is absent rather than False for the same
+    reason.
+    """
+    if resp is not None and getattr(req, "visitor_context_mode", None) == "payload":
+        resp.visitor_context_applied = "payload"
+    return resp
 
 
 async def _wall_body(
@@ -2981,7 +3003,7 @@ async def preview(
         raise HTTPException(status_code=503, detail="preview_capacity")
     _preview_inflight += 1
     try:
-        return await _preview_body(req)
+        return _stamp_visitor_context(await _preview_body(req), req)
     finally:
         _preview_inflight -= 1
 

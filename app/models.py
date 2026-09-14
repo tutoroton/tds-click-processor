@@ -1,6 +1,6 @@
 """Request/response models for click-processor."""
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from app.shipper_metrics import ShipStatus
 
@@ -418,6 +418,50 @@ class HealthResponse(BaseModel):
     shipper_reclaim_age_sample_count: int = 0
 
 
+#: ADR-0542 — the fields a caller MUST supply when it asserts `payload` mode.
+#: ONE list, shared by `PreviewRequest` and `WallRequest`, because a wall's
+#: criteria are drawn from the same vocabulary as a flow's: if the two could
+#: disagree about what a complete visitor is, they would silently disagree
+#: about the same stored criterion (risk A33).
+#:
+#: It MIRRORS `VISITOR_REQUIRED_KEYS` in `services/worker/src/index.js`, and the
+#: mirror is pinned by a test rather than by anyone remembering.
+VISITOR_CONTEXT_REQUIRED_FIELDS: frozenset[str] = frozenset({
+    "country", "region", "city",
+    "user_agent", "accept_language", "referer",
+    "asn", "continent", "timezone",
+    "is_bot", "is_proxy",
+})
+
+
+def _require_complete_visitor_context(self):
+    """Under `payload` mode every visitor field must have been SENT.
+
+    🔴 `model_fields_set` IS THE WHOLE MECHANISM, and nothing else would work.
+    Every field here carries a default, so a value-level check cannot tell
+    "the caller sent country=''" — which is LEGAL, because Cloudflare does not
+    always resolve geo for a real click either — from "the caller never sent
+    country at all", which is a broken payload. Pydantic records which fields
+    were explicitly provided, and that is exactly the distinction:
+
+        PreviewRequest(hostname="x", country="").model_fields_set -> {hostname, country}
+        PreviewRequest(hostname="x").model_fields_set             -> {hostname}
+
+    REQUIRED KEYS, NULLABLE VALUES (ADR-0541 D3, carried into ADR-0542): this
+    checks PRESENCE, never emptiness. Refusing an empty value would refuse a
+    visitor the real click will happily serve.
+    """
+    if self.visitor_context_mode != "payload":
+        return self
+    missing = sorted(VISITOR_CONTEXT_REQUIRED_FIELDS - set(self.model_fields_set))
+    if missing:
+        raise ValueError(
+            "visitor_context_mode='payload' requires every visitor field to be "
+            f"supplied; missing: {', '.join(missing)}"
+        )
+    return self
+
+
 class PreviewRequest(BaseModel):
     """Ask what a visitor WOULD be routed to, without routing them.
 
@@ -505,6 +549,26 @@ class PreviewRequest(BaseModel):
     # path produces would itself be the distinguishable answer.
     preview_key_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
 
+    # ADR-0542 — WHOSE CONNECTION DOES THIS REQUEST DESCRIBE?
+    #
+    # Absent or "edge": the fields above are the CALLER's own edge reading, which
+    # is what a browser call has always meant. "payload": the caller ASSERTS it
+    # is supplying the visitor, and the completeness rule below applies.
+    #
+    # 🔴 "payload" MEANS CALLER-ASSERTED, NEVER VERIFIED. Nothing downstream may
+    # read it as authentication, and we cannot check that a supplied context
+    # describes a real visitor — only that the caller said what it was doing.
+    #
+    # The WORKER is the primary gate (a node 422 never reaches the caller: the
+    # worker retries any non-OK answer against a second node and then reports a
+    # generic failure). This field, and `_require_complete_visitor` below, are
+    # DEFENCE IN DEPTH — a node must never simply trust a worker.
+    visitor_context_mode: str | None = Field(default=None, pattern=r"^(edge|payload)$")
+
+    _require_complete_visitor = model_validator(mode="after")(
+        _require_complete_visitor_context
+    )
+
     _coerce_query_params = field_validator("query_params", mode="before")(
         ClickRequest._coerce_query_params.__func__  # type: ignore[attr-defined]
     )
@@ -574,6 +638,17 @@ class WallRequest(BaseModel):
     # unkeyed internal caller rather than 422, and the cross-tenant guard is
     # what a PRESENTED key buys.
     preview_key_hash: str | None = None
+
+    # ADR-0542 — the SAME declaration as `PreviewRequest`, and the same
+    # validator, because the two models share a field set BY CONTRACT: a wall's
+    # criteria come from the same vocabulary as a flow's, so if these could
+    # disagree about what a supplied visitor means they would silently disagree
+    # about the same stored criterion (risk A33).
+    visitor_context_mode: str | None = Field(default=None, pattern=r"^(edge|payload)$")
+
+    _require_complete_visitor = model_validator(mode="after")(
+        _require_complete_visitor_context
+    )
 
 
 class WallTile(BaseModel):
@@ -647,6 +722,21 @@ class WallResponse(BaseModel):
     # A caller must read the absence as could-not-validate and never as a pass.
     wall_denied: str | None = None
     tenant_checked: bool | None = None
+    # ADR-0542 — THE SAME ECHO, ONE CONTRACT LATER, and deliberately modelled on
+    # `tenant_checked` directly above rather than invented.
+    #
+    # Set to "payload" ONLY when this node actually routed on caller-supplied
+    # visitor context. ABSENT otherwise — never "edge" as a claim, exactly as
+    # `tenant_checked` is absent rather than False, because absence is what an
+    # older build produces and the two must be indistinguishable.
+    #
+    # It closes BOTH halves of the version skew, at two different seams:
+    #   * stale NODE  — the worker asked for `payload`, sees no echo, and
+    #     refuses the answer rather than passing off an edge-computed one.
+    #   * stale WORKER — it discarded the body entirely, so the node never saw
+    #     the assertion and emits nothing; the CALLER sees no echo and knows its
+    #     visitor never arrived. Only the caller can catch that half.
+    visitor_context_applied: str | None = None
     # Unix seconds. Present only alongside minted codes; `None` when the ring is
     # not armed, so a caller can tell "no codes in this answer" from "codes that
     # never expire", which would be a far more dangerous reading.
@@ -722,3 +812,18 @@ class PreviewResponse(BaseModel):
     # talking to a node that ignored it (pre-R24 build, extra='ignore') and
     # must treat the answer as no-verdict, never as validated.
     tenant_checked: bool | None = None
+    # ADR-0542 — THE SAME ECHO, ONE CONTRACT LATER, and deliberately modelled on
+    # `tenant_checked` directly above rather than invented.
+    #
+    # Set to "payload" ONLY when this node actually routed on caller-supplied
+    # visitor context. ABSENT otherwise — never "edge" as a claim, exactly as
+    # `tenant_checked` is absent rather than False, because absence is what an
+    # older build produces and the two must be indistinguishable.
+    #
+    # It closes BOTH halves of the version skew, at two different seams:
+    #   * stale NODE  — the worker asked for `payload`, sees no echo, and
+    #     refuses the answer rather than passing off an edge-computed one.
+    #   * stale WORKER — it discarded the body entirely, so the node never saw
+    #     the assertion and emits nothing; the CALLER sees no echo and knows its
+    #     visitor never arrived. Only the caller can catch that half.
+    visitor_context_applied: str | None = None

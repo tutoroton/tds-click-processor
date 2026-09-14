@@ -92,13 +92,62 @@ def test_the_worker_and_both_models_agree_on_the_key_set():
         r"export const VISITOR_REQUIRED_KEYS = \[(.*?)\];", worker_src, re.S
     )
     assert block, "VISITOR_REQUIRED_KEYS not found in the worker source"
-    worker_keys = set(re.findall(r"'([a-z_]+)'", block.group(1)))
 
-    # Calibration: if the regex silently matched nothing, the comparison below
-    # would be `set() == set()` for an empty frozenset and could never fail.
-    assert len(worker_keys) == 11, f"parsed {len(worker_keys)} keys, expected 11"
+    # 🔴 COMMENTS ARE STRIPPED FIRST, and the partner-critic constructed the
+    # exact input that makes this necessary: leave
+    #     // 'referer' dropped 2026-09-20: …
+    # inside the brackets after removing 'referer' from the list, and the naive
+    # findall reports eleven keys INCLUDING referer. Both assertions below then
+    # pass while the worker requires ten and the node eleven — the very
+    # divergence this test exists to catch, hidden by the test itself.
+    body = re.sub(r"/\*.*?\*/", "", block.group(1), flags=re.S)
+    body = re.sub(r"//[^\n]*", "", body)
+    worker_keys = set(re.findall(r"'([A-Za-z0-9_]+)'", body))
+
+    # Calibration, and the denominator is DERIVED rather than hand-typed. A
+    # literal `== 11` is maintained by the same person, on the same day, as the
+    # change that legitimately moves the count — so it stops being independent
+    # exactly when it is needed. The floor is independent: the contract must be
+    # non-trivial, and a regex that matched nothing yields 0 and fails here
+    # rather than comparing two empty sets.
+    assert len(worker_keys) >= 8, f"parsed only {len(worker_keys)} keys — parser broken?"
+    assert len(worker_keys) == len(VISITOR_CONTEXT_REQUIRED_FIELDS), (
+        f"worker declares {len(worker_keys)} keys, node declares "
+        f"{len(VISITOR_CONTEXT_REQUIRED_FIELDS)}"
+    )
 
     assert worker_keys == set(VISITOR_CONTEXT_REQUIRED_FIELDS)
+
+
+def test_the_key_set_parser_is_not_fooled_by_a_comment():
+    """The parser's own calibration — the input the partner-critic constructed.
+
+    A commented-out key inside the array literal must NOT be counted. Without
+    this, the ratchet above reports agreement while the two sides disagree, and
+    it is the only guard either side has.
+
+    Also pinned: a double-quoted or capitalised key is invisible to a
+    single-quoted-lowercase regex. That is why the character class is widened
+    above and why the floor assertion exists — an unparseable list must fail
+    loudly rather than compare two empty sets.
+    """
+    fixture = (
+        "export const VISITOR_REQUIRED_KEYS = [\n"
+        "\t'country', 'region',\n"
+        "\t// 'referer' dropped 2026-09-20: nobody forwards it correctly\n"
+        "\t'city', /* 'timezone' pending */ 'asn',\n"
+        "];"
+    )
+    block = re.search(
+        r"export const VISITOR_REQUIRED_KEYS = \[(.*?)\];", fixture, re.S
+    )
+    body = re.sub(r"/\*.*?\*/", "", block.group(1), flags=re.S)
+    body = re.sub(r"//[^\n]*", "", body)
+    keys = set(re.findall(r"'([A-Za-z0-9_]+)'", body))
+
+    assert keys == {"country", "region", "city", "asn"}
+    assert "referer" not in keys, "a commented-out key was counted as declared"
+    assert "timezone" not in keys, "a block-commented key was counted as declared"
 
 
 def test_the_fixture_matches_the_contract():
@@ -255,6 +304,165 @@ def test_both_response_models_can_carry_the_echo(model):
     """
     assert "visitor_context_applied" in model.model_fields
     assert model.model_fields["visitor_context_applied"].default is None
+
+
+# ---------------------------------------------------------------------------
+# M-S1 (node half) — the HANDLER WIRING, which had no test at all
+# ---------------------------------------------------------------------------
+#
+# 🔴 FOUND BY THE PARTNER-CRITIC, and it is the finding with the worst live
+# consequence in the whole review. Every test above is MODEL-level. The echo is
+# stamped by `_stamp_visitor_context` at each handler's single exit, and that
+# wiring was asserted by nothing: the critic measured that deleting the call
+# from `wall()` or from `preview()`, or stamping unconditionally, or stamping a
+# wrong literal, all left the suite at 2429 green.
+#
+# What that costs in production is total: the WORKER refuses any payload answer
+# that lacks the echo, so an unstamped node yields `context_not_applied` on
+# every request and the whole feature is dark — invisible to CI, and only
+# discoverable by a live probe.
+#
+# These tests drive the real handler and monkeypatch only the BODY function, so
+# they need no Redis and no database. What they exercise is exactly the seam
+# that was uncovered: does the value the handler RETURNS carry the echo.
+
+
+@pytest.mark.parametrize(
+    "handler_name,body_name,response_factory,request_factory",
+    [
+        (
+            "preview",
+            "_preview_body",
+            lambda: PreviewResponse(matched=False, reason="blocked", tenant_checked=True),
+            lambda **kw: PreviewRequest(hostname="x", path="/go", **kw),
+        ),
+        (
+            "wall",
+            "_wall_body",
+            lambda: WallResponse(matched=False, reason="no_wall", tenant_checked=True),
+            lambda **kw: WallRequest(hostname="x", path="/go", **kw),
+        ),
+    ],
+)
+def test_the_handler_stamps_the_echo_on_a_payload_request(
+    monkeypatch, handler_name, body_name, response_factory, request_factory
+):
+    """M-S1 — a payload request comes back from the HANDLER carrying the echo."""
+    import asyncio
+
+    from app import main
+    from app.config import settings
+
+    # The dark gate fires FIRST in both handlers, by design — a disabled
+    # feature must not confirm it exists. Arm both so the request reaches the
+    # exit this test is about.
+    monkeypatch.setattr(settings, "route_preview_enabled", True)
+    monkeypatch.setattr(settings, "offerwall_serve_enabled", True)
+
+    # The edge-secret check is the second gate and is NOT what this test is
+    # about — it authenticates the WORKER, not the tenant, and has its own
+    # tests. Stub it so the request reaches the handler's exit.
+    async def _ok_key(_x_tds_key):
+        return 1
+
+    monkeypatch.setattr(main, "_check_tds_key", _ok_key)
+
+    async def _body(req, *args, **kwargs):
+        return response_factory()
+
+    monkeypatch.setattr(main, body_name, _body)
+
+    req = request_factory(visitor_context_mode="payload", **COMPLETE)
+    resp = asyncio.run(getattr(main, handler_name)(req))
+
+    assert resp.visitor_context_applied == "payload", (
+        "the handler returned an answer with no echo — the worker would refuse "
+        "it and the feature would be dark on every node"
+    )
+
+
+@pytest.mark.parametrize(
+    "handler_name,body_name,response_factory,request_factory",
+    [
+        (
+            "preview",
+            "_preview_body",
+            lambda: PreviewResponse(matched=False, reason="blocked", tenant_checked=True),
+            lambda **kw: PreviewRequest(hostname="x", path="/go", **kw),
+        ),
+        (
+            "wall",
+            "_wall_body",
+            lambda: WallResponse(matched=False, reason="no_wall", tenant_checked=True),
+            lambda **kw: WallRequest(hostname="x", path="/go", **kw),
+        ),
+    ],
+)
+def test_the_handler_does_not_stamp_an_edge_request(
+    monkeypatch, handler_name, body_name, response_factory, request_factory
+):
+    """M-S2 — THE CONTROL, and it is what makes the test above mean something.
+
+    An unconditional stamp would satisfy the payload test and be a lie: it would
+    tell every caller their context was applied, including the front end, which
+    supplied none. The critic measured that mutation as green too.
+    """
+    import asyncio
+
+    from app import main
+    from app.config import settings
+
+    # The dark gate fires FIRST in both handlers, by design — a disabled
+    # feature must not confirm it exists. Arm both so the request reaches the
+    # exit this test is about.
+    monkeypatch.setattr(settings, "route_preview_enabled", True)
+    monkeypatch.setattr(settings, "offerwall_serve_enabled", True)
+
+    # The edge-secret check is the second gate and is NOT what this test is
+    # about — it authenticates the WORKER, not the tenant, and has its own
+    # tests. Stub it so the request reaches the handler's exit.
+    async def _ok_key(_x_tds_key):
+        return 1
+
+    monkeypatch.setattr(main, "_check_tds_key", _ok_key)
+
+    async def _body(req, *args, **kwargs):
+        return response_factory()
+
+    monkeypatch.setattr(main, body_name, _body)
+
+    for kwargs in ({}, {"visitor_context_mode": "edge"}):
+        resp = asyncio.run(getattr(main, handler_name)(request_factory(**kwargs)))
+        assert resp.visitor_context_applied is None, (
+            f"an {kwargs or 'absent-mode'} request was told its context was applied"
+        )
+
+
+def test_the_stamped_value_is_exactly_the_literal_the_worker_checks():
+    """M-S1 — the worker compares `!== 'payload'`, so a near-miss is a 503.
+
+    Stamping "applied", or "PAYLOAD", or True would pass any is-it-set check and
+    fail every live request. Pinning the literal is the cheapest guard against a
+    refactor that "tidies" the value.
+    """
+    from app.main import _stamp_visitor_context
+
+    resp = PreviewResponse(matched=False)
+    req = PreviewRequest(hostname="x", visitor_context_mode="payload", **COMPLETE)
+    assert _stamp_visitor_context(resp, req).visitor_context_applied == "payload"
+
+
+def test_stamping_tolerates_a_none_response():
+    """A handler arm may legitimately return None; stamping must not raise.
+
+    Not hypothetical: the preview path returns `None` for row 3 (no credential),
+    and an exception here would convert that into a 500 on the one path that is
+    supposed to be an ordinary click.
+    """
+    from app.main import _stamp_visitor_context
+
+    req = PreviewRequest(hostname="x", visitor_context_mode="payload", **COMPLETE)
+    assert _stamp_visitor_context(None, req) is None
 
 
 def test_the_echo_defaults_to_absent_not_false():

@@ -1525,8 +1525,17 @@ async def _route_via_campaign(
 #: Query parameter carrying the signed route code. Namespaced `tds_` so it can
 #: never collide with a canonical slot or a client's own parameter — every name
 #: in `RESERVED_SLOTS`/`SUB_SLOTS` is a business name (`source`, `sub1`, ...).
-#: The CF Worker forwards it as an ordinary query parameter, which is why
-#: `services/worker/` needs no change at all (plan I-1).
+#: The CF Worker forwards it as an ordinary query parameter.
+#:
+#: ⚠️ This comment said `services/worker/` "needs no change at all (plan I-1)"
+#: until 2026-09-16, and that was wrong in a way nothing here could show: the
+#: worker applies a COUNT bound as well as a value-length one, and
+#: `boundedQueryParams` used to stop at `MAX_QUERY_PARAMS = 50`. A link carrying
+#: fifty parameters ahead of `tds_rc` therefore dropped the code AT THE EDGE, and
+#: the node routed normally — indistinguishable from a code its own guards
+#: refused. Finding F7; the worker now exempts the routing-control keys (`c` and
+#: this one) from that count, in the single function the click and the preview
+#: both call.
 ROUTE_CODE_PARAM: Final[str] = "tds_rc"
 
 

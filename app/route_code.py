@@ -45,8 +45,18 @@ Wire format — FIXED WIDTH, deliberately::
     code          = b64url_nopad(payload) "." b64url_nopad(HMAC_SHA256(key[kid], payload))
 
 That is **68 ASCII characters**, comfortably inside the CF Worker's
-``MAX_PARAM_VALUE_LENGTH = 512`` — which is why this rides to the node as an
-ordinary query parameter and ``services/worker/`` needs no change at all.
+``MAX_PARAM_VALUE_LENGTH = 512``, so the code rides to the node as an ordinary
+query parameter.
+
+⚠️ This sentence used to end *"and ``services/worker/`` needs no change at all"*,
+and it was wrong in a way the value bound cannot show. The worker applies TWO
+bounds, and the other one is a COUNT: ``boundedQueryParams`` stopped at
+``MAX_QUERY_PARAMS = 50``, so a link carrying fifty parameters before ``tds_rc``
+dropped the code at the edge and the node routed normally — indistinguishable,
+from anywhere, from a code the guards legitimately refused. Fixed 2026-09-16
+(finding F7): the worker now exempts the routing-control keys ``c`` and
+``tds_rc`` from the COUNT bound, in the one function both the click and the
+preview call.
 
 ⚠️ Why fixed-width and not ``identity_token``'s varint layout: every field here
 is a bounded integer, so there is no variable-length member to encode. Dropping

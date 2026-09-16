@@ -2779,6 +2779,11 @@ async def resolve_domain_campaign(r, req: ClickRequest) -> DomainResolution:
 
     Priority order: subdomain > path > param > root (first match wins).
 
+    Matching is CASE-INSENSITIVE on every tier: the hostname, the first
+    path segment and the `?c=` selector are all folded to lowercase before
+    the key lookup, because admin-api force-lowercases a binding value at
+    save (F2, 2026-09-16).
+
     Returns a `DomainResolution`:
       - matched  — `campaign_id` set, `blocked=False`, `binding_id` +
         `binding_alias` parsed from the binding value (F.31 JSON, or
@@ -2804,10 +2809,36 @@ async def resolve_domain_campaign(r, req: ClickRequest) -> DomainResolution:
         return _NO_DOMAIN_MATCH
 
     path = (req.path or "").strip("/")
-    first_segment = path.split("/")[0] if path else ""
+    # F2 (2026-09-16) — fold the MATCH key to lowercase, exactly as the
+    # hostname above already is. The admin-api save path force-lowercases
+    # every binding value (`campaigns/service.py` — `(raw or "").strip()
+    # .lower()`), so a STORED key can never carry an uppercase character.
+    # Comparing an arrival case-SENSITIVELY against it is therefore not a
+    # policy but a branch that cannot succeed: `/Promo` built the key
+    # `domain:{host}:path:Promo`, missed its own campaign, and fell through
+    # to geo — serving a DIFFERENT campaign's offer, not a 404.
+    #
+    # Normalising the MATCHER rather than restricting what may be SAVED is
+    # this repo's established answer to this shape:
+    # `ADR-0105-language-filter-single-english-strip-region-at-match` ruled
+    # exactly that way for the language filter.
+    #
+    # 🔴 Blast radius, read rather than assumed: these two locals feed ONLY
+    # the lookup keys below and `_root_rung_allowed`, which asks about
+    # truthiness alone (`not (first_segment or param_c)`) — a fold cannot
+    # move it. Neither escapes this function, so the click RECORD still
+    # carries what the visitor actually sent: `req.path` and
+    # `req.query_params` are untouched, and the selector is read
+    # independently by `resolution.resolve_slots`.
+    #
+    # Census on staging BEFORE the change (2026-09-16): of 202 bindings,
+    # ZERO carry any uppercase (path 0/48, param 0/134) and ZERO pairs
+    # differ only by case — so the register's worst outcome, two campaigns
+    # distinct by case collapsing into one, has no population to occur on.
+    first_segment = path.split("/")[0].lower() if path else ""
     # F-PARAM-2 — single source of truth for the binding-selector key (shared
     # with resolution.resolve_slots so it's excluded from extras, not leaked).
-    param_c = (req.query_params or {}).get(BINDING_SELECTOR_KEY, "")
+    param_c = (req.query_params or {}).get(BINDING_SELECTOR_KEY, "").lower()
 
     # Split off the first label as the candidate subdomain. A wildcard
     # subdomain needs ≥3 labels (`{label}.{base}` where the base itself

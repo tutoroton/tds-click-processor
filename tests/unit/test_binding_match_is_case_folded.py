@@ -98,8 +98,14 @@ class TestAnUppercaseArrivalReachesItsBinding:
 
 class TestControlsTheFixMustNotMove:
     async def test_CONTROL_an_exact_lowercase_arrival_still_matches(self):
-        """The half that already worked must keep working — the regression the
-        plan names is 'any currently-matching binding stops matching'."""
+        """An arrival that already matched by exact case still matches.
+
+        ⚠️ Narrowed 2026-09-16 after an adversarial review: this docstring used
+        to claim it covered the plan's whole regression clause, 'any currently
+        matching binding stops matching'. It does not — it exercises one
+        arrival shape. What the fold CAN change for already-matching traffic is
+        WHICH TIER answers, and that is pinned separately below.
+        """
         fake = await _seeded_lowercase_bindings()
         res = await resolve_domain_campaign(fake, _req(path="/promo"))
         assert res.campaign_id == CAMP_PATH
@@ -132,6 +138,52 @@ class TestControlsTheFixMustNotMove:
         res = await resolve_domain_campaign(fake, _req())
         assert res.campaign_id == "35"
         assert res.match_tier == "root"
+
+
+class TestTierPrecedenceMovesAndThatIsTHEPOINT:
+    """🔴 The consequence an adversarial review found that my own control had
+    over-claimed away.
+
+    The resolver answers the FIRST populated tier in the order
+    subdomain > path > param > root. Before the fold, `/Promo?c=other` built
+    `path:Promo`, missed, and fell through to the `?c=` tier. After it, the path
+    tier matches and answers FIRST — so the click changes campaign.
+
+    That is the tier order working as designed once the path tier can match at
+    all; it is not a new precedence rule. But it IS a behaviour change on
+    traffic that was already matching something, and shipping it unnamed would
+    have been the omission, not the change.
+
+    Measured on staging over 30 days before shipping, 386 446 events: arrivals
+    carrying BOTH an uppercase first segment and a `?c=` selector — ZERO;
+    answered by the param tier — ZERO; by subdomain — ZERO; by root — 2. The
+    positive controls are non-trivial (241 413 arrivals carry a first segment,
+    2 987 carry a selector), so those zeros mean none, not a broken parse.
+    """
+
+    async def test_an_uppercase_path_now_OUTRANKS_a_matching_param_selector(self):
+        fake = fakeredis.aioredis.FakeRedis(decode_responses=True)
+        await fake.set(f"domain:{HOST}:path:promo", _binding(CAMP_PATH, 901, "promo-path"))
+        await fake.set(f"domain:{HOST}:param:other", _binding(CAMP_PARAM, 902, "other-param"))
+
+        res = await resolve_domain_campaign(
+            fake, _req(path="/Promo", query_params={BINDING_SELECTOR_KEY: "other"}))
+
+        assert res.match_tier == "path", "the path tier answers once it can match"
+        assert res.campaign_id == CAMP_PATH
+
+    async def test_CONTROL_without_a_matching_path_the_selector_still_answers(self):
+        """The other side: where no path binding matches, the `?c=` tier answers
+        exactly as before. So the change above is the path tier becoming
+        reachable, not the param tier being broken."""
+        fake = fakeredis.aioredis.FakeRedis(decode_responses=True)
+        await fake.set(f"domain:{HOST}:param:other", _binding(CAMP_PARAM, 902, "other-param"))
+
+        res = await resolve_domain_campaign(
+            fake, _req(path="/Nowhere", query_params={BINDING_SELECTOR_KEY: "other"}))
+
+        assert res.match_tier == "param"
+        assert res.campaign_id == CAMP_PARAM
 
 
 class TestTheRecordedValueIsUntouched:

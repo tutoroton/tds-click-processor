@@ -149,8 +149,14 @@ def _resolve(
     redis_fail=False,
     ident=None,
     company_id=_COMPANY,
+    action_type="split",
 ):
-    """Drive the REAL resolver; ordinary routing serves `_NORMAL_TARGET`."""
+    """Drive the REAL resolver; ordinary routing serves `_NORMAL_TARGET`.
+
+    `action_type` defaults to the value this harness always hardcoded, so
+    every pre-existing caller is unchanged. It became an axis for F15: the
+    code may only be consulted when the winning flow HAS a target to
+    re-point."""
     ident = ident if ident is not None else FakeIdentRedis()
     r = FakeRoutingRedis(
         hashes=hashes if hashes is not None
@@ -177,7 +183,7 @@ def _resolve(
              patch.object(settings, "route_code_active_kid", _ACTIVE_KID), \
              patch.object(settings, "returning_uid_ttl_seconds", 1000):
             return await router._resolve_action_with_sticky(
-                r, {"action_type": "split"}, _click(code), "35",
+                r, {"action_type": action_type}, _click(code), "35",
                 source_mappings={}, campaign_mappings={},
                 sticky_active=sticky_active,
                 returning_flow_won=returning_flow_won,
@@ -189,6 +195,77 @@ def _resolve(
 
     result, status = asyncio.run(_runner())
     return result, status, r, ident
+
+
+class TestF15ACodeMayNotOverrideARefusal:
+    """F15 — a code names a TARGET; only a target-bearing action has one.
+
+    Measured on staging 2026-09-15, campaign 347, two clicks 2.4 s apart: the
+    same `block` flow won the cascade both times, and the second — carrying a
+    valid signed code — was served offer 176 with
+    `target_selection_path='route_code'`. An operator's refusal became a serve.
+
+    The harness patches `execute_action`, so `_NORMAL_TARGET` stands for
+    "whatever the winning flow would have done". That is the right granularity:
+    the question F15 asks is WHICH BRANCH DECIDED, not what a block executor
+    emits. A `block` winner must reach its own action; the code must not
+    short-circuit it.
+    """
+
+    def test_a_block_winner_is_NOT_overridden_by_a_valid_code(self):
+        result, status, _, _ = _resolve(code=_sign(), action_type="block")
+        assert result["target_id"] == _NORMAL_TARGET, (
+            "the code short-circuited the flow's own action — this is the "
+            "measured defect"
+        )
+        assert result["target_id"] != str(_CODED_TARGET)
+        assert result.get("target_selection_path") != "route_code"
+
+    def test_a_redirect_winner_is_NOT_overridden_either(self):
+        """The plan graded redirect as DEFER on a reading rather than a live
+        cell. It is decided here by the same rule, and named in the code as a
+        policy boundary: a redirect sends the visitor somewhere that is not a
+        target at all, so there is nothing for a code to re-point."""
+        result, status, _, _ = _resolve(code=_sign(), action_type="redirect")
+        assert result["target_id"] == _NORMAL_TARGET
+        assert result["target_id"] != str(_CODED_TARGET)
+
+    def test_CONTROL_an_offer_winner_still_honours_the_same_code(self):
+        """🔴 The control that stops this becoming a feature kill. The SAME
+        signed code, changing only the winner's action_type, must still serve
+        the coded target."""
+        result, status, _, _ = _resolve(code=_sign(), action_type="offer")
+        assert result["target_id"] == str(_CODED_TARGET)
+
+    def test_CONTROL_a_split_winner_still_honours_the_same_code(self):
+        result, status, _, _ = _resolve(code=_sign(), action_type="split")
+        assert result["target_id"] == str(_CODED_TARGET)
+
+    def test_CONTROL_an_offerwall_winner_still_honours_the_same_code(self):
+        """`offerwall` is the third member of PIN_BEARING_ACTION_TYPES. Pinned
+        so a future edit to that tuple cannot silently drop a kind that the
+        route-code feature depends on."""
+        result, status, _, _ = _resolve(code=_sign(), action_type="offerwall")
+        assert result["target_id"] == str(_CODED_TARGET)
+
+    def test_the_gate_reuses_the_STICKY_membership_rather_than_a_copy(self):
+        """🔴 The agreement is a mechanism, not a promise.
+
+        F15 and the sticky pin ask the same question — does this action have a
+        target? If a future edit gives the code path its own list, the two
+        drift and the defect returns on whichever one is forgotten. Assert the
+        gate is written against the shared tuple, and that the tuple still
+        holds exactly the three target-bearing kinds.
+        """
+        import inspect
+
+        src = inspect.getsource(router._resolve_action_with_sticky)
+        assert "code_eligible" in src, "the F15 gate is missing"
+        assert "PIN_BEARING_ACTION_TYPES" in src, (
+            "the gate no longer reads the shared membership — a private copy "
+            "will drift from the sticky pin's"
+        )
+        assert set(router.PIN_BEARING_ACTION_TYPES) == {"offer", "split", "offerwall"}
 
 
 class TestValidCodeIsHonoured:

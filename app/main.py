@@ -3202,7 +3202,42 @@ async def _preview_body(req: PreviewRequest) -> PreviewResponse:
     # an unbindable code: no code degrades to ordinary routing, which is the
     # feature simply not applying, while an unbindable one is the defect.
     preview_campaign_id = _to_int_or_none(result.get("campaign_id"))
-    if route_code.is_enabled() and preview_campaign_id:
+
+    # F14 — MINT ONLY WHERE THE CLICK WILL ACTUALLY CONSULT THE CODE.
+    #
+    # The code is read inside `_resolve_action_with_sticky`, which is reached
+    # only from the FLOW-CASCADE branch. The LEGACY SPLIT (`router.py` Stage 7-8)
+    # never looks at it — it re-rolls its own weighted pick per click. So a code
+    # minted for a legacy-served campaign is a promise the click path cannot
+    # keep, and worse, it is INVISIBLE: the click routes normally and records
+    # `split_weighted` / `matched_legacy_split`, which is exactly what a code the
+    # guards legitimately refused also looks like.
+    #
+    # Measured on deployed staging: the preview promised offer 444 / target 440
+    # with a signed code, and 12 real clicks carrying that exact code landed
+    # 8 on 440 and 4 on 441. Not one row said `route_code`.
+    #
+    # An ALLOW-LIST on `flow_cascade`, deliberately, not a deny-list on
+    # `legacy_split`. The router sets exactly three `route_via` values today
+    # (`flow_cascade`, `flow_cascade_block`, `legacy_split`); a fourth added
+    # later would silently inherit a mint under a deny-list. The other two are
+    # already unreachable at this point — a block returns `blocked` and is
+    # answered above, and a redirect has no positive offer id so it is answered
+    # `unidentified_target` — so today this changes behaviour for `legacy_split`
+    # alone while staying correct if that stops being true.
+    #
+    # NOT chosen: teaching the legacy split to consult the code. That is the
+    # larger change, it touches the routing hot path, and this fix does not have
+    # to. Symmetry is not a reason to take the more dangerous option.
+    #
+    # THE ABSENCE OF THE CODE IS THE SIGNAL, and it needs no new field: a code
+    # present means "this exact target is pinned for the click", a code absent
+    # means "this is our prediction, not a promise". Every caller already has to
+    # handle the absent case, because the ring can be disarmed.
+    route_via = (result.get("timing") or {}).get("route_via")
+    code_consultable = route_via == "flow_cascade"
+
+    if route_code.is_enabled() and preview_campaign_id and code_consultable:
         ttl = settings.route_code_ttl_seconds
         code = route_code.sign(
             company_id=company_id,

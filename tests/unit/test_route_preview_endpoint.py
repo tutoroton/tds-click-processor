@@ -514,3 +514,140 @@ def test_preview_query_params_coerce_exactly_like_a_click(enabled):
         PreviewRequest(hostname=HOST, query_params=raw).query_params
         == ClickRequest(click_id="x1", query_params=raw).query_params
     )
+
+
+# --------------------------------------------------------------------------- #
+# F14 — do not mint a promise the click path cannot keep                       #
+# --------------------------------------------------------------------------- #
+# The route code is consulted inside `_resolve_action_with_sticky`, reached ONLY
+# from the flow-cascade branch. The LEGACY SPLIT (router Stage 7-8) re-rolls its
+# own weighted pick per click and never looks at a code.
+#
+# Measured on deployed staging before the fix: the preview promised offer 444 /
+# target 440 with a signed code, and 12 real clicks carrying that exact code
+# landed 8 on 440 and 4 on 441 — every row `split_weighted` /
+# `matched_legacy_split`, not one `route_code`. The promise was invisible in both
+# directions: the landing page believed it, and the click record looked exactly
+# like a code the guards had legitimately refused.
+
+LEGACY_OFFER = 2
+LEGACY_TARGET = 20
+
+
+async def _seed_legacy_split_route(r) -> None:
+    """A campaign with NO FLOWS AT ALL, served by the legacy split.
+
+    🔴 The absence of `campaign:{id}:flows` IS the fixture, and it is also the
+    discriminator: with no flow hash anywhere the cascade cannot produce a
+    result, so a MATCHED answer here can only have come from Stage 7-8. That is
+    why every test below asserts `matched is True` — without it they would pass
+    just as happily against a fixture that routes nothing, which is the vacuous
+    green this whole file exists to refuse.
+    """
+    await r.set(
+        f"domain:{HOST}:root",
+        json.dumps({"campaign_id": CAMPAIGN, "binding_id": 1,
+                    "binding_alias": "root"}),
+    )
+    await r.sadd("campaigns:active", CAMPAIGN)
+    await r.hset(f"campaign:{CAMPAIGN}", mapping={
+        "company_id": str(COMPANY), "priority": "0", "weight": "100"})
+    # Stage 7 — `select_offer` reads the split hash first.
+    await r.hset(f"split:{CAMPAIGN}", mapping={str(LEGACY_OFFER): "100"})
+    await r.hset(f"offer:{LEGACY_OFFER}", mapping={
+        "name": "Legacy Split Offer",
+        "icon_url": "https://cdn.example/legacy.png",
+        "company_id": str(COMPANY),
+        "url": "https://advertiser.example/legacy",
+        "payout_value": "30", "payout_currency": "USD", "has_targets": "1"})
+    await r.sadd(f"offer:{LEGACY_OFFER}:targets", str(LEGACY_TARGET))
+    await r.hset(f"offer_target:{LEGACY_TARGET}", mapping={
+        "url": "https://advertiser.example/legacy?c={click_id}",
+        "is_default": "1", "availability": "active",
+        "offer_id": str(LEGACY_OFFER), "criteria": "[]", "priority": "0"})
+
+
+def test_the_legacy_fixture_really_takes_the_legacy_branch(enabled):
+    """The instrument before the claim.
+
+    If this fixture quietly routed through the cascade, every F14 test below
+    would be measuring the wrong branch and reporting success. Asserted against
+    the router's own `route_via`, which is the same field `_decision_reason`
+    turns into `matched_legacy_split` on a real click.
+    """
+    store = _fake()
+    _run(_seed_legacy_split_route(store.client()))
+
+    async def _drive():
+        from app.models import ClickRequest
+
+        # A FRESH client for THIS loop — hazard 10: fakeredis binds a client to
+        # the loop that first drives it while the data lives on the server, so
+        # reusing the seeding client here raises "bound to a different event
+        # loop". Measured, once, right here.
+        conn = store.client()
+
+        async def _get_redis():
+            return conn
+
+        with patch.object(router, "get_redis", _get_redis):
+            return await router.route(ClickRequest(
+                click_id="probe-legacy", hostname=HOST, path="/",
+                country="US",
+                user_agent="Mozilla/5.0 (iPhone; CPU iPhone OS 17_2)",
+            ))
+
+    result = _run(_drive())
+
+    assert result is not None
+    assert result["timing"]["route_via"] == "legacy_split"
+
+
+def test_a_legacy_split_campaign_is_answered_without_a_code(enabled):
+    """F14. The click will be served by a branch that never reads a code, so
+    minting one would be a promise nothing can keep."""
+    store = _fake()
+    _run(_seed_legacy_split_route(store.client()))
+
+    body = _post(store).json()
+
+    assert body["matched"] is True          # not a vacuous pass
+    assert body["offer_target_id"] == LEGACY_TARGET
+    assert body["route_code"] is None
+    assert body["expires_at"] is None
+
+
+def test_the_legacy_answer_still_names_the_offer(enabled):
+    """The FEATURE is not deleted, only its promise. A landing page still gets
+    everything it needs to advertise the offer — the absence of the code is the
+    in-band signal that this is a prediction rather than a pin, and every caller
+    already handles that case because the signing ring can be disarmed."""
+    store = _fake()
+    _run(_seed_legacy_split_route(store.client()))
+
+    body = _post(store).json()
+
+    assert body["matched"] is True
+    assert body["offer_id"] == LEGACY_OFFER
+    assert body["offer_name"] == "Legacy Split Offer"
+    assert body["offer_icon_url"] == "https://cdn.example/legacy.png"
+
+
+def test_a_flow_served_campaign_still_gets_its_code(enabled):
+    """The control, and it must be GREEN on both sides of the fix.
+
+    A guard that also silenced the flow-cascade path would close F14 by killing
+    the feature. This is the assertion that would have caught that, and it is
+    deliberately a near-duplicate of
+    `test_a_matched_preview_returns_the_decision_and_a_code` — stated again here
+    so the F14 block carries its own negative control instead of depending on a
+    reader noticing one forty lines up.
+    """
+    store = _fake()
+    _run(_seed_domain_route(store.client()))
+
+    body = _post(store).json()
+
+    assert body["matched"] is True
+    assert body["route_code"] is not None
+    assert body["expires_at"] > 0

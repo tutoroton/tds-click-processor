@@ -1888,6 +1888,52 @@ async def _resolve_action_with_sticky(
         # payload (`if wall_only and not decoded.is_wall_claim`), so the kind
         # cannot be spoofed by a caller. With no returning winner the argument
         # is False and this is byte-identical to before.
+        # 🔴 F15 (2026-09-16) — A CODE NAMES A TARGET, SO ONLY AN ACTION THAT
+        # HAS ONE MAY BE RE-POINTED BY IT.
+        #
+        # Measured on staging 2026-09-15, campaign 347, two clicks 2.4s
+        # apart: the SAME `block` flow won the cascade both times, and the
+        # second — carrying a valid signed code — was served offer 176 with
+        # `target_selection_path='route_code'`. An operator's refusal became
+        # a serve. Nothing between the cascade and the line below asked what
+        # KIND of action had won.
+        #
+        # A `block` is the operator's decision about THIS visitor, and a
+        # `redirect` sends them somewhere that is not a target at all —
+        # neither is a thing a code may re-point. `PIN_BEARING_ACTION_TYPES`
+        # is the membership the STICKY PIN already uses for exactly this
+        # question, and a code carries `t : offer_target_id` — the same class
+        # of claim. Reused rather than re-derived, so the two cannot drift.
+        #
+        # An allow-list, not `!= "block"`: a deny-list grows a hole every
+        # time an action type is added, and this one is closed by
+        # construction.
+        #
+        # 🔴 NARROWED BY CLAIM KIND, NOT SWITCHED OFF — and the first draft of
+        # this fix got that wrong. Refusing the code outright when the winner is
+        # not target-bearing ALSO refused a v3 WALL claim, and that broke
+        # `test_the_SAME_tile_on_a_STANDARD_campaign_names_the_ORDINARY_flow`,
+        # whose ordinary flow is a `redirect`. The repo had already decided that
+        # case in the tile's favour and pinned it; the draft read it as an open
+        # DEFER. The regression control is what caught it.
+        #
+        # So the term rides on `wall_only`, which is enforced INSIDE the
+        # resolver against the MAC-verified payload (`if wall_only and not
+        # decoded.is_wall_claim`) and therefore cannot be spoofed by a caller:
+        #
+        #   winner has a target  ⇒ unchanged; both kinds are consulted.
+        #   winner has none      ⇒ a v2 PREVIEW code is refused (the F15 fix);
+        #                          a v3 WALL claim keeps the power it already
+        #                          had (ADR-0515 / D3, «Сильніша плитка»).
+        #
+        # That is the same move ADR-0515 made on the returning guard: NARROW by
+        # kind, never delete. A preview code is an anonymous guess about a
+        # visitor (ADR-0454) and has no business overriding an operator's
+        # refusal. A tile is a human choosing an offer they were shown, and
+        # whether a `block` should outrank THAT is an owner question this change
+        # deliberately does not answer — it is queued, not decided here.
+        code_eligible = (flow.get("action_type") or "") in PIN_BEARING_ACTION_TYPES
+        code_only_if_wall = returning_flow_won or not code_eligible
         code_result = await _route_code_target(
             r, req, campaign_id,
             company_id=company_id,
@@ -1896,7 +1942,7 @@ async def _resolve_action_with_sticky(
             build_url_fn=_build_url,
             source_mappings=source_mappings,
             campaign_mappings=campaign_mappings,
-            wall_only=returning_flow_won,
+            wall_only=code_only_if_wall,
             trace=trace,
         )
         # Pop BEFORE the result travels anywhere (see the stamp site).

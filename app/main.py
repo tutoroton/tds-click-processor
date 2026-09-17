@@ -1350,13 +1350,34 @@ def _build_extra_params(attribution: dict | None, query_params: dict) -> dict:
     # never survive into `extra_params` and masquerade as real rule provenance.
     extras.pop("_param_rules", None)
     # E3 / F4 — the reserved `tds_*` routing-control family, RECORDED then
-    # STRIPPED. Same two-path asymmetry as `binding_selector` directly above:
-    # `resolve_slots` drops these on the RESOLVED path, while the no-match /
-    # pre-campaign branch rebuilds extras from the RAW query params and
-    # re-admits them. Measured on deployed staging 2026-09-17 — **1510 clicks
-    # in 30 days out of 386 289** carry a `tds_` key, 969 of them the exact
-    # pair `landing_url,tds_rc`. The mechanism is unconditional; the rate only
-    # reflects how often a coded link misses.
+    # STRIPPED. Measured on deployed staging 2026-09-17 — **1510 clicks in 30
+    # days out of 386 289** carry a `tds_` key, 969 of them the exact pair
+    # `landing_url,tds_rc`.
+    #
+    # 🔴 CORRECTED 2026-09-17 BY THE LIVE OBSERVATION, AND THE DEFECT IS WIDER
+    # THAN THIS COMMENT FIRST CLAIMED. It said — as did #5133's body and the
+    # test docstring — that this was the SAME two-path asymmetry as
+    # `binding_selector` directly above: dropped by `resolve_slots` on the
+    # RESOLVED path, re-admitted only by the no-match / pre-campaign branch.
+    # **False. `tds_*` leaks on BOTH paths.** `resolve_slots` (resolution.py)
+    # drops exactly four things from extras — a key in `examined_keys`, a key
+    # in `CANONICAL_SLOTS`, `BINDING_SELECTOR_KEY` (whose own comment reads
+    # "only `c` is removed"), and a `None` value. A `tds_` key is none of the
+    # four, so it survives resolution untouched.
+    #
+    # Proven, not inferred: the RED-baseline click of 2026-09-17 10:48:28
+    # carries `scope: company` — a flow WON, so it took the RESOLVED path —
+    # and `tds_rc` sat in its `extra_params` all the same. The
+    # `binding_selector` precedent one block up is real; it is simply not
+    # about this key. That is *a NAME is not a MECHANISM* (rule
+    # `entity-boundaries`) applied to a neighbouring BUG rather than a
+    # neighbouring entity — the story was carried three lines, unmeasured.
+    #
+    # It re-reads the census too: those 969 `landing_url,tds_rc` rows are
+    # ordinary RESOLVED clicks, not rare no-match ones, which is why the
+    # number is that large. **Nothing about the code below changes** — the
+    # strip runs on the merged `extras` whichever branch produced them, so the
+    # fix was always wider than its own PR described.
     #
     # 🔴 RECORD FIRST, AND NEVER STRIP BLIND. `extra_params.tds_rc` is today the
     # ONLY trace that a route code was presented and REFUSED: a refused code

@@ -9,10 +9,22 @@ MEASURED FIRST, on deployed staging 2026-09-17 (`tds.events`, 30 days):
 and the key-name census names the shape exactly — `landing_url,tds_rc` at 969
 rows. So this is a measurement, not a suspicion.
 
-WHY IT LEAKS, and why it is the same defect as `binding_selector` one line
-above: `resolve_slots` drops these on the RESOLVED path, while the no-match /
-pre-campaign branch rebuilds extras from the RAW query params and re-admits
-them. One rule, two paths, covered on one.
+WHY IT LEAKS — CORRECTED 2026-09-17 BY THE LIVE OBSERVATION. This docstring
+and #5133 both said it was the same two-path asymmetry as `binding_selector`:
+dropped by `resolve_slots` on the RESOLVED path, re-admitted only by the
+no-match / pre-campaign branch. **False. `tds_*` leaks on BOTH paths.**
+`resolve_slots` drops exactly four things from extras — a key in
+`examined_keys`, a key in `CANONICAL_SLOTS`, `BINDING_SELECTOR_KEY` ("only `c`
+is removed"), and a `None` value — and a `tds_` key is none of them.
+
+The live RED baseline settles it: that click carried `scope: company`, i.e. a
+flow won and it took the RESOLVED path, and `tds_rc` leaked anyway. So the 969
+`landing_url,tds_rc` rows are ordinary resolved clicks, not rare misses — which
+is why the count is that large.
+
+Consequence for THIS FILE, and the reason the correction belongs here:
+`TestTheResolvedPath` below was written as the defensive extra. It is the MAIN
+path. Not one assertion changes — only what a reader should conclude from it.
 
 🔴 WHY NOT STRIP BLIND. `extra_params.tds_rc` is today the ONLY trace that a
 route code was presented and REFUSED — a refused code leaves

@@ -1023,6 +1023,22 @@ def _decision_reason(result: dict, timing: dict, attr: dict) -> str:
         trace = attr.get("routing_trace") or {}
         # All-unavailable (availability floor excluded the flow[s]) → terminal
         # fallback; otherwise a plain no-flow + no-legacy-offer dead-end.
+        #
+        # F2i step 2 (ADR-0561) — a WALL campaign whose walls admitted nobody
+        # and which HAS a resolvable fallback is the same OUTCOME by a different
+        # MECHANISM, so it reports the same reason and keeps its own trace key.
+        # Two keys, not one: `availability_excluded` means the availability
+        # floor excluded the flows, and saying that about a wall that simply
+        # admitted nobody would be a false statement about which machinery ran.
+        # The reason names the outcome; the trace names the cause.
+        #
+        # Deliberately NOT a new enum member: `decision_reason` is closed and
+        # lives in FIVE places (admin-api `filter_fields.DECISION_REASONS` + its
+        # vendored json, stats-service `dimensions`, and both routing-model docs
+        # pages), pinned by `test_dims_parity_with_admin_api`. Reusing an
+        # existing member is what lets step 2 ship without touching any of them.
+        if trace.get("wall_terminal_fallback"):
+            return "terminal_fallback"
         return "terminal_fallback" if trace.get("availability_excluded") else "no_flow_no_offer"
     if rv == "legacy_split":
         # F2i step 1 — a wall campaign that fell through to the legacy split is

@@ -1349,6 +1349,64 @@ async def _route_via_campaign(
             ),
         )
 
+    # F2i step 2 — THE SWITCH, and it is GATED ON A FALLBACK ACTUALLY
+    # RESOLVING. ADR-0561.
+    #
+    # A wall campaign that reaches Stage 7 had a routing intent (its walls) and
+    # a filter blocked it, so serving the campaign-wide legacy split hands the
+    # visitor an offer the routing layer already excluded, chosen with no
+    # criteria at all. `router.py`'s own v2 C2 branch already rules that shape
+    # one level down: matched-but-unroutable serves THIS campaign's
+    # terminal_fallback rather than re-serving through Stage 7-8.
+    #
+    # 🔴 WHY THE GATE IS NOT OPTIONAL. Ungated, this is a DEGRADATION, and it
+    # was measured before it was written: `terminal_fallback` already fires on
+    # campaign 347 and what it served was a dead end (`offer_id 0`,
+    # `routing_status no_offer`), because ALL EIGHT offerwall-family campaigns
+    # have `fallback_url` NULL — and 214 of 285 campaigns overall do. Ungated
+    # this would convert 290 clicks across 29 countries in one week, on campaign
+    # 347 alone, from "an offer chosen badly" into "no offer at all".
+    # `_resolve_fallback_template(None, ...) -> None` is the precise
+    # discriminator "did the admin configure one", exactly as the CF-OBS-1
+    # branch below uses it. So: a wall campaign WITH a resolvable fallback gets
+    # it; one WITHOUT keeps today's behaviour rather than gaining a dead end.
+    #
+    # DARK BY CONSTRUCTION, with no flag: zero campaigns qualify today, so this
+    # branch cannot be taken on the current fleet. It activates per campaign, as
+    # operators opt in — which is also why F2i step 3 makes admin-api warn.
+    #
+    # 🔴 `_effective_flow_family`, NEVER the raw `flow_family` — the same reason
+    # step 1 gives one screen below: with wall delivery off the node acts on
+    # every campaign as 'standard', `first` flows ARE evaluated, and this
+    # fall-through is the ordinary pre-existing one, which this must not touch.
+    #
+    # NO NEW ENUM MEMBER, ANYWHERE. `decision_reason` is a closed enum living in
+    # FIVE places (admin-api filter_fields + its vendored json, stats-service
+    # dimensions, and both routing-model docs pages), and `routing_status` has a
+    # vocabulary of its own. So this reuses BOTH: `timing["result"] = "no_offer"`
+    # exactly as the CF-OBS-1 branch does, and a trace key that
+    # `main._decision_reason` maps onto the EXISTING `terminal_fallback`.
+    # ⚠️ And it is a SEPARATE key from `availability_excluded` on purpose: that
+    # one means the availability floor excluded the flows, which is NOT what
+    # happened here. Reusing it would make the row state a mechanism that did
+    # not run — the same class of false statement step 1's comment refuses.
+    if _effective_flow_family(campaign) == "offerwall":
+        _wall_own_fallback = _resolve_fallback_template(
+            campaign.get("fallback_url"), req, campaign_id,
+            source_mappings, campaign_mappings, identity_macros, param_fills,
+        )
+        if _wall_own_fallback:
+            _wt = attribution.get("routing_trace")
+            if _wt is not None:
+                _wt["wall_terminal_fallback"] = True
+            timing["route_total_ms"] = _ms_since(t_branch)
+            timing["result"] = "no_offer"
+            return _non_routed_result(
+                campaign_id, attribution, timing,
+                binding_id=binding_id, binding_alias=binding_alias,
+                fallback_url=_wall_own_fallback,
+            )
+
     # Stage 7 — legacy fallback (no flow matched).
     t0 = time.perf_counter()
     try:

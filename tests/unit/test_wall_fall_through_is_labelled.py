@@ -7,10 +7,25 @@ assertion in this file is not the new value — it is
 `test_the_SERVE_is_byte_identical_it_is_a_LABEL_only`. A step-1 change that
 altered routing would be step 2 arriving early and unmeasured.
 
-🔴 THIS FILE IS ALSO THE RED BASELINE FOR STEP 2. When the wall campaign is
-switched to `terminal_fallback` (gated on a resolvable `fallback_url`), the
-serve assertions here MUST go red and be updated in that lane, deliberately.
-A step-2 change that leaves this file green did not change what it claims to.
+🔴 THIS FILE IS THE RED BASELINE FOR STEP 2 — AND ITS FIRST PREDICTION WAS
+WRONG, which is corrected here in step 2's own lane rather than left standing.
+
+It said the serve assertions "MUST go red" when step 2 lands. **They do not, and
+they must not.** That sentence was written while step 2 was still imagined
+UNGATED; ADR-0561 added the gate afterwards, on a measurement — all EIGHT
+offerwall-family campaigns have `fallback_url` NULL, so an ungated switch would
+have handed every one of them a dead end.
+
+This fixture's campaign has no `fallback_url`. It is therefore the
+`wall · delivery ON · NO fallback` case, which step 2 deliberately leaves
+UNCHANGED — so this file staying green IS the gate working, and step 2 asserts
+exactly that in `test_a_wall_WITHOUT_a_fallback_is_UNCHANGED`
+(`test_wall_terminal_fallback_is_gated.py`). Verified rather than argued: the
+whole unit suite was diffed against an unmodified extract of `origin/stage` and
+the failure sets were identical, so no test anywhere changed state.
+
+What WOULD make this file go red is giving its campaign a `fallback_url` — and
+that is a different fixture, not a regression in this one.
 
 THE THREE ARMS, and why each exists:
 

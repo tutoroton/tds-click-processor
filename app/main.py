@@ -46,7 +46,7 @@ from app.diag import (
     _is_valid_test_id,
     traces_sampler as diag_traces_sampler,
 )
-from app import history, identity, route_code
+from app import history, identity, mint_quota, route_code
 from app.models import (
     ClickRequest,
     ClickResponse,
@@ -94,6 +94,8 @@ from app.telemetry import (
     OP_STREAM_ENTRY_LIMIT,
     OP_STREAM_WRITE_FAILED,
     OP_WALL_TILE_CODES_UNSIGNED,
+    OP_MINT_QUOTA_PREVIEW_WITHHELD,
+    OP_MINT_QUOTA_WALL_WITHHELD,
     OP_WATERMARK_SPILL,
     capture_op_exc_throttled,
     capture_op_msg,
@@ -2926,12 +2928,45 @@ async def _wall_body(
         tiles = await _viable_tiles(r, winner, allowed_avail)
         if tiles:
             wall_id = _to_int_or_none(winner.get("_id"))
-            expires_at = _mint_tile_codes(
-                tiles,
-                company_id=_to_int_or_none(attribution.get("company_id")),
-                campaign_id=int(campaign_id),
-                wall_id=wall_id,
-            )
+            # N1 — the per-campaign ISSUANCE budget, charged in CODES (one per
+            # tile) BEFORE anything is signed. Placed here and not at admission
+            # on purpose: the bulkhead above must keep costing "one counter read
+            # and nothing else", and this touches Redis.
+            #
+            # 🔴 A refusal WITHHOLDS THE CODES AND STILL SERVES THE WALL. That
+            # is not a softening — it is the state `_mint_tile_codes` already
+            # returns when the signing ring is unarmed, and its docstring calls
+            # it "the feature not applying, which is a state the system already
+            # handles". Raising instead would convert a bounded capability into
+            # a failed request, and the Worker would then try the SECOND node,
+            # which hands the caller a second budget: the precise thing this
+            # bound exists to stop.
+            try:
+                await mint_quota.charge_wall(
+                    _to_int_or_none(campaign_id), len(tiles),
+                )
+            except mint_quota.MintQuotaExceeded as exc:
+                expires_at = None
+                try:
+                    capture_op_msg_throttled(
+                        OP_MINT_QUOTA_WALL_WITHHELD, campaign_id,
+                        "wall served WITHOUT tile codes: this campaign has "
+                        "spent its route-code issuance budget for the window "
+                        "(TDS_MINT_QUOTA_WALL_CODES_PER_WINDOW). The catalogue "
+                        "is unaffected - its tiles route ordinarily.",
+                        campaign_id=campaign_id, wall_id=wall_id,
+                        tiles=len(tiles), cap=exc.cap,
+                        window_seconds=exc.window_seconds,
+                    )
+                except Exception:  # pragma: no cover - reporting never gates
+                    pass
+            else:
+                expires_at = _mint_tile_codes(
+                    tiles,
+                    company_id=_to_int_or_none(attribution.get("company_id")),
+                    campaign_id=int(campaign_id),
+                    wall_id=wall_id,
+                )
             return WallResponse(
                 matched=True,
                 wall_id=wall_id,
@@ -3296,15 +3331,44 @@ async def _preview_body(req: PreviewRequest) -> PreviewResponse:
     code_consultable = route_via == "flow_cascade"
 
     if route_code.is_enabled() and preview_campaign_id and code_consultable:
-        ttl = settings.route_code_ttl_seconds
-        code = route_code.sign(
-            company_id=company_id,
-            campaign_id=preview_campaign_id,
-            offer_id=offer_id,
-            offer_target_id=target_id,
-            ttl_seconds=ttl,
-        )
-        expires_at = int(time.time()) + ttl
+        # N1 — ONE code, so ONE unit, charged to the CREDENTIAL before signing.
+        # A preview without a key never reaches here with anything to bind (the
+        # Worker returns no verdict), so the credential is the honest principal
+        # on this path, unlike the wall's.
+        #
+        # 🔴 A refusal leaves `code` as None and the preview STILL ANSWERS. That
+        # is the documented safe default for this field - config.py's own note
+        # says "`/preview` still answers, with `route_code: null`". The landing
+        # page loses the ability to pin the route, not the answer, and it is the
+        # same shape as a node whose signing ring is simply not armed.
+        withheld = False
+        try:
+            await mint_quota.charge_preview(req.preview_key_hash)
+        except mint_quota.MintQuotaExceeded as exc:
+            withheld = True
+            try:
+                capture_op_msg_throttled(
+                    OP_MINT_QUOTA_PREVIEW_WITHHELD,
+                    req.preview_key_hash or "no-key",
+                    "preview answered WITHOUT a route code: this credential "
+                    "has spent its issuance budget for the window "
+                    "(TDS_MINT_QUOTA_PREVIEW_CODES_PER_WINDOW). The route "
+                    "prediction itself is unaffected.",
+                    campaign_id=preview_campaign_id, cap=exc.cap,
+                    window_seconds=exc.window_seconds,
+                )
+            except Exception:  # pragma: no cover - reporting never gates
+                pass
+        if not withheld:
+            ttl = settings.route_code_ttl_seconds
+            code = route_code.sign(
+                company_id=company_id,
+                campaign_id=preview_campaign_id,
+                offer_id=offer_id,
+                offer_target_id=target_id,
+                ttl_seconds=ttl,
+            )
+            expires_at = int(time.time()) + ttl
 
     # Edge-preview P2.5 (GTD-D151) — the offer's human-facing NAME and ICON,
     # read from the synced offer hash. The old note here said "the name and

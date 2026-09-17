@@ -1485,6 +1485,37 @@ async def _route_via_campaign(
     timing["target_resolved"] = target_url is not None
     timing["route_via"] = "legacy_split"
 
+    # F2i step 1 — MAKE IT VISIBLE. A LABEL, not a routing change: every line
+    # above and below is untouched, and the click is served exactly as before.
+    #
+    # WHAT IT MARKS. Reaching Stage 7 on a campaign the node is ACTING on as
+    # 'offerwall' means the wall pool produced no winner for this visitor, so
+    # the campaign-wide legacy split served instead — an offer chosen with no
+    # criteria at all, from the very flows the cascade excluded by family. On a
+    # standard campaign the same fall-through is a last resort reached AFTER
+    # rules were read and missed; on a wall campaign the rules were never read,
+    # so this path can be up to 100% of the campaign's traffic. Same mechanism,
+    # different cause and different frequency — and one `decision_reason` for
+    # both makes that difference unmeasurable.
+    #
+    # 🔴 `_effective_flow_family`, NEVER the raw `flow_family` already on the
+    # trace. The raw value says what the campaign CLAIMS; with
+    # `wall_delivery_enabled` off the node acts on every campaign as 'standard',
+    # `first` flows ARE evaluated, and this fall-through is the ordinary
+    # pre-existing one. Labelling THAT as wall-caused would be a false
+    # statement about which mechanism served the click — the same class of
+    # error the `domain_blocked` comment in `_decision_reason` was written for.
+    # It also keeps the dark flag honest: flag off ⇒ this key is never set ⇒
+    # byte-identical to the node before this change.
+    #
+    # NOT a new enum value on the trace: a bare bool on a dict that is already
+    # allocated and already stamped onto attribution, so no round trip and no
+    # per-click cost. It is read once, in `main._decision_reason`.
+    if _effective_flow_family(campaign) == "offerwall":
+        _wall_trace = attribution.get("routing_trace")
+        if _wall_trace is not None:
+            _wall_trace["wall_fell_to_legacy_split"] = True
+
     timing["route_total_ms"] = _ms_since(t_branch)
     timing["result"] = result_label
 

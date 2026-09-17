@@ -1025,6 +1025,20 @@ def _decision_reason(result: dict, timing: dict, attr: dict) -> str:
         # fallback; otherwise a plain no-flow + no-legacy-offer dead-end.
         return "terminal_fallback" if trace.get("availability_excluded") else "no_flow_no_offer"
     if rv == "legacy_split":
+        # F2i step 1 — a wall campaign that fell through to the legacy split is
+        # its OWN reason, not the generic one. The discriminator is stamped by
+        # `router._route_via_campaign` and reflects the EFFECTIVE flow family,
+        # so a node with wall delivery off never produces this value.
+        #
+        # Three causes reach here and the label deliberately names NONE of
+        # them: no wall published for the campaign, a wall with zero tiles, and
+        # a wall whose criteria admitted nobody. The row records what is
+        # MEASURABLE — a wall campaign served the criteria-free split — rather
+        # than a cause this branch cannot tell apart. A reason that named one
+        # would be right a third of the time and unfalsifiable the rest.
+        trace = attr.get("routing_trace") or {}
+        if trace.get("wall_fell_to_legacy_split"):
+            return "wall_campaign_legacy_split"
         return "matched_legacy_split"
     if rv == "flow_cascade":
         # v2 F-REASON-V2 — refine the returning-specific SUBSET of a flow match

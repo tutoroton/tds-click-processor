@@ -68,6 +68,17 @@ _EXCLUDED_OUT_OF_SCOPE = {
     # Its alerting posture belongs to the offerwall programme
     # (docs/development/offerwall-2026-09-04/), not to this LOSSFIX doc.
     "OP_WALL_TILE_CODES_UNSIGNED",
+    # F4/N1 mint quota (2026-09-17) — the same class as
+    # OP_PREVIEW_CAPACITY_SHED above. The issuance bound WITHHELD a route
+    # code on the zero-write /preview and /wall READ surfaces: the request
+    # still answers 200, the click path never reaches this code, and the
+    # bound fails closed for the MINT while never failing the click. A
+    # bulkhead doing its job is the opposite of a click-loss signal. Its
+    # alerting posture belongs to the ssv-completion programme
+    # (docs/development/ssv-completion-2026-09-16/), which uses the op as
+    # the success discriminator when arming the bound, not to this doc.
+    "OP_MINT_QUOTA_PREVIEW_WITHHELD",
+    "OP_MINT_QUOTA_WALL_WITHHELD",
 }
 
 

@@ -978,6 +978,43 @@ class Settings(BaseSettings):
     # time, which is a queue, not a bulkhead.
     offerwall_admission_charge_tiles: int = 24
 
+    # ------------------------------------------------------------------
+    # N1 — a per-principal RATE bound on route-code ISSUANCE.
+    #
+    # 🔴 NOT the same question as the two bulkheads above. Those bound
+    # CONCURRENCY (how many previews / tiles are in flight at once) and they
+    # are node-global. This bounds a RATE per PRINCIPAL: how many codes one
+    # credential, or one campaign's wall, may be issued per window. A caller
+    # pacing themselves below the in-flight caps can mint indefinitely, and
+    # that is the hole these close — see
+    # `docs/development/ssv-completion-2026-09-16/54-N1-BOUND-DESIGN.md`.
+    #
+    # Charged in CODES, never in requests: one wall request mints one code per
+    # tile, so a request quota would not be a capability quota at all. That is
+    # also the unit the offerwall bulkhead above already uses ("the budget is
+    # TILES, not requests"), so this follows the service's own convention
+    # rather than importing one.
+    #
+    # BOTH DEFAULT TO 0 = OFF, and off is byte-identical: no Redis op, no
+    # exception, nothing. A routing-plane bound lands dark and is armed per
+    # node, exactly as every other one in this programme has been.
+    #
+    # Two keyspaces, separate BY CONSTRUCTION (`app/mint_quota.py`): the
+    # preview budget keys on the credential hash, which a preview must present;
+    # the wall budget keys on the CAMPAIGN, because a wall mint needs only a
+    # known company and wall id — no credential — so a credential-keyed budget
+    # would leave that path unbounded. The wall budget is therefore a shedder
+    # shared by a campaign's visitors, not per-caller abuse protection, and
+    # saying so is part of shipping it.
+    mint_quota_preview_codes_per_window: int = 0
+    mint_quota_wall_codes_per_window: int = 0
+
+    # The window both budgets count in. A FIXED window (one INCRBY + one
+    # conditional EXPIRE) — the cheapest thing that can sit in front of
+    # signing. Its known cost is up to 2x the cap across a boundary, which is
+    # acceptable for a shedder and is written down rather than discovered.
+    mint_quota_window_seconds: int = 60
+
     model_config = {"env_prefix": "TDS_"}
 
     @model_validator(mode="after")

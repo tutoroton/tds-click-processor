@@ -131,6 +131,19 @@ OP_PREVIEW_KEYS_UNSYNCED = "preview_keys_unsynced"
 # second one stays individually visible.
 OP_WALL_TILE_CODES_UNSIGNED = "wall_tile_codes_unsigned"
 
+# N1 — the per-principal ISSUANCE budget refused, so codes were WITHHELD while
+# the answer itself was still served. Two ops rather than one, because the two
+# budgets are separate by construction and a shared dedup key has already made
+# one shed suppress the other's report once on this node (see the comment on
+# `OP_PREVIEW_CAPACITY_SHED`'s dedup key). Dedup on the principal, so one noisy
+# credential or campaign cannot hide a second.
+#
+# 🔴 This is NOT a capacity event: the bulkheads shed LOAD and answer 503; this
+# withholds an OPTIONAL capability and answers normally. An operator who reads
+# them as the same thing will tune the wrong number.
+OP_MINT_QUOTA_PREVIEW_WITHHELD = "mint_quota_preview_withheld"
+OP_MINT_QUOTA_WALL_WITHHELD = "mint_quota_wall_withheld"
+
 # LOSSFIX P2 c1 (2026-07-07) — a recovered `.wip` segment (orphan
 # adoption, B1) had a torn tail: the last line was incomplete or failed
 # to parse. Loss-free by construction (see disk_queue._truncate_torn_

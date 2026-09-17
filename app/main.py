@@ -79,6 +79,7 @@ from app.router import (
     route,
 )
 from app.resolution import BINDING_SELECTOR_KEY
+from app.router import RESERVED_ROUTING_PREFIX, ROUTE_CODE_PARAM
 from app.ua_parser import warmup as warmup_ua_parser
 from app.shipper import assert_shipper_ready, run_shipper
 from app.shipper_metrics import metrics as shipper_metrics
@@ -1301,6 +1302,12 @@ def _phase3_attribution_fields(
     return fields
 
 
+#: System-controlled provenance key: a route code WAS presented on this click.
+#: Underscore-prefixed like `_param_rules`, so it reads as ours at a glance in a
+#: JSONB blob full of advertiser names. It records the FACT, never the token.
+_ROUTE_CODE_PRESENTED_KEY = "_route_code_presented"
+
+
 def _build_extra_params(attribution: dict | None, query_params: dict) -> dict:
     """The click's `extra_params` JSONB — query params that did NOT bind
     to a dedicated reserved/sub column.
@@ -1342,6 +1349,36 @@ def _build_extra_params(attribution: dict | None, query_params: dict) -> dict:
     # `?_param_rules=` on EVERY path (matched + no-match) so a forged value can
     # never survive into `extra_params` and masquerade as real rule provenance.
     extras.pop("_param_rules", None)
+    # E3 / F4 — the reserved `tds_*` routing-control family, RECORDED then
+    # STRIPPED. Same two-path asymmetry as `binding_selector` directly above:
+    # `resolve_slots` drops these on the RESOLVED path, while the no-match /
+    # pre-campaign branch rebuilds extras from the RAW query params and
+    # re-admits them. Measured on deployed staging 2026-09-17 — **1510 clicks
+    # in 30 days out of 386 289** carry a `tds_` key, 969 of them the exact
+    # pair `landing_url,tds_rc`. The mechanism is unconditional; the rate only
+    # reflects how often a coded link misses.
+    #
+    # 🔴 RECORD FIRST, AND NEVER STRIP BLIND. `extra_params.tds_rc` is today the
+    # ONLY trace that a route code was presented and REFUSED: a refused code
+    # leaves `target_selection_path` empty, which is byte-identical to no code
+    # having been presented at all. Dropping the key silently would destroy the
+    # last handle on exactly the case an operator needs to debug. So the FACT
+    # survives in a system key and only the VALUE — a signed token, not
+    # advertiser data, and not something an analytics column should carry —
+    # goes away.
+    #
+    # The forged-value pop comes BEFORE the real write, for the same reason
+    # `_param_rules` is stripped above: a caller must not be able to supply
+    # `?_route_code_presented=` and have it read as provenance.
+    extras.pop(_ROUTE_CODE_PRESENTED_KEY, None)
+    _reserved = [
+        k for k in list(extras)
+        if str(k).lower().startswith(RESERVED_ROUTING_PREFIX)
+    ]
+    if any(str(k).lower() == ROUTE_CODE_PARAM for k in _reserved):
+        extras[_ROUTE_CODE_PRESENTED_KEY] = "1"
+    for _k in _reserved:
+        extras.pop(_k, None)
     return extras
 
 

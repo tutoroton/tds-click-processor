@@ -1538,6 +1538,21 @@ async def _route_via_campaign(
 #: both call.
 ROUTE_CODE_PARAM: Final[str] = "tds_rc"
 
+#: The reserved routing-control NAMESPACE that `ROUTE_CODE_PARAM` belongs to.
+#: Defined here, beside the key it generalises, so the click path has exactly
+#: ONE answer to "is this name ours" — `main._build_extra_params` imports it
+#: rather than re-spelling the literal, which is the duplication this repo has
+#: already paid for twice (`_slugify`, and the four-way `PIN_BEARING_ACTION_TYPES`
+#: term the wall docstring records).
+#:
+#: admin-api enforces the SAME namespace on the authoring side
+#: (`app/common/parameters.py`, `RESERVED_ROUTING_KEY_PREFIX`) so an operator
+#: cannot alias a data slot onto it. The two are deliberately separate
+#: constants in separate services — a shared import across a service boundary
+#: would be the coupling `microservice-boundaries` forbids — and the
+#: cross-service pin reads both literals rather than assuming they agree.
+RESERVED_ROUTING_PREFIX: Final[str] = "tds_"
+
 
 async def _route_code_target(
     r,

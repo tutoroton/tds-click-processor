@@ -8,7 +8,7 @@ canonical-binding rule documented in
 (F.X plan locked 2026-05-14).
 
 **Why a copy and not an import:** click-processor is the public
-mirror that runs on every edge node (`tutoroton/tds-click-processor`,
+mirror that runs on every edge node (`mx-team-dev/tds-click-processor`,
 deployed via `git subtree push`). It MUST NOT depend on admin-api
 code — the two services are deployed independently, run on different
 servers, and the click-processor sees admin-api only through the

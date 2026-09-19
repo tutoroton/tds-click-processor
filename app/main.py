@@ -4,7 +4,7 @@ Receives click parameters from CF Worker, evaluates routing rules
 against local Redis, returns destination URL for redirect.
 
 Mirror tip: any commit on `services/click-processor/` lands here +
-gets auto-mirrored to `tutoroton/tds-click-processor` (CI on stage
+gets auto-mirrored to `mx-team-dev/tds-click-processor` (CI on stage
 merge); admin-api polls the mirror tip every 120s and flags
 `update_available=true` for nodes still on an earlier SHA → operator
 sees the "Update available" badge in admin-panel → can roll forward
